@@ -1,0 +1,77 @@
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 25565,
+    "username": "your-microsoft-email@example.com",
+    "auth": "microsoft",
+    "password": "",
+    "profilesFolder": "auth-cache",
+    "version": "1.21.11",
+    "locale": "zh_CN"
+  },
+  "admins": [
+    "YourPlayerName"
+  ],
+  "momoOwner": "__momo__",
+  "web": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 8787,
+    "dashboardUrl": "http://127.0.0.1:8787/",
+    "trustProxy": false,
+    "maxLoginFailures": 5,
+    "loginFailWindowMs": 600000,
+    "loginBlockMs": 600000
+  },
+  "storage": {
+    "defaultQuotaSlots": 270,
+    "defaultCustomWarehouseQuotaSlots": 270,
+    "maxCustomWarehousesPerPlayer": 3
+  },
+  "commands": {
+    "home": "/home ck",
+    "tpa": "/tpa {player}",
+    "tpaccept": "/tpaccept {player}",
+    "msg": "/msg {player} {message}",
+    "publicFallback": false
+  },
+  "timing": {
+    "homeWaitMs": 3500,
+    "pickupWindowMs": 10000,
+    "postTeleportWaitMs": 1500,
+    "dropIntervalMs": 250,
+    "containerSettleMs": 250,
+    "openContainerTimeoutMs": 8000,
+    "inventoryUpdateTimeoutMs": 2000,
+    "pathTimeoutMs": 15000,
+    "pathNoProgressMs": 4000,
+    "commandDedupeMs": 1500,
+    "teleportRequestTimeoutMs": 15000,
+    "teleportDetectRadius": 8,
+    "reconnectDelayMs": 10000
+  },
+  "debug": true,
+  "debugChat": true,
+  "debugRawChat": false,
+  "resourcePack": {
+    "autoAccept": true
+  },
+  "warehouse": {
+    "defaultSyncRadius": 16,
+    "pickupRadius": 2,
+    "maxSyncRadius": 64,
+    "maxEmptyDepositAttempts": 3,
+    "chestBlockNames": [
+      "barrel"
+    ]
+  },
+  "language": {
+    "file": "data/zh_cn.json"
+  },
+  "aliases": {
+    "石头": "minecraft:stone",
+    "圆石": "minecraft:cobblestone",
+    "石英块": "minecraft:quartz_block",
+    "红石块": "minecraft:redstone_block"
+  }
+}

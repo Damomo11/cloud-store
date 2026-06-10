@@ -1,0 +1,13 @@
+node_modules/
+auth-cache/
+config.json
+config.local.json
+data/*.sqlite
+data/*.sqlite-*
+data/*.bak
+*.log
+__pycache__/
+*.pyc
+tmp-crash-*/
+cloud-store-mod/.gradle/
+cloud-store-mod/build/

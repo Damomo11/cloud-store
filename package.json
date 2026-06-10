@@ -1,0 +1,23 @@
+{
+  "name": "cloud-store-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Mineflayer cloud warehouse bot for player item deposit and withdrawal.",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dashboard": "python inventory-dashboard/dashboard.py",
+    "check": "node --check src/index.js && node --check src/db.js && node --check src/itemCatalog.js && node --check src/warehouse.js && node --check src/service.js && node --check scripts/download-lang.js && node --check scripts/litematic-materials.js",
+    "download:lang": "node scripts/download-lang.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.10.0",
+    "minecraft-data": "^3.110.2",
+    "mineflayer": "^4.37.1",
+    "mineflayer-pathfinder": "^2.4.5",
+    "vec3": "^0.1.10"
+  }
+}

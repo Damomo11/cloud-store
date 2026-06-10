@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "cloud_store_mod",
+  "version": "${version}",
+  "name": "云仓库助手",
+  "description": "把云仓库机器人的私聊命令封装成客户端 GUI。",
+  "authors": [
+    "Damomo"
+  ],
+  "contact": {},
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "com.damomo.cloudstoremod.CloudStoreModClient"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.18.4",
+    "minecraft": "1.21.11",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
