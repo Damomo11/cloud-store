@@ -5,6 +5,7 @@ const { sha1, stableStringify } = require('./utils')
 
 class ItemCatalog {
   constructor (version, aliases = {}, languageConfig = {}) {
+    this.version = version
     this.mcData = mcDataLoader(version)
     this.aliases = new Map()
     this.itemsByName = new Map()
@@ -67,14 +68,16 @@ class ItemCatalog {
 
   fromPrismarineItem (item) {
     const itemId = `minecraft:${item.name}`
-    const nbtJson = stableStringify(item.nbt || null)
     const rawMeta = {
       metadata: item.metadata ?? null,
       components: item.components || null
     }
-    const metaJson = stableStringify(rawMeta)
-    const fingerprintMeta = this.isShulkerBox(itemId) ? this.normalizeShulkerMetaForFingerprint(rawMeta) : rawMeta
-    const fingerprintNbt = this.isShulkerBox(itemId) ? null : (item.nbt || null)
+    const safeNbt = this.sanitizeNbtForStorage(itemId, item.nbt || null)
+    const safeMeta = this.sanitizeMetaForStorage(itemId, rawMeta)
+    const nbtJson = stableStringify(safeNbt)
+    const metaJson = stableStringify(safeMeta)
+    const fingerprintMeta = this.normalizeMetaForFingerprint(itemId, safeMeta)
+    const fingerprintNbt = this.normalizeNbtForFingerprint(itemId, safeNbt)
     const fingerprint = sha1(stableStringify({ itemId, nbtJson: stableStringify(fingerprintNbt), metaJson: stableStringify(fingerprintMeta) }))
     return {
       itemKey: `${itemId}|${fingerprint}`,
@@ -85,7 +88,7 @@ class ItemCatalog {
       amount: item.count,
       type: item.type,
       metadata: item.metadata,
-      nbt: item.nbt
+      nbt: safeNbt
     }
   }
 
@@ -105,12 +108,14 @@ class ItemCatalog {
   }
 
   canonicalizeStoredItem (row) {
-    if (!row?.itemId || !this.isShulkerBox(row.itemId)) return row
+    if (!row?.itemId) return row
     const meta = this.parseStoredJson(row.metaJson, {})
-    const canonicalMeta = this.normalizeShulkerMetaForFingerprint(meta)
+    const nbt = this.parseStoredJson(row.nbtJson, null)
+    const canonicalMeta = this.normalizeMetaForFingerprint(row.itemId, meta)
+    const canonicalNbt = this.normalizeNbtForFingerprint(row.itemId, nbt)
     const fingerprint = sha1(stableStringify({
       itemId: row.itemId,
-      nbtJson: stableStringify(null),
+      nbtJson: stableStringify(canonicalNbt),
       metaJson: stableStringify(canonicalMeta)
     }))
     return {
@@ -130,14 +135,14 @@ class ItemCatalog {
 
     const itemId = `minecraft:${item.name}`
     const components = Array.isArray(entry.components) && entry.components.length ? entry.components : null
-    const meta = { metadata: null, components }
+    const meta = this.sanitizeMetaForStorage(itemId, { metadata: null, components })
     if (Array.isArray(entry.removeComponents) && entry.removeComponents.length) {
       meta.removeComponents = entry.removeComponents
     }
 
     const nbtJson = stableStringify(null)
     const metaJson = stableStringify(meta)
-    const fingerprintMeta = this.isShulkerBox(itemId) ? this.normalizeShulkerMetaForFingerprint(meta) : meta
+    const fingerprintMeta = this.normalizeMetaForFingerprint(itemId, meta)
     const fingerprint = sha1(stableStringify({ itemId, nbtJson, metaJson: stableStringify(fingerprintMeta) }))
     const amount = Number.parseInt(entry.itemCount ?? entry.count ?? 0, 10)
     if (!Number.isFinite(amount) || amount <= 0) return null
@@ -225,6 +230,60 @@ class ItemCatalog {
     }
   }
 
+  normalizeMetaForFingerprint (itemId, meta) {
+    const base = this.isShulkerBox(itemId) ? this.normalizeShulkerMetaForFingerprint(meta) : meta
+    return this.stripVolatileMetaForFingerprint(itemId, base)
+  }
+
+  normalizeNbtForFingerprint (itemId, nbt) {
+    return (this.isShulkerBox(itemId) || this.isBeeContainer(itemId)) ? null : nbt
+  }
+
+  stripVolatileMetaForFingerprint (itemId, meta) {
+    if (!this.shouldIgnoreCraftEngineNetworkData(itemId)) return meta
+    const stripped = this.omitObjectKeyDeep(meta, 'craftengine:network_data')
+    if (Array.isArray(stripped?.components)) {
+      return {
+        ...stripped,
+        components: stripped.components.filter(component => !this.isEmptyCustomDataComponent(component))
+      }
+    }
+    return stripped
+  }
+
+  shouldIgnoreCraftEngineNetworkData (itemId) {
+    const normalized = this.normalizeItemId(itemId)
+    return normalized === 'minecraft:string' ||
+      normalized === 'minecraft:tripwire_hook' ||
+      normalized === 'minecraft:note_block'
+  }
+
+  omitObjectKeyDeep (value, keyToOmit) {
+    if (Array.isArray(value)) return value.map(item => this.omitObjectKeyDeep(item, keyToOmit))
+    if (!value || typeof value !== 'object') return value
+    const result = {}
+    for (const [key, child] of Object.entries(value)) {
+      if (key === keyToOmit) continue
+      result[key] = this.omitObjectKeyDeep(child, keyToOmit)
+    }
+    return result
+  }
+
+  isEmptyCustomDataComponent (component) {
+    if (component?.type !== 'custom_data') return false
+    return this.isEmptyValue(component.data)
+  }
+
+  isEmptyValue (value) {
+    if (value === undefined || value === null) return true
+    if (Array.isArray(value)) return value.length === 0 || value.every(item => this.isEmptyValue(item))
+    if (typeof value !== 'object') return false
+    if (Object.prototype.hasOwnProperty.call(value, 'type') && Object.prototype.hasOwnProperty.call(value, 'value')) {
+      return this.isEmptyValue(value.value)
+    }
+    return Object.keys(value).length === 0 || Object.values(value).every(child => this.isEmptyValue(child))
+  }
+
   normalizeContainerEntryForFingerprint (entry) {
     if (!entry || !Number.isInteger(entry.itemId)) return null
     const count = Number.parseInt(entry.itemCount ?? entry.count ?? 0, 10)
@@ -263,6 +322,127 @@ class ItemCatalog {
   isShulkerBox (itemId) {
     const normalized = this.normalizeItemId(itemId)
     return /(^|:)shulker_box$/.test(normalized) || /_shulker_box$/.test(normalized)
+  }
+
+  isBeeContainer (itemId) {
+    const normalized = this.normalizeItemId(itemId)
+    return normalized === 'minecraft:beehive' || normalized === 'minecraft:bee_nest'
+  }
+
+  sanitizeNbtForStorage (itemId, nbtValue) {
+    if (!nbtValue) return null
+    if (this.isBeeContainer(itemId)) return null
+    return this.compactLargeValue(nbtValue, 'nbt')
+  }
+
+  sanitizeMetaForStorage (itemId, meta = {}) {
+    const result = {
+      metadata: meta?.metadata ?? null,
+      components: Array.isArray(meta?.components)
+        ? meta.components.map(component => this.sanitizeComponentForStorage(itemId, component)).filter(Boolean)
+        : (meta?.components || null)
+    }
+    if (Array.isArray(meta?.removeComponents) && meta.removeComponents.length) {
+      result.removeComponents = [...meta.removeComponents]
+    }
+    return result
+  }
+
+  sanitizeComponentForStorage (itemId, component) {
+    if (!component || typeof component !== 'object') return component
+
+    const type = component.type
+    if (this.isBeeContainer(itemId) && ['bees', 'block_entity_data', 'custom_data'].includes(type)) {
+      return {
+        ...component,
+        data: this.summarizeBeeComponent(type, component.data)
+      }
+    }
+
+    return {
+      ...component,
+      data: this.compactLargeValue(component.data, `component:${type}`)
+    }
+  }
+
+  summarizeBeeComponent (type, data) {
+    if (type === 'bees') {
+      const bees = Array.isArray(data?.bees) ? data.bees : []
+      return {
+        beeCount: bees.length,
+        bees: bees.map(bee => ({
+          ticksInHive: this.safeInteger(bee?.ticksInHive),
+          minTicksInHive: this.safeInteger(bee?.minTicksInHive)
+        }))
+      }
+    }
+
+    const summary = this.summarizeBeeNbt(data?.data || data)
+    if (data && typeof data === 'object' && Object.prototype.hasOwnProperty.call(data, 'type')) {
+      summary.type = data.type
+    }
+    return summary
+  }
+
+  summarizeBeeNbt (value) {
+    const text = this.safeStableStringify(value)
+    return {
+      omittedBeeNbt: true,
+      beeCount: this.extractBeeCountFromValue(value),
+      hash: text ? sha1(text).slice(0, 12) : '',
+      originalLength: text.length
+    }
+  }
+
+  compactLargeValue (value, kind) {
+    if (value === undefined || value === null) return value ?? null
+    const maxLength = 20000
+    const text = this.safeStableStringify(value)
+    if (text.length <= maxLength) return value
+    return {
+      omittedLargeValue: true,
+      kind,
+      hash: sha1(text).slice(0, 12),
+      originalLength: text.length,
+      preview: this.previewLargeValue(value)
+    }
+  }
+
+  safeStableStringify (value) {
+    try {
+      return stableStringify(value)
+    } catch {
+      try {
+        return JSON.stringify(value, (_key, child) => typeof child === 'bigint' ? child.toString() : child)
+      } catch {
+        return String(value)
+      }
+    }
+  }
+
+  previewLargeValue (value) {
+    const text = this.componentText(value).trim()
+    if (text) return text.slice(0, 120)
+    if (Array.isArray(value)) return `array(${value.length})`
+    if (value && typeof value === 'object') return Object.keys(value).slice(0, 12).join(',')
+    return String(value).slice(0, 120)
+  }
+
+  safeInteger (value) {
+    const parsed = Number.parseInt(value, 10)
+    return Number.isFinite(parsed) ? parsed : 0
+  }
+
+  extractBeeCountFromValue (value) {
+    let count = 0
+    this.walkValue(value, child => {
+      if (count > 0 || !child || typeof child !== 'object') return
+      const bees = child.Bees ?? child.bees
+      if (Array.isArray(bees)) count = bees.length
+      if (Array.isArray(bees?.value?.value)) count = bees.value.value.length
+      if (Array.isArray(bees?.value)) count = bees.value.length
+    })
+    return count
   }
 
   aggregatePrismarineItems (items) {
@@ -355,6 +535,9 @@ class ItemCatalog {
     const customName = this.extractCustomName(item.components)
     if (customName) return customName
 
+    const beeContainerName = this.describeBeeContainer(itemId, item.components)
+    if (beeContainerName) return beeContainerName
+
     if (this.normalizeItemId(itemId) === 'minecraft:enchanted_book') {
       const enchantments = this.extractEnchantments(item.components)
       if (enchantments.length) {
@@ -374,6 +557,9 @@ class ItemCatalog {
 
     const customName = this.extractCustomName(meta.components)
     if (customName) return customName
+
+    const beeContainerName = this.describeBeeContainer(itemId, meta.components)
+    if (beeContainerName) return beeContainerName
 
     if (this.normalizeItemId(itemId) === 'minecraft:enchanted_book') {
       const enchantments = this.extractEnchantments(meta.components)
@@ -417,6 +603,28 @@ class ItemCatalog {
       if (Number.isFinite(parsed) && parsed > 0) duration = parsed
     })
     return Math.max(1, Math.min(3, duration || 1))
+  }
+
+  describeBeeContainer (itemId, components) {
+    if (!this.isBeeContainer(itemId)) return ''
+    const count = this.extractBeeCountFromComponents(components)
+    if (!count) return ''
+    return `${this.getDisplayName(itemId)}（含蜂${count}）`
+  }
+
+  extractBeeCountFromComponents (components) {
+    if (!Array.isArray(components)) return 0
+    const bees = components.find(component => component?.type === 'bees')
+    const count = Number.parseInt(bees?.data?.beeCount, 10)
+    if (Number.isFinite(count) && count > 0) return count
+    if (Array.isArray(bees?.data?.bees)) return bees.data.bees.length
+
+    let nestedCount = 0
+    for (const component of components) {
+      if (!['block_entity_data', 'custom_data'].includes(component?.type)) continue
+      nestedCount = Math.max(nestedCount, this.extractBeeCountFromValue(component.data))
+    }
+    return nestedCount
   }
 
   extractCustomName (components) {

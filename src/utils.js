@@ -10,6 +10,7 @@ function sha1 (value) {
 
 function stableStringify (value) {
   if (value === undefined) return 'null'
+  if (typeof value === 'bigint') return JSON.stringify(value.toString())
   if (value === null || typeof value !== 'object') return JSON.stringify(value)
   if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`
   const keys = Object.keys(value).sort()

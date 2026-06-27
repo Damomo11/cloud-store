@@ -30,6 +30,10 @@ npm run download:lang
 copy config.example.json config.json
 ```
 
+`config.json` 支持 JSONC 风格注释（`//` 和 `/* ... */`），可以直接参考 `config.example.json` 里的英文说明。
+
+启动时程序会自动为旧版 `config.json` 补齐新增字段，只补缺失项，不覆盖已有账号、密码、服务器地址等配置。写回前会生成 `config.json.bak-时间戳` 备份。
+
 关键配置：
 
 - `server`: 服务器地址、端口、机器人账号、认证方式和 MC 版本
@@ -39,11 +43,19 @@ copy config.example.json config.json
 - `commands.tpaccept`: 默认 `/tpaccept {player}`，管理员请求传送到机器人位置时自动接受
 - `storage.defaultCustomWarehouseQuotaSlots`: 自定义仓库默认额度
 - `storage.maxCustomWarehousesPerPlayer`: 每个玩家最多可创建的自定义仓库数量，默认 3
-- `web.enabled` / `web.host` / `web.port` / `web.dashboardUrl`: 内置 Web 面板开关、监听地址和展示地址
-- `web.maxLoginFailures` / `web.loginFailWindowMs` / `web.loginBlockMs`: 登录密钥防爆破，默认 10 分钟内错 5 次封禁该 IP 10 分钟
+- `web.enabled` / `web.host` / `web.port`: 内置 Web 面板开关、监听地址和端口；`web.host` 是监听地址，`0.0.0.0` 表示监听所有网卡
+- `web.dashboardUrl`: 可选的公网展示地址；本机/内网使用可以不填，内穿或反代时填真实访问地址，不要填 `http://0.0.0.0:端口/`
+- `web.maxLoginFailures` / `web.loginFailWindowMs` / `web.loginBlockMs`: 密钥登录防爆破，默认 10 分钟内错 5 次封禁该 IP 10 分钟
+- `web.loginCodeTtlMs`: 网页“临时验证码”的有效期，默认 120000 毫秒；用户离开等待界面会作废
 - `web.trustProxy`: 是否信任穿透/反代传来的 `X-Forwarded-For` 真实 IP；公网反代需要按实际情况开启
+- `timing.homeWaitMs` / `timing.homeTimeoutMs`: `/home` 后的最短等待和最长等待；服务器 home 有读秒或延迟时调大 `homeTimeoutMs`
+- `timing.dropConfirmTimeoutMs`: 取货交付时等待背包数量减少的时间；服务器背包同步慢时可调大
 - `timing.inventoryUpdateTimeoutMs`: 取物品点击后等待背包更新的时间，服务器卡顿时可调大
 - `warehouse.defaultSyncRadius`: `!同步仓库` 的默认半径
+- `warehouse.homeSkipRadius`: bot 已在已同步木桶附近时跳过 `/home` 的判定半径，默认 8
+- `warehouse.layoutMode`: 仓库开箱站位模式，默认 `normal`；圆柱形仓库可设为 `cylinder`
+- `warehouse.cylinder.axis`: 圆柱通道延伸方向，`x` 表示按木桶所在 X 面移动，`z` 表示按木桶所在 Z 面移动
+- `warehouse.cylinder.tunnelCenter`: 圆柱通道中心坐标；留空时使用 bot `/home` 后所在位置，`axis=x` 时每次会自动替换为目标木桶的 X，`axis=z` 时自动替换为目标木桶的 Z
 - `debugChat`: 打印命令、回复、去重等命令相关日志
 - `debugRawChat`: 打印原始公屏、私聊、系统聊天包；默认关闭，只有排查聊天格式时再打开
 - `aliases`: 中文物品名到 `minecraft:item_id` 的映射
@@ -65,7 +77,7 @@ npm start
 http://127.0.0.1:8787/
 ```
 
-首次使用前，玩家需要先在游戏内私聊机器人设置登录密钥：
+玩家可以在网页使用“临时验证码”登录；如果想固定密钥，也可以先在游戏内私聊机器人设置登录密钥：
 
 ```text
 设置密钥 1234

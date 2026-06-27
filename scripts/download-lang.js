@@ -1,12 +1,12 @@
 const fs = require('node:fs')
 const path = require('node:path')
 const https = require('node:https')
+const { loadConfig } = require('../src/config')
 
 const MANIFEST_URL = 'https://piston-meta.mojang.com/mc/game/version_manifest_v2.json'
 
 function readConfig () {
-  const configPath = path.resolve(process.cwd(), 'config.json')
-  return JSON.parse(fs.readFileSync(configPath, 'utf8'))
+  return loadConfig(path.resolve(process.cwd(), 'config.json'))
 }
 
 function getJson (url) {

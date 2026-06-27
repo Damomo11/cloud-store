@@ -2,6 +2,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const nbt = require('prismarine-nbt')
 const mcDataLoader = require('minecraft-data')
+const { loadOptionalConfig } = require('../src/config')
 
 function unwrap (value) {
   return value?.value ?? value
@@ -67,11 +68,33 @@ function displayNameForBlock (blockId, language = {}) {
   return language[`block.minecraft.${key}`] || language[`item.minecraft.${key}`] || blockId
 }
 
+const BLOCK_ITEM_ALIASES = new Map([
+  ['redstone_wire', 'redstone'],
+  ['tripwire', 'string'],
+  ['wall_torch', 'torch'],
+  ['soul_wall_torch', 'soul_torch'],
+  ['redstone_wall_torch', 'redstone_torch']
+])
+
 function itemIdForBlockId (blockId, mcData) {
   const name = blockId.replace(/^minecraft:/, '')
+  const directAlias = BLOCK_ITEM_ALIASES.get(name)
+  if (directAlias && mcData.itemsByName[directAlias]) return `minecraft:${directAlias}`
   if (/_wall_fan$/.test(name)) {
     const fanName = name.replace('_wall_fan', '_fan')
     if (mcData.itemsByName[fanName]) return `minecraft:${fanName}`
+  }
+  if (/_wall_sign$/.test(name)) {
+    const signName = name.replace('_wall_sign', '_sign')
+    if (mcData.itemsByName[signName]) return `minecraft:${signName}`
+  }
+  if (/_wall_hanging_sign$/.test(name)) {
+    const signName = name.replace('_wall_hanging_sign', '_hanging_sign')
+    if (mcData.itemsByName[signName]) return `minecraft:${signName}`
+  }
+  if (/_wall_banner$/.test(name)) {
+    const bannerName = name.replace('_wall_banner', '_banner')
+    if (mcData.itemsByName[bannerName]) return `minecraft:${bannerName}`
   }
   return mcData.itemsByName[name] ? blockId : null
 }
@@ -81,8 +104,7 @@ function stackSizeForItemId (itemId, mcData) {
   return mcData.itemsByName[name]?.stackSize || 64
 }
 
-async function parseLitematicMaterials (filePath, options = {}) {
-  const data = fs.readFileSync(filePath)
+async function parseLitematicData (data, options = {}) {
   const { parsed } = await nbt.parse(data)
   const root = parsed.value
   const regions = root.Regions?.value || {}
@@ -149,8 +171,8 @@ async function parseLitematicMaterials (filePath, options = {}) {
     .sort((a, b) => b.amount - a.amount || a.displayName.localeCompare(b.displayName, 'zh-CN'))
 
   return {
-    file: filePath,
-    name: unwrap(metadata.Name) || path.basename(filePath),
+    file: options.filePath || '',
+    name: unwrap(metadata.Name) || (options.filePath ? path.basename(options.filePath) : 'uploaded.litematic'),
     author: unwrap(metadata.Author) || '',
     litematicVersion: unwrap(root.Version),
     minecraftDataVersion: unwrap(root.MinecraftDataVersion),
@@ -169,6 +191,11 @@ async function parseLitematicMaterials (filePath, options = {}) {
   }
 }
 
+async function parseLitematicMaterials (filePath, options = {}) {
+  const data = fs.readFileSync(filePath)
+  return parseLitematicData(data, { ...options, filePath })
+}
+
 async function main () {
   const filePath = process.argv[2]
   if (!filePath) {
@@ -176,8 +203,7 @@ async function main () {
     process.exit(1)
   }
 
-  const configPath = path.resolve(process.cwd(), 'config.json')
-  const config = fs.existsSync(configPath) ? JSON.parse(fs.readFileSync(configPath, 'utf8')) : {}
+  const config = loadOptionalConfig(path.resolve(process.cwd(), 'config.json'), {})
   const result = await parseLitematicMaterials(path.resolve(filePath), {
     version: config.server?.version || '1.21.1',
     languageFile: path.resolve(process.cwd(), config.language?.file || 'data/zh_cn.json'),
@@ -213,5 +239,6 @@ if (require.main === module) {
 }
 
 module.exports = {
+  parseLitematicData,
   parseLitematicMaterials
 }

@@ -1,7 +1,7 @@
 {
   "source": "server_registry_data",
   "registryId": "minecraft:enchantment",
-  "exportedAt": "2026-06-09T16:00:07.981Z",
+  "exportedAt": "2026-06-13T15:07:53.190Z",
   "count": 89,
   "enchantments": [
     {
@@ -6498,6 +6498,7 @@
                       "flags": {
                         "is_flying": 1
                       },
+                      "periodic_tick": 15,
                       "location": {
                         "position": {
                           "y": {

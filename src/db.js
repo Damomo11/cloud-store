@@ -111,6 +111,17 @@ class StoreDb {
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
 
+      CREATE TABLE IF NOT EXISTS player_item_name_overrides (
+        player_uuid TEXT NOT NULL,
+        item_key TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (player_uuid, item_key),
+        FOREIGN KEY (item_key) REFERENCES items(item_key) ON DELETE CASCADE
+      );
+
       CREATE TABLE IF NOT EXISTS item_key_aliases (
         short_code TEXT PRIMARY KEY,
         item_key TEXT NOT NULL,
@@ -138,6 +149,15 @@ class StoreDb {
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
 
+      CREATE TABLE IF NOT EXISTS web_sessions (
+        session_hash TEXT PRIMARY KEY,
+        owner_uuid TEXT NOT NULL,
+        username TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+
       CREATE TABLE IF NOT EXISTS inventory_mismatches (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         kind TEXT NOT NULL,
@@ -155,11 +175,27 @@ class StoreDb {
         resolved_at TEXT
       );
 
+      CREATE TABLE IF NOT EXISTS active_recovery_tasks (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        type TEXT NOT NULL,
+        actor_username TEXT NOT NULL DEFAULT '',
+        owner_uuid TEXT NOT NULL DEFAULT '',
+        owner_username TEXT NOT NULL DEFAULT '',
+        owner_scope TEXT NOT NULL DEFAULT 'personal',
+        vault_name TEXT NOT NULL DEFAULT '',
+        target_username TEXT NOT NULL DEFAULT '',
+        phase TEXT NOT NULL DEFAULT '',
+        items_json TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+
       CREATE INDEX IF NOT EXISTS idx_items_item_id ON items(item_id);
       CREATE INDEX IF NOT EXISTS idx_balances_item_key ON balances(item_key);
       CREATE INDEX IF NOT EXISTS idx_chest_slots_item_key ON chest_slots(item_key);
       CREATE INDEX IF NOT EXISTS idx_custom_warehouse_members_player ON custom_warehouse_members(player_uuid);
       CREATE INDEX IF NOT EXISTS idx_item_key_aliases_item_key ON item_key_aliases(item_key);
+      CREATE INDEX IF NOT EXISTS idx_player_item_name_overrides_item ON player_item_name_overrides(item_key);
       CREATE INDEX IF NOT EXISTS idx_shulker_contents_contained_key ON shulker_contents(contained_item_key);
       CREATE INDEX IF NOT EXISTS idx_shulker_contents_contained_id ON shulker_contents(contained_item_id);
       CREATE INDEX IF NOT EXISTS idx_web_login_tokens_hash ON web_login_tokens(token_hash);
@@ -168,6 +204,8 @@ class StoreDb {
     `)
 
     this.ensureColumn('items', 'display_name_manual', 'INTEGER NOT NULL DEFAULT 0')
+    this.ensureColumn('active_recovery_tasks', 'items_json', "TEXT NOT NULL DEFAULT '[]'")
+    this.ensureColumn('players', 'default_owner_uuid', "TEXT NOT NULL DEFAULT ''")
     this.migrateManualItemNamesToOverrides()
 
     for (const username of this.config.admins || []) {
@@ -182,9 +220,9 @@ class StoreDb {
 
   setCatalog (catalog) {
     this.catalog = catalog
-    const migrated = this.canonicalizeShulkerItemKeys()
+    const migrated = this.canonicalizeItemKeys()
     if (migrated.moved > 0) {
-      console.log(`Canonicalized ${migrated.moved} shulker item keys, merged ${migrated.mergedBalances} balance rows`)
+      console.log(`Canonicalized ${migrated.moved} item keys, merged ${migrated.mergedBalances} balance rows`)
     }
     this.rebuildShulkerContentIndex()
   }
@@ -207,14 +245,13 @@ class StoreDb {
     return indexed
   }
 
-  canonicalizeShulkerItemKeys () {
+  canonicalizeItemKeys () {
     if (!this.catalog) return { moved: 0, mergedBalances: 0 }
 
     const rows = this.db.prepare(`
       SELECT item_key AS itemKey, item_id AS itemId, display_name AS displayName,
              nbt_json AS nbtJson, meta_json AS metaJson, display_name_manual AS displayNameManual
       FROM items
-      WHERE item_id LIKE '%shulker_box'
       ORDER BY created_at ASC, item_key ASC
     `).all()
 
@@ -240,6 +277,20 @@ class StoreDb {
       const oldBalances = this.db.prepare('SELECT owner_uuid AS ownerUuid, amount FROM balances WHERE item_key = ?')
       const deleteOldBalances = this.db.prepare('DELETE FROM balances WHERE item_key = ?')
       const updateSlots = this.db.prepare('UPDATE chest_slots SET item_key = ? WHERE item_key = ?')
+      const oldPlayerOverrides = this.db.prepare(`
+        SELECT player_uuid AS playerUuid, display_name AS displayName
+        FROM player_item_name_overrides
+        WHERE item_key = ?
+      `)
+      const insertPlayerOverride = this.db.prepare(`
+        INSERT INTO player_item_name_overrides (player_uuid, item_key, item_id, display_name, updated_at)
+        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(player_uuid, item_key) DO UPDATE SET
+          item_id = excluded.item_id,
+          display_name = player_item_name_overrides.display_name,
+          updated_at = CURRENT_TIMESTAMP
+      `)
+      const deletePlayerOverrides = this.db.prepare('DELETE FROM player_item_name_overrides WHERE item_key = ?')
       const deleteOldItem = this.db.prepare('DELETE FROM items WHERE item_key = ?')
       const manualOverrideStmt = this.db.prepare(`
         UPDATE item_name_overrides
@@ -258,6 +309,10 @@ class StoreDb {
         }
         deleteOldBalances.run(move.old.itemKey)
         updateSlots.run(move.canonical.itemKey, move.old.itemKey)
+        for (const override of oldPlayerOverrides.all(move.old.itemKey)) {
+          insertPlayerOverride.run(override.playerUuid, move.canonical.itemKey, move.canonical.itemId, override.displayName)
+        }
+        deletePlayerOverrides.run(move.old.itemKey)
 
         const oldCode = this.shortCodeForItemKey(move.old.itemKey)
         const newCode = this.shortCodeForItemKey(move.canonical.itemKey)
@@ -283,6 +338,60 @@ class StoreDb {
     return this.db.transaction(fn)()
   }
 
+  saveRecoveryTask (task) {
+    this.db.prepare(`
+      INSERT INTO active_recovery_tasks (
+        id, type, actor_username, owner_uuid, owner_username, owner_scope,
+        vault_name, target_username, phase, items_json, updated_at
+      )
+      VALUES (1, @type, @actorUsername, @ownerUuid, @ownerUsername, @ownerScope,
+        @vaultName, @targetUsername, @phase, @itemsJson, CURRENT_TIMESTAMP)
+      ON CONFLICT(id) DO UPDATE SET
+        type = excluded.type,
+        actor_username = excluded.actor_username,
+        owner_uuid = excluded.owner_uuid,
+        owner_username = excluded.owner_username,
+        owner_scope = excluded.owner_scope,
+        vault_name = excluded.vault_name,
+        target_username = excluded.target_username,
+        phase = excluded.phase,
+        items_json = excluded.items_json,
+        updated_at = CURRENT_TIMESTAMP
+    `).run({
+      type: String(task.type || ''),
+      actorUsername: String(task.actorUsername || ''),
+      ownerUuid: String(task.ownerUuid || ''),
+      ownerUsername: String(task.ownerUsername || ''),
+      ownerScope: String(task.ownerScope || 'personal'),
+      vaultName: String(task.vaultName || ''),
+      targetUsername: String(task.targetUsername || ''),
+      phase: String(task.phase || ''),
+      itemsJson: JSON.stringify(Array.isArray(task.items) ? task.items : [])
+    })
+  }
+
+  getRecoveryTask () {
+    const row = this.db.prepare(`
+      SELECT type, actor_username AS actorUsername, owner_uuid AS ownerUuid,
+             owner_username AS ownerUsername, owner_scope AS ownerScope,
+             vault_name AS vaultName, target_username AS targetUsername,
+             phase, items_json AS itemsJson, created_at AS createdAt, updated_at AS updatedAt
+      FROM active_recovery_tasks
+      WHERE id = 1
+    `).get()
+    if (!row) return null
+    try {
+      row.items = JSON.parse(row.itemsJson || '[]')
+    } catch {
+      row.items = []
+    }
+    return row
+  }
+
+  clearRecoveryTask () {
+    this.db.prepare('DELETE FROM active_recovery_tasks WHERE id = 1').run()
+  }
+
   cleanupGhostOwners () {
     let invalidQuotas = 0
     let orphanPlayers = 0
@@ -305,6 +414,7 @@ class StoreDb {
         WHERE uuid LIKE 'name:%'
           AND uuid NOT IN (SELECT owner_uuid FROM balances)
           AND uuid NOT IN (SELECT owner_uuid FROM web_login_tokens)
+          AND uuid NOT IN (SELECT player_uuid FROM player_item_name_overrides)
           AND uuid NOT IN (SELECT player_uuid FROM custom_warehouse_members)
           AND uuid NOT IN (SELECT owner_uuid FROM player_quotas)
           AND uuid NOT IN (SELECT COALESCE(uuid, '') FROM admin_users)
@@ -411,6 +521,47 @@ class StoreDb {
     return { changed: 1, shortCode: code, itemKey: row.itemKey || '' }
   }
 
+  getPlayerItemNameOverrides (playerUuid, itemKeys = []) {
+    const uniqueKeys = [...new Set((itemKeys || []).filter(Boolean))]
+    if (!playerUuid || !uniqueKeys.length) return new Map()
+    const placeholders = uniqueKeys.map(() => '?').join(',')
+    const rows = this.db.prepare(`
+      SELECT item_key AS itemKey, display_name AS displayName
+      FROM player_item_name_overrides
+      WHERE player_uuid = ? AND item_key IN (${placeholders})
+    `).all(playerUuid, ...uniqueKeys)
+    return new Map(rows.map(row => [row.itemKey, row.displayName]))
+  }
+
+  savePlayerItemNameOverride (playerUuid, itemKey, displayName) {
+    const item = this.getItemByKey(itemKey)
+    if (!item) throw new Error(`找不到物品：${itemKey}`)
+    const player = String(playerUuid || '').trim()
+    if (!player) throw new Error('缺少玩家身份，无法设置个人别名。')
+    const nextName = String(displayName || '').trim()
+    const shortCode = this.shortCodeForItemKey(itemKey)
+
+    if (!nextName) {
+      const changed = this.db.prepare(`
+        DELETE FROM player_item_name_overrides
+        WHERE player_uuid = ? AND item_key = ?
+      `).run(player, itemKey).changes
+      return { ...item, displayName: item.displayName, personalAlias: '', shortCode, changed }
+    }
+
+    if ([...nextName].length > 80) throw new Error('别名不能超过 80 个字。')
+    this.db.prepare(`
+      INSERT INTO player_item_name_overrides (player_uuid, item_key, item_id, display_name, updated_at)
+      VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(player_uuid, item_key) DO UPDATE SET
+        item_id = excluded.item_id,
+        display_name = excluded.display_name,
+        updated_at = CURRENT_TIMESTAMP
+    `).run(player, item.itemKey, item.itemId, nextName)
+
+    return { ...item, displayName: nextName, personalAlias: nextName, shortCode, changed: 1 }
+  }
+
   migrateManualItemNamesToOverrides () {
     const rows = this.db.prepare(`
       SELECT item_key AS itemKey, item_id AS itemId, display_name AS displayName
@@ -466,7 +617,7 @@ class StoreDb {
 
   setWebLoginToken (ownerUuid, username, token) {
     token = String(token || '').trim()
-    if (!token) throw new Error('登录密钥不能为空。')
+    if (!token) throw new Error('登录密码不能为空。')
     const tokenHash = this.hashWebLoginToken(token)
     const tokenHint = token.slice(-6)
 
@@ -496,12 +647,30 @@ class StoreDb {
 
   getPlayerByUsername (username) {
     return this.db.prepare(`
-      SELECT uuid, username
+      SELECT uuid, username, default_owner_uuid AS defaultOwnerUuid
       FROM players
       WHERE lower(username) = lower(?)
       ORDER BY last_seen_at DESC
       LIMIT 1
     `).get(username) || null
+  }
+
+  getPlayerDefaultOwnerUuid (playerUuid) {
+    const row = this.db.prepare(`
+      SELECT default_owner_uuid AS defaultOwnerUuid
+      FROM players
+      WHERE uuid = ?
+      LIMIT 1
+    `).get(playerUuid)
+    return String(row?.defaultOwnerUuid || '').trim()
+  }
+
+  setPlayerDefaultOwnerUuid (playerUuid, ownerUuid) {
+    this.db.prepare(`
+      UPDATE players
+      SET default_owner_uuid = ?, last_seen_at = CURRENT_TIMESTAMP
+      WHERE uuid = ?
+    `).run(String(ownerUuid || '').trim(), playerUuid)
   }
 
   addAdmin (username, uuid = null) {
@@ -817,8 +986,24 @@ class StoreDb {
     return row.amount || 0
   }
 
+  isPlayerOwnerAccessible (playerUuid, ownerUuid) {
+    if (!ownerUuid) return false
+    if (ownerUuid === playerUuid) return true
+    if (ownerUuid.startsWith('vault:')) {
+      return this.isCustomWarehouseMember(ownerUuid.slice(6), playerUuid)
+    }
+    return false
+  }
+
+  getEffectiveDefaultOwnerUuid (playerUuid) {
+    const configured = this.getPlayerDefaultOwnerUuid(playerUuid)
+    return this.isPlayerOwnerAccessible(playerUuid, configured) ? configured : playerUuid
+  }
+
   listWebOwnersForUser (user) {
     const isAdmin = this.isAdmin(user.username, user.uuid)
+    const defaultOwnerUuid = this.getEffectiveDefaultOwnerUuid(user.uuid)
+    const markDefault = owner => ({ ...owner, isDefault: owner.ownerUuid === defaultOwnerUuid })
     const owners = []
 
     if (isAdmin) {
@@ -830,12 +1015,12 @@ class StoreDb {
         HAVING totalAmount > 0
         ORDER BY p.username COLLATE NOCASE ASC
       `).all()) {
-        owners.push({ ownerUuid: row.uuid, label: row.username, type: 'personal', role: 'admin', totalAmount: row.totalAmount })
+        owners.push(markDefault({ ownerUuid: row.uuid, label: row.username, type: 'personal', role: 'admin', totalAmount: row.totalAmount }))
       }
 
       const momoTotal = this.ownerTotalAmount(this.momoOwner)
       if (momoTotal > 0) {
-        owners.push({ ownerUuid: this.momoOwner, label: 'momo', type: 'system', role: 'admin', totalAmount: momoTotal })
+        owners.push(markDefault({ ownerUuid: this.momoOwner, label: 'momo', type: 'system', role: 'admin', totalAmount: momoTotal }))
       }
 
       for (const row of this.db.prepare(`
@@ -846,18 +1031,18 @@ class StoreDb {
         HAVING totalAmount > 0
         ORDER BY w.name COLLATE NOCASE ASC
       `).all()) {
-        owners.push({ ownerUuid: `vault:${row.nameLower}`, label: `仓库:${row.name}`, type: 'custom', role: 'admin', totalAmount: row.totalAmount })
+        owners.push(markDefault({ ownerUuid: `vault:${row.nameLower}`, label: `仓库:${row.name}`, type: 'custom', role: 'admin', totalAmount: row.totalAmount }))
       }
       return owners
     }
 
-    owners.push({
+    owners.push(markDefault({
       ownerUuid: user.uuid,
       label: user.username,
       type: 'personal',
       role: 'owner',
       totalAmount: this.ownerTotalAmount(user.uuid)
-    })
+    }))
 
     for (const row of this.db.prepare(`
       SELECT w.name_lower AS nameLower, w.name, m.role, COALESCE(SUM(b.amount), 0) AS totalAmount
@@ -869,7 +1054,7 @@ class StoreDb {
       HAVING totalAmount > 0
       ORDER BY w.name COLLATE NOCASE ASC
     `).all(user.uuid)) {
-      owners.push({ ownerUuid: `vault:${row.nameLower}`, label: `仓库:${row.name}`, type: 'custom', role: row.role, totalAmount: row.totalAmount })
+      owners.push(markDefault({ ownerUuid: `vault:${row.nameLower}`, label: `仓库:${row.name}`, type: 'custom', role: row.role, totalAmount: row.totalAmount }))
     }
 
     return owners
@@ -884,7 +1069,7 @@ class StoreDb {
     return false
   }
 
-  getWebInventory (ownerUuid) {
+  getWebInventory (ownerUuid, viewerUuid = '') {
     const rows = this.db.prepare(`
       SELECT b.owner_uuid AS ownerUuid, i.item_key AS itemKey, i.item_id AS itemId,
              i.display_name AS displayName, i.nbt_json AS nbtJson,
@@ -897,6 +1082,8 @@ class StoreDb {
 
     const shulkerKeys = rows.filter(row => row.itemId.endsWith('shulker_box')).map(row => row.itemKey)
     const shulkerContents = this.getShulkerContentsByBox(shulkerKeys)
+    const contentKeys = [...shulkerContents.values()].flat().map(item => item.itemKey)
+    const personalAliases = this.getPlayerItemNameOverrides(viewerUuid, [...rows.map(row => row.itemKey), ...contentKeys])
     const totalAmount = rows.reduce((sum, row) => sum + row.amount, 0)
 
     return {
@@ -906,12 +1093,27 @@ class StoreDb {
         totalAmount,
         itemTypes: rows.length
       },
-      items: rows.map(row => ({
-        ...this.rowToItem(row),
-        amount: row.amount,
-        shortCode: this.shortCodeForItemKey(row.itemKey),
-        shulkerContents: shulkerContents.get(row.itemKey) || []
-      }))
+      items: rows.map(row => {
+        const personalAlias = personalAliases.get(row.itemKey) || ''
+        const contents = (shulkerContents.get(row.itemKey) || []).map(item => {
+          const contentAlias = personalAliases.get(item.itemKey) || ''
+          return {
+            ...item,
+            adminDisplayName: item.displayName,
+            personalAlias: contentAlias,
+            displayName: contentAlias || item.displayName
+          }
+        })
+        return {
+          ...this.rowToItem(row),
+          adminDisplayName: row.displayName,
+          personalAlias,
+          displayName: personalAlias || row.displayName,
+          amount: row.amount,
+          shortCode: this.shortCodeForItemKey(row.itemKey),
+          shulkerContents: contents
+        }
+      })
     }
   }
 
@@ -1207,6 +1409,7 @@ class StoreDb {
       this.db.prepare('DELETE FROM balances').run()
       this.db.prepare('DELETE FROM inventory_mismatches').run()
       this.db.prepare('DELETE FROM transactions').run()
+      this.db.prepare('DELETE FROM player_item_name_overrides').run()
       this.db.prepare('DELETE FROM items').run()
     })
 

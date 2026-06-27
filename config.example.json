@@ -1,45 +1,122 @@
 {
+  // Minecraft server and bot account settings.
   "server": {
+    // Server address and port.
     "host": "127.0.0.1",
     "port": 25565,
+
+    // Bot login account. For Microsoft auth, use the account email.
     "username": "your-microsoft-email@example.com",
+
+    // Supported values usually are "microsoft" or "offline".
     "auth": "microsoft",
+
+    // Only needed for auth modes that require a password. Leave empty for Microsoft auth.
     "password": "",
+
+    // Local auth cache folder for Microsoft login tokens.
     "profilesFolder": "auth-cache",
+
+    // Main Minecraft protocol version. The server may still negotiate a nearby protocol.
     "version": "1.21.11",
+
+    // Fallback protocol versions used when the newest protocol crashes on unusual item data.
+    "protocolFallbackVersions": [
+      "1.21.9",
+      "1.21.8"
+    ],
+
+    // Client language sent to the server.
     "locale": "zh_CN"
   },
+
+  // Player names with admin permission.
   "admins": [
     "YourPlayerName"
   ],
+
+  // Internal owner used for unclaimed or extra physical items.
   "momoOwner": "__momo__",
+
+  // Built-in web dashboard.
   "web": {
+    // Enable the web dashboard.
     "enabled": true,
+
+    // Bind address. Use "0.0.0.0" to listen on all network interfaces.
     "host": "127.0.0.1",
+
+    // HTTP port for the dashboard.
     "port": 8787,
-    "dashboardUrl": "http://127.0.0.1:8787/",
+
+    // Optional public URL shown in chat and logs.
+    // Leave it commented out to auto-generate a local URL from host/port.
+    // For reverse proxy or tunnel use, set this to the real public URL.
+    // Do not set this to "http://0.0.0.0:8787/" because 0.0.0.0 is only a bind address.
+    // "dashboardUrl": "https://your-public-domain.example/",
+
+    // Trust X-Forwarded-For / X-Real-IP headers from a reverse proxy.
     "trustProxy": false,
+
+    // Login brute-force protection.
     "maxLoginFailures": 5,
     "loginFailWindowMs": 600000,
-    "loginBlockMs": 600000
+    "loginBlockMs": 600000,
+
+    // Temporary web login code lifetime.
+    "loginCodeTtlMs": 120000,
+
+    // Web session lifetime. This is sliding-renewed while the page is in use.
+    "sessionTtlMs": 2592000000
   },
+
+  // Storage quota and custom warehouse limits.
   "storage": {
+    // Default personal quota in slots. 270 slots = 17280 normal 64-stack items.
     "defaultQuotaSlots": 270,
+
+    // Default custom warehouse quota in slots.
     "defaultCustomWarehouseQuotaSlots": 270,
+
+    // Maximum custom warehouses each player can create.
     "maxCustomWarehousesPerPlayer": 3
   },
+
+  // Server commands used by the bot.
   "commands": {
+    // Home command used to return to the warehouse.
     "home": "/home ck",
+
+    // Request teleport to a player.
     "tpa": "/tpa {player}",
+
+    // Accept an admin teleport request.
     "tpaccept": "/tpaccept {player}",
+
+    // Private message command.
     "msg": "/msg {player} {message}",
+
+    // If true, the bot may use public chat when private message fails.
     "publicFallback": false
   },
+
+  // Timing knobs. Increase these if the server is laggy.
   "timing": {
+    // Minimum wait after /home before accepting the position as stable.
     "homeWaitMs": 3500,
+
+    // Maximum wait for /home to reach the known warehouse area.
+    "homeTimeoutMs": 30000,
+
     "pickupWindowMs": 10000,
     "postTeleportWaitMs": 1500,
     "dropIntervalMs": 250,
+
+    // Maximum wait for inventory count to decrease after dropping an item stack.
+    "dropConfirmTimeoutMs": 5000,
+
+    "pickupSettleMs": 3500,
+    "pickupStableMs": 700,
     "containerSettleMs": 250,
     "openContainerTimeoutMs": 8000,
     "inventoryUpdateTimeoutMs": 2000,
@@ -50,24 +127,74 @@
     "teleportDetectRadius": 8,
     "reconnectDelayMs": 10000
   },
+
+  // General debug logging.
   "debug": true,
+
+  // Command/chat debug logging.
   "debugChat": true,
+
+  // Raw chat packet logging. Enable only when diagnosing custom chat formats.
   "debugRawChat": false,
+
+  // Server resource pack behavior.
   "resourcePack": {
+    // Automatically accept forced server resource packs.
     "autoAccept": true
   },
+
+  // Physical warehouse layout and container scanning.
   "warehouse": {
+    // "normal" works for ordinary layouts. "cylinder" enables special stand-position logic.
+    "layoutMode": "normal",
+
+    // Default scan radius for !同步仓库.
     "defaultSyncRadius": 16,
+
+    // Item pickup radius when collecting player drops.
     "pickupRadius": 2,
+
+    // If the bot is already near a known barrel, it may skip /home.
+    "homeSkipRadius": 8,
+
+    // Maximum allowed scan radius.
     "maxSyncRadius": 64,
+
+    // Stop deposit after trying this many empty candidate barrels.
     "maxEmptyDepositAttempts": 3,
+
+    // Extra settings for cylinder warehouse layouts.
+    "cylinder": {
+      // Main tunnel axis: "x" or "z".
+      "axis": "x",
+
+      // Optional tunnel center. null means auto-detect from the bot's home position.
+      "tunnelCenter": {
+        "x": null,
+        "y": null,
+        "z": null
+      },
+
+      // Y offsets to try when choosing standing positions.
+      "yOffsets": [
+        0,
+        -1,
+        1
+      ]
+    },
+
+    // Only these block names are treated as warehouse containers.
     "chestBlockNames": [
       "barrel"
     ]
   },
+
+  // Localized language file used for Chinese item names.
   "language": {
     "file": "data/zh_cn.json"
   },
+
+  // Manual item name aliases. Left side is what players type, right side is minecraft:item_id.
   "aliases": {
     "石头": "minecraft:stone",
     "圆石": "minecraft:cobblestone",

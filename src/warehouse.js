@@ -10,15 +10,80 @@ class Warehouse {
     this.catalog = catalog
     this.config = config
     this.chestNames = new Set(config.warehouse.chestBlockNames || ['barrel'])
+    this.homePosition = null
   }
 
   debug (message) {
     if (this.config.debug) console.log(`[warehouse] ${message}`)
   }
 
-  async goHome () {
-    this.bot.chat(this.config.commands.home)
-    await sleep(this.config.timing.homeWaitMs)
+  async goHome (options = {}) {
+    const command = this.config.commands.home
+    const requireWarehouse = Boolean(options.requireWarehouse && this.db.listChests().length)
+    this.bot.chat(command)
+
+    if (requireWarehouse) {
+      await this.waitUntilNearKnownWarehouse(command)
+    } else {
+      await sleep(this.config.timing.homeWaitMs)
+    }
+
+    this.captureHomePosition()
+  }
+
+  async waitUntilNearKnownWarehouse (command) {
+    const minWaitMs = Number(this.config.timing.homeWaitMs || 3500)
+    const timeoutMs = Number(this.config.timing.homeTimeoutMs || Math.max(30000, minWaitMs))
+    const startedAt = Date.now()
+    let lastPosition = this.bot.entity?.position ? this.describePosition(this.bot.entity.position) : '?'
+
+    while (Date.now() - startedAt < timeoutMs) {
+      if (this.isClientClosed()) {
+        throw new Error(`${command} 等待过程中连接已断开，将由重连流程继续处理。`)
+      }
+      const pos = this.bot.entity?.position
+      if (pos) lastPosition = this.describePosition(pos)
+      if (Date.now() - startedAt >= minWaitMs && this.isNearKnownWarehouse()) return
+      await sleep(250)
+    }
+
+    if (this.isNearKnownWarehouse()) return
+    throw new Error(`${command} 后 ${timeoutMs}ms 内没有回到仓库附近，当前坐标 ${lastPosition}。请检查 home 点或服务器传送是否失败。`)
+  }
+
+  isClientClosed () {
+    const client = this.bot._client
+    return Boolean(client?.ended || client?.socket?.destroyed || client?.socket?._writableState?.destroyed)
+  }
+
+  captureHomePosition () {
+    const pos = this.bot.entity?.position
+    if (!pos) return
+    this.homePosition = pos.clone()
+    this.debug(`home position ${this.describePosition(this.homePosition)}`)
+  }
+
+  async goHomeIfAway () {
+    if (this.isNearKnownWarehouse()) {
+      this.debug('already near known warehouse, skip home command')
+      return false
+    }
+    await this.goHome({ requireWarehouse: true })
+    return true
+  }
+
+  isNearKnownWarehouse () {
+    const pos = this.bot.entity?.position
+    if (!pos) return false
+    const radius = Number(this.config.warehouse?.homeSkipRadius || 8)
+    const radiusSq = radius * radius
+    for (const chest of this.db.listChests()) {
+      const dx = pos.x - chest.x
+      const dy = pos.y - chest.y
+      const dz = pos.z - chest.z
+      if ((dx * dx) + (dy * dy) + (dz * dz) <= radiusSq) return true
+    }
+    return false
   }
 
   async settleResidualToMomo () {
@@ -465,7 +530,7 @@ class Warehouse {
 
   async syncWarehouse (radius) {
     this.debug(`sync start radius=${radius}`)
-    await this.goHome()
+    await this.goHome({ requireWarehouse: this.db.listChests().length > 0 })
     const blocks = this.findContainerBlocks(radius)
     this.debug(`found ${blocks.length} openable container blocks: ${blocks.map(block => this.describeBlock(block)).join(' | ')}`)
 
@@ -529,7 +594,27 @@ class Warehouse {
       .map(pos => this.bot.blockAt(pos))
       .filter(Boolean)
       .filter(block => this.shouldScanContainerBlock(block))
-      .sort((a, b) => b.position.y - a.position.y || a.position.x - b.position.x || a.position.z - b.position.z)
+      .sort((a, b) => this.compareContainerScanOrder(a, b))
+  }
+
+  compareContainerScanOrder (a, b) {
+    if (!this.isCylinderMode()) {
+      return b.position.y - a.position.y || a.position.x - b.position.x || a.position.z - b.position.z
+    }
+
+    const axis = this.cylinderAxis()
+    const home = this.homePosition || this.bot.entity?.position
+    const homeAxis = home ? Math.floor(axis === 'x' ? home.x : home.z) : 0
+    const aAxis = axis === 'x' ? a.position.x : a.position.z
+    const bAxis = axis === 'x' ? b.position.x : b.position.z
+    const axisDistance = Math.abs(aAxis - homeAxis) - Math.abs(bAxis - homeAxis)
+
+    if (axisDistance !== 0) return axisDistance
+    if (aAxis !== bAxis) return aAxis - bAxis
+
+    const aCross = axis === 'x' ? a.position.z : a.position.x
+    const bCross = axis === 'x' ? b.position.z : b.position.x
+    return b.position.y - a.position.y || aCross - bCross || a.position.x - b.position.x || a.position.z - b.position.z
   }
 
   shouldScanContainerBlock (block) {
@@ -555,7 +640,7 @@ class Warehouse {
 
   async openContainerAt (chest) {
     this.debug(`goto ${this.describeChest(chest)} from ${this.describePosition(this.bot.entity.position)}`)
-    await this.gotoNear(chest.x, chest.y, chest.z)
+    await this.gotoForContainer(chest)
     const block = this.bot.blockAt(new Vec3(chest.x, chest.y, chest.z))
     if (!block || !this.chestNames.has(block.name)) {
       throw new Error(`找不到箱子：${chest.x},${chest.y},${chest.z}`)
@@ -563,6 +648,100 @@ class Warehouse {
     const container = await this.openContainerBlock(block)
     this.warnUnexpectedContainerWindow(container, chest)
     return container
+  }
+
+  async gotoForContainer (chest) {
+    if (this.isCylinderMode()) {
+      const moved = await this.gotoCylinderContainerStand(chest)
+      if (moved) return
+    }
+    await this.gotoNear(chest.x, chest.y, chest.z)
+  }
+
+  isCylinderMode () {
+    const mode = String(this.config.warehouse?.layoutMode || this.config.warehouse?.mode || 'normal').toLowerCase()
+    return mode === 'cylinder'
+  }
+
+  cylinderConfig () {
+    return this.config.warehouse?.cylinder || {}
+  }
+
+  cylinderAxis () {
+    const axis = String(this.cylinderConfig().axis || 'x').toLowerCase()
+    return axis === 'z' ? 'z' : 'x'
+  }
+
+  cylinderTunnelCenter () {
+    const cylinder = this.cylinderConfig()
+    const configured = cylinder.tunnelCenter || cylinder.center || {}
+    const home = this.homePosition || this.bot.entity?.position
+
+    const fallback = {
+      x: home ? Math.floor(home.x) : 0,
+      y: home ? Math.floor(home.y) : 0,
+      z: home ? Math.floor(home.z) : 0
+    }
+
+    return {
+      x: this.optionalInteger(configured.x, fallback.x),
+      y: this.optionalInteger(configured.y, fallback.y),
+      z: this.optionalInteger(configured.z, fallback.z)
+    }
+  }
+
+  optionalInteger (value, fallback) {
+    if (value === undefined || value === null || value === '') return fallback
+    const parsed = Number(value)
+    return Number.isFinite(parsed) ? Math.floor(parsed) : fallback
+  }
+
+  async gotoCylinderContainerStand (chest) {
+    if (!this.bot.pathfinder) return false
+
+    const axis = this.cylinderAxis()
+    const tunnel = this.cylinderTunnelCenter()
+    const stand = axis === 'x'
+      ? new Vec3(chest.x, tunnel.y, tunnel.z)
+      : new Vec3(tunnel.x, tunnel.y, chest.z)
+
+    const candidates = this.getCylinderStandCandidates(stand)
+    this.debug(`cylinder stand candidates for ${this.describeChest(chest)} axis=${axis}: ${candidates.map(pos => this.describeGridPosition(pos)).join(' | ') || 'none'}`)
+
+    for (const pos of candidates) {
+      try {
+        await this.gotoWithMovements(new GoalBlock(pos.x, pos.y, pos.z), `cylinder stand ${this.describeGridPosition(pos)} for ${this.describeChest(chest)}`)
+        return true
+      } catch (error) {
+        this.debug(`cylinder stand failed ${this.describeGridPosition(pos)}: ${error.message}`)
+      }
+    }
+
+    return false
+  }
+
+  getCylinderStandCandidates (stand) {
+    const yOffsets = this.cylinderConfig().yOffsets
+    const configuredOffsets = Array.isArray(yOffsets) && yOffsets.length
+      ? yOffsets.map(value => Number.parseInt(value, 10)).filter(Number.isFinite)
+      : [0, -1, 1]
+    const positions = []
+    const seen = new Set()
+
+    for (const dy of configuredOffsets) {
+      const pos = stand.offset(0, dy, 0)
+      const key = `${pos.x},${pos.y},${pos.z}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      if (this.isStandable(pos)) positions.push(pos)
+    }
+
+    const botPos = this.bot.entity.position
+    return positions.sort((a, b) => {
+      const da = a.offset(0.5, 0, 0.5).distanceTo(botPos)
+      const db = b.offset(0.5, 0, 0.5).distanceTo(botPos)
+      return da - db
+    })
   }
 
   expectedContainerSlots () {
@@ -687,11 +866,7 @@ class Warehouse {
 
   async gotoNear (x, y, z) {
     if (!this.bot.pathfinder) return
-    const movements = new Movements(this.bot)
-    movements.canDig = false
-    movements.allow1by1towers = false
-    movements.allowParkour = false
-    this.bot.pathfinder.setMovements(movements)
+    this.setupMovements()
     const candidates = this.getStandPositionsAround(x, y, z)
     this.debug(`stand candidates for ${x},${y},${z}: ${candidates.map(pos => this.describeGridPosition(pos)).join(' | ') || 'none'}`)
 
@@ -707,6 +882,23 @@ class Warehouse {
 
     this.debug(`path fallback GoalNear for ${x},${y},${z}`)
     await this.gotoGoalWithRecovery(new GoalNear(x, y, z, 2), `near ${x},${y},${z}`)
+  }
+
+  setupMovements () {
+    if (!this.bot.pathfinder) return
+    const movements = new Movements(this.bot)
+    movements.canDig = false
+    movements.allow1by1towers = false
+    movements.allowParkour = false
+    movements.scafoldingBlocks = []
+    movements.countScaffoldingItems = () => 0
+    movements.getScaffoldingItem = () => null
+    this.bot.pathfinder.setMovements(movements)
+  }
+
+  async gotoWithMovements (goal, label) {
+    this.setupMovements()
+    await this.gotoGoalWithRecovery(goal, label)
   }
 
   getStandPositionsAround (x, y, z) {
@@ -853,6 +1045,7 @@ class Warehouse {
   async collectNearbyDropsUntil (deadlineMs, shouldStop) {
     const radius = this.config.warehouse.pickupRadius || 2
     this.debug(`collect drops start radius=${radius} until=${new Date(deadlineMs).toISOString()}`)
+    this.setupMovements()
     while (Date.now() < deadlineMs && !shouldStop()) {
       const entity = this.nearestDroppedItem()
       if (entity) {
@@ -872,6 +1065,43 @@ class Warehouse {
     this.debug('collect drops end')
   }
 
+  async waitForPickupSettle (options = {}) {
+    const maxMs = Number(options.maxMs ?? this.config.timing.pickupSettleMs ?? 3500)
+    const stableMs = Number(options.stableMs ?? this.config.timing.pickupStableMs ?? 700)
+    const intervalMs = 100
+    const startedAt = Date.now()
+    let stableSince = Date.now()
+    let lastSignature = this.inventorySignature()
+
+    while (Date.now() - startedAt < maxMs) {
+      await sleep(intervalMs)
+      const signature = this.inventorySignature()
+      const hasNearbyDrop = Boolean(this.nearestDroppedItem())
+      if (signature !== lastSignature || hasNearbyDrop) {
+        lastSignature = signature
+        stableSince = Date.now()
+        continue
+      }
+      if (Date.now() - stableSince >= stableMs) break
+    }
+
+    this.debug(`pickup settled inventory=${this.inventorySummaryForDebug()} nearbyDrop=${Boolean(this.nearestDroppedItem())}`)
+  }
+
+  inventorySignature () {
+    return this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
+      .map(item => `${item.itemKey}:${item.amount}`)
+      .sort()
+      .join('|')
+  }
+
+  inventorySummaryForDebug () {
+    const items = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
+    const total = items.reduce((sum, item) => sum + item.amount, 0)
+    const held = this.bot.heldItem ? `${this.bot.heldItem.name} x${this.bot.heldItem.count}` : 'empty'
+    return `${items.length} types/${total} items held=${held}`
+  }
+
   nearestDroppedItem () {
     const botPos = this.bot.entity.position
     let best = null
@@ -889,15 +1119,60 @@ class Warehouse {
 
   async dropInventoryToPlayer (username) {
     const dropped = []
+    if (this.bot.currentWindow) {
+      this.debug(`closing open window before dropping: ${this.bot.currentWindow.type || this.bot.currentWindow.id}`)
+      this.bot.closeWindow(this.bot.currentWindow)
+      await sleep(150)
+    }
+
     while (this.bot.inventory.items().length) {
       const item = this.bot.inventory.items()[0]
       const normalized = this.catalog.fromPrismarineItem(item)
+      const before = this.inventoryCountByItemKey(normalized.itemKey)
+      const startedAt = Date.now()
+      this.debug(`drop start ${normalized.displayName} x${item.count} slot=${item.slot} to ${username}`)
       await this.lookAtPlayer(username)
-      await this.bot.tossStack(item)
-      dropped.push(normalized)
+      await this.dropStackFast(item)
+      const moved = await this.waitForInventoryDecrease(normalized.itemKey, before)
+      if (moved <= 0) {
+        throw new Error(`丢出 ${normalized.displayName} 超时，背包数量没有减少。`)
+      }
+      dropped.push({ ...normalized, amount: moved })
+      this.debug(`drop done ${normalized.displayName} x${moved} in ${Date.now() - startedAt}ms`)
       await sleep(this.config.timing.dropIntervalMs)
     }
     return this.mergeItems(dropped)
+  }
+
+  async dropStackFast (item) {
+    const timeoutMs = Number(this.config.timing.dropConfirmTimeoutMs || 5000)
+    try {
+      // Mode 4, button 1 is the vanilla "drop entire stack from slot" action.
+      await this.withTimeout(
+        this.bot.clickWindow(item.slot, 1, 4),
+        timeoutMs,
+        `丢出物品点击超时 slot=${item.slot}`
+      )
+    } catch (error) {
+      this.debug(`fast drop failed for ${item.name}@${item.slot}: ${error.message}; fallback tossStack`)
+      await this.withTimeout(
+        this.bot.tossStack(item),
+        timeoutMs,
+        `丢出物品超时 ${item.name} x${item.count}`
+      )
+    }
+  }
+
+  async waitForInventoryDecrease (itemKey, before) {
+    const timeoutMs = Number(this.config.timing.dropConfirmTimeoutMs || 5000)
+    const intervalMs = 100
+    const startedAt = Date.now()
+    while (Date.now() - startedAt < timeoutMs) {
+      const after = this.inventoryCountByItemKey(itemKey)
+      if (after < before) return before - after
+      await sleep(intervalMs)
+    }
+    return Math.max(0, before - this.inventoryCountByItemKey(itemKey))
   }
 
   async lookAtPlayer (username) {

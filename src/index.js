@@ -3,19 +3,12 @@ const path = require('node:path')
 const mineflayer = require('mineflayer')
 const nbt = require('prismarine-nbt')
 const { pathfinder } = require('mineflayer-pathfinder')
+const { loadConfig } = require('./config')
 const StoreDb = require('./db')
 const ItemCatalog = require('./itemCatalog')
 const Warehouse = require('./warehouse')
 const CloudStoreService = require('./service')
 const CloudStoreWebServer = require('./webServer')
-
-function loadConfig () {
-  const configPath = path.resolve(process.cwd(), 'config.json')
-  if (!fs.existsSync(configPath)) {
-    throw new Error('找不到 config.json，请复制 config.example.json 后填写服务器配置。')
-  }
-  return JSON.parse(fs.readFileSync(configPath, 'utf8'))
-}
 
 function createBot (config) {
   const options = {
@@ -24,7 +17,8 @@ function createBot (config) {
     username: config.server.username,
     auth: config.server.auth,
     version: config.server.version,
-    locale: config.server.locale || 'zh_CN'
+    locale: config.server.locale || 'zh_CN',
+    logErrors: false
   }
 
   if (config.server.password) options.password = config.server.password
@@ -38,17 +32,78 @@ function createBot (config) {
   return bot
 }
 
-const config = loadConfig()
-const db = new StoreDb(path.resolve(process.cwd(), 'data', 'cloud-store.sqlite'), config)
-const catalog = new ItemCatalog(config.server.version, config.aliases, config.language)
-db.setCatalog(catalog)
-const refreshedDisplayNames = db.refreshItemDisplayNames(catalog)
-if (refreshedDisplayNames > 0) {
-  console.log(`Refreshed ${refreshedDisplayNames} stored item display names`)
+function createCatalogForVersion (version) {
+  return new ItemCatalog(version, config.aliases, config.language)
 }
+
+function attachCatalog (nextCatalog) {
+  db.setCatalog(nextCatalog)
+  const refreshedDisplayNames = db.refreshItemDisplayNames(nextCatalog)
+  if (refreshedDisplayNames > 0) {
+    console.log(`Refreshed ${refreshedDisplayNames} stored item display names`)
+  }
+}
+
+function buildProtocolVersionList (config) {
+  const configured = config.server.version
+  const fallbacks = Array.isArray(config.server.protocolFallbackVersions)
+    ? config.server.protocolFallbackVersions
+    : (configured === '1.21.11' ? ['1.21.9', '1.21.8'] : [])
+  const versions = [configured, ...fallbacks]
+    .map(version => String(version || '').trim())
+    .filter(Boolean)
+  return [...new Set(versions)]
+}
+
+function shouldFallbackProtocol (error) {
+  const message = String(error?.message || error || '')
+  return /SlotComponent|array size is abnormally large|Read error.*intArray|play\.toClient/i.test(message)
+}
+
+function advanceProtocolFallback (reason) {
+  if (protocolVersionIndex >= protocolVersions.length - 1) return false
+  const previous = protocolVersions[protocolVersionIndex]
+  protocolVersionIndex += 1
+  console.error(`[protocol] ${previous} 启动失败，切换到 ${protocolVersions[protocolVersionIndex]}。原因：${reason}`)
+  return true
+}
+
+function formatKickReason (reason) {
+  if (typeof reason === 'string') return reason
+  try {
+    return JSON.stringify(reason)
+  } catch {
+    return String(reason)
+  }
+}
+
+function formatDisconnectReason (reason) {
+  if (!reason) return ''
+  if (typeof reason === 'string') return reason
+  if (reason instanceof Error) return `${reason.code || reason.name}: ${reason.message}`
+  try {
+    return JSON.stringify(reason)
+  } catch {
+    return String(reason)
+  }
+}
+
+function isSocketDisconnectError (error) {
+  return ['EPIPE', 'ECONNRESET', 'ETIMEDOUT', 'ECONNABORTED'].includes(error?.code)
+}
+
+const config = loadConfig(path.resolve(process.cwd(), 'config.json'), { autoUpdate: true })
+const db = new StoreDb(path.resolve(process.cwd(), 'data', 'cloud-store.sqlite'), config)
+const protocolVersions = buildProtocolVersionList(config)
+let protocolVersionIndex = 0
+let catalog = createCatalogForVersion(protocolVersions[protocolVersionIndex] || config.server.version)
+attachCatalog(catalog)
 
 console.log(`Starting cloud store bot: ${config.server.username}@${config.server.host}:${config.server.port}`)
 console.log(`Minecraft version: ${config.server.version}, auth: ${config.server.auth}`)
+if (protocolVersions.length > 1) {
+  console.log(`Protocol fallback versions: ${protocolVersions.join(' -> ')}`)
+}
 
 let currentBot = null
 let currentService = null
@@ -72,13 +127,32 @@ function launchBot () {
     console.log(`[reconnect] attempt ${reconnectAttempt}`)
   }
 
-  const bot = createBot(config)
+  const activeVersion = protocolVersions[protocolVersionIndex] || config.server.version
+  if (activeVersion !== config.server.version) {
+    console.log(`[protocol] launching with fallback Minecraft version ${activeVersion}`)
+  }
+  if (catalog.version !== activeVersion) {
+    catalog = createCatalogForVersion(activeVersion)
+    attachCatalog(catalog)
+  }
+
+  const launchConfig = {
+    ...config,
+    server: {
+      ...config.server,
+      version: activeVersion
+    }
+  }
+
+  const bot = createBot(launchConfig)
   currentBot = bot
   let loggedIn = false
   let spawned = false
+  let lastDisconnectReason = ''
+  const acceptedResourcePacks = new Set()
 
-  const warehouse = new Warehouse(bot, db, catalog, config)
-  const service = new CloudStoreService(bot, db, catalog, warehouse, config)
+  const warehouse = new Warehouse(bot, db, catalog, launchConfig)
+  const service = new CloudStoreService(bot, db, catalog, warehouse, launchConfig)
   service.setWebAuth(webServer)
   setupRegistryExport(bot, catalog, db)
 
@@ -108,9 +182,15 @@ function launchBot () {
   bot.on('resourcePack', (url, hashOrUuid) => {
     console.log(`[resourcePack] server requested pack: ${url} ${hashOrUuid || ''}`)
     if (config.resourcePack?.autoAccept !== false) {
+      const packKey = String(hashOrUuid || url || '')
+      if (packKey && acceptedResourcePacks.has(packKey)) {
+        console.log(`[resourcePack] already accepted ${packKey}, skip mineflayer helper`)
+        return
+      }
       console.log('[resourcePack] accepting resource pack via mineflayer helper')
       try {
         bot.acceptResourcePack()
+        if (packKey) acceptedResourcePacks.add(packKey)
       } catch (error) {
         console.error('[resourcePack] mineflayer accept failed:', error)
       }
@@ -122,29 +202,59 @@ function launchBot () {
   bot._client?.on('add_resource_pack', data => {
     console.log('[resourcePack] add_resource_pack packet:', JSON.stringify(data))
     if (config.resourcePack?.autoAccept !== false) {
-      acceptResourcePackDirect(bot, data.uuid)
+      acceptResourcePackOnce(bot, acceptedResourcePacks, data.uuid)
     }
   })
 
   bot._client?.on('resource_pack_send', data => {
     console.log('[resourcePack] resource_pack_send packet:', JSON.stringify(data))
     if (config.resourcePack?.autoAccept !== false && data.uuid) {
-      acceptResourcePackDirect(bot, data.uuid)
+      acceptResourcePackOnce(bot, acceptedResourcePacks, data.uuid)
     }
+  })
+
+  bot._client?.on('end', reason => {
+    lastDisconnectReason = formatDisconnectReason(reason)
+    if (lastDisconnectReason) console.warn(`[client] connection ended: ${lastDisconnectReason}`)
+  })
+
+  bot._client?.on('close', reason => {
+    lastDisconnectReason = formatDisconnectReason(reason)
+    if (lastDisconnectReason) console.warn(`[client] connection closed: ${lastDisconnectReason}`)
   })
 
   bot.on('kicked', reason => {
     clearInterval(loginWatchdog)
     console.error('Bot kicked:', reason)
+    const kickReason = formatKickReason(reason)
+    lastDisconnectReason = kickReason
+    if (!spawned && /outdated|version|protocol|版本|协议/i.test(kickReason)) {
+      advanceProtocolFallback(`kick before spawn: ${kickReason}`)
+    }
   })
 
   bot.on('error', error => {
+    if (isSocketDisconnectError(error)) {
+      console.warn(`[network] ${error.code}: socket 已断开，等待重连。${lastDisconnectReason ? `lastReason=${lastDisconnectReason}` : '通常是服务器/代理主动断开或网络抖动。'}`)
+      return
+    }
+    if (!spawned && shouldFallbackProtocol(error)) {
+      const advanced = advanceProtocolFallback(error.message)
+      if (advanced) {
+        console.error(`[protocol] Slot/NBT 解析失败，准备用 ${protocolVersions[protocolVersionIndex]} 重连：${error.message}`)
+        try {
+          bot._client?.end('protocol fallback')
+        } catch {}
+        scheduleReconnect(1000)
+        return
+      }
+    }
     console.error('Bot error:', error)
   })
 
   bot.on('end', () => {
     clearInterval(loginWatchdog)
-    console.log('Bot disconnected')
+    console.log(`Bot disconnected${lastDisconnectReason ? `: ${lastDisconnectReason}` : ''}`)
     if (currentBot === bot) currentBot = null
     if (currentService === service) currentService = null
     scheduleReconnect()
@@ -233,9 +343,9 @@ function registryEnchantmentDisplayName (data, name, catalog) {
   return catalog.getEnchantmentDisplayName(name)
 }
 
-function scheduleReconnect () {
+function scheduleReconnect (delayOverrideMs = null) {
   if (shuttingDown || reconnectTimer) return
-  const delay = Math.max(1000, Number(config.timing?.reconnectDelayMs || 10000))
+  const delay = Math.max(1000, Number(delayOverrideMs || config.timing?.reconnectDelayMs || 10000))
   console.log(`[reconnect] will reconnect in ${delay}ms`)
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null
@@ -248,6 +358,16 @@ function scheduleReconnect () {
   }, delay)
 }
 
+function acceptResourcePackOnce (bot, acceptedResourcePacks, uuid) {
+  const key = String(uuid || '')
+  if (key && acceptedResourcePacks.has(key)) {
+    console.log(`[resourcePack] already accepted ${key}, skip duplicate status packets`)
+    return
+  }
+  const accepted = acceptResourcePackDirect(bot, uuid)
+  if (accepted && key) acceptedResourcePacks.add(key)
+}
+
 function acceptResourcePackDirect (bot, uuid) {
   const statuses = [
     ['ACCEPTED', 3],
@@ -255,14 +375,17 @@ function acceptResourcePackDirect (bot, uuid) {
     ['SUCCESSFULLY_LOADED', 0]
   ]
 
+  let ok = true
   for (const [label, result] of statuses) {
     try {
       bot._client.write('resource_pack_receive', { uuid, result })
       console.log(`[resourcePack] sent ${label} for ${uuid}`)
     } catch (error) {
+      ok = false
       console.error(`[resourcePack] failed to send ${label}:`, error)
     }
   }
+  return ok
 }
 
 process.on('SIGINT', () => {
