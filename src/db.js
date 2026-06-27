@@ -587,19 +587,225 @@ class StoreDb {
   }
 
   upsertPlayer (uuid, username) {
-    this.db.prepare(`
-      INSERT INTO players (uuid, username, last_seen_at)
-      VALUES (?, ?, CURRENT_TIMESTAMP)
-      ON CONFLICT(uuid) DO UPDATE SET
-        username = excluded.username,
-        last_seen_at = CURRENT_TIMESTAMP
-    `).run(uuid, username)
+    const cleanUuid = String(uuid || '').trim()
+    const cleanUsername = String(username || '').trim()
+    if (!cleanUuid || !cleanUsername) return
+
+    this.transaction(() => {
+      this.db.prepare(`
+        INSERT INTO players (uuid, username, last_seen_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(uuid) DO UPDATE SET
+          username = excluded.username,
+          last_seen_at = CURRENT_TIMESTAMP
+      `).run(cleanUuid, cleanUsername)
+
+      this.migrateGhostPlayerIdentity(cleanUuid, cleanUsername)
+
+      this.db.prepare(`
+        UPDATE admin_users
+        SET uuid = COALESCE(uuid, ?)
+        WHERE username_lower = ?
+      `).run(cleanUuid, cleanUsername.toLowerCase())
+    })
+  }
+
+  migrateGhostPlayerIdentity (uuid, username) {
+    if (uuid.startsWith('name:')) return
+
+    const ghostUuids = new Set([`name:${username}`])
+    const addRows = rows => {
+      for (const row of rows) {
+        if (row.uuid && row.uuid !== uuid) ghostUuids.add(row.uuid)
+      }
+    }
+
+    addRows(this.db.prepare(`
+      SELECT uuid
+      FROM players
+      WHERE uuid LIKE 'name:%' AND lower(username) = lower(?)
+    `).all(username))
+    addRows(this.db.prepare(`
+      SELECT player_uuid AS uuid
+      FROM custom_warehouse_members
+      WHERE player_uuid LIKE 'name:%' AND lower(username) = lower(?)
+    `).all(username))
+    addRows(this.db.prepare(`
+      SELECT owner_uuid AS uuid
+      FROM web_login_tokens
+      WHERE owner_uuid LIKE 'name:%' AND lower(username) = lower(?)
+    `).all(username))
+    addRows(this.db.prepare(`
+      SELECT owner_uuid AS uuid
+      FROM web_sessions
+      WHERE owner_uuid LIKE 'name:%' AND lower(username) = lower(?)
+    `).all(username))
+    addRows(this.db.prepare(`
+      SELECT player_uuid AS uuid
+      FROM transactions
+      WHERE player_uuid LIKE 'name:%' AND lower(username) = lower(?)
+    `).all(username))
+
+    for (const ghostUuid of ghostUuids) {
+      if (!ghostUuid || ghostUuid === uuid || !ghostUuid.startsWith('name:')) continue
+      this.migrateGhostPlayerDefaults(ghostUuid, uuid)
+      this.migrateGhostCustomWarehouseMembers(ghostUuid, uuid, username)
+      this.migrateGhostPlayerItemAliases(ghostUuid, uuid)
+      this.migrateGhostWebLoginToken(ghostUuid, uuid, username)
+      this.migrateGhostPlayerQuota(ghostUuid, uuid)
+      this.db.prepare('UPDATE web_sessions SET owner_uuid = ?, username = ? WHERE owner_uuid = ?').run(uuid, username, ghostUuid)
+      this.db.prepare('UPDATE transactions SET player_uuid = ?, username = ? WHERE player_uuid = ?').run(uuid, username, ghostUuid)
+      this.deleteOrphanGhostPlayer(ghostUuid)
+    }
+  }
+
+  migrateGhostPlayerDefaults (ghostUuid, uuid) {
+    const ghostDefault = this.db.prepare(`
+      SELECT default_owner_uuid AS defaultOwnerUuid
+      FROM players
+      WHERE uuid = ?
+      LIMIT 1
+    `).get(ghostUuid)?.defaultOwnerUuid
+    if (!ghostDefault) return
 
     this.db.prepare(`
-      UPDATE admin_users
-      SET uuid = COALESCE(uuid, ?)
-      WHERE username_lower = ?
-    `).run(uuid, username.toLowerCase())
+      UPDATE players
+      SET default_owner_uuid = CASE
+        WHEN default_owner_uuid = '' THEN ?
+        ELSE default_owner_uuid
+      END
+      WHERE uuid = ?
+    `).run(ghostDefault, uuid)
+  }
+
+  migrateGhostCustomWarehouseMembers (ghostUuid, uuid, username) {
+    const rows = this.db.prepare(`
+      SELECT warehouse_name_lower AS warehouseNameLower, role
+      FROM custom_warehouse_members
+      WHERE player_uuid = ?
+    `).all(ghostUuid)
+    const existingStmt = this.db.prepare(`
+      SELECT role
+      FROM custom_warehouse_members
+      WHERE warehouse_name_lower = ? AND player_uuid = ?
+      LIMIT 1
+    `)
+    const updateExistingStmt = this.db.prepare(`
+      UPDATE custom_warehouse_members
+      SET username = ?, role = ?
+      WHERE warehouse_name_lower = ? AND player_uuid = ?
+    `)
+    const moveStmt = this.db.prepare(`
+      UPDATE custom_warehouse_members
+      SET player_uuid = ?, username = ?
+      WHERE warehouse_name_lower = ? AND player_uuid = ?
+    `)
+    const deleteGhostStmt = this.db.prepare(`
+      DELETE FROM custom_warehouse_members
+      WHERE warehouse_name_lower = ? AND player_uuid = ?
+    `)
+
+    for (const row of rows) {
+      const existing = existingStmt.get(row.warehouseNameLower, uuid)
+      if (existing) {
+        const role = existing.role === 'admin' || row.role === 'admin' ? 'admin' : existing.role
+        updateExistingStmt.run(username, role || 'member', row.warehouseNameLower, uuid)
+        deleteGhostStmt.run(row.warehouseNameLower, ghostUuid)
+      } else {
+        moveStmt.run(uuid, username, row.warehouseNameLower, ghostUuid)
+      }
+    }
+  }
+
+  migrateGhostPlayerItemAliases (ghostUuid, uuid) {
+    const rows = this.db.prepare(`
+      SELECT item_key AS itemKey
+      FROM player_item_name_overrides
+      WHERE player_uuid = ?
+    `).all(ghostUuid)
+    const existsStmt = this.db.prepare(`
+      SELECT 1
+      FROM player_item_name_overrides
+      WHERE player_uuid = ? AND item_key = ?
+      LIMIT 1
+    `)
+    const moveStmt = this.db.prepare(`
+      UPDATE player_item_name_overrides
+      SET player_uuid = ?
+      WHERE player_uuid = ? AND item_key = ?
+    `)
+    const deleteStmt = this.db.prepare(`
+      DELETE FROM player_item_name_overrides
+      WHERE player_uuid = ? AND item_key = ?
+    `)
+
+    for (const row of rows) {
+      if (existsStmt.get(uuid, row.itemKey)) {
+        deleteStmt.run(ghostUuid, row.itemKey)
+      } else {
+        moveStmt.run(uuid, ghostUuid, row.itemKey)
+      }
+    }
+  }
+
+  migrateGhostWebLoginToken (ghostUuid, uuid, username) {
+    const ghost = this.db.prepare(`
+      SELECT 1
+      FROM web_login_tokens
+      WHERE owner_uuid = ?
+      LIMIT 1
+    `).get(ghostUuid)
+    if (!ghost) return
+
+    const existing = this.db.prepare(`
+      SELECT 1
+      FROM web_login_tokens
+      WHERE owner_uuid = ?
+      LIMIT 1
+    `).get(uuid)
+    if (existing) {
+      this.db.prepare('DELETE FROM web_login_tokens WHERE owner_uuid = ?').run(ghostUuid)
+    } else {
+      this.db.prepare('UPDATE web_login_tokens SET owner_uuid = ?, username = ? WHERE owner_uuid = ?').run(uuid, username, ghostUuid)
+    }
+  }
+
+  migrateGhostPlayerQuota (ghostUuid, uuid) {
+    const ghost = this.db.prepare(`
+      SELECT 1
+      FROM player_quotas
+      WHERE owner_uuid = ?
+      LIMIT 1
+    `).get(ghostUuid)
+    if (!ghost) return
+
+    const existing = this.db.prepare(`
+      SELECT 1
+      FROM player_quotas
+      WHERE owner_uuid = ?
+      LIMIT 1
+    `).get(uuid)
+    if (existing) {
+      this.db.prepare('DELETE FROM player_quotas WHERE owner_uuid = ?').run(ghostUuid)
+    } else {
+      this.db.prepare('UPDATE player_quotas SET owner_uuid = ? WHERE owner_uuid = ?').run(uuid, ghostUuid)
+    }
+  }
+
+  deleteOrphanGhostPlayer (ghostUuid) {
+    this.db.prepare(`
+      DELETE FROM players
+      WHERE uuid = ?
+        AND uuid LIKE 'name:%'
+        AND uuid NOT IN (SELECT owner_uuid FROM balances)
+        AND uuid NOT IN (SELECT owner_uuid FROM web_login_tokens)
+        AND uuid NOT IN (SELECT owner_uuid FROM web_sessions)
+        AND uuid NOT IN (SELECT player_uuid FROM player_item_name_overrides)
+        AND uuid NOT IN (SELECT player_uuid FROM custom_warehouse_members)
+        AND uuid NOT IN (SELECT owner_uuid FROM player_quotas)
+        AND uuid NOT IN (SELECT player_uuid FROM transactions)
+        AND uuid NOT IN (SELECT COALESCE(uuid, '') FROM admin_users)
+    `).run(ghostUuid)
   }
 
   hashWebLoginToken (token) {
