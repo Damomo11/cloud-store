@@ -1506,18 +1506,22 @@ const HTML = `<!doctype html>
     .code { color: var(--muted); font-size: 12px; }
     .withdrawbar { display: grid; grid-template-columns: minmax(0, 1fr) 190px auto; gap: 10px; align-items: start; margin-bottom: 18px; }
     .admin-transferbar {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) 230px auto;
-      gap: 10px;
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 8px;
       align-items: center;
-      margin: -8px 0 18px;
-      padding: 10px;
-      border: 1px solid #3b3020;
-      border-radius: 8px;
-      background: #16130f;
+      margin: -8px 0 14px;
     }
-    .admin-transferbar input { width: 100%; }
-    .admin-transferbar .muted { font-size: 13px; }
+    .admin-transferbar input { width: min(360px, 38vw); }
+    .admin-transferbar .muted {
+      max-width: 160px;
+      color: var(--gold);
+      font-size: 13px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
     .target-player-box { position: relative; min-width: 0; }
     .target-player-box input { width: 100%; }
     .player-menu {
@@ -1592,7 +1596,7 @@ const HTML = `<!doctype html>
     .tooltip {
       position: fixed;
       z-index: 50;
-      max-width: 360px;
+      max-width: min(560px, calc(100vw - 18px));
       pointer-events: none;
       background: rgba(12, 12, 14, .97);
       border: 1px solid #4b3d28;
@@ -1604,10 +1608,23 @@ const HTML = `<!doctype html>
     }
     .tooltip .tip-title { color: var(--gold); font-weight: 800; margin-bottom: 4px; }
     .tooltip .tip-line { color: #d8d4ca; font-size: 13px; margin-top: 2px; }
-    .tip-grid { display: grid; grid-template-columns: repeat(7, 28px); gap: 4px; margin-top: 8px; }
-    .tip-slot { width: 28px; height: 28px; display: grid; place-items: center; background: #242428; border: 1px solid #33343a; border-radius: 4px; position: relative; overflow: hidden; }
-    .tip-slot img { max-width: 24px; max-height: 24px; image-rendering: pixelated; }
-    .tip-slot span { position: absolute; right: 1px; bottom: 0; font-size: 10px; text-shadow: 1px 1px #000; }
+    .tip-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; margin-top: 8px; max-height: 360px; overflow: auto; }
+    .tip-slot {
+      min-width: 0;
+      height: 54px;
+      display: grid;
+      grid-template-columns: 42px minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 7px;
+      background: #242428;
+      border: 1px solid #33343a;
+      border-radius: 6px;
+      padding: 5px 7px 5px 5px;
+      overflow: hidden;
+    }
+    .tip-slot img { width: 40px; height: 40px; object-fit: contain; image-rendering: pixelated; }
+    .tip-slot-name { min-width: 0; color: #f1efe8; font-size: 12px; line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .tip-slot span { color: #fff; font-size: 12px; font-weight: 700; text-shadow: 1px 1px #000; }
     table { width: 100%; border-collapse: collapse; }
     th, td { border-bottom: 1px solid var(--line); padding: 11px 9px; text-align: left; vertical-align: top; }
     th { color: var(--gold); font-weight: 700; }
@@ -1701,7 +1718,11 @@ const HTML = `<!doctype html>
       .app { grid-template-columns: 1fr; }
       aside { min-height: auto; }
       main { padding: 20px; }
-      .withdrawbar, .admin-transferbar { grid-template-columns: 1fr; }
+      .withdrawbar { grid-template-columns: 1fr; }
+      .admin-transferbar { justify-content: stretch; }
+      .admin-transferbar input { width: 100%; flex: 1 1 220px; }
+      .admin-transferbar .muted { white-space: normal; }
+      .tip-grid { grid-template-columns: 1fr; }
       .litematicbar { grid-template-columns: 1fr; }
       .command-row { grid-template-columns: 1fr; }
     }
@@ -2512,6 +2533,7 @@ const HTML = `<!doctype html>
         lines.push('<div class="tip-grid">' + shulker.slice(0, 21).map(x =>
           '<div class="tip-slot" title="' + esc(x.displayName || x.itemId) + '">' +
           '<img data-tip-icon="' + esc(x.itemId) + '" alt="">' +
+          '<div class="tip-slot-name">' + esc(x.displayName || x.itemId) + '</div>' +
           '<span>' + esc(shortCount(x.amount)) + '</span>' +
           '</div>'
         ).join('') + '</div>');

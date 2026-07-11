@@ -18,7 +18,7 @@ public final class CloudStoreConfig {
             .getConfigDir()
             .resolve("cloud-store-mod.properties");
 
-    public String botName = "NanKinz1";
+    public String botName = "YourBotName";
     public String lastWarehouse = "";
     public String syncSecret = "";
     public List<String> warehouseNames = new ArrayList<>();
@@ -41,7 +41,7 @@ public final class CloudStoreConfig {
         }
 
         if (config.botName.isBlank()) {
-            config.botName = "NanKinz1";
+            config.botName = "YourBotName";
         }
         config.ensureLastWarehouseInList();
         return config;

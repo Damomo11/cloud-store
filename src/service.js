@@ -583,8 +583,7 @@ class CloudStoreService {
     if (!/^[A-Za-z0-9_]{3,16}$/.test(target)) throw new Error('目标玩家 ID 格式不正确。')
 
     const requests = webRequests.map(entry => {
-      const count = Number.parseInt(entry.amount, 10)
-      if (!Number.isFinite(count) || count <= 0) throw new Error('取出数量必须是大于 0 的整数。')
+      const count = this.parsePositiveAmount(entry.amount, '取出数量')
       let resolved = null
       if (entry.itemKey) {
         const item = this.db.getItemByKey(entry.itemKey)
@@ -677,6 +676,39 @@ class CloudStoreService {
       if (this.active) this.active.phase = 'deposit_teleport_to_player'
       const teleported = await this.teleportToPlayer(username)
       if (!teleported) {
+        await this.warehouse.waitForPickupSettle()
+        const receivedAfterTimeout = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
+        if (receivedAfterTimeout.length) {
+          this.msg(username, `没有检测到你在附近，但已收到物品，正在存入${this.ownerScopeName(storageOwner)}。`)
+          if (this.active) this.active.phase = 'deposit_return_home'
+          this.saveRecoveryTask('deposit', username, storageOwner, username, 'deposit_return_home')
+          await this.warehouse.goHome({ requireWarehouse: true })
+          if (this.active) this.active.phase = 'deposit_storing'
+          this.saveRecoveryTask('deposit', username, storageOwner, username, 'deposit_storing')
+          const result = await this.warehouse.depositInventoryForOwner(storageOwner.uuid, storageOwner.username)
+          const status = result.deposited.length
+            ? (result.leftover.length ? 'partial_after_teleport_timeout' : 'ok_after_teleport_timeout')
+            : (result.leftover.length ? 'no_space_after_teleport_timeout' : 'empty_after_teleport_timeout')
+          logSession(status, result.deposited.length ? result.deposited : result.leftover, {
+            phase: this.active?.phase || 'deposit_storing',
+            depositedAmount: this.totalAmount(result.deposited),
+            leftoverAmount: this.totalAmount(result.leftover),
+            reason: 'teleport_timeout_with_inventory'
+          })
+          if (result.deposited.length) {
+            const prefix = result.leftover.length ? '部分存入' : '存入完成'
+            this.msg(username, `${this.ownerActionPrefix(storageOwner)}${prefix}：${this.formatDepositSummary(result.deposited)}。`)
+          } else {
+            this.msg(username, result.leftover.length ? `收到物品但暂时无法入库：${this.formatDepositSummary(result.leftover)}。` : '没有收到可入库的物品。')
+          }
+          if (result.leftover.length) {
+            this.accountResidualAsMomo(result.leftover, `deposit leftover after teleport timeout, actor=${username}, owner=${storageOwner.uuid}`)
+            const reason = result.stopReason ? `${result.stopReason} ` : '仓库空间不足，'
+            this.msg(username, `${reason}剩余${this.formatDepositSummary(result.leftover)}已转记为 momo，避免影响下一个玩家。`)
+          }
+          this.db.clearRecoveryTask()
+          return
+        }
         logSession('teleport_timeout', [], {
           phase: this.active?.phase || 'deposit_teleport_to_player',
           timeoutMs: this.config.timing.teleportRequestTimeoutMs || 15000
@@ -881,7 +913,7 @@ class CloudStoreService {
       return
     }
 
-    const missingByItem = this.groupMissingByDisplay(plan.allocations, deliveredTotal)
+    const missingByItem = this.groupMissingByDisplay(plan.allocations, allDeducted)
     if (!deliveryToOther) {
       for (const notice of missingByItem) this.msg(username, notice)
     }
@@ -1419,18 +1451,28 @@ class CloudStoreService {
   buildWithdrawPlan (ownerUuid, requests, ownerLabel = '你当前') {
     const notices = []
     const allocations = []
+    const reservedLooseItems = new Map()
     const reservedShulkerBoxes = new Map()
 
     for (const request of requests) {
       const rows = request.itemKey
         ? this.db.getOwnerItemsByItemKey(ownerUuid, request.itemKey)
         : this.db.getOwnerItemsByItemId(ownerUuid, request.itemId)
-      const looseAvailable = rows.reduce((sum, row) => sum + row.amount, 0)
+      const availableRows = rows
+        .map(row => ({
+          ...row,
+          availableAmount: Math.max(0, Number(row.amount || 0) - Number(reservedLooseItems.get(row.itemKey) || 0))
+        }))
+        .filter(row => row.availableAmount > 0)
+      const looseAvailable = availableRows.reduce((sum, row) => sum + row.availableAmount, 0)
       const displayName = request.displayName || this.catalog.getDisplayName(request.itemId)
       const shulkerRows = this.resolveShulkerRowsForWithdraw(ownerUuid, request)
-      const shulkerAvailable = shulkerRows.reduce((sum, row) => sum + Number(row.totalContainedAmount || 0), 0)
+      const shulkerAvailable = shulkerRows.reduce((sum, row) => {
+        const reserved = Math.min(Number(reservedShulkerBoxes.get(row.shulkerItemKey) || 0), Number(row.shulkerAmount || 0))
+        const availableBoxes = Math.max(0, Number(row.shulkerAmount || 0) - reserved)
+        return sum + availableBoxes * Number(row.containedAmount || 0)
+      }, 0)
       const available = looseAvailable + shulkerAvailable
-      const loosePlanned = Math.min(request.amount, looseAvailable)
 
       if (available <= 0) {
         notices.push(`${ownerLabel}只有 0 个${displayName}，无法取出 ${request.amount} 个。`)
@@ -1441,22 +1483,46 @@ class CloudStoreService {
         notices.push(`${ownerLabel}散装和潜影盒内合计只有 ${available} 个${displayName}，将尽量取出。`)
       }
 
+      let remainingRequest = Math.min(request.amount, available)
+      let preferredShulkerCovered = 0
+
+      for (const row of shulkerRows) {
+        if (remainingRequest <= 0) break
+        const perBox = Number(row.containedAmount || 0)
+        const ownedBoxes = Number(row.shulkerAmount || 0)
+        const reserved = reservedShulkerBoxes.get(row.shulkerItemKey) || 0
+        const availableBoxes = Math.max(0, ownedBoxes - reserved)
+        if (perBox <= 0 || availableBoxes <= 0 || !this.isSingleItemShulkerRow(row)) continue
+
+        const boxes = Math.min(availableBoxes, Math.floor(remainingRequest / perBox))
+        if (boxes <= 0) continue
+
+        const coveredAmount = boxes * perBox
+        const allocation = this.shulkerRowToAllocation(row, boxes, displayName, request, coveredAmount)
+        allocations.push(allocation)
+        reservedShulkerBoxes.set(row.shulkerItemKey, reserved + boxes)
+        preferredShulkerCovered += coveredAmount
+        remainingRequest -= coveredAmount
+      }
+
+      const loosePlanned = Math.min(remainingRequest, looseAvailable)
       let remaining = loosePlanned
-      for (const row of rows) {
+      for (const row of availableRows) {
         if (remaining <= 0) break
-        const amount = Math.min(row.amount, remaining)
-        allocations.push({ ...row, amount })
+        const amount = Math.min(row.availableAmount, remaining)
+        const { availableAmount, ...item } = row
+        allocations.push({
+          ...item,
+          amount,
+          requestItemKey: request?.itemKey || '',
+          requestItemId: request?.itemId || '',
+          requestDisplayName: displayName
+        })
+        reservedLooseItems.set(row.itemKey, Number(reservedLooseItems.get(row.itemKey) || 0) + amount)
         remaining -= amount
       }
 
-      let remainingInside = request.amount - loosePlanned
-      const alreadySelectedInside = shulkerRows.reduce((sum, row) => {
-        const selected = Math.min(reservedShulkerBoxes.get(row.shulkerItemKey) || 0, row.shulkerAmount || 0)
-        return sum + selected * Number(row.containedAmount || 0)
-      }, 0)
-      remainingInside = Math.max(0, remainingInside - alreadySelectedInside)
-
-      const shulkerAllocations = []
+      let remainingInside = request.amount - preferredShulkerCovered - loosePlanned
       for (const row of shulkerRows) {
         if (remainingInside <= 0) break
         const perBox = Number(row.containedAmount || 0)
@@ -1471,17 +1537,24 @@ class CloudStoreService {
         const coveredAmount = Math.min(remainingInside, boxes * perBox)
         const allocation = this.shulkerRowToAllocation(row, boxes, displayName, request, coveredAmount)
         allocations.push(allocation)
-        shulkerAllocations.push(allocation)
         reservedShulkerBoxes.set(row.shulkerItemKey, reserved + boxes)
         remainingInside -= coveredAmount
       }
 
-      if (looseAvailable < request.amount && shulkerAllocations.length) {
-        notices.push(`${ownerLabel}散装只有 ${looseAvailable} 个${displayName}，会额外取出潜影盒：${this.formatShulkerAllocationList(shulkerAllocations)}。`)
-      }
     }
 
     return { notices, allocations: this.mergeAllocations(allocations) }
+  }
+
+  isSingleItemShulkerRow (row) {
+    const slotCount = Number(row?.slotCount || 0)
+    const totalSlotCount = Number(row?.totalSlotCount || 0)
+    const containedAmount = Number(row?.containedAmount || 0)
+    const totalContainedAmount = Number(row?.boxContainedAmount || 0)
+    return slotCount > 0 &&
+      containedAmount > 0 &&
+      totalSlotCount === slotCount &&
+      totalContainedAmount === containedAmount
   }
 
   buildWithdrawPlanForRequest (player, storageOwner, requests) {
@@ -1515,7 +1588,7 @@ class CloudStoreService {
       const tagged = this.withWithdrawOwner(plan.allocations, owner)
       if (tagged.length && owner.scope === 'custom') supplementNames.push(owner.vaultName)
       allocations.push(...tagged)
-      remainingRequests = this.remainingWithdrawRequestsAfterOwner(owner.uuid, remainingRequests)
+      remainingRequests = this.remainingWithdrawRequestsAfterPlan(remainingRequests, plan.allocations)
     }
 
     const notices = []
@@ -1546,24 +1619,18 @@ class CloudStoreService {
     }))
   }
 
-  remainingWithdrawRequestsAfterOwner (ownerUuid, requests) {
+  remainingWithdrawRequestsAfterPlan (requests, allocations) {
+    const coveredByKey = this.sumWithdrawCoverageByKey(allocations)
     const remaining = []
     for (const request of requests || []) {
-      const available = this.availableWithdrawAmount(ownerUuid, request)
-      const left = Number(request.amount || 0) - available
+      const key = this.withdrawCoverageKey(request)
+      const covered = Number(coveredByKey.get(key) || 0)
+      const used = Math.min(Number(request.amount || 0), covered)
+      if (covered > 0) coveredByKey.set(key, covered - used)
+      const left = Number(request.amount || 0) - used
       if (left > 0) remaining.push({ ...request, amount: left })
     }
     return remaining
-  }
-
-  availableWithdrawAmount (ownerUuid, request) {
-    const rows = request.itemKey
-      ? this.db.getOwnerItemsByItemKey(ownerUuid, request.itemKey)
-      : this.db.getOwnerItemsByItemId(ownerUuid, request.itemId)
-    const looseAvailable = rows.reduce((sum, row) => sum + Number(row.amount || 0), 0)
-    const shulkerRows = this.resolveShulkerRowsForWithdraw(ownerUuid, request)
-    const shulkerAvailable = shulkerRows.reduce((sum, row) => sum + Number(row.totalContainedAmount || 0), 0)
-    return looseAvailable + shulkerAvailable
   }
 
   allocateWithdrawnToPlanned (planned, withdrawn) {
@@ -1613,14 +1680,15 @@ class CloudStoreService {
   mergeAllocations (allocations) {
     const byKey = new Map()
     for (const item of allocations) {
-      const existing = byKey.get(item.itemKey)
+      const key = `${item.itemKey}|${this.withdrawCoverageKey(item)}`
+      const existing = byKey.get(key)
       if (existing) {
         existing.amount += item.amount
         if (Number(item.coverageAmount || 0) > 0 || Number(existing.coverageAmount || 0) > 0) {
           existing.coverageAmount = Number(existing.coverageAmount || 0) + Number(item.coverageAmount || 0)
         }
       } else {
-        byKey.set(item.itemKey, { ...item })
+        byKey.set(key, { ...item })
       }
     }
     return [...byKey.values()]
@@ -1728,7 +1796,7 @@ class CloudStoreService {
       const subtract = Math.min(Number(item.amount || 0), left)
       const amount = Math.max(0, Number(item.amount || 0) - subtract)
       leftoverByKey.set(item.itemKey, left - subtract)
-      if (amount > 0) result.push({ ...item, amount })
+      if (amount > 0) result.push(this.withDeliveredCoverageAmount(item, amount))
     }
     return result
   }
@@ -1931,8 +1999,7 @@ class CloudStoreService {
 
     const addRequest = (name, amountText, source) => {
       const item = this.resolveStoredItem(name)
-      const amount = Number.parseInt(amountText, 10)
-      if (amount <= 0) throw new Error(`数量必须大于 0：${source}`)
+      const amount = this.parsePositiveAmount(amountText, `数量：${source}`)
       requests.push({ ...item, amount })
     }
 
@@ -1977,6 +2044,14 @@ class CloudStoreService {
       throw new Error(`缺少数量：${nameParts.join(' ')}，格式示例 石头64 或 石头 64`)
     }
     return requests
+  }
+
+  parsePositiveAmount (value, label = '数量') {
+    const text = String(value ?? '').trim()
+    if (!/^\d+$/.test(text)) throw new Error(`${label}必须是大于 0 的整数。`)
+    const amount = Number(text)
+    if (!Number.isSafeInteger(amount) || amount <= 0) throw new Error(`${label}必须是大于 0 的整数。`)
+    return amount
   }
 
   parseWithdrawCommand (text, owner, fallbackTarget = '') {
@@ -2024,9 +2099,16 @@ class CloudStoreService {
 
     if (task?.type === 'withdraw') {
       console.warn(`[residual-recovery] returning pending withdraw items before task: actor=${task.actorUsername}, target=${task.targetUsername}, held=${this.formatItemList(held)}`)
+      const owner = this.recoveryOwnerFromTask(task)
+      const delivered = this.isWithdrawDeliveryPhase(task.phase) && task.items?.length
+        ? this.subtractLeftoverFromDelivered(task.items, held)
+        : []
       const result = await this.warehouse.depositInventoryWithoutBalance('withdraw_residual_recovery', `actor=${task.actorUsername}, target=${task.targetUsername}, phase=${task.phase}`)
       if (result.leftover?.length) {
         throw new Error(`机器人背包里还有上次取货未交付物品未能回收入库：${this.formatItemList(result.leftover)}。请先检查仓库路径或空间。`)
+      }
+      if (delivered.length) {
+        this.recordWithdrawDeduction(owner, delivered, `actor=${task.actorUsername}, target=${task.targetUsername}, phase=${task.phase}, recovery=residual`)
       }
       this.db.clearRecoveryTask()
       return

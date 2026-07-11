@@ -232,7 +232,7 @@ class ItemCatalog {
 
   normalizeMetaForFingerprint (itemId, meta) {
     const base = this.isShulkerBox(itemId) ? this.normalizeShulkerMetaForFingerprint(meta) : meta
-    return this.stripVolatileMetaForFingerprint(itemId, base)
+    return this.sortMetaComponentsForFingerprint(this.stripVolatileMetaForFingerprint(itemId, base))
   }
 
   normalizeNbtForFingerprint (itemId, nbt) {
@@ -294,6 +294,7 @@ class ItemCatalog {
         .filter(component => this.shouldKeepComponentForFingerprint(component))
         .map(component => this.normalizeComponentForFingerprint(component))
       : []
+    components.sort((a, b) => this.compareFingerprintValues(a, b))
     const removeComponents = Array.isArray(entry.removeComponents) && entry.removeComponents.length
       ? [...entry.removeComponents].sort()
       : []
@@ -315,8 +316,40 @@ class ItemCatalog {
   normalizeComponentForFingerprint (component) {
     return {
       type: component.type,
-      data: component.data ?? null
+      data: this.sortNestedItemComponentsForFingerprint(component.data ?? null)
     }
+  }
+
+  sortMetaComponentsForFingerprint (meta) {
+    if (!meta || typeof meta !== 'object') return meta
+    return this.sortNestedItemComponentsForFingerprint(meta)
+  }
+
+  sortNestedItemComponentsForFingerprint (value) {
+    if (Array.isArray(value)) return value.map(item => this.sortNestedItemComponentsForFingerprint(item))
+    if (!value || typeof value !== 'object') return value
+
+    const result = {}
+    for (const [key, child] of Object.entries(value)) {
+      if ((key === 'components' || key === 'removeComponents') && Array.isArray(child)) {
+        result[key] = this.sortComponentListForFingerprint(child)
+      } else {
+        result[key] = this.sortNestedItemComponentsForFingerprint(child)
+      }
+    }
+    return result
+  }
+
+  sortComponentListForFingerprint (components) {
+    return components
+      .map(component => this.sortNestedItemComponentsForFingerprint(component))
+      .sort((a, b) => this.compareFingerprintValues(a, b))
+  }
+
+  compareFingerprintValues (a, b) {
+    const ak = stableStringify(a)
+    const bk = stableStringify(b)
+    return ak.localeCompare(bk)
   }
 
   isShulkerBox (itemId) {

@@ -291,6 +291,16 @@ class StoreDb {
           updated_at = CURRENT_TIMESTAMP
       `)
       const deletePlayerOverrides = this.db.prepare('DELETE FROM player_item_name_overrides WHERE item_key = ?')
+      const oldItemKeyAliases = this.db.prepare(`
+        SELECT short_code AS shortCode, reason
+        FROM item_key_aliases
+        WHERE item_key = ?
+      `)
+      const insertItemKeyAlias = this.db.prepare(`
+        INSERT OR IGNORE INTO item_key_aliases (short_code, item_key, reason)
+        VALUES (?, ?, ?)
+      `)
+      const deleteItemKeyAliases = this.db.prepare('DELETE FROM item_key_aliases WHERE item_key = ?')
       const deleteOldItem = this.db.prepare('DELETE FROM items WHERE item_key = ?')
       const manualOverrideStmt = this.db.prepare(`
         UPDATE item_name_overrides
@@ -313,6 +323,11 @@ class StoreDb {
           insertPlayerOverride.run(override.playerUuid, move.canonical.itemKey, move.canonical.itemId, override.displayName)
         }
         deletePlayerOverrides.run(move.old.itemKey)
+        const aliases = oldItemKeyAliases.all(move.old.itemKey)
+        deleteItemKeyAliases.run(move.old.itemKey)
+        for (const alias of aliases) {
+          insertItemKeyAlias.run(alias.shortCode, move.canonical.itemKey, alias.reason || 'canonicalized_item_key')
+        }
 
         const oldCode = this.shortCodeForItemKey(move.old.itemKey)
         const newCode = this.shortCodeForItemKey(move.canonical.itemKey)
@@ -1429,6 +1444,12 @@ class StoreDb {
              GROUP_CONCAT(DISTINCT contained.display_name) AS containedDisplayNames,
              SUM(sc.amount) AS containedAmount,
              SUM(sc.slot_count) AS slotCount,
+             (SELECT COALESCE(SUM(all_sc.slot_count), 0)
+              FROM shulker_contents all_sc
+              WHERE all_sc.shulker_item_key = sc.shulker_item_key) AS totalSlotCount,
+             (SELECT COALESCE(SUM(all_sc.amount), 0)
+              FROM shulker_contents all_sc
+              WHERE all_sc.shulker_item_key = sc.shulker_item_key) AS boxContainedAmount,
              SUM(sc.amount) * b.amount AS totalContainedAmount
       FROM shulker_contents sc
       JOIN balances b ON b.item_key = sc.shulker_item_key
@@ -1456,6 +1477,12 @@ class StoreDb {
              contained.display_name AS containedDisplayNames,
              sc.amount AS containedAmount,
              sc.slot_count AS slotCount,
+             (SELECT COALESCE(SUM(all_sc.slot_count), 0)
+              FROM shulker_contents all_sc
+              WHERE all_sc.shulker_item_key = sc.shulker_item_key) AS totalSlotCount,
+             (SELECT COALESCE(SUM(all_sc.amount), 0)
+              FROM shulker_contents all_sc
+              WHERE all_sc.shulker_item_key = sc.shulker_item_key) AS boxContainedAmount,
              sc.amount * b.amount AS totalContainedAmount
       FROM shulker_contents sc
       JOIN balances b ON b.item_key = sc.shulker_item_key
