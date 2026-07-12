@@ -7,6 +7,7 @@
 
     // Bot login account. For Microsoft auth, use the account email.
     "username": "your-microsoft-email@example.com",
+    "botName": "NanKinz1",
 
     // Supported values usually are "microsoft" or "offline".
     "auth": "microsoft",
@@ -109,6 +110,7 @@
     "homeTimeoutMs": 30000,
 
     "pickupWindowMs": 10000,
+    "depositLeaveDistance": 4,
     "postTeleportWaitMs": 1500,
     "dropIntervalMs": 250,
 

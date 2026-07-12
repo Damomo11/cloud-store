@@ -59,13 +59,19 @@ class CloudStoreWebServer {
       if (req.method === 'GET' && url.pathname === '/api/inventory') return this.sendJson(res, this.apiInventory(session, url))
       if (req.method === 'GET' && url.pathname === '/api/online-players') return this.sendJson(res, this.apiOnlinePlayers(session, url))
       if (req.method === 'GET' && url.pathname === '/api/transactions') return this.sendJson(res, this.apiTransactions(session, url))
+      if (req.method === 'GET' && url.pathname === '/api/my/organizations') return this.sendJson(res, this.apiMyOrganizations(session))
+      if (req.method === 'GET' && url.pathname === '/api/my/aliases') return this.sendJson(res, this.apiMyAliases(session, url))
       if (req.method === 'GET' && url.pathname === '/api/admin/owners') return this.sendJson(res, this.apiAdminOwners(session))
+      if (req.method === 'GET' && url.pathname === '/api/admin/warehouse-provisioning') return this.sendJson(res, this.apiAdminWarehouseProvisioning(session))
+      if (req.method === 'GET' && url.pathname === '/api/admin/organization-warehouse/detail') return this.sendJson(res, this.apiAdminOrganizationWarehouseDetail(session, url))
+      if (req.method === 'GET' && url.pathname === '/api/warehouse-admin/organizations') return this.sendJson(res, this.apiWarehouseAdminOrganizations(session))
       if (req.method === 'GET' && url.pathname === '/api/admin/inventory') return this.sendJson(res, this.apiAdminInventory(session, url))
       if (req.method === 'GET' && url.pathname === '/api/admin/mismatches') return this.sendJson(res, this.apiAdminMismatches(session, url))
       if (req.method === 'GET' && url.pathname === '/api/admin/transactions') return this.sendJson(res, this.apiAdminTransactions(session, url))
       if (req.method === 'GET' && url.pathname === '/api/admin/chests') return this.sendJson(res, this.apiAdminChests(session, url))
       if (req.method === 'GET' && url.pathname === '/api/admin/chest') return this.sendJson(res, this.apiAdminChest(session, url))
       if (req.method === 'GET' && url.pathname === '/api/admin/aliases') return this.sendJson(res, this.apiAdminAliases(session, url))
+      if (req.method === 'GET' && url.pathname === '/api/admin/quotas') return this.sendJson(res, this.apiAdminQuotas(session, url))
       if (req.method === 'POST' && url.pathname === '/api/login') {
         const body = await this.readBody(req)
         return this.sendJson(res, this.apiLogin(session, body, this.clientIp(req)))
@@ -105,9 +111,61 @@ class CloudStoreWebServer {
         const body = await this.readBody(req)
         return this.sendJson(res, this.apiItemAliasSave(session, body))
       }
+      if (req.method === 'POST' && url.pathname === '/api/item-alias/delete') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiItemAliasDelete(session, body))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/my/global-alias/toggle') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiMyGlobalAliasToggle(session, body))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/warehouse-admin/member/add') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiWarehouseAdminMemberAdd(session, body))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/warehouse-admin/member/remove') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiWarehouseAdminMemberRemove(session, body))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/warehouse-admin/member/role') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiWarehouseAdminMemberRole(session, body))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/warehouse-admin/rename') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiWarehouseAdminRename(session, body))
+      }
       if (req.method === 'POST' && url.pathname === '/api/admin/adjust') {
         const body = await this.readBody(req)
         return this.sendJson(res, this.apiAdminAdjust(session, body))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/admin/personal-warehouse/create') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiAdminCreatePersonalWarehouse(session, body))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/admin/organization-warehouse/create') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiAdminCreateOrganizationWarehouse(session, body))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/admin/organization-warehouse/member/add') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiAdminOrganizationMemberAdd(session, body))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/admin/organization-warehouse/member/remove') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiAdminOrganizationMemberRemove(session, body))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/admin/organization-warehouse/member/role') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiAdminOrganizationMemberRole(session, body))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/admin/personal-warehouse/delete') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiAdminDeletePersonalWarehouse(session, body))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/admin/organization-warehouse/delete') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiAdminDeleteOrganizationWarehouse(session, body))
       }
       if (req.method === 'POST' && url.pathname === '/api/admin/transfer') {
         const body = await this.readBody(req)
@@ -117,6 +175,10 @@ class CloudStoreWebServer {
         const body = await this.readBody(req)
         return this.sendJson(res, this.apiAdminMismatchDeduct(session, body))
       }
+      if (req.method === 'POST' && url.pathname === '/api/admin/mismatch/resolve') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiAdminMismatchResolve(session, body))
+      }
       if (req.method === 'POST' && url.pathname === '/api/admin/alias/save') {
         const body = await this.readBody(req)
         return this.sendJson(res, this.apiAdminAliasSave(session, body))
@@ -124,6 +186,10 @@ class CloudStoreWebServer {
       if (req.method === 'POST' && url.pathname === '/api/admin/alias/delete') {
         const body = await this.readBody(req)
         return this.sendJson(res, this.apiAdminAliasDelete(session, body))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/admin/quota/save') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiAdminQuotaSave(session, body))
       }
       this.sendText(res, 404, 'Not found')
     } catch (error) {
@@ -157,7 +223,18 @@ class CloudStoreWebServer {
     const ownerUuid = url.searchParams.get('owner') || user.uuid
     this.requireOwnerAccess(user, ownerUuid)
     const startedAt = Date.now()
-    const result = { ok: true, ...this.db.getWebInventory(ownerUuid, user.uuid), active: this.activeSnapshot() }
+    const isCustom = ownerUuid.startsWith('vault:')
+    const defaultSlots = isCustom
+      ? (this.config.storage?.defaultCustomWarehouseQuotaSlots || this.config.storage?.defaultQuotaSlots || 270)
+      : (this.config.storage?.defaultQuotaSlots || 270)
+    const quotaSlots = this.db.getQuotaSlots(ownerUuid, defaultSlots)
+    const usedSlots = this.adminOwnerUsedSlots(ownerUuid)
+    const result = {
+      ok: true,
+      ...this.db.getWebInventory(ownerUuid, user.uuid),
+      quota: { usedSlots, quotaSlots, usagePercent: quotaSlots > 0 ? Math.round(usedSlots / quotaSlots * 1000) / 10 : 0 },
+      active: this.activeSnapshot()
+    }
     const elapsed = Date.now() - startedAt
     if (this.config.debug && elapsed > 100) {
       console.warn(`[web] slow inventory ${ownerUuid}: ${elapsed}ms, ${result.items?.length || 0} rows`)
@@ -167,14 +244,183 @@ class CloudStoreWebServer {
 
   apiTransactions (session, url) {
     const user = this.requireUser(session)
-    const ownerUuid = url.searchParams.get('owner') || user.uuid
+    const ownerUuid = url.searchParams.get('owner') || this.db.getEffectiveDefaultOwnerUuid(user.uuid)
+    const page = Math.max(1, Number.parseInt(url.searchParams.get('page'), 10) || 1)
+    const pageSize = this.clampLimit(url.searchParams.get('pageSize'), 30, 100)
+    if (!ownerUuid) return { ok: true, ownerUuid: '', ownerLabel: '', page: 1, pageSize, total: 0, totalPages: 1, rows: [] }
     this.requireOwnerAccess(user, ownerUuid)
+    const typeQ = String(url.searchParams.get('type') || '').trim().toLowerCase()
+    const operatorQ = String(url.searchParams.get('operator') || '').trim().toLowerCase()
+    const itemQ = String(url.searchParams.get('item') || '').trim().toLowerCase()
+    const statusQ = String(url.searchParams.get('status') || '').trim().toLowerCase()
+    const q = String(url.searchParams.get('q') || '').trim().toLowerCase()
+    const dateFrom = String(url.searchParams.get('dateFrom') || '').trim()
+    const dateTo = String(url.searchParams.get('dateTo') || '').trim()
+    const rows = this.db.db.prepare(`
+      SELECT id, type, status, player_uuid AS playerUuid, username,
+             items_json AS itemsJson, message, created_at AS createdAt
+      FROM transactions WHERE player_uuid = ? ORDER BY id DESC LIMIT 10000
+    `).all(ownerUuid)
+    const transactionItems = this.prepareTransactionItems(rows)
+    const result = []
+    for (const row of rows) {
+      const details = this.transactionDetails(row.message)
+      const operator = this.transactionOperator(row, details)
+      const items = this.decorateTransactionItems(transactionItems.itemsById.get(row.id) || [], transactionItems.contentsByBox)
+      const createdAtLabel = this.formatBeijingTime(row.createdAt)
+      const createdDate = createdAtLabel.slice(0, 10)
+      if (typeQ && !this.textMatches(row.type, typeQ) && !this.textMatches(this.transactionTypeLabel(row.type), typeQ)) continue
+      if (operatorQ && !this.textMatches(operator, operatorQ)) continue
+      if (statusQ && row.status.toLowerCase() !== statusQ) continue
+      if (dateFrom && createdDate < dateFrom) continue
+      if (dateTo && createdDate > dateTo) continue
+      if (itemQ && !items.some(item => this.adminTransactionItemMatches(item, itemQ))) continue
+      if (q && !this.textMatches(row.message, q) && !this.textMatches(operator, q) && !items.some(item => this.adminTransactionItemMatches(item, q))) continue
+      result.push({
+        ...row,
+        typeLabel: this.transactionTypeLabel(row.type),
+        statusLabel: this.transactionStatusLabel(row.status),
+        ownerLabel: this.db.ownerLabel(row.playerUuid),
+        operator,
+        details,
+        messageLabel: this.transactionMessageLabel(row.message),
+        createdAtLabel,
+        items
+      })
+    }
+    const total = result.length
+    const totalPages = Math.max(1, Math.ceil(total / pageSize))
+    const currentPage = Math.min(page, totalPages)
+    return { ok: true, ownerUuid, ownerLabel: this.db.ownerLabel(ownerUuid), page: currentPage, pageSize, total, totalPages, rows: result.slice((currentPage - 1) * pageSize, currentPage * pageSize) }
+  }
+
+  apiMyOrganizations (session) {
+    const user = this.requireUser(session)
+    const rows = this.db.listCustomWarehousesForPlayer(user.uuid).map(warehouse => {
+      const ownerUuid = `vault:${warehouse.nameLower}`
+      const defaultSlots = this.config.storage?.defaultCustomWarehouseQuotaSlots || this.config.storage?.defaultQuotaSlots || 270
+      const quotaSlots = this.db.getQuotaSlots(ownerUuid, defaultSlots)
+      const usedSlots = this.adminOwnerUsedSlots(ownerUuid)
+      return {
+        ...warehouse,
+        ownerUuid,
+        isAdmin: warehouse.role === 'admin',
+        usedSlots,
+        quotaSlots,
+        usagePercent: quotaSlots > 0 ? Math.round(usedSlots / quotaSlots * 1000) / 10 : 0,
+        members: this.db.listCustomWarehouseMembers(warehouse.name)
+      }
+    })
+    return { ok: true, rows }
+  }
+
+  apiWarehouseAdminOrganizations (session) {
+    const user = this.requireUser(session)
+    const warehouses = this.db.listCustomWarehousesForPlayer(user.uuid).filter(warehouse => warehouse.role === 'admin')
+    if (!warehouses.length) {
+      const error = new Error('你不是任何组织仓库的仓库管理员。')
+      error.status = 403
+      throw error
+    }
+    const rows = warehouses.map(warehouse => {
+      const ownerUuid = `vault:${warehouse.nameLower}`
+      const defaultSlots = this.config.storage?.defaultCustomWarehouseQuotaSlots || this.config.storage?.defaultQuotaSlots || 270
+      const quotaSlots = this.db.getQuotaSlots(ownerUuid, defaultSlots)
+      const usedSlots = this.adminOwnerUsedSlots(ownerUuid)
+      return {
+        ...warehouse,
+        ownerUuid,
+        usedSlots,
+        quotaSlots,
+        usagePercent: quotaSlots > 0 ? Math.round(usedSlots / quotaSlots * 1000) / 10 : 0,
+        members: this.db.listCustomWarehouseMembers(warehouse.name)
+      }
+    })
+    return { ok: true, rows }
+  }
+
+  requireWarehouseAdmin (session, name) {
+    const user = this.requireUser(session)
+    const warehouse = this.db.getCustomWarehouse(name)
+    if (!warehouse) throw new Error(`找不到仓库：${name}`)
+    if (!this.db.isCustomWarehouseAdmin(warehouse.name, user.uuid)) {
+      const error = new Error('只有这个组织仓库的仓库管理员可以执行该操作。')
+      error.status = 403
+      throw error
+    }
+    return warehouse
+  }
+
+  apiMyAliases (session, url) {
+    const user = this.requireUser(session)
+    const q = String(url.searchParams.get('q') || '').trim()
+    const personalRows = this.db.listPlayerItemAliases(user.uuid, '')
+    const personalByItem = new Map()
+    for (const row of personalRows) {
+      if (!personalByItem.has(row.itemKey)) personalByItem.set(row.itemKey, { ...this.adminItem(row), aliases: [] })
+      personalByItem.get(row.itemKey).aliases.push(row.alias)
+    }
+    const globalRows = this.db.listGlobalItemAliasesForPlayer(user.uuid, '')
+    const matchingGlobalKeys = new Set(globalRows.filter(row => !q || this.adminItemMatches(this.adminItem(row), q) || this.textMatches(row.alias, q)).map(row => row.itemKey))
     return {
       ok: true,
-      ownerUuid,
-      ownerLabel: this.db.ownerLabel(ownerUuid),
-      rows: this.db.listWebTransactions(ownerUuid, 100).map(row => this.decorateTransaction(row))
+      personal: [...personalByItem.values()].filter(row => !q || this.adminItemMatches(row, q) || row.aliases.some(alias => this.textMatches(alias, q))),
+      global: globalRows.filter(row => !q || matchingGlobalKeys.has(row.itemKey)).map(row => ({ ...this.adminItem(row), alias: row.alias, enabled: row.enabled }))
     }
+  }
+
+  resolveKnownPlayer (value) {
+    const raw = String(value || '').trim()
+    if (!raw) throw new Error('请填写玩家 ID。')
+    const service = this.serviceProvider()
+    const onlineName = service?.bot?.players ? Object.keys(service.bot.players).find(name => name.toLowerCase() === raw.toLowerCase()) : ''
+    const online = onlineName ? service.bot.players[onlineName] : null
+    if (online?.uuid) {
+      this.db.upsertPlayer(online.uuid, onlineName)
+      return { uuid: online.uuid, username: onlineName }
+    }
+    const player = this.db.getPlayerByUsername(raw)
+    if (!player?.uuid || player.uuid.startsWith('name:')) throw new Error(`找不到玩家：${raw}。玩家需要在线或曾经使用过云仓库。`)
+    return player
+  }
+
+  apiWarehouseAdminMemberAdd (session, body) {
+    const warehouse = this.requireWarehouseAdmin(session, body.warehouse)
+    const player = this.resolveKnownPlayer(body.username)
+    this.db.addCustomWarehouseMember(warehouse.name, player.uuid, player.username)
+    return { ok: true, message: `已把 ${player.username} 添加到仓库 ${warehouse.name}。` }
+  }
+
+  apiWarehouseAdminMemberRemove (session, body) {
+    const warehouse = this.requireWarehouseAdmin(session, body.warehouse)
+    const playerUuid = String(body.playerUuid || '').trim()
+    if (!playerUuid) throw new Error('缺少成员。')
+    if (playerUuid === warehouse.creatorUuid) throw new Error('不能删除仓库创建者。')
+    if (this.db.isCustomWarehouseAdmin(warehouse.name, playerUuid)) throw new Error('请先取消该成员的管理员身份。')
+    const changed = this.db.removeCustomWarehouseMember(warehouse.name, playerUuid)
+    return { ok: true, message: changed ? '已删除仓库成员。' : '该玩家不是普通成员。' }
+  }
+
+  apiWarehouseAdminMemberRole (session, body) {
+    const warehouse = this.requireWarehouseAdmin(session, body.warehouse)
+    const playerUuid = String(body.playerUuid || '').trim()
+    const role = String(body.role || '').trim()
+    if (!['admin', 'member'].includes(role)) throw new Error('成员角色无效。')
+    if (playerUuid === warehouse.creatorUuid && role !== 'admin') throw new Error('不能取消仓库创建者的管理员身份。')
+    const member = this.db.listCustomWarehouseMembers(warehouse.name).find(row => row.playerUuid === playerUuid)
+    if (!member) throw new Error('找不到该仓库成员。')
+    this.db.setCustomWarehouseMemberRole(warehouse.name, member.playerUuid, member.username, role)
+    return { ok: true, message: `已把 ${member.username} 设置为${role === 'admin' ? '仓库管理员' : '普通成员'}。` }
+  }
+
+  apiWarehouseAdminRename (session, body) {
+    const warehouse = this.requireWarehouseAdmin(session, body.warehouse)
+    const newName = String(body.newName || '').trim()
+    if (!newName) throw new Error('新仓库名不能为空。')
+    if (/\s/.test(newName)) throw new Error('仓库名不能包含空格。')
+    if ([...newName].length > 15) throw new Error('仓库名最多 15 个字。')
+    const renamed = this.db.renameCustomWarehouse(warehouse.name, newName)
+    return { ok: true, message: `仓库已改名为 ${renamed.name}。`, warehouse: renamed }
   }
 
   apiOnlinePlayers (session, url) {
@@ -549,7 +795,8 @@ class CloudStoreWebServer {
     return {
       uuid: user.uuid,
       username: user.username,
-      isAdmin: this.db.isAdmin(user.username, user.uuid)
+      isAdmin: this.db.isAdmin(user.username, user.uuid),
+      isWarehouseAdmin: this.db.listCustomWarehousesForPlayer(user.uuid).some(warehouse => warehouse.role === 'admin')
     }
   }
 
@@ -594,11 +841,153 @@ class CloudStoreWebServer {
     }
 
     for (const row of this.db.db.prepare('SELECT DISTINCT owner_uuid AS ownerUuid FROM balances ORDER BY owner_uuid').all()) addOwner(row.ownerUuid)
-    for (const row of this.db.db.prepare('SELECT uuid FROM players ORDER BY username COLLATE NOCASE ASC').all()) addOwner(row.uuid)
+    for (const row of this.db.listPersonalWarehouses()) addOwner(row.ownerUuid)
     for (const row of this.db.db.prepare('SELECT name_lower AS nameLower FROM custom_warehouses ORDER BY name COLLATE NOCASE ASC').all()) addOwner(`vault:${row.nameLower}`)
     addOwner(this.config.momoOwner)
 
     return { ok: true, rows: [...owners.values()].sort((a, b) => a.label.localeCompare(b.label, 'zh-CN')) }
+  }
+
+  resolveProvisionPlayer (value) {
+    const raw = String(value || '').trim()
+    if (!/^[A-Za-z0-9_]{3,16}$/.test(raw)) throw new Error('玩家 ID 格式不正确。')
+    const service = this.serviceProvider()
+    const onlineName = service?.bot?.players ? Object.keys(service.bot.players).find(name => name.toLowerCase() === raw.toLowerCase()) : ''
+    const online = onlineName ? service.bot.players[onlineName] : null
+    if (online?.uuid) {
+      this.db.upsertPlayer(online.uuid, onlineName)
+      return { uuid: online.uuid, username: onlineName }
+    }
+    const known = this.db.getPlayerByUsername(raw)
+    if (known?.uuid) return known
+    const player = { uuid: `name:${raw}`, username: raw }
+    this.db.upsertPlayer(player.uuid, player.username)
+    return player
+  }
+
+  apiAdminWarehouseProvisioning (session) {
+    this.requireAdmin(session)
+    return {
+      ok: true,
+      personal: this.db.listPersonalWarehouses().map(row => ({ ...row, usedSlots: this.adminOwnerUsedSlots(row.ownerUuid), totalAmount: this.db.ownerTotalAmount(row.ownerUuid) })),
+      organizations: this.db.db.prepare(`
+        SELECT name_lower AS nameLower, name, creator_uuid AS creatorUuid,
+               creator_username AS creatorUsername, created_at AS createdAt,
+               (SELECT COUNT(*) FROM custom_warehouse_members m WHERE m.warehouse_name_lower = w.name_lower) AS memberCount
+        FROM custom_warehouses w ORDER BY name COLLATE NOCASE ASC
+      `).all().map(row => {
+        const ownerUuid = `vault:${row.nameLower}`
+        return { ...row, ownerUuid, usedSlots: this.adminOwnerUsedSlots(ownerUuid), totalAmount: this.db.ownerTotalAmount(ownerUuid) }
+      })
+    }
+  }
+
+  apiAdminOrganizationWarehouseDetail (session, url) {
+    this.requireAdmin(session)
+    const warehouse = this.db.getCustomWarehouse(url.searchParams.get('name') || '')
+    if (!warehouse) throw new Error('找不到组织仓库。')
+    const ownerUuid = `vault:${warehouse.nameLower}`
+    const defaultSlots = this.config.storage?.defaultCustomWarehouseQuotaSlots || this.config.storage?.defaultQuotaSlots || 270
+    const quotaSlots = this.db.getQuotaSlots(ownerUuid, defaultSlots)
+    const usedSlots = this.adminOwnerUsedSlots(ownerUuid)
+    return {
+      ok: true,
+      warehouse: {
+        ...warehouse,
+        ownerUuid,
+        totalAmount: this.db.ownerTotalAmount(ownerUuid),
+        usedSlots,
+        quotaSlots,
+        usagePercent: quotaSlots > 0 ? Math.round(usedSlots / quotaSlots * 1000) / 10 : 0,
+        members: this.db.listCustomWarehouseMembers(warehouse.name)
+      }
+    }
+  }
+
+  apiAdminCreatePersonalWarehouse (session, body) {
+    const admin = this.requireAdmin(session)
+    const player = this.resolveProvisionPlayer(body.username)
+    const result = this.db.createPersonalWarehouse(player.uuid, player.username, admin)
+    return { ok: true, message: result.changed ? `已为 ${player.username} 创建个人仓库。` : `${player.username} 已经有个人仓库。`, warehouse: result }
+  }
+
+  apiAdminCreateOrganizationWarehouse (session, body) {
+    this.requireAdmin(session)
+    const name = String(body.name || '').trim()
+    if (!name) throw new Error('组织仓库名不能为空。')
+    if (/\s/.test(name)) throw new Error('组织仓库名不能包含空格。')
+    if ([...name].length > 15) throw new Error('组织仓库名最多 15 个字。')
+    if (this.db.getCustomWarehouse(name)) throw new Error(`仓库名已存在：${name}`)
+    const creator = this.resolveProvisionPlayer(body.creatorUsername)
+    this.db.createCustomWarehouse(name, creator.uuid, creator.username)
+    return { ok: true, message: `已创建组织仓库 ${name}，仓库管理员为 ${creator.username}。` }
+  }
+
+  apiAdminOrganizationMemberAdd (session, body) {
+    const admin = this.requireAdmin(session)
+    const warehouse = this.db.getCustomWarehouse(body.warehouse)
+    if (!warehouse) throw new Error('找不到组织仓库。')
+    const player = this.resolveProvisionPlayer(body.username)
+    const role = String(body.role || 'member').trim()
+    if (!['admin', 'member'].includes(role)) throw new Error('成员角色无效。')
+    this.db.setCustomWarehouseMemberRole(warehouse.name, player.uuid, player.username, role)
+    this.db.addTransaction('web_admin_organization_member_add', 'ok', `vault:${warehouse.nameLower}`, `仓库:${warehouse.name}`, [], `admin=${admin.username}; member=${player.username}; role=${role}`)
+    return { ok: true, message: `已添加 ${player.username}，身份为${role === 'admin' ? '仓库管理员' : '普通成员'}。` }
+  }
+
+  apiAdminOrganizationMemberRemove (session, body) {
+    const admin = this.requireAdmin(session)
+    const warehouse = this.db.getCustomWarehouse(body.warehouse)
+    if (!warehouse) throw new Error('找不到组织仓库。')
+    const playerUuid = String(body.playerUuid || '').trim()
+    const member = this.db.listCustomWarehouseMembers(warehouse.name).find(row => row.playerUuid === playerUuid)
+    if (!member) throw new Error('找不到该仓库成员。')
+    this.db.removeCustomWarehouseMemberAny(warehouse.name, playerUuid)
+    this.db.db.prepare("UPDATE players SET default_owner_uuid = '' WHERE uuid = ? AND default_owner_uuid = ?").run(playerUuid, `vault:${warehouse.nameLower}`)
+    this.db.addTransaction('web_admin_organization_member_remove', 'ok', `vault:${warehouse.nameLower}`, `仓库:${warehouse.name}`, [], `admin=${admin.username}; member=${member.username}; role=${member.role}`)
+    return { ok: true, message: `已从 ${warehouse.name} 删除成员 ${member.username}。` }
+  }
+
+  apiAdminOrganizationMemberRole (session, body) {
+    const admin = this.requireAdmin(session)
+    const warehouse = this.db.getCustomWarehouse(body.warehouse)
+    if (!warehouse) throw new Error('找不到组织仓库。')
+    const playerUuid = String(body.playerUuid || '').trim()
+    const role = String(body.role || '').trim()
+    if (!['admin', 'member'].includes(role)) throw new Error('成员角色无效。')
+    const member = this.db.listCustomWarehouseMembers(warehouse.name).find(row => row.playerUuid === playerUuid)
+    if (!member) throw new Error('找不到该仓库成员。')
+    this.db.setCustomWarehouseMemberRole(warehouse.name, member.playerUuid, member.username, role)
+    this.db.addTransaction('web_admin_organization_member_role', 'ok', `vault:${warehouse.nameLower}`, `仓库:${warehouse.name}`, [], `admin=${admin.username}; member=${member.username}; role=${role}`)
+    return { ok: true, message: `已把 ${member.username} 设置为${role === 'admin' ? '仓库管理员' : '普通成员'}。` }
+  }
+
+  ensureWarehouseDeletionSafe (ownerUuid) {
+    const service = this.serviceProvider()
+    const activeOwnerUuid = service?.active?.owner?.uuid || service?.active?.player?.uuid || ''
+    if (activeOwnerUuid === ownerUuid) throw new Error('该仓库正在进行存取操作，暂时不能删除。')
+    const recovery = this.db.getRecoveryTask()
+    if (recovery?.ownerUuid === ownerUuid) throw new Error('该仓库存在未完成的恢复任务，暂时不能删除。')
+  }
+
+  apiAdminDeletePersonalWarehouse (session, body) {
+    const admin = this.requireAdmin(session)
+    const ownerUuid = String(body.ownerUuid || '').trim()
+    if (!ownerUuid || String(body.confirmOwnerUuid || '') !== ownerUuid) throw new Error('删除确认信息不正确。')
+    this.ensureWarehouseDeletionSafe(ownerUuid)
+    const result = this.db.deletePersonalWarehouseToMomo(ownerUuid, admin.username)
+    return { ok: true, message: `已删除 ${result.ownerUsername} 的个人仓库，${result.itemTypes} 种、共 ${result.totalAmount} 件物品已转入 momo。` }
+  }
+
+  apiAdminDeleteOrganizationWarehouse (session, body) {
+    const admin = this.requireAdmin(session)
+    const warehouse = this.db.getCustomWarehouse(body.warehouse)
+    if (!warehouse) throw new Error('找不到组织仓库。')
+    if (this.db.normalizeWarehouseName(body.confirmName) !== warehouse.nameLower) throw new Error('删除确认信息不正确。')
+    const ownerUuid = `vault:${warehouse.nameLower}`
+    this.ensureWarehouseDeletionSafe(ownerUuid)
+    const result = this.db.deleteCustomWarehouseToMomo(warehouse.name, admin.username)
+    return { ok: true, message: `已删除组织仓库 ${warehouse.name}，${result.itemTypes} 种、共 ${result.totalAmount} 件物品已转入 momo。` }
   }
 
   apiAdminInventory (session, url) {
@@ -621,12 +1010,23 @@ class CloudStoreWebServer {
     const owners = new Set()
     const itemKeys = new Set()
     let totalAmount = 0
+    const allItemKeys = rows.map(row => row.itemKey)
+    const aliases = this.db.getGlobalAliasesForItems(allItemKeys)
+    const shulkerContents = this.db.getShulkerContentsByBox(rows.filter(row => row.itemId.endsWith('shulker_box')).map(row => row.itemKey))
     for (const row of rows) {
       const ownerLabel = this.db.ownerLabel(row.ownerUuid)
       const item = this.adminItem(row)
       if (ownerQ && !this.textMatches(ownerLabel, ownerQ) && !this.textMatches(row.ownerUuid, ownerQ)) continue
-      if (itemQ && !this.adminItemMatches(item, itemQ)) continue
-      result.push({ ...item, ownerUuid: row.ownerUuid, ownerLabel, amount: Number(row.amount || 0) })
+      const decorated = {
+        ...item,
+        ownerUuid: row.ownerUuid,
+        ownerLabel,
+        amount: Number(row.amount || 0),
+        globalAliases: aliases.get(row.itemKey) || [],
+        shulkerContents: shulkerContents.get(row.itemKey) || []
+      }
+      if (itemQ && !this.adminItemMatches(decorated, itemQ) && !decorated.globalAliases.some(alias => this.textMatches(alias, itemQ)) && !decorated.shulkerContents.some(content => this.adminItemMatches(content, itemQ))) continue
+      result.push(decorated)
       owners.add(row.ownerUuid)
       itemKeys.add(row.itemKey)
       totalAmount += Number(row.amount || 0)
@@ -685,20 +1085,41 @@ class CloudStoreWebServer {
   apiAdminTransactions (session, url) {
     this.requireAdmin(session)
     const q = String(url.searchParams.get('q') || '').trim().toLowerCase()
-    const limit = this.clampLimit(url.searchParams.get('limit'), 200, 1000)
+    const typeQ = String(url.searchParams.get('type') || '').trim().toLowerCase()
+    const operatorQ = String(url.searchParams.get('operator') || '').trim().toLowerCase()
+    const statusQ = String(url.searchParams.get('status') || '').trim().toLowerCase()
+    const ownerQ = String(url.searchParams.get('owner') || '').trim().toLowerCase()
+    const itemQ = String(url.searchParams.get('item') || '').trim().toLowerCase()
+    const dateFrom = String(url.searchParams.get('dateFrom') || '').trim()
+    const dateTo = String(url.searchParams.get('dateTo') || '').trim()
+    const page = Math.max(1, Number.parseInt(url.searchParams.get('page'), 10) || 1)
+    const pageSize = this.clampLimit(url.searchParams.get('pageSize'), 30, 100)
+    const fetchLimit = 10000
     const rows = this.db.db.prepare(`
       SELECT id, type, status, player_uuid AS playerUuid, username,
              items_json AS itemsJson, message, created_at AS createdAt
       FROM transactions
       ORDER BY id DESC
       LIMIT ?
-    `).all(limit * 3)
+    `).all(fetchLimit)
+    const transactionItems = this.prepareTransactionItems(rows)
 
     const result = []
     for (const row of rows) {
       const ownerLabel = this.db.ownerLabel(row.playerUuid)
-      const items = this.parseItemsJson(row.itemsJson)
-      if (q && !this.textMatches(ownerLabel, q) && !this.textMatches(row.username, q) && !this.textMatches(row.type, q) && !this.textMatches(row.message, q) && !items.some(item => this.adminItemMatches(this.adminItem(item), q))) continue
+      const decoratedItems = this.decorateTransactionItems(transactionItems.itemsById.get(row.id) || [], transactionItems.contentsByBox)
+      const details = this.transactionDetails(row.message)
+      const operator = this.transactionOperator(row, details)
+      const createdAtLabel = this.formatBeijingTime(row.createdAt)
+      const createdDate = createdAtLabel.slice(0, 10)
+      if (typeQ && !this.textMatches(row.type, typeQ) && !this.textMatches(this.transactionTypeLabel(row.type), typeQ)) continue
+      if (operatorQ && !this.textMatches(operator, operatorQ)) continue
+      if (statusQ && row.status.toLowerCase() !== statusQ) continue
+      if (ownerQ && !this.textMatches(ownerLabel, ownerQ) && !this.textMatches(row.username, ownerQ) && !this.textMatches(row.playerUuid, ownerQ)) continue
+      if (dateFrom && createdDate < dateFrom) continue
+      if (dateTo && createdDate > dateTo) continue
+      if (itemQ && !decoratedItems.some(item => this.adminTransactionItemMatches(item, itemQ))) continue
+      if (q && !this.textMatches(ownerLabel, q) && !this.textMatches(operator, q) && !this.textMatches(row.username, q) && !this.textMatches(row.type, q) && !this.textMatches(row.message, q) && !decoratedItems.some(item => this.adminTransactionItemMatches(item, q))) continue
       result.push({
         id: row.id,
         type: row.type,
@@ -708,15 +1129,20 @@ class CloudStoreWebServer {
         playerUuid: row.playerUuid,
         username: row.username,
         ownerLabel,
+        operator,
         message: row.message,
         messageLabel: this.transactionMessageLabel(row.message),
         createdAt: row.createdAt,
-        createdAtLabel: this.formatBeijingTime(row.createdAt),
-        items: items.map(item => ({ ...this.adminItem(item), amount: Number(item.amount || 0) }))
+        createdAtLabel,
+        details,
+        items: decoratedItems
       })
-      if (result.length >= limit) break
     }
-    return { ok: true, rows: result }
+    const total = result.length
+    const totalPages = Math.max(1, Math.ceil(total / pageSize))
+    const currentPage = Math.min(page, totalPages)
+    const offset = (currentPage - 1) * pageSize
+    return { ok: true, page: currentPage, pageSize, total, totalPages, rows: result.slice(offset, offset + pageSize) }
   }
 
   apiAdminChests (session, url) {
@@ -762,23 +1188,54 @@ class CloudStoreWebServer {
   apiAdminAliases (session, url) {
     this.requireAdmin(session)
     const q = String(url.searchParams.get('q') || '').trim()
+    const aliasRows = this.db.listGlobalItemAliases('')
+    const aliases = new Map()
+    for (const row of aliasRows) {
+      if (!aliases.has(row.itemKey)) aliases.set(row.itemKey, [])
+      aliases.get(row.itemKey).push(row.alias)
+    }
+    const items = new Map()
+    for (const row of aliasRows) {
+      if (!items.has(row.itemKey)) items.set(row.itemKey, this.adminItem(row))
+    }
     return {
       ok: true,
-      rows: this.db.listItemNameOverrides(q).map(row => ({
-        shortCode: row.shortCode,
-        itemKey: row.itemKey || '',
-        itemId: row.itemId || '',
-        displayName: row.displayName,
-        nbtJson: row.nbtJson || '',
-        metaJson: row.metaJson || '',
-        createdAt: row.createdAt,
-        updatedAt: row.updatedAt
-      }))
+      rows: [...items.values()].map(row => ({ ...row, aliases: aliases.get(row.itemKey) || [] }))
+        .filter(row => !q || this.adminItemMatches(row, q) || row.aliases.some(alias => this.textMatches(alias, q)))
+    }
+  }
+
+  apiAdminQuotas (session, url) {
+    this.requireAdmin(session)
+    const q = String(url.searchParams.get('q') || '').trim().toLowerCase()
+    const owners = this.apiAdminOwners(session).rows
+    const rows = owners.filter(owner => Number(owner.totalAmount || 0) > 0).map(owner => {
+      const isCustom = owner.ownerUuid.startsWith('vault:')
+      const defaultSlots = isCustom
+        ? (this.config.storage?.defaultCustomWarehouseQuotaSlots || this.config.storage?.defaultQuotaSlots || 270)
+        : (this.config.storage?.defaultQuotaSlots || 270)
+      const quotaSlots = this.db.getQuotaSlots(owner.ownerUuid, defaultSlots)
+      const usedSlots = this.adminOwnerUsedSlots(owner.ownerUuid)
+      return { ...owner, usedSlots, quotaSlots, usagePercent: quotaSlots > 0 ? Math.round(usedSlots / quotaSlots * 1000) / 10 : 0 }
+    }).filter(row => !q || this.textMatches(row.label, q) || this.textMatches(row.ownerUuid, q))
+    const chestCount = Number(this.db.db.prepare('SELECT COUNT(*) AS count FROM chests').get().count || 0)
+    const usedPhysicalSlots = Number(this.db.db.prepare('SELECT COUNT(*) AS count FROM chest_slots WHERE amount > 0').get().count || 0)
+    const slotsPerChest = Number(this.config.warehouse?.containerSlots || 27)
+    const totalPhysicalSlots = chestCount * slotsPerChest
+    return {
+      ok: true,
+      overall: {
+        chestCount,
+        usedSlots: usedPhysicalSlots,
+        totalSlots: totalPhysicalSlots,
+        usagePercent: totalPhysicalSlots > 0 ? Math.round(usedPhysicalSlots / totalPhysicalSlots * 1000) / 10 : 0
+      },
+      rows
     }
   }
 
   apiAdminAdjust (session, body) {
-    this.requireAdmin(session)
+    const user = this.requireAdmin(session)
     const ownerUuid = String(body.ownerUuid || '').trim()
     const itemKey = this.resolveAdminItemKey(body.itemKey || '')
     const action = String(body.action || '').trim()
@@ -795,13 +1252,14 @@ class CloudStoreWebServer {
     const changed = [{ ...item, amount: Math.abs(delta) }]
     this.db.transaction(() => {
       this.db.adjustBalance(ownerUuid, itemKey, delta)
-      this.db.addTransaction(`web_admin_${action}`, 'ok', ownerUuid, this.db.ownerLabel(ownerUuid), changed, `admin ${action} ${itemKey} ${amount}`)
+      this.db.addTransaction(`web_admin_${action}`, 'ok', ownerUuid, this.db.ownerLabel(ownerUuid), changed, `admin=${user.username}; action=${action}; item=${itemKey}; amount=${amount}`)
     })
     return { ok: true, message: `已更新 ${this.db.ownerLabel(ownerUuid)} 的 ${item.displayName}：${current} -> ${current + delta}。` }
   }
 
   apiAdminTransfer (session, body) {
-    this.requireAdmin(session)
+    const user = this.requireAdmin(session)
+    if (Array.isArray(body.items)) return this.apiAdminTransferMany(body, user)
     const fromOwnerUuid = this.resolveAdminOwnerArgument(body.fromOwnerUuid || body.fromOwnerText || '')
     const toOwnerUuid = this.resolveAdminOwnerArgument(body.toOwnerUuid || body.toOwnerText || '')
     const itemKey = this.resolveAdminItemKey(body.itemKey || '')
@@ -818,14 +1276,43 @@ class CloudStoreWebServer {
     this.db.transaction(() => {
       this.db.adjustBalance(fromOwnerUuid, itemKey, -movedAmount)
       this.db.adjustBalance(toOwnerUuid, itemKey, movedAmount)
-      this.db.addTransaction('web_admin_transfer_out', 'ok', fromOwnerUuid, this.db.ownerLabel(fromOwnerUuid), moved, `admin transfer to ${toOwnerUuid}`)
-      this.db.addTransaction('web_admin_transfer_in', 'ok', toOwnerUuid, this.db.ownerLabel(toOwnerUuid), moved, `admin transfer from ${fromOwnerUuid}`)
+      this.db.addTransaction('web_admin_transfer_out', 'ok', fromOwnerUuid, this.db.ownerLabel(fromOwnerUuid), moved, `admin=${user.username}; to=${toOwnerUuid}`)
+      this.db.addTransaction('web_admin_transfer_in', 'ok', toOwnerUuid, this.db.ownerLabel(toOwnerUuid), moved, `admin=${user.username}; from=${fromOwnerUuid}`)
     })
     return { ok: true, message: `已转移 ${item.displayName} x${movedAmount}：${this.db.ownerLabel(fromOwnerUuid)} -> ${this.db.ownerLabel(toOwnerUuid)}。` }
   }
 
+  apiAdminTransferMany (body, user) {
+    const toOwnerUuid = this.resolveAdminOwnerArgument(body.toOwnerUuid || body.toOwnerText || '')
+    if (!toOwnerUuid) throw new Error('缺少目标玩家或仓库。')
+    if (body.items.length > 200) throw new Error('单次最多转账 200 种物品。')
+    const requested = body.items.map(entry => {
+      const fromOwnerUuid = this.resolveAdminOwnerArgument(entry.fromOwnerUuid || '')
+      const itemKey = this.resolveAdminItemKey(entry.itemKey || '')
+      const amount = Number.parseInt(entry.amount, 10)
+      if (!fromOwnerUuid || !itemKey || !Number.isInteger(amount) || amount <= 0) throw new Error('待转账物品数据无效。')
+      if (fromOwnerUuid === toOwnerUuid) throw new Error(`目标不能与来源仓库 ${this.db.ownerLabel(fromOwnerUuid)} 相同。`)
+      const item = this.db.getItemByKey(itemKey)
+      const current = this.db.getBalance(fromOwnerUuid, itemKey)
+      if (!item || current < amount) throw new Error(`${this.db.ownerLabel(fromOwnerUuid)} 的物品库存不足。`)
+      return { fromOwnerUuid, itemKey, amount, item }
+    })
+    if (!requested.length) throw new Error('没有待转账物品。')
+    this.db.transaction(() => {
+      for (const row of requested) {
+        const moved = [{ ...row.item, amount: row.amount }]
+        this.db.adjustBalance(row.fromOwnerUuid, row.itemKey, -row.amount)
+        this.db.adjustBalance(toOwnerUuid, row.itemKey, row.amount)
+        this.db.addTransaction('web_admin_transfer_out', 'ok', row.fromOwnerUuid, this.db.ownerLabel(row.fromOwnerUuid), moved, `admin=${user.username}; to=${toOwnerUuid}`)
+        this.db.addTransaction('web_admin_transfer_in', 'ok', toOwnerUuid, this.db.ownerLabel(toOwnerUuid), moved, `admin=${user.username}; from=${row.fromOwnerUuid}`)
+      }
+    })
+    const total = requested.reduce((sum, row) => sum + row.amount, 0)
+    return { ok: true, message: `已向 ${this.db.ownerLabel(toOwnerUuid)} 转账 ${requested.length} 种、共 ${total} 个物品。` }
+  }
+
   apiAdminMismatchDeduct (session, body) {
-    this.requireAdmin(session)
+    const user = this.requireAdmin(session)
     const id = Number.parseInt(body.id, 10)
     if (!Number.isInteger(id) || id <= 0) throw new Error('异常 ID 必须是正整数。')
     const row = this.db.db.prepare(`
@@ -847,7 +1334,7 @@ class CloudStoreWebServer {
     const changed = [{ ...item, amount }]
     this.db.transaction(() => {
       this.db.adjustBalance(row.ownerUuid, row.itemKey, -amount)
-      this.db.addTransaction('web_admin_mismatch_deduct', 'ok', row.ownerUuid, this.db.ownerLabel(row.ownerUuid), changed, `mismatch ${row.kind} #${row.id} deduct ${amount}`)
+      this.db.addTransaction('web_admin_mismatch_deduct', 'ok', row.ownerUuid, this.db.ownerLabel(row.ownerUuid), changed, `admin=${user.username}; mismatch=${row.kind}; id=${row.id}; deduct=${amount}`)
       this.db.db.prepare(`
         UPDATE inventory_mismatches
         SET status = 'resolved',
@@ -860,6 +1347,40 @@ class CloudStoreWebServer {
       `).run(`Web已扣除账本库存 x${amount}`, `Web已扣除账本库存 x${amount}`, id)
     })
     return { ok: true, message: `已扣除 ${this.db.ownerLabel(row.ownerUuid)} 的 ${row.displayName || row.itemId} x${amount}，异常已处理。` }
+  }
+
+  apiAdminMismatchResolve (session, body) {
+    const user = this.requireAdmin(session)
+    const id = Number.parseInt(body.id, 10)
+    if (!Number.isInteger(id) || id <= 0) throw new Error('异常 ID 必须是正整数。')
+    const row = this.db.db.prepare(`
+      SELECT id, kind, status, owner_uuid AS ownerUuid, username,
+             item_key AS itemKey, item_id AS itemId, display_name AS displayName,
+             nbt_json AS nbtJson, meta_json AS metaJson, amount
+      FROM inventory_mismatches WHERE id = ? LIMIT 1
+    `).get(id)
+    if (!row) throw new Error('没有找到这条异常记录。')
+    if (row.status !== 'open') return { ok: true, message: '这条异常已经处理过。' }
+    if (row.kind === 'missing') return this.apiAdminMismatchDeduct(session, body)
+
+    const targetOwnerUuid = this.resolveAdminOwnerArgument(body.targetOwnerUuid || body.targetOwnerText || '')
+    if (!targetOwnerUuid) throw new Error('多余物品需要选择转入的目标仓库。')
+    const amount = Number(row.amount || 0)
+    if (amount <= 0) throw new Error('异常数量无效。')
+    const item = this.db.getItemByKey(row.itemKey) || this.db.rowToItem(row)
+    this.db.transaction(() => {
+      this.db.upsertItem(item)
+      this.db.adjustBalance(targetOwnerUuid, row.itemKey, amount)
+      this.db.addTransaction('web_admin_mismatch_transfer', 'ok', targetOwnerUuid, this.db.ownerLabel(targetOwnerUuid), [{ ...item, amount }], `mismatch #${row.id}; admin=${user.username}; source=physical_extra`)
+      this.db.db.prepare(`
+        UPDATE inventory_mismatches
+        SET status = 'resolved', resolved_at = CURRENT_TIMESTAMP,
+            owner_uuid = ?, username = ?,
+            note = CASE WHEN note = '' THEN ? ELSE note || '；' || ? END
+        WHERE id = ?
+      `).run(targetOwnerUuid, this.db.ownerLabel(targetOwnerUuid), `Web已转入目标库存 x${amount}`, `Web已转入目标库存 x${amount}`, id)
+    })
+    return { ok: true, message: `已把多余的 ${row.displayName || row.itemId} x${amount} 转入 ${this.db.ownerLabel(targetOwnerUuid)}。` }
   }
 
   resolveAdminOwnerArgument (value) {
@@ -878,7 +1399,10 @@ class CloudStoreWebServer {
     }
 
     const directPlayer = this.db.db.prepare('SELECT uuid FROM players WHERE uuid = ? LIMIT 1').get(raw)
-    if (directPlayer) return directPlayer.uuid
+    if (directPlayer) {
+      if (!this.db.hasPersonalWarehouse(directPlayer.uuid)) throw new Error(`${this.db.ownerLabel(directPlayer.uuid)} 还没有个人仓库。`)
+      return directPlayer.uuid
+    }
 
     const warehouse = this.db.getCustomWarehouse(raw)
     if (warehouse) return `vault:${warehouse.nameLower}`
@@ -890,6 +1414,7 @@ class CloudStoreWebServer {
     const online = onlineName ? service.bot.players[onlineName] : null
     if (online?.uuid) {
       this.db.upsertPlayer(online.uuid, onlineName)
+      if (!this.db.hasPersonalWarehouse(online.uuid)) throw new Error(`${onlineName} 还没有个人仓库。请先由管理员创建。`)
       return online.uuid
     }
 
@@ -897,6 +1422,7 @@ class CloudStoreWebServer {
     if (!player?.uuid || player.uuid.startsWith('name:')) {
       throw new Error(`找不到玩家或仓库：${raw}。玩家需要在线，或之前已用正版 UUID 使用过机器人。`)
     }
+    if (!this.db.hasPersonalWarehouse(player.uuid)) throw new Error(`${player.username} 还没有个人仓库。请先由管理员创建。`)
     return player.uuid
   }
 
@@ -916,34 +1442,77 @@ class CloudStoreWebServer {
     const itemKey = String(body.itemKey || '').trim()
     const displayName = String(body.displayName || '').trim()
     const item = this.db.savePlayerItemNameOverride(user.uuid, itemKey, displayName)
+    const personalDisplayName = body.updateDisplayName
+      ? this.db.setPlayerItemDisplayName(user.uuid, itemKey, displayName)
+      : (this.db.getPlayerItemDisplayNames(user.uuid, [itemKey]).get(itemKey) || '')
     return {
       ok: true,
       itemKey,
       displayName: item.displayName,
       personalAlias: item.personalAlias || '',
-      message: item.personalAlias
-        ? `已设置个人别名：${item.shortCode || item.itemId} -> ${item.personalAlias}。`
-        : `已清除个人别名：${item.shortCode || item.itemId}。`
+      personalAliases: item.personalAliases || [],
+      personalDisplayName,
+      message: `已添加个人别名：${item.shortCode || item.itemId} -> ${item.personalAlias}。`
     }
+  }
+
+  apiItemAliasDelete (session, body) {
+    const user = this.requireUser(session)
+    const result = this.db.deletePlayerItemAlias(user.uuid, body.alias)
+    if (result.itemKey) {
+      const displayName = this.db.getPlayerItemDisplayNames(user.uuid, [result.itemKey]).get(result.itemKey) || ''
+      if (displayName.toLowerCase() === String(result.alias || '').toLowerCase()) this.db.setPlayerItemDisplayName(user.uuid, result.itemKey, '')
+    }
+    return { ok: true, message: result.changed ? `已删除个人别名：${result.alias}。` : '没有找到这个个人别名。' }
+  }
+
+  apiMyGlobalAliasToggle (session, body) {
+    const user = this.requireUser(session)
+    const result = this.db.setGlobalItemAliasEnabled(user.uuid, body.alias, Boolean(body.enabled))
+    return { ok: true, ...result, message: `已${result.enabled ? '启用' : '禁用'}全局别名：${result.alias}。` }
   }
 
   apiAdminAliasSave (session, body) {
     const user = this.requireAdmin(session)
     const itemKey = String(body.itemKey || '').trim()
-    const displayName = String(body.displayName || '').trim()
-    const item = this.db.saveItemNameOverride(itemKey, displayName)
-    this.db.addTransaction('web_admin_alias_save', 'ok', this.config.momoOwner, user.username, [{ ...item, amount: 0 }], `alias ${item.shortCode}: ${item.oldDisplayName} -> ${item.displayName}`)
-    return { ok: true, message: `已设置别名：${item.shortCode} -> ${item.displayName}。` }
+    const alias = String(body.alias || body.displayName || '').trim()
+    const item = this.db.saveGlobalItemAlias(itemKey, alias)
+    if (body.updateDisplayName) this.db.saveItemNameOverride(itemKey, alias)
+    this.db.addTransaction('web_admin_alias_save', 'ok', this.config.momoOwner, user.username, [{ ...item, amount: 0 }], `global_alias=${item.alias}; item=${item.shortCode}`)
+    return { ok: true, message: `已添加全局别名：${item.alias} -> ${item.displayName}。${body.updateDisplayName ? '库存显示名称也已更新。' : ''}` }
   }
 
   apiAdminAliasDelete (session, body) {
     const user = this.requireAdmin(session)
-    const shortCode = String(body.shortCode || '').trim()
-    const result = this.db.deleteItemNameOverride(shortCode)
+    const alias = String(body.alias || '').trim()
+    const result = this.db.deleteGlobalItemAlias(alias)
     if (result.changed) {
-      this.db.addTransaction('web_admin_alias_delete', 'ok', this.config.momoOwner, user.username, [], `delete alias ${result.shortCode}`)
+      this.db.addTransaction('web_admin_alias_delete', 'ok', this.config.momoOwner, user.username, [], `delete global_alias=${result.alias}`)
     }
-    return { ok: true, message: result.changed ? `已删除别名：${result.shortCode}。` : '没有找到这条别名。' }
+    return { ok: true, message: result.changed ? `已删除全局别名：${result.alias}。` : '没有找到这条全局别名。' }
+  }
+
+  apiAdminQuotaSave (session, body) {
+    const user = this.requireAdmin(session)
+    const ownerUuid = this.resolveAdminOwnerArgument(body.ownerUuid || body.ownerText || '')
+    const quotaSlots = Number.parseInt(body.quotaSlots, 10)
+    if (!ownerUuid) throw new Error('缺少仓库。')
+    if (!Number.isInteger(quotaSlots) || quotaSlots < 0 || quotaSlots > 1000000) throw new Error('额度必须是 0 到 1000000 的整数。')
+    this.db.setQuotaSlots(ownerUuid, quotaSlots)
+    this.db.addTransaction('web_admin_quota_save', 'ok', ownerUuid, this.db.ownerLabel(ownerUuid), [], `admin=${user.username}; quota_slots=${quotaSlots}`)
+    return { ok: true, message: `已把 ${this.db.ownerLabel(ownerUuid)} 的额度设置为 ${quotaSlots} 格。` }
+  }
+
+  adminOwnerUsedSlots (ownerUuid) {
+    const rows = this.db.db.prepare(`
+      SELECT b.amount, i.item_id AS itemId
+      FROM balances b JOIN items i ON i.item_key = b.item_key
+      WHERE b.owner_uuid = ? AND b.amount > 0
+    `).all(ownerUuid)
+    return rows.reduce((sum, row) => {
+      const stackSize = Math.max(1, Number(this.db.catalog?.getStackSize(row.itemId) || 64))
+      return sum + Math.ceil(Number(row.amount || 0) / stackSize)
+    }, 0)
   }
 
   adminItem (row) {
@@ -959,7 +1528,68 @@ class CloudStoreWebServer {
   }
 
   adminItemMatches (item, query) {
-    return [item.displayName, item.itemId, item.itemKey, item.shortCode, item.nbtJson, item.metaJson].some(value => this.textMatches(value, query))
+    return [item.displayName, item.itemId, item.itemKey, item.shortCode, item.nbtJson, item.metaJson, ...(item.globalAliases || [])].some(value => this.textMatches(value, query))
+  }
+
+  adminTransactionItemMatches (item, query) {
+    if (this.adminItemMatches(item, query)) return true
+    if (!item.itemKey || !String(item.itemId || '').endsWith('shulker_box')) return false
+    const contents = Array.isArray(item.shulkerContents)
+      ? item.shulkerContents
+      : (this.db.getShulkerContentsByBox([item.itemKey]).get(item.itemKey) || [])
+    return contents.some(content => this.adminItemMatches(content, query))
+  }
+
+  prepareTransactionItems (rows) {
+    const itemsById = new Map()
+    const shulkerKeys = new Set()
+    for (const row of rows || []) {
+      const items = this.parseItemsJson(row.itemsJson)
+      itemsById.set(row.id, items)
+      for (const item of items) {
+        const itemKey = item.itemKey || item.item_key || ''
+        const itemId = item.itemId || item.item_id || ''
+        if (itemKey && String(itemId).endsWith('shulker_box')) shulkerKeys.add(itemKey)
+      }
+    }
+    return {
+      itemsById,
+      contentsByBox: this.db.getShulkerContentsByBox([...shulkerKeys])
+    }
+  }
+
+  decorateTransactionItems (items, prefetchedContents = null) {
+    const decorated = (items || []).map(item => ({
+      ...this.adminItem(item),
+      amount: Number(item.amount || 0)
+    }))
+    const shulkerKeys = [...new Set(decorated
+      .filter(item => item.itemKey && String(item.itemId || '').endsWith('shulker_box'))
+      .map(item => item.itemKey))]
+    const contentsByBox = prefetchedContents || this.db.getShulkerContentsByBox(shulkerKeys)
+    return decorated.map(item => ({
+      ...item,
+      shulkerContents: (contentsByBox.get(item.itemKey) || []).map(content => ({
+        ...this.adminItem(content),
+        amount: Number(content.amount || 0),
+        slotCount: Number(content.slotCount || 0)
+      }))
+    }))
+  }
+
+  transactionDetails (message) {
+    const details = {}
+    for (const part of String(message || '').split(/[;,]\s*/)) {
+      const match = part.match(/^([^=]+)=(.*)$/)
+      if (match) details[match[1].trim()] = match[2].trim()
+    }
+    const transfer = String(message || '').match(/admin transfer (?:to|from) (.+)$/)
+    if (transfer) details.counterparty = this.db.ownerLabel(transfer[1].trim())
+    return details
+  }
+
+  transactionOperator (row, details = {}) {
+    return String(details.admin || details.actor || details.operator || details.player || row.username || '').trim()
   }
 
   textMatches (value, query) {
@@ -1020,14 +1650,25 @@ class CloudStoreWebServer {
       withdraw_death_recovery: '死亡恢复取货',
       disconnect_recovery_deposit: '重连恢复存货',
       disconnect_recovery_withdraw: '重连恢复取货',
+      deposit_residual_recovery: '存货残留恢复',
+      withdraw_residual_recovery: '取货残留恢复',
+      admin_adjust_add: '指令增加库存',
+      admin_adjust_remove: '指令减少库存',
       web_admin_add: '管理员增加库存',
       web_admin_subtract: '管理员减少库存',
       web_admin_set: '管理员设置库存',
       web_admin_transfer_out: '管理员转出',
       web_admin_transfer_in: '管理员转入',
       web_admin_mismatch_deduct: '异常扣除',
+      web_admin_mismatch_transfer: '多余物品转入库存',
+      warehouse_delete_transfer_out: '删除仓库转出',
+      warehouse_delete_transfer_in: '删除仓库转入 momo',
+      web_admin_organization_member_add: '管理员添加组织成员',
+      web_admin_organization_member_remove: '管理员删除组织成员',
+      web_admin_organization_member_role: '管理员设置组织身份',
       web_admin_alias_save: '保存物品别名',
-      web_admin_alias_delete: '删除物品别名'
+      web_admin_alias_delete: '删除物品别名',
+      web_admin_quota_save: '设置仓库额度'
     }
     return labels[type] || String(type || '')
   }
@@ -1038,9 +1679,14 @@ class CloudStoreWebServer {
       partial: '部分完成',
       empty: '空操作',
       no_space: '空间不足',
+      failed: '失败',
       cancelled: '已取消',
       error: '失败',
       teleport_timeout: '传送超时',
+      ok_after_teleport_timeout: '传送超时后成功入库',
+      partial_after_teleport_timeout: '传送超时后部分入库',
+      no_space_after_teleport_timeout: '传送超时后空间不足',
+      empty_after_teleport_timeout: '传送超时后未收到物品',
       quota_full: '额度已满',
       open: '未处理',
       resolved: '已处理'
@@ -1066,6 +1712,8 @@ class CloudStoreWebServer {
       depositedAmount: '存入数量',
       leftoverAmount: '剩余数量',
       finishedByUser: '玩家提前结束',
+      stopReason: '结束原因',
+      playerDistance: '玩家距离',
       vault: '仓库',
       radius: '半径',
       chests: '木桶数',
@@ -1074,13 +1722,38 @@ class CloudStoreWebServer {
       leftover_amount: '剩余数量',
       timeoutMs: '超时',
       recovery: '恢复方式',
-      error: '错误'
+      error: '错误',
+      admin: '操作管理员',
+      player: '玩家',
+      requested: '请求数量',
+      to: '转入目标',
+      from: '来源仓库',
+      action: '操作',
+      item: '物品',
+      amount: '数量',
+      mismatch: '异常类型',
+      id: '记录编号',
+      deduct: '扣除数量',
+      source: '来源',
+      global_alias: '全局别名',
+      'delete global_alias': '删除全局别名',
+      quota_slots: '额度格数',
+      deletedOwner: '被删除仓库',
+      warehouseType: '仓库类型',
+      member: '成员',
+      role: '身份',
+      batch: '批次',
+      reason: '原因',
+      usedSlots: '已用格数',
+      quotaSlots: '额度格数'
     }
     const valueLabels = {
       personal: '个人仓库',
-      custom: '自定义仓库',
+      custom: '组织仓库',
       true: '是',
       false: '否',
+      player_left: '玩家离开超过距离',
+      timeout: '等待时间结束',
       deposit_storing: '入库中',
       deposit_teleport_to_player: '等待玩家接受传送',
       deposit_collecting: '收集物品中',
@@ -1093,14 +1766,27 @@ class CloudStoreWebServer {
       withdraw_dropping: '交付物品',
       withdraw_return_home: '返回仓库',
       disconnect: '断线重连',
-      quota_check: '检查额度'
+      quota_check: '检查额度',
+      death: '机器人死亡',
+      cancelled: '操作取消',
+      physical_extra: '仓库实物多余'
     }
-    const pairs = text.split(/\s*,\s*/).map(part => {
+    const pairs = text.split(/\s*[;,]\s*/).map(part => {
       const index = part.indexOf('=')
-      if (index <= 0) return part
+      if (index <= 0) {
+        const mismatch = part.match(/^mismatch\s+#(\d+)$/i)
+        if (mismatch) return `异常记录 #${mismatch[1]}`
+        const transfer = part.match(/^admin transfer (to|from) (.+)$/i)
+        if (transfer) return `${transfer[1].toLowerCase() === 'to' ? '管理员转入目标' : '管理员转出来源'}：${transfer[2]}`
+        return part
+      }
       const key = part.slice(0, index).trim()
       const value = part.slice(index + 1).trim()
-      const displayValue = value.startsWith('vault:') ? `仓库:${value.slice(6)}` : (valueLabels[value] || value)
+      let displayValue = value.startsWith('vault:') ? `仓库:${value.slice(6)}` : (valueLabels[value] || value)
+      if (key === 'role') displayValue = value === 'admin' ? '仓库管理员' : (value === 'member' ? '普通成员' : displayValue)
+      if (key === 'action') displayValue = ({ add: '增加库存', subtract: '减少库存', set: '设置库存' })[value] || displayValue
+      if (key === 'mismatch') displayValue = ({ extra: '多余物品', missing: '缺失物品' })[value] || displayValue
+      if (key === 'warehouseType') displayValue = ({ personal: '个人仓库', custom: '组织仓库' })[value] || displayValue
       return `${keyLabels[key] || key}：${displayValue}`
     })
     return pairs.join('，')
@@ -1151,7 +1837,8 @@ class CloudStoreWebServer {
   }
 
   botDisplayName () {
-    return this.serviceProvider()?.bot?.username || this.config.server?.botName || this.config.server?.username || '机器人名'
+    const value = String(this.serviceProvider()?.bot?.username || this.config.server?.botName || this.config.server?.username || '').trim()
+    return value && !value.includes('@') ? value : 'NanKinz1'
   }
 
   getSession (req, res) {
@@ -1355,13 +2042,14 @@ const HTML = `<!doctype html>
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      min-height: 100vh;
+      height: 100vh;
+      overflow: hidden;
       background: var(--bg);
       color: var(--text);
       font: 15px/1.5 "Microsoft YaHei", system-ui, sans-serif;
       letter-spacing: 0;
     }
-    .app { min-height: 100vh; display: grid; grid-template-columns: 250px 1fr; }
+    .app { height: 100vh; min-height: 0; display: grid; grid-template-columns: 250px minmax(0, 1fr); overflow: hidden; }
     aside {
       background: var(--side);
       border-right: 1px solid var(--line);
@@ -1369,10 +2057,13 @@ const HTML = `<!doctype html>
       display: flex;
       flex-direction: column;
       gap: 24px;
+      height: 100vh;
+      min-height: 0;
+      overflow: hidden;
     }
     .brand { font-size: 30px; font-weight: 800; color: var(--text); }
     .brand span { color: var(--orange); }
-    nav { border-top: 1px solid var(--line); padding-top: 14px; display: grid; gap: 8px; }
+    nav { flex: 1 1 auto; border-top: 1px solid var(--line); padding-top: 14px; display: grid; gap: 8px; overflow-y: auto; min-height: 0; align-content: start; }
     .navbtn {
       width: 100%;
       display: block;
@@ -1387,7 +2078,7 @@ const HTML = `<!doctype html>
       text-decoration: none;
     }
     .navbtn.active { background: #2a251e; color: var(--gold); }
-    .userbox { margin-top: auto; border-top: 1px solid var(--line); padding-top: 20px; color: var(--gold); }
+    .userbox { margin-top: auto; flex: 0 0 auto; border-top: 1px solid var(--line); padding-top: 20px; color: var(--gold); background: var(--side); }
     .dot { display: inline-block; width: 8px; height: 8px; border-radius: 99px; background: var(--green); margin-right: 9px; }
     button, input, select {
       border: 1px solid var(--line);
@@ -1402,7 +2093,8 @@ const HTML = `<!doctype html>
     button.primary { color: var(--gold); border-color: #4a3921; background: #1b1712; }
     button.solid { background: var(--gold); color: #1a1510; border-color: var(--gold); font-weight: 700; }
     button.ghost { color: var(--muted); }
-    main { padding: 40px; }
+    button.danger { color: #ffb1b1; border-color: #763f3f; background: #2a1717; }
+    main { min-width: 0; height: 100vh; overflow-y: auto; padding: 40px; }
     .hero {
       border: 1px solid var(--line);
       background: var(--panel);
@@ -1412,6 +2104,7 @@ const HTML = `<!doctype html>
       margin-bottom: 26px;
     }
     .hero strong { color: #fff; font-weight: 800; }
+    .quota-inline { margin-left: 14px; color: var(--gold); font-size: 15px; white-space: nowrap; }
     .toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 18px; flex-wrap: wrap; }
     .toolbar input { min-width: 260px; }
     .toolbar select { min-width: 210px; }
@@ -1608,6 +2301,10 @@ const HTML = `<!doctype html>
     }
     .tooltip .tip-title { color: var(--gold); font-weight: 800; margin-bottom: 4px; }
     .tooltip .tip-line { color: #d8d4ca; font-size: 13px; margin-top: 2px; }
+    .tip-text-list { display: grid; gap: 4px; margin-top: 8px; min-width: 230px; max-height: 360px; overflow: auto; }
+    .tip-text-row { display: flex; justify-content: space-between; gap: 18px; border-bottom: 1px solid #2c2c31; padding: 5px 2px; color: #eeeae1; font-size: 13px; }
+    .tip-text-row:last-child { border-bottom: 0; }
+    .tip-text-row span:last-child { color: var(--gold); white-space: nowrap; }
     .tip-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; margin-top: 8px; max-height: 360px; overflow: auto; }
     .tip-slot {
       min-width: 0;
@@ -1639,6 +2336,64 @@ const HTML = `<!doctype html>
     .ops { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
     .ops button { padding: 6px 8px; }
     .wrap { max-width: 360px; white-space: normal; word-break: break-word; }
+    .admin-grid-panel { padding: 14px; min-height: 150px; }
+    .compact-admin-grid { display: grid; grid-template-columns: repeat(auto-fill, 78px); gap: 10px; align-items: start; }
+    .compact-admin-grid .item { box-sizing: border-box; }
+    .compact-admin-grid .item .owner-dot { position: absolute; left: 4px; top: 4px; width: 7px; height: 7px; border-radius: 50%; background: var(--gold); box-shadow: 0 0 0 2px #151518; }
+    .admin-transfer-top { display: grid; grid-template-columns: minmax(0, 1fr) minmax(190px, 280px) auto; gap: 9px; align-items: start; margin-bottom: 10px; }
+    .admin-quick-alias { display: flex; gap: 9px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
+    .alias-detail-panel { margin-top: 12px; padding: 14px; min-height: 90px; }
+    .alias-detail-head { display: grid; grid-template-columns: 58px minmax(0, 1fr); gap: 10px; align-items: center; margin-bottom: 10px; }
+    .global-alias-toggle-list { display: grid; gap: 6px; }
+    .global-alias-toggle-row { display: grid; grid-template-columns: minmax(120px, 1fr) auto 48px; gap: 10px; align-items: center; border-top: 1px solid var(--line); padding: 8px 0; }
+    .admin-item-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+    .admin-item-card { min-width: 0; border: 1px solid #2d2d32; background: #151518; border-radius: 9px; padding: 10px; cursor: pointer; }
+    .admin-item-card:hover { border-color: #5d492a; }
+    .admin-item-card.selected { border-color: var(--gold); background: #211b12; }
+    .admin-item-main { display: grid; grid-template-columns: 52px minmax(0, 1fr); gap: 9px; align-items: center; }
+    .admin-item-icon { width: 52px; height: 52px; background: #252529; border-radius: 7px; display: grid; place-items: center; position: relative; }
+    .admin-item-icon img { width: 44px; height: 44px; object-fit: contain; image-rendering: pixelated; }
+    .admin-item-icon .count { font-size: 12px; }
+    .admin-item-name { color: #f1efe8; font-weight: 700; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .admin-item-meta { color: var(--muted); font-size: 12px; margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .admin-actionbar { position: sticky; bottom: 10px; z-index: 12; display: grid; grid-template-columns: minmax(180px, 1fr) minmax(180px, 260px) 130px auto; gap: 8px; align-items: center; margin-top: 12px; padding: 10px; border: 1px solid #4a3921; border-radius: 9px; background: rgba(20,18,15,.96); box-shadow: 0 8px 30px rgba(0,0,0,.35); }
+    .mismatch-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+    .mismatch-columns h3 { color: var(--gold); margin: 5px 0 9px; }
+    .mismatch-card { cursor: default; }
+    .mismatch-actions { display: flex; gap: 6px; margin-top: 9px; }
+    .mismatch-actions select { min-width: 0; width: 100%; padding: 6px; }
+    .mismatch-actions button { padding: 6px 8px; white-space: nowrap; }
+    .alias-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+    .alias-tag { display: inline-flex; gap: 5px; align-items: center; border: 1px solid #493a25; background: #201a12; color: #f4d48a; border-radius: 99px; padding: 3px 7px; font-size: 12px; }
+    .transaction-shulker { cursor: help; text-decoration: underline dotted rgba(244, 212, 138, .7); text-underline-offset: 3px; }
+    .alias-tag button { border: 0; padding: 0; color: #c9b47e; background: transparent; }
+    .admin-alias-list { padding: 14px; display: grid; gap: 9px; }
+    .alias-row { display: grid; grid-template-columns: 58px minmax(160px, 1fr) minmax(220px, 2fr); gap: 10px; align-items: center; border-bottom: 1px solid var(--line); padding: 8px 0; }
+    .alias-add { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+    .alias-add input { min-width: 150px; flex: 1; }
+    .usage-track { width: 150px; height: 7px; overflow: hidden; border-radius: 99px; background: #29292d; margin-top: 5px; }
+    .usage-fill { height: 100%; background: var(--gold); }
+    .pager { display: flex; justify-content: center; align-items: center; gap: 10px; margin-top: 12px; }
+    .empty-state { padding: 70px 20px; text-align: center; color: var(--muted); }
+    .empty-state h3 { color: var(--gold); margin: 8px 0; }
+    .empty-icon { font-size: 48px; color: #6e5933; }
+    .organization-list { display: grid; gap: 14px; }
+    .organization-card { border: 1px solid var(--line); background: var(--panel); border-radius: 10px; padding: 16px; }
+    .organization-head { display: flex; gap: 12px; justify-content: space-between; align-items: flex-start; margin-bottom: 12px; }
+    .organization-name { color: var(--gold); font-size: 20px; font-weight: 800; }
+    .organization-summary { display: flex; gap: 12px; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
+    .member-list { display: grid; gap: 7px; margin-top: 12px; }
+    .member-row { display: grid; grid-template-columns: minmax(120px, 1fr) 130px auto; gap: 8px; align-items: center; border-top: 1px solid rgba(255,255,255,.05); padding-top: 7px; }
+    .organization-actions { display: flex; gap: 7px; flex-wrap: wrap; margin-top: 12px; }
+    .organization-actions input { min-width: 180px; }
+    .section-title { color: var(--gold); margin: 18px 0 8px; }
+    .warehouse-create-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    .warehouse-create-card { padding: 16px; }
+    .warehouse-create-card h3 { color: var(--gold); margin: 0 0 6px; }
+    .switch { width: 44px; height: 24px; border-radius: 99px; padding: 2px; background: #33343a; border: 0; }
+    .switch::after { content: ''; display: block; width: 20px; height: 20px; border-radius: 50%; background: #aaa; transition: transform .15s; }
+    .switch.on { background: #71582e; }
+    .switch.on::after { transform: translateX(20px); background: var(--gold); }
     .nbt-modal-backdrop {
       position: fixed;
       inset: 0;
@@ -1664,12 +2419,15 @@ const HTML = `<!doctype html>
     .nbt-body { overflow: auto; padding: 14px 16px; }
     .alias-form {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto auto;
+      grid-template-columns: minmax(0, 1fr) auto;
       gap: 8px;
       align-items: center;
       margin-bottom: 12px;
     }
     .alias-note { grid-column: 1 / -1; color: var(--muted); font-size: 13px; }
+    .alias-form > .alias-tags { grid-column: 1 / -1; }
+    .check-label { grid-column: 1 / -1; display: flex; gap: 7px; align-items: center; color: var(--muted); font-size: 13px; }
+    .check-label input { width: auto; margin: 0; }
     .nbt-body pre {
       margin: 0;
       white-space: pre-wrap;
@@ -1716,12 +2474,22 @@ const HTML = `<!doctype html>
     .hidden { display: none !important; }
     @media (max-width: 860px) {
       .app { grid-template-columns: 1fr; }
-      aside { min-height: auto; }
-      main { padding: 20px; }
+      body { height: auto; min-height: 100vh; overflow: auto; }
+      .app { height: auto; min-height: 100vh; overflow: visible; }
+      aside { height: auto; min-height: auto; overflow: visible; }
+      nav { overflow: visible; }
+      main { height: auto; overflow: visible; padding: 20px; }
       .withdrawbar { grid-template-columns: 1fr; }
       .admin-transferbar { justify-content: stretch; }
       .admin-transferbar input { width: 100%; flex: 1 1 220px; }
       .admin-transferbar .muted { white-space: normal; }
+      .admin-actionbar { grid-template-columns: 1fr; }
+      .admin-transfer-top { grid-template-columns: 1fr; }
+      .mismatch-columns { grid-template-columns: 1fr; }
+      .alias-row { grid-template-columns: 48px minmax(0, 1fr); }
+      .alias-row .alias-add { grid-column: 1 / -1; }
+      .member-row { grid-template-columns: 1fr; }
+      .warehouse-create-grid { grid-template-columns: 1fr; }
       .tip-grid { grid-template-columns: 1fr; }
       .litematicbar { grid-template-columns: 1fr; }
       .command-row { grid-template-columns: 1fr; }
@@ -1765,6 +2533,8 @@ const HTML = `<!doctype html>
       <nav>
         <button class="navbtn active" data-view="inventory">▦　库存</button>
         <button class="navbtn" data-view="transactions">▤　交易记录</button>
+        <button class="navbtn" data-view="my">☺　我的</button>
+        <button id="warehouseAdminLink" class="navbtn hidden" data-view="warehouseAdmin">♜　组织管理</button>
         <button class="navbtn" data-view="help">？　帮助</button>
         <button id="adminLink" class="navbtn hidden" data-view="admin">▣　管理</button>
       </nav>
@@ -1774,7 +2544,7 @@ const HTML = `<!doctype html>
       </div>
     </aside>
     <main>
-      <div class="hero">欢迎回来，<strong id="heroName">-</strong>。 共 <strong id="heroTypes">0</strong> 种物品，<strong id="heroAmount">0</strong> 件。</div>
+      <div id="inventoryHero" class="hero">欢迎回来，<strong id="heroName">-</strong>。 共 <strong id="heroTypes">0</strong> 种物品，<strong id="heroAmount">0</strong> 件。 <span id="inventoryQuota" class="quota-inline">仓库额度 0/0格</span></div>
       <section id="inventoryView">
         <div class="toolbar">
           <div class="title">远程存储 <span id="loaded" class="muted">0/0 种已加载</span></div>
@@ -1793,11 +2563,6 @@ const HTML = `<!doctype html>
           </div>
           <button id="withdraw" class="solid">取货</button>
         </div>
-        <div id="inventoryAdminTransfer" class="admin-transferbar hidden">
-          <div class="muted">管理员账本转账：把上方已选物品从当前仓库转给目标。</div>
-          <input id="inventoryTransferTarget" placeholder="目标：玩家ID / 仓库名 / 仓库:仓库名 / momo">
-          <button id="inventoryTransferRun" class="solid">转账</button>
-        </div>
         <div class="litematicbar">
           <button id="litematicPick" class="primary">上传投影</button>
           <input id="litematicFile" class="hidden" type="file" accept=".litematic">
@@ -1809,9 +2574,19 @@ const HTML = `<!doctype html>
       <section id="transactionsView" class="hidden">
         <div class="toolbar">
           <div class="title">交易记录</div>
-          <button id="refreshTx" class="primary">刷新</button>
+          <select id="txOwner"></select>
+          <input id="txType" placeholder="类型">
+          <input id="txOperator" placeholder="操作者">
+          <input id="txItem" placeholder="物品（含潜影盒内容）">
+          <select id="txStatus"><option value="">全部状态</option><option value="ok">成功</option><option value="failed">失败</option></select>
+          <input id="txFrom" type="date" title="开始日期">
+          <input id="txTo" type="date" title="结束日期">
+          <input id="txQ" placeholder="备注/其他字段">
+          <button id="txLoad" class="primary">查询</button>
+          <button id="txRefresh" class="primary">刷新</button>
         </div>
-        <div id="transactions" class="panel"></div>
+        <div id="transactions" class="panel tablewrap"></div>
+        <div class="pager"><button id="txPrev">上一页</button><span id="txPage">第 1 / 1 页</span><button id="txNext">下一页</button></div>
       </section>
       <section id="helpView" class="hidden">
         <div class="toolbar">
@@ -1931,7 +2706,7 @@ const HTML = `<!doctype html>
               <div class="command-row">
                 <div>
                   <div class="command-name">创建仓库</div>
-                  <div class="command-desc">每个人最多创建 3 个组织仓库。</div>
+                  <div class="command-desc">仅云仓库系统管理员可用；普通玩家需要由管理员分配仓库。</div>
                 </div>
                 <code class="cmd">/msg <span class="help-bot">bot</span> 创建仓库 椰汁橙</code>
               </div>
@@ -1988,27 +2763,65 @@ const HTML = `<!doctype html>
           </section>
         </div>
       </section>
+      <section id="myView" class="hidden">
+        <div class="toolbar"><div class="title">我的</div><button id="myRefresh" class="primary">刷新</button></div>
+        <div class="subnav">
+          <button class="primary active" data-my-tab="organizations">组织</button>
+          <button class="primary" data-my-tab="aliases">别名</button>
+        </div>
+        <section id="myOrganizations"><div id="myOrganizationList" class="organization-list"></div></section>
+        <section id="myAliases" class="hidden">
+          <div class="toolbar"><input id="myAliasQ" placeholder="筛选物品、短码或别名"><button id="myAliasLoad" class="primary">查询</button></div>
+          <h3 class="section-title">我的个人别名</h3><div id="myPersonalAliases" class="panel admin-grid-panel"></div><div id="myPersonalAliasDetail" class="panel alias-detail-panel"><p class="muted">点击物品图标管理个人别名。</p></div>
+          <h3 class="section-title">管理员全局别名</h3><p class="muted">默认全部启用。禁用后，该别名不会再用于你的搜索和取货指令。</p><div id="myGlobalAliases" class="panel admin-grid-panel"></div><div id="myGlobalAliasDetail" class="panel alias-detail-panel"><p class="muted">点击物品图标管理全局别名开关。</p></div>
+        </section>
+      </section>
+      <section id="warehouseAdminView" class="hidden">
+        <div class="toolbar"><div class="title">组织管理</div><button id="warehouseAdminRefresh" class="primary">刷新</button></div>
+        <p class="muted">这里只显示你担任仓库管理员的组织仓库。系统管理员身份不会自动获得这里的权限。</p>
+        <div id="warehouseAdminOrganizationList" class="organization-list"></div>
+      </section>
       <section id="adminView" class="hidden">
         <div class="toolbar">
           <div class="title">管理面板</div>
           <button id="adminRefresh" class="primary">刷新</button>
         </div>
         <div class="subnav">
-          <button class="primary active" data-admin-tab="inventory">总库存</button>
+          <button class="primary active" data-admin-tab="inventory">库存</button>
+          <button class="primary" data-admin-tab="warehouses">组织管理</button>
           <button class="primary" data-admin-tab="mismatches">库存异常</button>
-          <button class="primary" data-admin-tab="transfer">物品转账</button>
-          <button class="primary" data-admin-tab="chests">木桶位置</button>
+          <button class="primary" data-admin-tab="chests">木桶视图</button>
           <button class="primary" data-admin-tab="transactions">交易记录</button>
-          <button class="primary" data-admin-tab="aliases">别名管理</button>
+          <button class="primary" data-admin-tab="aliases">全局别名</button>
+          <button class="primary" data-admin-tab="quotas">额度管理</button>
         </div>
         <section id="adminInventory">
           <div class="toolbar">
-            <input id="adminInvOwner" placeholder="按归属筛选">
+            <span id="adminInvStatus" class="muted">等待加载</span>
+            <select id="adminInvOwner"><option value="">全部仓库</option></select>
             <input id="adminInvItem" placeholder="按物品/ID/短码筛选">
             <button id="adminInvLoad" class="primary">查询</button>
           </div>
+          <div class="admin-transfer-top">
+            <div id="adminSelectedList" class="selected-list"><span class="selected-empty">点击物品加入待转账列表</span></div>
+            <input id="adminTransferTarget" placeholder="目标玩家 ID 或仓库名">
+            <button id="adminTransferRun" class="solid">转账</button>
+          </div>
+          <div class="admin-quick-alias">
+            <button id="adminAliasMode" class="primary">全局别名</button>
+            <span id="adminAliasModeHint" class="muted">开启后点击物品图标查看 NBT 并设置全局别名</span>
+          </div>
           <div id="adminInvStats" class="stats"></div>
-          <div id="adminInvTable" class="panel tablewrap"></div>
+          <div id="adminInvGrid" class="panel admin-grid-panel"></div>
+        </section>
+        <section id="adminWarehouses" class="hidden">
+          <div class="warehouse-create-grid">
+            <div class="panel warehouse-create-card"><h3>创建个人仓库</h3><p class="muted">填写玩家 ID。创建后该玩家可以立即使用个人仓库。</p><div class="alias-add"><input id="adminPersonalWarehousePlayer" placeholder="玩家 ID"><button id="adminPersonalWarehouseCreate" class="solid">创建个人仓库</button></div></div>
+            <div class="panel warehouse-create-card"><h3>创建组织仓库</h3><p class="muted">指定仓库名和首位仓库管理员。</p><div class="alias-add"><input id="adminOrganizationWarehouseName" placeholder="组织仓库名"><input id="adminOrganizationWarehouseCreator" placeholder="仓库管理员玩家 ID"><button id="adminOrganizationWarehouseCreate" class="solid">创建组织仓库</button></div></div>
+          </div>
+          <h3 class="section-title">已创建的个人仓库</h3><div id="adminPersonalWarehouseList" class="panel tablewrap"></div>
+          <h3 class="section-title">已有组织仓库</h3><div id="adminOrganizationWarehouseList" class="panel tablewrap"></div>
+          <div id="adminOrganizationWarehouseDetail" class="panel alias-detail-panel"><p class="muted">点击组织仓库右侧的“查看”管理详情、成员与管理员。</p></div>
         </section>
         <section id="adminMismatches" class="hidden">
           <div class="toolbar">
@@ -2018,39 +2831,41 @@ const HTML = `<!doctype html>
             <button id="adminMmLoad" class="primary">查询</button>
           </div>
           <div id="adminMmStats" class="stats"></div>
-          <div id="adminMmTable" class="panel tablewrap"></div>
-        </section>
-        <section id="adminTransfer" class="hidden">
-          <div class="toolbar">
-            <input id="adminTransferFrom" placeholder="来源：玩家ID / 仓库名 / 仓库:仓库名 / momo">
-            <input id="adminTransferTo" placeholder="目标：玩家ID / 仓库名 / 仓库:仓库名 / momo">
-            <input id="adminTransferItem" placeholder="物品短码或完整 itemKey">
-            <input id="adminTransferAmount" type="number" min="1" placeholder="数量">
-            <button id="adminTransferRun" class="solid">转账</button>
+          <div class="mismatch-columns">
+            <div><h3>多余物品</h3><div id="adminMmExtra" class="panel admin-grid-panel"></div></div>
+            <div><h3>缺失物品</h3><div id="adminMmMissing" class="panel admin-grid-panel"></div></div>
           </div>
-          <div class="panel" style="padding:14px;color:var(--muted)">数据库转账只修改账本，不移动木桶实物。玩家需存在于记录中或当前在线；组织仓库必须已创建。</div>
         </section>
         <section id="adminChests" class="hidden">
-          <div class="toolbar">
-            <input id="adminChestQ" placeholder="按木桶坐标筛选">
-            <button id="adminChestLoad" class="primary">查询</button>
-          </div>
-          <div id="adminChestTable" class="panel tablewrap"></div>
-          <div id="adminChestDetail" class="panel tablewrap" style="margin-top:14px"></div>
+          <div class="empty-state panel"><div class="empty-icon">▦</div><h3>木桶视图</h3><p>此模块将在下一次专项重构中实现。本次先保留入口与布局位置。</p></div>
         </section>
         <section id="adminTransactions" class="hidden">
           <div class="toolbar">
-            <input id="adminTxQ" placeholder="按归属/类型/物品/备注筛选">
+            <input id="adminTxOwner" placeholder="目标仓库/玩家">
+            <input id="adminTxType" placeholder="类型">
+            <input id="adminTxOperator" placeholder="操作者">
+            <input id="adminTxItem" placeholder="物品（含潜影盒内容）">
+            <select id="adminTxStatus"><option value="">全部状态</option><option value="ok">成功</option><option value="failed">失败</option></select>
+            <input id="adminTxFrom" type="date" title="开始日期">
+            <input id="adminTxTo" type="date" title="结束日期">
+            <input id="adminTxQ" placeholder="备注/操作者/其他字段">
             <button id="adminTxLoad" class="primary">查询</button>
           </div>
           <div id="adminTxTable" class="panel tablewrap"></div>
+          <div class="pager"><button id="adminTxPrev">上一页</button><span id="adminTxPage">第 1 / 1 页</span><button id="adminTxNext">下一页</button></div>
         </section>
         <section id="adminAliases" class="hidden">
           <div class="toolbar">
             <input id="adminAliasQ" placeholder="按别名/短码/ID/NBT筛选">
             <button id="adminAliasLoad" class="primary">查询</button>
           </div>
-          <div id="adminAliasTable" class="panel tablewrap"></div>
+          <div id="adminAliasGrid" class="panel admin-grid-panel"></div>
+          <div id="adminAliasDetail" class="panel alias-detail-panel"><p class="muted">点击上方物品图标管理全局别名。</p></div>
+        </section>
+        <section id="adminQuotas" class="hidden">
+          <div class="toolbar"><input id="adminQuotaQ" placeholder="筛选仓库"><button id="adminQuotaLoad" class="primary">查询</button></div>
+          <div id="adminQuotaOverall" class="stats"></div>
+          <div id="adminQuotaTable" class="panel tablewrap"></div>
         </section>
       </section>
       <p id="toast" class="toast"></p>
@@ -2065,10 +2880,18 @@ const HTML = `<!doctype html>
       </div>
       <div class="nbt-body">
         <div id="aliasEditor" class="alias-form hidden">
-          <input id="aliasInput" placeholder="填写你的个人别名，留空可清除">
-          <button id="aliasSave" class="solid">保存别名</button>
-          <button id="aliasClear" class="ghost">清除</button>
+          <input id="aliasInput" placeholder="新增一个个人别名">
+          <button id="aliasSave" class="solid">添加别名</button>
+          <div id="aliasExisting" class="alias-tags"></div>
+          <label class="check-label"><input id="aliasUseDisplayName" type="checkbox"> 同时修改我的库存显示名称</label>
           <div id="aliasNote" class="alias-note"></div>
+        </div>
+        <div id="globalAliasEditor" class="alias-form hidden">
+          <input id="globalAliasInput" placeholder="新增一个全局别名">
+          <button id="globalAliasSave" class="solid">添加全局别名</button>
+          <div id="globalAliasExisting" class="alias-tags"></div>
+          <label class="check-label"><input id="globalAliasUseDisplayName" type="checkbox"> 同时修改所有库存中的显示名称</label>
+          <div id="globalAliasNote" class="alias-note"></div>
         </div>
         <pre id="nbtModalText"></pre>
       </div>
@@ -2078,7 +2901,7 @@ const HTML = `<!doctype html>
   <div id="tooltip" class="tooltip"></div>
 
   <script>
-    const state = { view: 'inventory', user: null, owners: [], owner: '', items: [], tx: [], selected: new Map(), aliasMode: false, aliasItem: null, adminTab: 'inventory', adminOwners: [], adminInventoryRows: new Map(), actionCooldownUntil: 0, actionCooldownTimer: null, iconRenderId: 0, activePoll: null, iconCache: new Map(), inventoryCache: new Map(), inventoryLoadId: 0, iconScrollTimer: null, onlinePlayersTimer: null, loginChallengeTimer: null, loginChallengeExpiresAt: 0, loginChallengeCommand: '' };
+    const state = { view: 'inventory', myTab: 'organizations', myPersonalAliasItemKey: '', myGlobalAliasItemKey: '', user: null, owners: [], owner: '', items: [], tx: [], txPage: 1, txTotalPages: 1, selected: new Map(), aliasMode: false, aliasItem: null, adminTab: 'inventory', adminAliasMode: false, adminGlobalAliasItem: null, adminOrganizationName: '', adminInventoryLoadId: 0, adminOwners: [], adminInventoryRows: new Map(), adminSelected: new Map(), adminAliasItem: null, adminTxPage: 1, adminTxTotalPages: 1, actionCooldownUntil: 0, actionCooldownTimer: null, iconRenderId: 0, activePoll: null, iconCache: new Map(), inventoryCache: new Map(), inventoryLoadId: 0, iconScrollTimer: null, onlinePlayersTimer: null, loginChallengeTimer: null, loginChallengeExpiresAt: 0, loginChallengeCommand: '' };
     const $ = id => document.getElementById(id);
     const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
     const num = value => Number(value || 0).toLocaleString('zh-CN');
@@ -2283,7 +3106,6 @@ const HTML = `<!doctype html>
       if (!data.loggedIn) {
         $('app').classList.add('hidden');
         $('login').classList.remove('hidden');
-        $('inventoryAdminTransfer')?.classList.add('hidden');
         const botName = data.botName || 'bot';
         $('loginCommand').textContent = '/msg ' + botName + ' 设置密码 xxx';
         $('loginExample').textContent = '/msg ' + botName + ' 设置密码 1234';
@@ -2296,12 +3118,12 @@ const HTML = `<!doctype html>
       $('app').classList.remove('hidden');
       state.user = data.user;
       state.owners = data.owners || [];
-      state.defaultOwnerUuid = data.defaultOwnerUuid || state.user.uuid;
+      state.defaultOwnerUuid = data.defaultOwnerUuid || '';
       updateBotNameLabels(data.botName || 'bot');
       $('username').textContent = state.user.username;
       $('heroName').textContent = state.user.username;
       $('adminLink').classList.toggle('hidden', !state.user.isAdmin);
-      $('inventoryAdminTransfer').classList.toggle('hidden', !state.user.isAdmin);
+      $('warehouseAdminLink').classList.toggle('hidden', !state.user.isWarehouseAdmin);
       renderOwners();
       await loadInventory();
       loadOnlinePlayers('').catch(error => toast(error.message));
@@ -2425,18 +3247,32 @@ const HTML = `<!doctype html>
     }
 
     function renderOwners() {
+      if (!state.owners.length) {
+        $('owner').innerHTML = '<option value="">没有可用仓库</option>';
+        state.owner = '';
+        $('setDefaultOwner').disabled = true;
+        $('deposit').disabled = true;
+        $('withdraw').disabled = true;
+        $('txOwner').innerHTML = '<option value="">没有可用仓库</option>';
+        return;
+      }
       $('owner').innerHTML = state.owners.map(owner => {
         const label = owner.label + (owner.isDefault ? '（默认）' : '');
         return '<option value="' + esc(owner.ownerUuid) + '">' + esc(label) + '</option>';
       }).join('');
-      const fallbackOwner = state.owners.find(owner => owner.ownerUuid === state.defaultOwnerUuid)?.ownerUuid || state.owners[0]?.ownerUuid || state.user.uuid;
+      const fallbackOwner = state.owners.find(owner => owner.ownerUuid === state.defaultOwnerUuid)?.ownerUuid || state.owners[0]?.ownerUuid || '';
       state.owner = state.owner && state.owners.some(owner => owner.ownerUuid === state.owner) ? state.owner : fallbackOwner;
       $('owner').value = state.owner;
+      const txValue = $('txOwner').value || state.owner;
+      $('txOwner').innerHTML = state.owners.map(owner => '<option value="' + esc(owner.ownerUuid) + '">' + esc(owner.label) + '</option>').join('');
+      $('txOwner').value = state.owners.some(owner => owner.ownerUuid === txValue) ? txValue : state.owner;
       const selected = state.owners.find(owner => owner.ownerUuid === state.owner);
       if ($('setDefaultOwner')) {
         $('setDefaultOwner').textContent = selected?.isDefault ? '默认仓库' : '设为默认';
         $('setDefaultOwner').disabled = Boolean(selected?.isDefault);
       }
+      $('deposit').disabled = false;
+      $('withdraw').disabled = false;
     }
 
     async function setDefaultOwner() {
@@ -2456,12 +3292,24 @@ const HTML = `<!doctype html>
       renderLitematicPlan(null);
       $('heroTypes').textContent = num(data.stats?.itemTypes || 0);
       $('heroAmount').textContent = num(data.stats?.totalAmount || 0);
+      $('inventoryQuota').textContent = '仓库额度 ' + num(data.quota?.usedSlots || 0) + '/' + num(data.quota?.quotaSlots || 0) + '格';
       renderSelected();
       renderInventory();
     }
 
     async function loadInventory(options = {}) {
       state.owner = $('owner').value || state.owner;
+      if (!state.owner) {
+        state.items = [];
+        state.selected.clear();
+        $('heroTypes').textContent = '0';
+        $('heroAmount').textContent = '0';
+        $('inventoryQuota').textContent = '当前没有可用仓库';
+        $('loaded').textContent = '0/0 种已加载';
+        $('inventory').innerHTML = '<div class="empty-state"><div class="empty-icon">▦</div><h3>没有可用仓库</h3><p>请联系云仓库管理员创建个人仓库，或让组织仓库管理员把你加入组织仓库。</p></div>';
+        renderSelected();
+        return;
+      }
       const loadId = ++state.inventoryLoadId;
       const cached = state.inventoryCache.get(state.owner);
       if (cached && !options.force) {
@@ -2508,8 +3356,22 @@ const HTML = `<!doctype html>
       $('onlinePlayers').classList.add('hidden');
     }
 
+    function transactionItemsHtml(items, tooltipItems) {
+      if (!items?.length) return '<span class="muted">无</span>';
+      return items.map(item => {
+        const name = item.displayName || item.itemId;
+        const isShulker = String(item.itemId || '').endsWith('shulker_box');
+        let tooltipKey = '';
+        if (isShulker && tooltipItems) {
+          tooltipKey = String(tooltipItems.size);
+          tooltipItems.set(tooltipKey, item);
+        }
+        return '<span class="alias-tag' + (isShulker ? ' transaction-shulker' : '') + '"' + (tooltipKey ? ' data-transaction-tip="' + esc(tooltipKey) + '"' : '') + '>' + esc(name) + ' x' + num(item.amount) + '</span>';
+      }).join(' ');
+    }
+
     function itemText(item) {
-      return [item.displayName, item.adminDisplayName, item.personalAlias, item.itemId, item.itemKey, item.shortCode, item.nbtJson, item.metaJson, ...(item.shulkerContents || []).map(x => x.displayName + ' ' + x.adminDisplayName + ' ' + x.itemId + ' ' + x.shortCode)].join(' ').toLowerCase();
+      return [item.displayName, item.adminDisplayName, ...(item.personalAliases || []), ...(item.globalAliases || []), item.itemId, item.itemKey, item.shortCode, item.nbtJson, item.metaJson, ...(item.shulkerContents || []).map(x => x.displayName + ' ' + x.adminDisplayName + ' ' + (x.personalAliases || []).join(' ') + ' ' + (x.globalAliases || []).join(' ') + ' ' + x.itemId + ' ' + x.shortCode)].join(' ').toLowerCase();
     }
 
     function shortCount(value) {
@@ -2523,8 +3385,10 @@ const HTML = `<!doctype html>
       const shulker = item.shulkerContents || [];
       const lines = [
         '<div class="tip-title">' + esc(item.displayName || item.itemId) + '</div>',
-        item.personalAlias ? '<div class="tip-line">个人别名：' + esc(item.personalAlias) + '</div>' : '',
+        item.personalAliases?.length ? '<div class="tip-line">个人别名：' + esc(item.personalAliases.join('、')) + '</div>' : '',
+        item.globalAliases?.length ? '<div class="tip-line">全局别名：' + esc(item.globalAliases.join('、')) + '</div>' : '',
         item.adminDisplayName && item.adminDisplayName !== item.displayName ? '<div class="tip-line">默认名：' + esc(item.adminDisplayName) + '</div>' : '',
+        item.ownerLabel ? '<div class="tip-line">归属：' + esc(item.ownerLabel) + '</div>' : '',
         '<div class="tip-line">数量：' + num(item.amount) + '</div>',
         '<div class="tip-line">ID：' + esc(item.itemId) + '</div>'
       ].filter(Boolean);
@@ -2552,6 +3416,42 @@ const HTML = `<!doctype html>
         const itemId = img.dataset.tipIcon;
         img.src = iconUrl(itemId, 'item');
         img.onerror = () => { img.style.display = 'none'; };
+      }
+    }
+
+    function transactionTooltipHtml(item) {
+      const contents = item.shulkerContents || [];
+      const lines = [
+        '<div class="tip-title">' + esc(item.displayName || item.itemId) + '</div>',
+        '<div class="tip-line">交易数量：' + num(item.amount) + ' 盒</div>',
+        '<div class="tip-line">盒内物品（每盒）</div>'
+      ];
+      if (contents.length) {
+        lines.push('<div class="tip-text-list">' + contents.map(content =>
+          '<div class="tip-text-row"><span>' + esc(content.displayName || content.itemId) + '</span><span>x' + num(content.amount) + '</span></div>'
+        ).join('') + '</div>');
+      } else {
+        lines.push('<div class="tip-text-list"><div class="muted">潜影盒为空，或这条历史记录没有盒内物品索引。</div></div>');
+      }
+      return lines.join('');
+    }
+
+    function showTransactionTip(event, item) {
+      if (!canHoverTooltip()) return;
+      const tip = $('tooltip');
+      tip.innerHTML = transactionTooltipHtml(item);
+      tip.style.display = 'block';
+      moveTip(event);
+    }
+
+    function bindTransactionTooltips(containerId, tooltipItems) {
+      if (!canHoverTooltip()) return;
+      for (const element of document.querySelectorAll('#' + containerId + ' [data-transaction-tip]')) {
+        const item = tooltipItems.get(element.dataset.transactionTip);
+        if (!item) continue;
+        element.addEventListener('mouseenter', event => showTransactionTip(event, item));
+        element.addEventListener('mousemove', moveTip);
+        element.addEventListener('mouseleave', hideTip);
       }
     }
 
@@ -2607,14 +3507,14 @@ const HTML = `<!doctype html>
       $('aliasMode').textContent = state.aliasMode ? '退出别名' : '物品别名';
       $('inventory').classList.toggle('alias-mode', state.aliasMode);
       $('selectedList').innerHTML = state.aliasMode
-        ? '<span class="selected-empty">改名模式：点击物品图标查看 NBT 并设置你的个人别名</span>'
+        ? '<span class="selected-empty">别名模式：点击物品图标查看详情，可添加多个个人别名</span>'
         : (state.selected.size ? $('selectedList').innerHTML : '<span class="selected-empty">点击物品加入待取列表</span>');
       if (!state.aliasMode) renderSelected();
     }
 
     function renderSelected() {
       if (state.aliasMode) {
-        $('selectedList').innerHTML = '<span class="selected-empty">改名模式：点击物品图标查看 NBT 并设置你的个人别名</span>';
+        $('selectedList').innerHTML = '<span class="selected-empty">别名模式：点击物品图标查看详情，可添加多个个人别名</span>';
         return;
       }
       const rows = [...state.selected.values()];
@@ -2741,7 +3641,7 @@ const HTML = `<!doctype html>
       }
       $('inventory').innerHTML = '<div class="grid">' + rows.map(item => {
         const selected = state.selected.has(item.itemKey) ? ' selected' : '';
-        const aliasTitle = item.personalAlias ? '个人别名：' + item.personalAlias : (item.adminDisplayName && item.adminDisplayName !== item.displayName ? '默认名：' + item.adminDisplayName : '');
+        const aliasTitle = item.personalAliases?.length ? '个人别名：' + item.personalAliases.join('、') : (item.adminDisplayName && item.adminDisplayName !== item.displayName ? '默认名：' + item.adminDisplayName : '');
         return '<div class="item' + selected + '" data-key="' + esc(item.itemKey) + '">' +
           '<div class="icon"><img data-key="' + esc(item.itemKey) + '" alt="" loading="lazy" decoding="async"><span class="fallback">' + esc((item.displayName || item.itemId).slice(0, 4)) + '</span><span class="count">' + esc(shortCount(item.amount)) + '</span></div>' +
           '<div class="name" title="' + esc(aliasTitle) + '">' + esc(item.displayName || item.itemId) + '</div>' +
@@ -2764,16 +3664,20 @@ const HTML = `<!doctype html>
     }
 
     async function loadTransactions() {
-      const data = await api('/api/transactions', { owner: state.owner });
+      const data = await api('/api/transactions', { owner: $('txOwner').value, type: $('txType').value, operator: $('txOperator').value, item: $('txItem').value, status: $('txStatus').value, dateFrom: $('txFrom').value, dateTo: $('txTo').value, q: $('txQ').value, page: state.txPage, pageSize: 30 });
       state.tx = data.rows || [];
-      if (!state.tx.length) {
-        $('transactions').innerHTML = '<p class="muted" style="text-align:center;margin:46px 0">暂无交易记录。</p>';
-        return;
-      }
-      $('transactions').innerHTML = '<table><thead><tr><th>时间</th><th>类型</th><th>状态</th><th>物品</th><th>备注</th></tr></thead><tbody>' + state.tx.map(row => {
-        const items = row.items?.length ? row.items.map(item => esc(item.displayName || item.itemId) + ' x' + num(item.amount)).join('，') : '<span class="muted">无</span>';
-        return '<tr><td>' + esc(row.createdAtLabel || row.createdAt) + '</td><td>' + esc(row.typeLabel || row.type) + '</td><td>' + esc(row.statusLabel || row.status) + '</td><td>' + items + '</td><td class="muted">' + esc(row.messageLabel || row.message || '') + '</td></tr>';
-      }).join('') + '</tbody></table>';
+      state.txPage = data.page || 1;
+      state.txTotalPages = data.totalPages || 1;
+      $('txPage').textContent = '第 ' + state.txPage + ' / ' + state.txTotalPages + ' 页，共 ' + num(data.total || 0) + ' 条';
+      $('txPrev').disabled = state.txPage <= 1;
+      $('txNext').disabled = state.txPage >= state.txTotalPages;
+      const tooltipItems = new Map();
+      renderTable('transactions', ['时间', '类型', '操作者', '归属', '物品', '备注'], state.tx.map(row => {
+        const items = transactionItemsHtml(row.items, tooltipItems);
+        const details = row.messageLabel ? '<span class="alias-tag">' + esc(row.messageLabel) + '</span>' : '';
+        return '<tr><td>' + esc(row.createdAtLabel || row.createdAt) + '</td><td>' + esc(row.typeLabel || row.type) + '<div class="muted">' + esc(row.statusLabel || row.status) + '</div></td><td>' + esc(row.operator || '') + '</td><td>' + esc(row.ownerLabel || '') + '</td><td class="wrap">' + items + '</td><td class="wrap muted">' + details + '</td></tr>';
+      }), '没有交易记录。');
+      bindTransactionTooltips('transactions', tooltipItems);
     }
 
     function renderTable(target, headers, rows, emptyText = '没有数据。') {
@@ -2792,9 +3696,17 @@ const HTML = `<!doctype html>
 
     async function loadAdminOwners() {
       if (!state.user?.isAdmin) return;
-      if (state.adminOwners.length) return;
-      const data = await api('/api/admin/owners');
-      state.adminOwners = data.rows || [];
+      if (!state.adminOwners.length) {
+        const data = await api('/api/admin/owners');
+        state.adminOwners = data.rows || [];
+      }
+      const inventoryValue = $('adminInvOwner')?.value || '';
+      if ($('adminInvOwner')) {
+        const occupied = state.adminOwners.filter(owner => Number(owner.totalAmount || 0) > 0);
+        $('adminInvOwner').innerHTML = '<option value="">全部有库存仓库</option>' + occupied.map(owner =>
+          '<option value="' + esc(owner.ownerUuid) + '"' + (owner.ownerUuid === inventoryValue ? ' selected' : '') + '>' + esc(owner.label) + '（' + num(owner.totalAmount) + '件）</option>'
+        ).join('');
+      }
     }
 
     function ownerOptions(selected = '') {
@@ -2818,7 +3730,7 @@ const HTML = `<!doctype html>
         '归属: ' + (row.ownerLabel || row.ownerUuid || ''),
         '短码: ' + (row.shortCode || ''),
         '名称: ' + (row.displayName || ''),
-        row.personalAlias ? '个人别名: ' + row.personalAlias : '',
+        row.personalAliases?.length ? '个人别名: ' + row.personalAliases.join('、') : '',
         row.adminDisplayName && row.adminDisplayName !== row.displayName ? '默认名: ' + row.adminDisplayName : '',
         'ID: ' + (row.itemId || ''),
         '数量: ' + Number(row.amount || 0),
@@ -2834,7 +3746,9 @@ const HTML = `<!doctype html>
 
     function openNbtModal(row) {
       state.aliasItem = null;
+      state.adminGlobalAliasItem = null;
       $('aliasEditor').classList.add('hidden');
+      $('globalAliasEditor').classList.add('hidden');
       $('nbtModalTitle').textContent = (row.displayName || row.itemId || '物品详情') + (row.shortCode ? ' #' + row.shortCode : '');
       $('nbtModalText').textContent = adminItemDetailText(row);
       $('nbtModalHint').textContent = row.nbtJson || row.metaJson ? '可以按 NBT 或 meta 里的关键词筛选总库存。' : '这个物品没有额外 NBT/meta。';
@@ -2843,21 +3757,47 @@ const HTML = `<!doctype html>
 
     function openAliasModal(item) {
       state.aliasItem = item;
+      state.adminGlobalAliasItem = null;
       $('aliasEditor').classList.remove('hidden');
-      $('aliasInput').value = item.personalAlias || '';
+      $('globalAliasEditor').classList.add('hidden');
+      $('aliasInput').value = '';
+      $('aliasUseDisplayName').checked = false;
+      $('aliasExisting').innerHTML = (item.personalAliases || []).length
+        ? item.personalAliases.map(alias => '<span class="alias-tag">' + esc(alias) + '<button data-personal-alias-delete="' + esc(alias) + '">×</button></span>').join('')
+        : '<span class="muted">还没有设置个人别名</span>';
       $('aliasNote').textContent = '默认名：' + (item.adminDisplayName || item.itemId || '') + '；短码：' + (item.shortCode || '无');
       $('nbtModalTitle').textContent = (item.displayName || item.itemId || '物品详情') + (item.shortCode ? ' #' + item.shortCode : '');
       $('nbtModalText').textContent = adminItemDetailText(item);
-      $('nbtModalHint').textContent = item.nbtJson || item.metaJson ? '这里保存的是你的个人别名，不会影响其他玩家。' : '这个物品没有额外 NBT/meta；个人别名只影响你自己看到的名字。';
+      $('nbtModalHint').textContent = '一件物品可以添加多个个人别名；这些别名只影响你自己的搜索、显示和取货。';
       $('nbtModal').classList.remove('hidden');
       $('aliasInput').focus();
+    }
+
+    function openGlobalAliasModal(item) {
+      state.aliasItem = null;
+      state.adminGlobalAliasItem = item;
+      $('aliasEditor').classList.add('hidden');
+      $('globalAliasEditor').classList.remove('hidden');
+      $('globalAliasInput').value = '';
+      $('globalAliasUseDisplayName').checked = false;
+      $('globalAliasExisting').innerHTML = (item.globalAliases || []).length
+        ? item.globalAliases.map(alias => '<span class="alias-tag">' + esc(alias) + '<button data-admin-alias-delete="' + esc(alias) + '">×</button></span>').join('')
+        : '<span class="muted">还没有设置全局别名</span>';
+      $('globalAliasNote').textContent = '物品：' + (item.displayName || item.itemId) + '；短码：' + (item.shortCode || '无');
+      $('nbtModalTitle').textContent = (item.displayName || item.itemId || '物品详情') + (item.shortCode ? ' #' + item.shortCode : '');
+      $('nbtModalText').textContent = adminItemDetailText(item);
+      $('nbtModalHint').textContent = '全局别名供所有启用该别名的玩家搜索和取货；修改库存显示名称为可选操作。';
+      $('nbtModal').classList.remove('hidden');
+      $('globalAliasInput').focus();
     }
 
     function closeNbtModal() {
       $('nbtModal').classList.add('hidden');
       $('nbtModalText').textContent = '';
       $('aliasEditor').classList.add('hidden');
+      $('globalAliasEditor').classList.add('hidden');
       state.aliasItem = null;
+      state.adminGlobalAliasItem = null;
     }
 
     async function copyNbtModal() {
@@ -2867,68 +3807,191 @@ const HTML = `<!doctype html>
       toast('已复制物品详情。');
     }
 
-    function applyAliasToLocalItem(itemKey, displayName, personalAlias) {
+    function applyAliasToLocalItem(itemKey, personalAliases, personalDisplayName = '') {
       for (const item of state.items) {
         if (item.itemKey !== itemKey) continue;
-        item.displayName = displayName || item.adminDisplayName || item.itemId;
-        item.personalAlias = personalAlias || '';
+        item.personalAliases = personalAliases || [];
+        item.personalAlias = item.personalAliases[0] || '';
+        item.personalDisplayName = personalDisplayName || '';
+        item.displayName = item.personalDisplayName || item.adminDisplayName || item.itemId;
       }
       const picked = state.selected.get(itemKey);
-      if (picked) picked.displayName = displayName || picked.displayName;
+      if (picked) picked.displayName = personalDisplayName || picked.displayName;
       state.inventoryCache.delete(state.owner);
       renderSelected();
       renderInventory();
     }
 
-    async function savePersonalAlias(displayName = null) {
+    async function savePersonalAlias() {
       if (!state.aliasItem) return;
-      const nextName = displayName === null ? $('aliasInput').value.trim() : String(displayName || '').trim();
+      const nextName = $('aliasInput').value.trim();
+      if (!nextName) throw new Error('请填写要新增的个人别名。');
       const data = await post('/api/item-alias/save', {
         itemKey: state.aliasItem.itemKey,
-        displayName: nextName
+        displayName: nextName,
+        updateDisplayName: $('aliasUseDisplayName').checked
       });
-      applyAliasToLocalItem(data.itemKey, data.displayName, data.personalAlias);
+      applyAliasToLocalItem(data.itemKey, data.personalAliases || [], data.personalDisplayName || '');
       const updated = state.items.find(item => item.itemKey === data.itemKey) || {
         ...state.aliasItem,
-        displayName: data.displayName,
-        personalAlias: data.personalAlias
+        personalAliases: data.personalAliases || []
       };
       openAliasModal(updated);
       toast(data.message);
     }
 
-    async function loadAdminInventory() {
-      await loadAdminOwners();
-      const data = await api('/api/admin/inventory', {
-        owner: $('adminInvOwner').value,
-        item: $('adminInvItem').value
-      });
-      renderStats('adminInvStats', {
-        '归属数': data.stats?.owners || 0,
-        '物品种类': data.stats?.itemTypes || 0,
-        '物品总数': data.stats?.totalAmount || 0
-      });
-      state.adminInventoryRows = new Map();
-      renderTable('adminInvTable', ['归属', '短码', '物品', '数量', '操作'], (data.rows || []).map((row, index) => {
-        const rowId = String(index);
-        state.adminInventoryRows.set(rowId, row);
-        return '<tr data-owner="' + esc(row.ownerUuid) + '" data-item="' + esc(row.itemKey) + '" data-admin-row="' + esc(rowId) + '">' +
-          '<td>' + esc(row.ownerLabel) + '</td>' +
-          '<td>' + esc(row.shortCode) + '</td>' +
-          '<td class="wrap">' + esc(row.displayName) + '<div class="muted">' + esc(row.itemId) + '</div></td>' +
-          '<td>' + num(row.amount) + '</td>' +
-          '<td><div class="ops">' +
-            '<button data-admin-nbt>查看 NBT</button>' +
-            '<input class="compact-input" type="number" min="0" value="' + esc(row.amount) + '" data-admin-amount>' +
-            '<button data-admin-set>设置</button>' +
-            '<select class="compact-select" data-admin-target>' + ownerOptions(row.ownerUuid) + '</select>' +
-            '<input class="compact-input" type="number" min="1" value="' + esc(Math.min(Number(row.amount || 1), 64)) + '" data-admin-transfer-amount>' +
-            '<button data-admin-transfer>转移</button>' +
-            '<input class="compact-select" style="width:170px" value="' + esc(row.displayName) + '" data-admin-alias placeholder="给物品起别名">' +
-            '<button data-admin-alias-save>保存别名</button>' +
-          '</div></td>' +
-        '</tr>';
-      }), '没有库存。');
+    async function saveGlobalAliasFromModal() {
+      if (!state.adminGlobalAliasItem) return;
+      const alias = $('globalAliasInput').value.trim();
+      if (!alias) throw new Error('请填写全局别名。');
+      const data = await post('/api/admin/alias/save', { itemKey: state.adminGlobalAliasItem.itemKey, alias, updateDisplayName: $('globalAliasUseDisplayName').checked });
+      const itemKey = state.adminGlobalAliasItem.itemKey;
+      toast(data.message);
+      await loadAdminInventory();
+      const updated = [...state.adminInventoryRows.values()].find(row => row.itemKey === itemKey);
+      if (updated) openGlobalAliasModal(updated);
+    }
+
+    async function loadMyOrganizations() {
+      const data = await api('/api/my/organizations');
+      const rows = data.rows || [];
+      $('myOrganizationList').innerHTML = rows.length ? rows.map(warehouse => {
+        const members = (warehouse.members || []).map(member =>
+          '<div class="member-row" data-member="' + esc(member.playerUuid) + '"><div><strong>' + esc(member.username) + '</strong>' + (member.playerUuid === warehouse.creatorUuid ? '<div class="muted">创建者</div>' : '') + '</div>' +
+          '<span class="muted">' + (member.role === 'admin' ? '管理员' : '成员') + '</span><span></span></div>'
+        ).join('');
+        return '<div class="organization-card" data-warehouse="' + esc(warehouse.name) + '"><div class="organization-head"><div><div class="organization-name">' + esc(warehouse.name) + '</div><div class="organization-summary"><span>' + (warehouse.role === 'admin' ? '仓库管理员' : '普通成员') + '</span><span>' + num((warehouse.members || []).length) + ' 名成员</span></div></div><div><strong>' + num(warehouse.usedSlots) + ' / ' + num(warehouse.quotaSlots) + ' 格</strong><div class="usage-track"><div class="usage-fill" style="width:' + Math.min(100, Number(warehouse.usagePercent || 0)) + '%"></div></div><div class="muted">使用率 ' + esc(warehouse.usagePercent) + '%</div></div></div><div class="member-list">' + members + '</div></div>';
+      }).join('') : '<div class="empty-state panel"><div class="empty-icon">♙</div><h3>还没有组织仓库</h3><p>你尚未创建或加入任何组织仓库。</p></div>';
+    }
+
+    async function loadMyAliases() {
+      const data = await api('/api/my/aliases', { q: $('myAliasQ').value });
+      const personal = data.personal || [];
+      state.myPersonalAliasRows = new Map(personal.map(row => [row.itemKey, row]));
+      $('myPersonalAliases').innerHTML = personal.length ? '<div class="compact-admin-grid">' + personal.map(row => aliasGridItemHtml(row, 'my-personal-alias-card', state.myPersonalAliasItemKey === row.itemKey, row.aliases.length + ' 个别名')).join('') + '</div>' : '<p class="muted">你还没有设置个人别名。可在库存页进入“物品别名”模式添加。</p>';
+
+      const globalMap = new Map();
+      for (const row of data.global || []) {
+        if (!globalMap.has(row.itemKey)) globalMap.set(row.itemKey, { ...row, aliases: [] });
+        globalMap.get(row.itemKey).aliases.push({ alias: row.alias, enabled: row.enabled });
+      }
+      const globals = [...globalMap.values()];
+      state.myGlobalAliasRows = globalMap;
+      $('myGlobalAliases').innerHTML = globals.length ? '<div class="compact-admin-grid">' + globals.map(row => aliasGridItemHtml(row, 'my-global-alias-card', state.myGlobalAliasItemKey === row.itemKey, row.aliases.length + ' 个别名')).join('') + '</div>' : '<p class="muted">管理员还没有设置全局别名。</p>';
+
+      if (state.myPersonalAliasItemKey && state.myPersonalAliasRows.has(state.myPersonalAliasItemKey)) renderMyPersonalAliasDetail(state.myPersonalAliasRows.get(state.myPersonalAliasItemKey));
+      else { state.myPersonalAliasItemKey = ''; $('myPersonalAliasDetail').innerHTML = '<p class="muted">点击物品图标管理个人别名。</p>'; }
+      if (state.myGlobalAliasItemKey && state.myGlobalAliasRows.has(state.myGlobalAliasItemKey)) renderMyGlobalAliasDetail(state.myGlobalAliasRows.get(state.myGlobalAliasItemKey));
+      else { state.myGlobalAliasItemKey = ''; $('myGlobalAliasDetail').innerHTML = '<p class="muted">点击物品图标管理全局别名开关。</p>'; }
+    }
+
+    function aliasGridItemHtml(row, attribute, selected, note) {
+      return '<div class="item' + (selected ? ' selected' : '') + '" data-' + attribute + '="' + esc(row.itemKey) + '" title="' + esc(row.displayName + ' · ' + note) + '"><div class="icon"><img src="' + esc(iconUrl(row.itemId, 'item')) + '" alt=""><span class="fallback">' + esc((row.displayName || row.itemId).slice(0, 4)) + '</span></div><div class="name">' + esc(row.displayName) + '</div></div>';
+    }
+
+    function renderMyPersonalAliasDetail(row) {
+      state.myPersonalAliasItemKey = row.itemKey;
+      document.querySelectorAll('[data-my-personal-alias-card]').forEach(card => card.classList.toggle('selected', card.dataset.myPersonalAliasCard === row.itemKey));
+      $('myPersonalAliasDetail').innerHTML = '<div class="alias-detail-head"><div class="admin-item-icon"><img src="' + esc(iconUrl(row.itemId, 'item')) + '" alt=""></div><div><div class="admin-item-name">' + esc(row.displayName) + '</div><div class="admin-item-meta">#' + esc(row.shortCode) + ' · ' + esc(row.itemId) + '</div></div></div><div class="alias-tags">' + row.aliases.map(alias => '<span class="alias-tag">' + esc(alias) + '<button data-personal-alias-delete="' + esc(alias) + '">×</button></span>').join('') + '</div><div class="alias-add" data-item="' + esc(row.itemKey) + '" style="margin-top:10px"><input data-my-alias-input placeholder="新增个人别名"><button data-my-alias-add>添加</button></div>';
+    }
+
+    function renderMyGlobalAliasDetail(row) {
+      state.myGlobalAliasItemKey = row.itemKey;
+      document.querySelectorAll('[data-my-global-alias-card]').forEach(card => card.classList.toggle('selected', card.dataset.myGlobalAliasCard === row.itemKey));
+      $('myGlobalAliasDetail').innerHTML = '<div class="alias-detail-head"><div class="admin-item-icon"><img src="' + esc(iconUrl(row.itemId, 'item')) + '" alt=""></div><div><div class="admin-item-name">' + esc(row.displayName) + '</div><div class="admin-item-meta">#' + esc(row.shortCode) + ' · ' + esc(row.itemId) + '</div></div></div><div class="global-alias-toggle-list">' + row.aliases.map(item => '<div class="global-alias-toggle-row"><span>' + esc(item.alias) + '</span><span class="muted">' + (item.enabled ? '已启用' : '已禁用') + '</span><button class="switch' + (item.enabled ? ' on' : '') + '" data-global-alias-toggle="' + esc(item.alias) + '" data-enabled="' + (item.enabled ? '1' : '0') + '"></button></div>').join('') + '</div>';
+    }
+
+    function loadMyCurrent() {
+      return state.myTab === 'organizations' ? loadMyOrganizations() : loadMyAliases();
+    }
+
+    function setMyTab(tab) {
+      state.myTab = tab;
+      document.querySelectorAll('[data-my-tab]').forEach(btn => btn.classList.toggle('active', btn.dataset.myTab === tab));
+      $('myOrganizations').classList.toggle('hidden', tab !== 'organizations');
+      $('myAliases').classList.toggle('hidden', tab !== 'aliases');
+      loadMyCurrent().catch(error => toast(error.message));
+    }
+
+    function adminCardHtml(row, index, options = {}) {
+      const selected = state.adminSelected.has(index) ? ' selected' : '';
+      const aliases = (row.globalAliases || row.aliases || []).join('、');
+      return '<div class="admin-item-card' + selected + (options.className ? ' ' + options.className : '') + '" data-admin-card="' + esc(index) + '">' +
+        '<div class="admin-item-main"><div class="admin-item-icon"><img src="' + esc(iconUrl(row.itemId, 'item')) + '" alt=""><span class="count">' + esc(shortCount(row.amount)) + '</span></div>' +
+        '<div><div class="admin-item-name" title="' + esc(row.displayName) + '">' + esc(row.displayName || row.itemId) + '</div>' +
+        '<div class="admin-item-meta">' + esc(row.ownerLabel || '') + '</div><div class="admin-item-meta">#' + esc(row.shortCode || '无短码') + (aliases ? ' · ' + esc(aliases) : '') + '</div></div></div>' +
+        (options.actions || '') + '</div>';
+    }
+
+    function renderAdminTransferSelection() {
+      if (state.adminAliasMode) {
+        $('adminSelectedList').innerHTML = '<span class="selected-empty">别名模式：点击下方物品图标查看 NBT 和设置全局别名</span>';
+        return;
+      }
+      const rows = [...state.adminSelected.values()];
+      if (!rows.length) {
+        $('adminSelectedList').innerHTML = '<span class="selected-empty">点击物品加入待转账列表</span>';
+      } else {
+        $('adminSelectedList').innerHTML = rows.map(row =>
+          '<div class="pick" data-admin-pick="' + esc(row.selectionKey) + '"><span class="pick-name" title="' + esc(row.ownerLabel + ' · ' + row.displayName) + '">' + esc(row.displayName) + '</span><input type="number" min="1" max="' + esc(row.amount) + '" value="' + esc(row.selectedAmount) + '" data-admin-pick-amount><button class="ghost" data-admin-pick-remove>×</button></div>'
+        ).join('') + '<button class="ghost selected-clear" data-admin-pick-clear>清空</button>';
+      }
+    }
+
+    function compactAdminItemHtml(row, index, selected = false) {
+      return '<div class="item' + (selected ? ' selected' : '') + '" data-admin-card="' + esc(index) + '"><div class="icon"><img src="' + esc(iconUrl(row.itemId, 'item')) + '" alt=""><span class="fallback">' + esc((row.displayName || row.itemId).slice(0, 4)) + '</span><span class="count">' + esc(shortCount(row.amount)) + '</span></div><div class="name">' + esc(row.displayName || row.itemId) + '</div></div>';
+    }
+
+    function loadAdminInventorySelectionState() {
+      document.querySelectorAll('#adminInvGrid [data-admin-card]').forEach(card => card.classList.toggle('selected', state.adminSelected.has(card.dataset.adminCard)));
+    }
+
+    function bindAdminInventoryTooltips() {
+      if (!canHoverTooltip()) return;
+      for (const card of document.querySelectorAll('#adminInvGrid [data-admin-card]')) {
+        const item = state.adminInventoryRows.get(card.dataset.adminCard);
+        if (!item) continue;
+        card.addEventListener('mouseenter', event => showTip(event, item));
+        card.addEventListener('mousemove', moveTip);
+        card.addEventListener('mouseleave', hideTip);
+      }
+    }
+
+    async function loadAdminInventory(options = {}) {
+      const loadId = ++state.adminInventoryLoadId;
+      const startedAt = performance.now();
+      const requestedOwner = options.owner !== undefined ? String(options.owner || '') : String($('adminInvOwner').value || '');
+      $('adminInvStatus').textContent = '加载中…';
+      $('adminInvOwner').disabled = true;
+      $('adminInvLoad').disabled = true;
+      $('adminInvGrid').style.opacity = '.55';
+      try {
+        state.adminOwners = [];
+        await loadAdminOwners();
+        const ownerExists = [...$('adminInvOwner').options].some(option => option.value === requestedOwner);
+        const owner = ownerExists ? requestedOwner : '';
+        $('adminInvOwner').value = owner;
+        const data = await api('/api/admin/inventory', { owner, item: $('adminInvItem').value });
+        if (loadId !== state.adminInventoryLoadId) return;
+        renderStats('adminInvStats', { '仓库数': data.stats?.owners || 0, '物品种类': data.stats?.itemTypes || 0, '物品总数': data.stats?.totalAmount || 0 });
+        state.adminInventoryRows = new Map();
+        state.adminSelected.clear();
+        const rows = data.rows || [];
+        rows.forEach((row, index) => state.adminInventoryRows.set(String(index), row));
+        $('adminInvGrid').innerHTML = rows.length ? '<div class="compact-admin-grid">' + rows.map((row, index) => compactAdminItemHtml(row, String(index))).join('') + '</div>' : '<p class="muted" style="text-align:center">没有库存。</p>';
+        $('adminInvStatus').textContent = '已加载 ' + rows.length + ' 种 · ' + Math.round(performance.now() - startedAt) + 'ms';
+        renderAdminTransferSelection();
+        bindAdminInventoryTooltips();
+      } catch (error) {
+        if (loadId === state.adminInventoryLoadId) $('adminInvStatus').textContent = '加载失败：' + error.message;
+        throw error;
+      } finally {
+        if (loadId === state.adminInventoryLoadId) {
+          $('adminInvOwner').disabled = false;
+          $('adminInvLoad').disabled = false;
+          $('adminInvGrid').style.opacity = '';
+        }
+      }
     }
 
     async function loadAdminMismatches() {
@@ -2942,138 +4005,183 @@ const HTML = `<!doctype html>
         '多余数量': data.stats?.extraAmount || 0,
         '缺失数量': data.stats?.missingAmount || 0
       });
-      renderTable('adminMmTable', ['时间', '类型', '归属', '短码', '物品', '数量', '说明', '操作'], (data.rows || []).map(row =>
-        '<tr data-mm-owner="' + esc(row.ownerLabel || row.username || '') + '" data-mm-item="' + esc(row.displayName || row.itemId || '') + '" data-mm-amount="' + esc(row.amount) + '">' +
-          '<td>' + esc(row.createdAt) + (row.resolvedAt ? '<div class="muted">处理：' + esc(row.resolvedAt) + '</div>' : '') + '</td>' +
-          '<td>' + (row.kind === 'extra' ? '多余' : '缺失') + '<div class="muted">' + (row.status === 'open' ? '未处理' : '已处理') + '</div></td>' +
-          '<td>' + esc(row.ownerLabel || row.username || '') + '</td>' +
-          '<td>' + esc(row.shortCode) + '</td>' +
-          '<td class="wrap">' + esc(row.displayName) + '<div class="muted">' + esc(row.itemId) + '</div></td>' +
-          '<td>' + num(row.amount) + '</td>' +
-          '<td class="wrap muted">' + esc(row.note || '') + '</td>' +
-          '<td>' + (row.status === 'open' ? '<button data-admin-mm-deduct="' + esc(row.id) + '">扣除库存</button>' : '') + '</td>' +
-        '</tr>'
-      ), '没有库存异常。');
+      await loadAdminOwners();
+      const rows = data.rows || [];
+      const mismatchHtml = row => adminCardHtml(row, 'mm-' + row.id, {
+        className: 'mismatch-card',
+        actions: row.status !== 'open' ? '<div class="admin-item-meta">已处理 ' + esc(row.resolvedAt || '') + '</div>' : row.kind === 'extra'
+          ? '<div class="mismatch-actions"><select data-mm-target><option value="">目标仓库</option>' + ownerOptions() + '</select><button data-admin-mm-resolve="' + esc(row.id) + '">转入</button></div>'
+          : '<div class="mismatch-actions"><button data-admin-mm-deduct="' + esc(row.id) + '">清除库存</button></div>'
+      });
+      const extra = rows.filter(row => row.kind === 'extra');
+      const missing = rows.filter(row => row.kind === 'missing');
+      $('adminMmExtra').innerHTML = extra.length ? '<div class="admin-item-grid">' + extra.map(mismatchHtml).join('') + '</div>' : '<p class="muted">没有多余物品。</p>';
+      $('adminMmMissing').innerHTML = missing.length ? '<div class="admin-item-grid">' + missing.map(mismatchHtml).join('') + '</div>' : '<p class="muted">没有缺失物品。</p>';
+    }
+
+    async function loadAdminWarehouseProvisioning() {
+      const data = await api('/api/admin/warehouse-provisioning');
+      renderTable('adminPersonalWarehouseList', ['玩家', '库存', '已用格数', '创建时间', '操作'], (data.personal || []).map(row =>
+        '<tr><td>' + esc(row.username) + '<div class="muted">' + esc(row.ownerUuid) + '</div></td><td>' + num(row.totalAmount) + ' 件</td><td>' + num(row.usedSlots) + ' 格</td><td>' + esc(row.createdAt || '') + '</td><td><button class="danger" data-admin-personal-delete="' + esc(row.ownerUuid) + '" data-owner-name="' + esc(row.username) + '">删除</button></td></tr>'
+      ), '还没有创建个人仓库。');
+      renderTable('adminOrganizationWarehouseList', ['仓库', '首位管理员', '成员', '库存', '已用格数', '创建时间', '操作'], (data.organizations || []).map(row =>
+        '<tr><td>' + esc(row.name) + '</td><td>' + esc(row.creatorUsername) + '</td><td>' + num(row.memberCount) + ' 人</td><td>' + num(row.totalAmount) + ' 件</td><td>' + num(row.usedSlots) + ' 格</td><td>' + esc(row.createdAt || '') + '</td><td><button data-admin-org-view="' + esc(row.name) + '">查看</button></td></tr>'
+      ), '还没有组织仓库。');
+      const names = new Set((data.organizations || []).map(row => row.name));
+      if (state.adminOrganizationName && names.has(state.adminOrganizationName)) await loadAdminOrganizationDetail(state.adminOrganizationName);
+      else if (state.adminOrganizationName) {
+        state.adminOrganizationName = '';
+        $('adminOrganizationWarehouseDetail').innerHTML = '<p class="muted">点击组织仓库右侧的“查看”管理详情、成员与管理员。</p>';
+      }
+    }
+
+    async function loadAdminOrganizationDetail(name) {
+      const data = await api('/api/admin/organization-warehouse/detail', { name });
+      const warehouse = data.warehouse;
+      state.adminOrganizationName = warehouse.name;
+      const members = (warehouse.members || []).map(member =>
+        '<div class="member-row" data-admin-org-member="' + esc(member.playerUuid) + '"><div><strong>' + esc(member.username) + '</strong>' + (member.playerUuid === warehouse.creatorUuid ? '<div class="muted">首位管理员</div>' : '') + '</div><select data-admin-org-role><option value="member"' + (member.role === 'member' ? ' selected' : '') + '>普通成员</option><option value="admin"' + (member.role === 'admin' ? ' selected' : '') + '>仓库管理员</option></select><button class="danger" data-admin-org-member-remove>删除成员</button></div>'
+      ).join('');
+      $('adminOrganizationWarehouseDetail').innerHTML =
+        '<div class="organization-card" data-admin-org-detail="' + esc(warehouse.name) + '">' +
+          '<div class="organization-head"><div><div class="organization-name">' + esc(warehouse.name) + '</div><div class="organization-summary"><span>首位管理员：' + esc(warehouse.creatorUsername) + '</span><span>' + num((warehouse.members || []).length) + ' 名成员</span><span>' + num(warehouse.totalAmount) + ' 件物品</span></div></div><div><strong>' + num(warehouse.usedSlots) + ' / ' + num(warehouse.quotaSlots) + ' 格</strong><div class="usage-track"><div class="usage-fill" style="width:' + Math.min(100, Number(warehouse.usagePercent || 0)) + '%"></div></div><div class="muted">使用率 ' + esc(warehouse.usagePercent) + '%</div></div></div>' +
+          '<div class="organization-actions"><input data-admin-org-add-name placeholder="玩家 ID"><select data-admin-org-add-role><option value="member">普通成员</option><option value="admin">仓库管理员</option></select><button data-admin-org-member-add>添加成员</button><button class="danger" data-admin-org-delete>删除组织仓库</button></div>' +
+          '<div class="member-list">' + (members || '<p class="muted">没有成员。</p>') + '</div>' +
+        '</div>';
+    }
+
+    async function createAdminPersonalWarehouse() {
+      const data = await post('/api/admin/personal-warehouse/create', { username: $('adminPersonalWarehousePlayer').value });
+      toast(data.message); $('adminPersonalWarehousePlayer').value = ''; state.adminOwners = []; await loadAdminWarehouseProvisioning();
+    }
+
+    async function createAdminOrganizationWarehouse() {
+      const data = await post('/api/admin/organization-warehouse/create', { name: $('adminOrganizationWarehouseName').value, creatorUsername: $('adminOrganizationWarehouseCreator').value });
+      toast(data.message); $('adminOrganizationWarehouseName').value = ''; $('adminOrganizationWarehouseCreator').value = ''; state.adminOwners = []; await loadAdminWarehouseProvisioning();
+    }
+
+    async function loadWarehouseAdminOrganizations() {
+      const data = await api('/api/warehouse-admin/organizations');
+      const rows = data.rows || [];
+      $('warehouseAdminOrganizationList').innerHTML = rows.length ? rows.map(warehouse => {
+        const actions = '<div class="organization-actions"><input data-org-new-name value="' + esc(warehouse.name) + '" placeholder="新仓库名"><button data-org-rename>修改仓库名</button><input data-org-add-name placeholder="玩家 ID"><button data-org-member-add>添加成员</button></div>';
+        const members = (warehouse.members || []).map(member =>
+          '<div class="member-row" data-member="' + esc(member.playerUuid) + '"><div><strong>' + esc(member.username) + '</strong>' + (member.playerUuid === warehouse.creatorUuid ? '<div class="muted">创建者</div>' : '') + '</div><select data-member-role' + (member.playerUuid === warehouse.creatorUuid ? ' disabled' : '') + '><option value="member"' + (member.role === 'member' ? ' selected' : '') + '>普通成员</option><option value="admin"' + (member.role === 'admin' ? ' selected' : '') + '>仓库管理员</option></select>' + (member.playerUuid !== warehouse.creatorUuid ? '<button data-org-member-remove>删除成员</button>' : '<span></span>') + '</div>'
+        ).join('');
+        return '<div class="organization-card" data-warehouse="' + esc(warehouse.name) + '"><div class="organization-head"><div><div class="organization-name">' + esc(warehouse.name) + '</div><div class="organization-summary"><span>创建者：' + esc(warehouse.creatorUsername) + '</span><span>' + num((warehouse.members || []).length) + ' 名成员</span></div></div><div><strong>' + num(warehouse.usedSlots) + ' / ' + num(warehouse.quotaSlots) + ' 格</strong><div class="usage-track"><div class="usage-fill" style="width:' + Math.min(100, Number(warehouse.usagePercent || 0)) + '%"></div></div></div></div>' + actions + '<div class="member-list">' + members + '</div></div>';
+      }).join('') : '<div class="empty-state panel"><div class="empty-icon">♙</div><h3>没有组织仓库</h3></div>';
     }
 
     async function runAdminTransfer() {
-      const fromOwnerText = $('adminTransferFrom').value.trim();
-      const toOwnerText = $('adminTransferTo').value.trim();
-      const itemKey = $('adminTransferItem').value.trim();
-      const amount = $('adminTransferAmount').value;
-      const data = await post('/api/admin/transfer', { fromOwnerText, toOwnerText, itemKey, amount });
+      const target = $('adminTransferTarget').value.trim();
+      const rows = [...state.adminSelected.values()];
+      if (!target) throw new Error('请输入目标玩家 ID 或仓库名。');
+      if (!rows.length) throw new Error('请先选择要转账的物品。');
+      const total = rows.reduce((sum, row) => sum + Number(row.selectedAmount || 0), 0);
+      if (!confirm('确认把已选的 ' + rows.length + ' 种、共 ' + total + ' 个物品转账给 ' + target + ' 吗？')) return;
+      const data = await post('/api/admin/transfer', { toOwnerText: target, items: rows.map(row => ({ fromOwnerUuid: row.ownerUuid, itemKey: row.itemKey, amount: row.selectedAmount })) });
       toast(data.message);
-      state.adminOwnersLoaded = false;
-      if (state.adminTab === 'transfer') {
-        $('adminTransferAmount').value = '';
-      }
+      state.adminOwners = [];
+      await loadAdminInventory();
     }
 
-    async function runInventoryAdminTransfer() {
-      if (!state.user?.isAdmin) return;
-      const target = $('inventoryTransferTarget').value.trim();
-      if (!target) return toast('请填写转账目标。');
-      const rows = [...state.selected.values()].filter(row => Number(row.amount || 0) > 0);
-      if (!rows.length) return toast('请先点击物品加入待转账列表。');
-      const total = rows.reduce((sum, row) => sum + Number(row.amount || 0), 0);
-      const ok = confirm('确认从当前仓库转账 ' + rows.length + ' 种、共 ' + total + ' 个物品给 ' + target + ' 吗？');
-      if (!ok) return;
-
-      for (const row of rows) {
-        await post('/api/admin/transfer', {
-          fromOwnerUuid: state.owner,
-          toOwnerText: target,
-          itemKey: row.itemKey,
-          amount: row.amount
-        });
-      }
-      toast('账本转账完成：' + rows.length + ' 种，共 ' + total + ' 个。');
-      state.selected.clear();
-      state.inventoryCache.delete(state.owner);
-      state.adminOwnersLoaded = false;
-      await loadInventory({ force: true });
-    }
-
-    async function loadAdminChests() {
-      const data = await api('/api/admin/chests', { q: $('adminChestQ').value });
-      renderTable('adminChestTable', ['木桶', '方块', '槽位', '物品数', '最后同步', '操作'], (data.rows || []).map(row =>
-        '<tr>' +
-          '<td>' + esc(row.chestId) + '</td>' +
-          '<td>' + esc(row.blockName) + '</td>' +
-          '<td>' + num(row.slotCount) + '</td>' +
-          '<td>' + num(row.totalAmount) + '</td>' +
-          '<td>' + esc(row.lastSeenAt || '') + '</td>' +
-          '<td><button data-admin-chest="' + esc(row.chestId) + '">查看</button></td>' +
-        '</tr>'
-      ), '没有木桶记录。');
-    }
-
-    async function loadAdminChestDetail(chestId) {
-      const data = await api('/api/admin/chest', { chest: chestId });
-      $('adminChestDetail').innerHTML = '<div class="title" style="font-size:18px;margin-bottom:10px">' + esc(data.chest.chestId) + '</div>';
-      renderTable('adminChestDetail', ['槽位', '短码', '物品', '数量'], (data.items || []).map(row =>
-        '<tr><td>' + esc(row.slot) + '</td><td>' + esc(row.shortCode) + '</td><td class="wrap">' + esc(row.displayName) + '<div class="muted">' + esc(row.itemId) + '</div></td><td>' + num(row.amount) + '</td></tr>'
-      ), '这个木桶没有记录物品。');
+    function setAdminAliasMode(enabled) {
+      state.adminAliasMode = Boolean(enabled);
+      state.adminSelected.clear();
+      $('adminAliasMode').classList.toggle('solid', state.adminAliasMode);
+      $('adminAliasMode').textContent = state.adminAliasMode ? '退出别名' : '全局别名';
+      $('adminAliasModeHint').textContent = state.adminAliasMode ? '别名模式：点击物品图标查看 NBT 并设置全局别名' : '开启后点击物品图标查看 NBT 并设置全局别名';
+      $('adminTransferTarget').disabled = state.adminAliasMode;
+      $('adminTransferRun').disabled = state.adminAliasMode;
+      renderAdminTransferSelection();
+      loadAdminInventorySelectionState();
     }
 
     async function loadAdminTransactions() {
-      const data = await api('/api/admin/transactions', { q: $('adminTxQ').value });
-      renderTable('adminTxTable', ['时间', '类型', '归属', '物品', '备注'], (data.rows || []).map(row => {
-        const items = row.items?.length ? row.items.map(item => esc(item.displayName || item.itemId) + ' x' + num(item.amount)).join('，') : '<span class="muted">无</span>';
-        return '<tr><td>' + esc(row.createdAtLabel || row.createdAt) + '</td><td>' + esc(row.typeLabel || row.type) + '<div class="muted">' + esc(row.statusLabel || row.status) + '</div></td><td>' + esc(row.ownerLabel || row.username || '') + '</td><td class="wrap">' + items + '</td><td class="wrap muted">' + esc(row.messageLabel || row.message || '') + '</td></tr>';
+      const data = await api('/api/admin/transactions', { q: $('adminTxQ').value, owner: $('adminTxOwner').value, type: $('adminTxType').value, operator: $('adminTxOperator').value, item: $('adminTxItem').value, status: $('adminTxStatus').value, dateFrom: $('adminTxFrom').value, dateTo: $('adminTxTo').value, page: state.adminTxPage, pageSize: 30 });
+      state.adminTxPage = data.page || 1;
+      state.adminTxTotalPages = data.totalPages || 1;
+      $('adminTxPage').textContent = '第 ' + state.adminTxPage + ' / ' + state.adminTxTotalPages + ' 页，共 ' + num(data.total || 0) + ' 条';
+      $('adminTxPrev').disabled = state.adminTxPage <= 1;
+      $('adminTxNext').disabled = state.adminTxPage >= state.adminTxTotalPages;
+      const tooltipItems = new Map();
+      renderTable('adminTxTable', ['时间', '类型', '操作者', '归属', '物品', '备注'], (data.rows || []).map(row => {
+        const items = transactionItemsHtml(row.items, tooltipItems);
+        const details = row.messageLabel ? '<span class="alias-tag">' + esc(row.messageLabel) + '</span>' : '';
+        return '<tr><td>' + esc(row.createdAtLabel || row.createdAt) + '</td><td>' + esc(row.typeLabel || row.type) + '<div class="muted">' + esc(row.statusLabel || row.status) + '</div></td><td>' + esc(row.operator || '') + '</td><td>' + esc(row.ownerLabel || row.username || '') + '</td><td class="wrap">' + items + '</td><td class="wrap muted">' + details + '</td></tr>';
       }), '没有交易记录。');
+      bindTransactionTooltips('adminTxTable', tooltipItems);
     }
 
     async function loadAdminAliases() {
       const data = await api('/api/admin/aliases', { q: $('adminAliasQ').value });
-      renderTable('adminAliasTable', ['别名', '短码', '物品', '详细 NBT', '更新时间', '操作'], (data.rows || []).map(row => {
-        const detail = [
-          row.itemKey ? 'itemKey: ' + row.itemKey : '',
-          row.nbtJson ? 'NBT: ' + row.nbtJson : '',
-          row.metaJson ? 'meta: ' + row.metaJson : ''
-        ].filter(Boolean).join('\\n');
-        return '<tr>' +
-          '<td>' + esc(row.displayName) + '</td>' +
-          '<td>' + esc(row.shortCode) + '</td>' +
-          '<td class="wrap">' + esc(row.itemId || '') + '<div class="muted">' + esc(row.itemKey || '') + '</div></td>' +
-          '<td class="wrap">' + (detail ? '<details><summary>查看详情</summary><pre style="white-space:pre-wrap;max-width:520px">' + esc(detail) + '</pre></details>' : '<span class="muted">无</span>') + '</td>' +
-          '<td>' + esc(row.updatedAt || row.createdAt || '') + '</td>' +
-          '<td><button data-admin-alias-delete="' + esc(row.shortCode) + '">删除</button></td>' +
-        '</tr>';
-      }), '没有别名。');
+      const rows = data.rows || [];
+      state.adminAliasRows = new Map(rows.map(row => [row.itemKey, row]));
+      $('adminAliasGrid').innerHTML = rows.length ? '<div class="compact-admin-grid">' + rows.map(row =>
+        '<div class="item' + (state.adminAliasItem?.itemKey === row.itemKey ? ' selected' : '') + '" data-admin-alias-card="' + esc(row.itemKey) + '" title="' + esc(row.displayName + ' · ' + row.aliases.join('、')) + '"><div class="icon"><img src="' + esc(iconUrl(row.itemId, 'item')) + '" alt=""><span class="fallback">' + esc((row.displayName || row.itemId).slice(0, 4)) + '</span></div><div class="name">' + esc(row.displayName) + '</div></div>'
+      ).join('') + '</div>' : '<p class="muted">没有已设置的全局别名。</p>';
+      if (state.adminAliasItem && state.adminAliasRows.has(state.adminAliasItem.itemKey)) {
+        renderAdminAliasDetail(state.adminAliasRows.get(state.adminAliasItem.itemKey));
+      } else {
+        state.adminAliasItem = null;
+        $('adminAliasDetail').innerHTML = '<p class="muted">点击上方物品图标管理全局别名。</p>';
+      }
+    }
+
+    function renderAdminAliasDetail(row) {
+      state.adminAliasItem = row;
+      document.querySelectorAll('[data-admin-alias-card]').forEach(card => card.classList.toggle('selected', card.dataset.adminAliasCard === row.itemKey));
+      $('adminAliasDetail').innerHTML = '<div class="alias-detail-head"><div class="admin-item-icon"><img src="' + esc(iconUrl(row.itemId, 'item')) + '" alt=""></div><div><div class="admin-item-name">' + esc(row.displayName) + '</div><div class="admin-item-meta">#' + esc(row.shortCode) + ' · ' + esc(row.itemId) + '</div></div></div><div class="alias-tags">' + row.aliases.map(alias => '<span class="alias-tag">' + esc(alias) + '<button data-admin-alias-delete="' + esc(alias) + '">×</button></span>').join('') + '</div><div class="alias-add" style="margin-top:10px"><input id="adminAliasDetailInput" placeholder="新增全局别名"><button data-admin-alias-detail-save>添加别名</button></div><label class="check-label" style="margin-top:8px"><input id="adminAliasDetailUseDisplayName" type="checkbox"> 同时修改所有库存中的显示名称</label>';
+    }
+
+    async function loadAdminQuotas() {
+      const data = await api('/api/admin/quotas', { q: $('adminQuotaQ').value });
+      renderStats('adminQuotaOverall', { '木桶数量': data.overall?.chestCount || 0, '已用物理格数': data.overall?.usedSlots || 0, '总物理格数': data.overall?.totalSlots || 0, '整体使用率 %': data.overall?.usagePercent || 0 });
+      renderTable('adminQuotaTable', ['仓库', '使用情况', '额度', '操作'], (data.rows || []).map(row =>
+        '<tr data-owner="' + esc(row.ownerUuid) + '"><td>' + esc(row.label) + '<div class="muted">' + esc(row.ownerUuid) + '</div></td><td>' + num(row.usedSlots) + ' / ' + num(row.quotaSlots) + ' 格<div class="usage-track"><div class="usage-fill" style="width:' + Math.min(100, Number(row.usagePercent || 0)) + '%"></div></div><div class="muted">' + esc(row.usagePercent) + '%</div></td><td><input class="compact-input" type="number" min="0" value="' + esc(row.quotaSlots) + '" data-quota-value></td><td><button data-quota-save>保存</button></td></tr>'
+      ), '没有仓库额度。');
     }
 
     async function loadAdminCurrent() {
       if (!state.user?.isAdmin) return;
       if (state.adminTab === 'inventory') return loadAdminInventory();
+      if (state.adminTab === 'warehouses') return loadAdminWarehouseProvisioning();
       if (state.adminTab === 'mismatches') return loadAdminMismatches();
-      if (state.adminTab === 'transfer') return Promise.resolve();
-      if (state.adminTab === 'chests') return loadAdminChests();
+      if (state.adminTab === 'chests') return Promise.resolve();
       if (state.adminTab === 'transactions') return loadAdminTransactions();
       if (state.adminTab === 'aliases') return loadAdminAliases();
+      if (state.adminTab === 'quotas') return loadAdminQuotas();
     }
 
     function setAdminTab(tab) {
+      if (tab !== 'inventory' && state.adminAliasMode) setAdminAliasMode(false);
       state.adminTab = tab;
       document.querySelectorAll('[data-admin-tab]').forEach(btn => btn.classList.toggle('active', btn.dataset.adminTab === tab));
       $('adminInventory').classList.toggle('hidden', tab !== 'inventory');
+      $('adminWarehouses').classList.toggle('hidden', tab !== 'warehouses');
       $('adminMismatches').classList.toggle('hidden', tab !== 'mismatches');
-      $('adminTransfer').classList.toggle('hidden', tab !== 'transfer');
       $('adminChests').classList.toggle('hidden', tab !== 'chests');
       $('adminTransactions').classList.toggle('hidden', tab !== 'transactions');
       $('adminAliases').classList.toggle('hidden', tab !== 'aliases');
+      $('adminQuotas').classList.toggle('hidden', tab !== 'quotas');
       loadAdminCurrent().catch(error => toast(error.message));
     }
 
     function setView(view) {
       if (view === 'admin' && !state.user?.isAdmin) return toast('只有管理员可以打开管理界面。');
+      if (view === 'warehouseAdmin' && !state.user?.isWarehouseAdmin) return toast('你不是任何组织仓库的仓库管理员。');
       state.view = view;
       document.querySelectorAll('.navbtn').forEach(btn => btn.classList.toggle('active', btn.dataset.view === view));
       $('inventoryView').classList.toggle('hidden', view !== 'inventory');
+      $('inventoryHero').classList.toggle('hidden', view !== 'inventory');
       $('transactionsView').classList.toggle('hidden', view !== 'transactions');
+      $('myView').classList.toggle('hidden', view !== 'my');
+      $('warehouseAdminView').classList.toggle('hidden', view !== 'warehouseAdmin');
       $('helpView').classList.toggle('hidden', view !== 'help');
       $('adminView').classList.toggle('hidden', view !== 'admin');
       if (view === 'transactions') loadTransactions().catch(error => toast(error.message));
+      if (view === 'my') loadMyCurrent().catch(error => toast(error.message));
+      if (view === 'warehouseAdmin') loadWarehouseAdminOrganizations().catch(error => toast(error.message));
       if (view === 'admin') loadAdminCurrent().catch(error => toast(error.message));
     }
 
@@ -3101,23 +4209,36 @@ const HTML = `<!doctype html>
     window.addEventListener('touchstart', hideTip, { passive: true });
     $('litematicPick').addEventListener('click', () => $('litematicFile').click());
     $('litematicFile').addEventListener('change', uploadLitematic);
-    $('refreshTx').addEventListener('click', event => {
-      runButtonTask(event.currentTarget, '刷新中...', '记录已刷新', () => loadTransactions()).catch(error => toast(error.message));
+    $('txLoad').addEventListener('click', () => { state.txPage = 1; loadTransactions().catch(error => toast(error.message)); });
+    $('txRefresh').addEventListener('click', event => {
+      runButtonTask(event.currentTarget, '刷新中...', '交易记录已刷新', () => loadTransactions()).catch(error => toast(error.message));
     });
+    $('txOwner').addEventListener('change', () => { state.txPage = 1; loadTransactions().catch(error => toast(error.message)); });
+    $('txPrev').addEventListener('click', () => { if (state.txPage > 1) state.txPage--; loadTransactions().catch(error => toast(error.message)); });
+    $('txNext').addEventListener('click', () => { if (state.txPage < state.txTotalPages) state.txPage++; loadTransactions().catch(error => toast(error.message)); });
     $('adminRefresh').addEventListener('click', event => {
       runButtonTask(event.currentTarget, '刷新中...', '管理数据已刷新', () => loadAdminCurrent()).catch(error => toast(error.message));
     });
-    $('adminInvLoad').addEventListener('click', () => loadAdminInventory().catch(error => toast(error.message)));
+    $('adminInvLoad').addEventListener('click', () => loadAdminInventory({ owner: $('adminInvOwner').value }).catch(error => toast(error.message)));
+    $('adminInvOwner').addEventListener('change', event => loadAdminInventory({ owner: event.currentTarget.value }).catch(error => toast(error.message)));
     $('adminMmLoad').addEventListener('click', () => loadAdminMismatches().catch(error => toast(error.message)));
     $('adminTransferRun').addEventListener('click', () => runAdminTransfer().catch(error => toast(error.message)));
-    $('inventoryTransferRun').addEventListener('click', () => runInventoryAdminTransfer().catch(error => toast(error.message)));
-    $('adminChestLoad').addEventListener('click', () => loadAdminChests().catch(error => toast(error.message)));
-    $('adminTxLoad').addEventListener('click', () => loadAdminTransactions().catch(error => toast(error.message)));
+    $('adminAliasMode').addEventListener('click', () => setAdminAliasMode(!state.adminAliasMode));
+    $('globalAliasSave').addEventListener('click', () => saveGlobalAliasFromModal().catch(error => toast(error.message)));
+    $('globalAliasInput').addEventListener('keydown', event => { if (event.key === 'Enter') saveGlobalAliasFromModal().catch(error => toast(error.message)); });
+    $('adminPersonalWarehouseCreate').addEventListener('click', () => createAdminPersonalWarehouse().catch(error => toast(error.message)));
+    $('adminOrganizationWarehouseCreate').addEventListener('click', () => createAdminOrganizationWarehouse().catch(error => toast(error.message)));
+    $('adminTxLoad').addEventListener('click', () => { state.adminTxPage = 1; loadAdminTransactions().catch(error => toast(error.message)); });
+    $('adminTxPrev').addEventListener('click', () => { if (state.adminTxPage > 1) state.adminTxPage--; loadAdminTransactions().catch(error => toast(error.message)); });
+    $('adminTxNext').addEventListener('click', () => { if (state.adminTxPage < state.adminTxTotalPages) state.adminTxPage++; loadAdminTransactions().catch(error => toast(error.message)); });
     $('adminAliasLoad').addEventListener('click', () => loadAdminAliases().catch(error => toast(error.message)));
+    $('adminQuotaLoad').addEventListener('click', () => loadAdminQuotas().catch(error => toast(error.message)));
+    $('myRefresh').addEventListener('click', () => loadMyCurrent().catch(error => toast(error.message)));
+    $('warehouseAdminRefresh').addEventListener('click', () => loadWarehouseAdminOrganizations().catch(error => toast(error.message)));
+    $('myAliasLoad').addEventListener('click', () => loadMyAliases().catch(error => toast(error.message)));
     $('nbtClose').addEventListener('click', closeNbtModal);
     $('nbtCopy').addEventListener('click', () => copyNbtModal().catch(error => toast(error.message)));
     $('aliasSave').addEventListener('click', () => savePersonalAlias().catch(error => toast(error.message)));
-    $('aliasClear').addEventListener('click', () => savePersonalAlias('').catch(error => toast(error.message)));
     $('aliasInput').addEventListener('keydown', event => {
       if (event.key === 'Enter') savePersonalAlias().catch(error => toast(error.message));
     });
@@ -3128,6 +4249,7 @@ const HTML = `<!doctype html>
       if (event.key === 'Escape') closeNbtModal();
     });
     document.querySelectorAll('[data-admin-tab]').forEach(btn => btn.addEventListener('click', () => setAdminTab(btn.dataset.adminTab)));
+    document.querySelectorAll('[data-my-tab]').forEach(btn => btn.addEventListener('click', () => setMyTab(btn.dataset.myTab)));
     $('loginCodeTab').addEventListener('click', () => setLoginMode('code'));
     $('loginTokenTab').addEventListener('click', () => setLoginMode('token'));
     $('loginCodeStart').addEventListener('click', startLoginChallenge);
@@ -3175,56 +4297,223 @@ const HTML = `<!doctype html>
         return;
       }
       if (!event.target.closest('.target-player-box')) hideOnlinePlayers();
-      const setBtn = event.target.closest('[data-admin-set]');
-      const transferBtn = event.target.closest('[data-admin-transfer]');
+      const adminCard = event.target.closest('#adminInvGrid [data-admin-card]');
+      const adminPickRemove = event.target.closest('[data-admin-pick-remove]');
+      const adminPickClear = event.target.closest('[data-admin-pick-clear]');
       const mmDeduct = event.target.closest('[data-admin-mm-deduct]');
-      const chestBtn = event.target.closest('[data-admin-chest]');
-      const nbtBtn = event.target.closest('[data-admin-nbt]');
+      const mmResolve = event.target.closest('[data-admin-mm-resolve]');
       const aliasSave = event.target.closest('[data-admin-alias-save]');
+      const aliasDetailSave = event.target.closest('[data-admin-alias-detail-save]');
       const aliasDelete = event.target.closest('[data-admin-alias-delete]');
+      const adminAliasCard = event.target.closest('[data-admin-alias-card]');
+      const quotaSave = event.target.closest('[data-quota-save]');
+      const personalAliasDelete = event.target.closest('[data-personal-alias-delete]');
+      const myAliasAdd = event.target.closest('[data-my-alias-add]');
+      const myPersonalAliasCard = event.target.closest('[data-my-personal-alias-card]');
+      const myGlobalAliasCard = event.target.closest('[data-my-global-alias-card]');
+      const globalAliasToggle = event.target.closest('[data-global-alias-toggle]');
+      const orgRename = event.target.closest('[data-org-rename]');
+      const orgMemberAdd = event.target.closest('[data-org-member-add]');
+      const orgMemberRemove = event.target.closest('[data-org-member-remove]');
+      const adminOrgView = event.target.closest('[data-admin-org-view]');
+      const adminOrgMemberAdd = event.target.closest('[data-admin-org-member-add]');
+      const adminOrgMemberRemove = event.target.closest('[data-admin-org-member-remove]');
+      const adminPersonalDelete = event.target.closest('[data-admin-personal-delete]');
+      const adminOrgDelete = event.target.closest('[data-admin-org-delete]');
       try {
-        if (setBtn) {
-          const row = setBtn.closest('tr');
-          const amount = row.querySelector('[data-admin-amount]').value;
-          const data = await post('/api/admin/adjust', { ownerUuid: row.dataset.owner, itemKey: row.dataset.item, action: 'set', amount });
+        if (adminPickRemove) {
+          state.adminSelected.delete(adminPickRemove.closest('[data-admin-pick]').dataset.adminPick);
+          renderAdminTransferSelection();
+          loadAdminInventorySelectionState();
+        } else if (adminPickClear) {
+          state.adminSelected.clear();
+          renderAdminTransferSelection();
+          loadAdminInventorySelectionState();
+        } else if (personalAliasDelete) {
+          const alias = personalAliasDelete.dataset.personalAliasDelete;
+          const data = await post('/api/item-alias/delete', { alias });
           toast(data.message);
-          await loadAdminInventory();
-        } else if (transferBtn) {
-          const row = transferBtn.closest('tr');
-          const toOwnerUuid = row.querySelector('[data-admin-target]').value;
-          const amount = row.querySelector('[data-admin-transfer-amount]').value;
-          const data = await post('/api/admin/transfer', { fromOwnerUuid: row.dataset.owner, toOwnerUuid, itemKey: row.dataset.item, amount });
+          if (state.aliasItem) {
+            state.aliasItem.personalAliases = (state.aliasItem.personalAliases || []).filter(name => name.toLowerCase() !== alias.toLowerCase());
+            applyAliasToLocalItem(state.aliasItem.itemKey, state.aliasItem.personalAliases);
+            openAliasModal(state.items.find(item => item.itemKey === state.aliasItem.itemKey) || state.aliasItem);
+          }
+          state.inventoryCache.clear();
+          if (state.owner) await loadInventory({ force: true });
+          if (state.view === 'my' && state.myTab === 'aliases') await loadMyAliases();
+        } else if (myAliasAdd) {
+          const row = myAliasAdd.closest('[data-item]');
+          const alias = row.querySelector('[data-my-alias-input]').value;
+          const data = await post('/api/item-alias/save', { itemKey: row.dataset.item, displayName: alias });
           toast(data.message);
-          state.adminOwnersLoaded = false;
-          await loadAdminInventory();
+          state.inventoryCache.clear();
+          if (state.owner) await loadInventory({ force: true });
+          await loadMyAliases();
+        } else if (myPersonalAliasCard) {
+          const row = state.myPersonalAliasRows?.get(myPersonalAliasCard.dataset.myPersonalAliasCard);
+          if (row) renderMyPersonalAliasDetail(row);
+        } else if (myGlobalAliasCard) {
+          const row = state.myGlobalAliasRows?.get(myGlobalAliasCard.dataset.myGlobalAliasCard);
+          if (row) renderMyGlobalAliasDetail(row);
+        } else if (globalAliasToggle) {
+          const enabled = globalAliasToggle.dataset.enabled !== '1';
+          const data = await post('/api/my/global-alias/toggle', { alias: globalAliasToggle.dataset.globalAliasToggle, enabled });
+          toast(data.message);
+          state.inventoryCache.clear();
+          if (state.owner) await loadInventory({ force: true });
+          await loadMyAliases();
+        } else if (adminOrgView) {
+          await loadAdminOrganizationDetail(adminOrgView.dataset.adminOrgView);
+        } else if (adminOrgMemberAdd) {
+          const card = adminOrgMemberAdd.closest('[data-admin-org-detail]');
+          const data = await post('/api/admin/organization-warehouse/member/add', {
+            warehouse: card.dataset.adminOrgDetail,
+            username: card.querySelector('[data-admin-org-add-name]').value,
+            role: card.querySelector('[data-admin-org-add-role]').value
+          });
+          toast(data.message); await loadAdminWarehouseProvisioning();
+        } else if (adminOrgMemberRemove) {
+          const card = adminOrgMemberRemove.closest('[data-admin-org-detail]');
+          const member = adminOrgMemberRemove.closest('[data-admin-org-member]');
+          if (!confirm('确认从这个组织仓库删除该成员吗？系统管理员可以删除包括首位管理员在内的任意成员。')) return;
+          const data = await post('/api/admin/organization-warehouse/member/remove', { warehouse: card.dataset.adminOrgDetail, playerUuid: member.dataset.adminOrgMember });
+          toast(data.message); await loadAdminWarehouseProvisioning();
+        } else if (adminPersonalDelete) {
+          const ownerUuid = adminPersonalDelete.dataset.adminPersonalDelete;
+          const ownerName = adminPersonalDelete.dataset.ownerName;
+          if (!confirm('确认删除 ' + ownerName + ' 的个人仓库吗？该仓库全部库存会转入 momo，此操作不可撤销。')) return;
+          const data = await post('/api/admin/personal-warehouse/delete', { ownerUuid, confirmOwnerUuid: ownerUuid });
+          toast(data.message); state.adminOwners = []; state.owners = []; state.inventoryCache.clear();
+          const me = await api('/api/me'); state.owners = me.owners || []; state.defaultOwnerUuid = me.defaultOwnerUuid; renderOwners();
+          await loadAdminWarehouseProvisioning();
+        } else if (adminOrgDelete) {
+          const card = adminOrgDelete.closest('[data-admin-org-detail]');
+          const warehouse = card.dataset.adminOrgDetail;
+          const confirmation = prompt('删除组织仓库会把全部库存转入 momo。请输入仓库名 “' + warehouse + '” 确认删除：');
+          if (confirmation === null) return;
+          const data = await post('/api/admin/organization-warehouse/delete', { warehouse, confirmName: confirmation });
+          toast(data.message); state.adminOrganizationName = ''; state.adminOwners = []; state.owners = []; state.inventoryCache.clear();
+          const me = await api('/api/me'); state.owners = me.owners || []; state.defaultOwnerUuid = me.defaultOwnerUuid; renderOwners();
+          await loadAdminWarehouseProvisioning();
+        } else if (orgRename) {
+          const card = orgRename.closest('[data-warehouse]');
+          const data = await post('/api/warehouse-admin/rename', { warehouse: card.dataset.warehouse, newName: card.querySelector('[data-org-new-name]').value });
+          toast(data.message);
+          state.owners = [];
+          state.inventoryCache.clear();
+          const me = await api('/api/me'); state.owners = me.owners || []; state.defaultOwnerUuid = me.defaultOwnerUuid; renderOwners();
+          await loadWarehouseAdminOrganizations();
+        } else if (orgMemberAdd) {
+          const card = orgMemberAdd.closest('[data-warehouse]');
+          const data = await post('/api/warehouse-admin/member/add', { warehouse: card.dataset.warehouse, username: card.querySelector('[data-org-add-name]').value });
+          toast(data.message); await loadWarehouseAdminOrganizations();
+        } else if (orgMemberRemove) {
+          const card = orgMemberRemove.closest('[data-warehouse]');
+          const member = orgMemberRemove.closest('[data-member]');
+          if (!confirm('确认删除这个仓库成员吗？')) return;
+          const data = await post('/api/warehouse-admin/member/remove', { warehouse: card.dataset.warehouse, playerUuid: member.dataset.member });
+          toast(data.message); await loadWarehouseAdminOrganizations();
         } else if (mmDeduct) {
-          const row = mmDeduct.closest('tr');
-          const ok = confirm('确认扣除 ' + (row?.dataset.mmOwner || '') + ' 的 ' + (row?.dataset.mmItem || '') + ' x' + (row?.dataset.mmAmount || '') + ' 吗？');
+          const ok = confirm('确认清除这条缺失物品对应的账本库存吗？');
           if (!ok) return;
           const data = await post('/api/admin/mismatch/deduct', { id: mmDeduct.dataset.adminMmDeduct });
           toast(data.message);
           await loadAdminMismatches();
-        } else if (chestBtn) {
-          await loadAdminChestDetail(chestBtn.dataset.adminChest);
-        } else if (nbtBtn) {
-          const row = nbtBtn.closest('tr');
-          const data = state.adminInventoryRows.get(row.dataset.adminRow);
-          if (!data) throw new Error('找不到这一行的物品详情，请刷新后再试。');
-          openNbtModal(data);
-        } else if (aliasSave) {
-          const row = aliasSave.closest('tr');
-          const displayName = row.querySelector('[data-admin-alias]').value;
-          const data = await post('/api/admin/alias/save', { itemKey: row.dataset.item, displayName });
+        } else if (mmResolve) {
+          const card = mmResolve.closest('[data-admin-card]');
+          const targetOwnerUuid = card.querySelector('[data-mm-target]').value;
+          if (!targetOwnerUuid) throw new Error('请选择多余物品要转入的目标仓库。');
+          const data = await post('/api/admin/mismatch/resolve', { id: mmResolve.dataset.adminMmResolve, targetOwnerUuid });
           toast(data.message);
-          await loadAdminInventory();
-          if (state.adminTab === 'aliases') await loadAdminAliases();
-        } else if (aliasDelete) {
-          const data = await post('/api/admin/alias/delete', { shortCode: aliasDelete.dataset.adminAliasDelete });
+          await loadAdminMismatches();
+        } else if (aliasDetailSave) {
+          if (!state.adminAliasItem) throw new Error('请先选择物品。');
+          const input = $('adminAliasDetailInput');
+          const data = await post('/api/admin/alias/save', { itemKey: state.adminAliasItem.itemKey, alias: input.value, updateDisplayName: $('adminAliasDetailUseDisplayName').checked });
           toast(data.message);
           await loadAdminAliases();
+        } else if (aliasSave) {
+          const row = aliasSave.closest('.alias-row');
+          const input = row.querySelector('[data-admin-alias-input]');
+          const data = await post('/api/admin/alias/save', { itemKey: row.dataset.item, alias: input.value });
+          toast(data.message);
+          await loadAdminAliases();
+        } else if (aliasDelete) {
+          const deletedAlias = aliasDelete.dataset.adminAliasDelete;
+          const data = await post('/api/admin/alias/delete', { alias: deletedAlias });
+          toast(data.message);
+          if (state.adminGlobalAliasItem) {
+            state.adminGlobalAliasItem.globalAliases = (state.adminGlobalAliasItem.globalAliases || []).filter(alias => alias.toLowerCase() !== deletedAlias.toLowerCase());
+            openGlobalAliasModal(state.adminGlobalAliasItem);
+            await loadAdminInventory();
+          } else {
+            await loadAdminAliases();
+          }
+        } else if (adminAliasCard) {
+          const row = state.adminAliasRows?.get(adminAliasCard.dataset.adminAliasCard);
+          if (row) renderAdminAliasDetail(row);
+        } else if (quotaSave) {
+          const row = quotaSave.closest('tr');
+          const data = await post('/api/admin/quota/save', { ownerUuid: row.dataset.owner, quotaSlots: row.querySelector('[data-quota-value]').value });
+          toast(data.message);
+          await loadAdminQuotas();
+        } else if (adminCard) {
+          const key = adminCard.dataset.adminCard;
+          const row = state.adminInventoryRows.get(key);
+          if (!row) return;
+          if (state.adminAliasMode) {
+            openGlobalAliasModal(row);
+            return;
+          }
+          if (state.adminSelected.has(key)) {
+            state.adminSelected.delete(key);
+          } else {
+            state.adminSelected.set(key, { ...row, selectionKey: key, selectedAmount: Math.max(1, Math.min(Number(row.amount || 1), 64)) });
+          }
+          adminCard.classList.toggle('selected', state.adminSelected.has(key));
+          renderAdminTransferSelection();
         }
       } catch (error) {
         toast(error.message);
+      }
+    });
+
+    document.addEventListener('change', async event => {
+      const adminAmount = event.target.closest('[data-admin-pick-amount]');
+      if (adminAmount) {
+        const key = adminAmount.closest('[data-admin-pick]').dataset.adminPick;
+        const row = state.adminSelected.get(key);
+        if (row) {
+          row.selectedAmount = Math.max(1, Math.min(Number(row.amount || 1), Number.parseInt(adminAmount.value, 10) || 1));
+          adminAmount.value = row.selectedAmount;
+        }
+        return;
+      }
+      const adminRoleSelect = event.target.closest('[data-admin-org-role]');
+      if (adminRoleSelect) {
+        try {
+          const card = adminRoleSelect.closest('[data-admin-org-detail]');
+          const member = adminRoleSelect.closest('[data-admin-org-member]');
+          const data = await post('/api/admin/organization-warehouse/member/role', { warehouse: card.dataset.adminOrgDetail, playerUuid: member.dataset.adminOrgMember, role: adminRoleSelect.value });
+          toast(data.message);
+          await loadAdminOrganizationDetail(card.dataset.adminOrgDetail);
+        } catch (error) {
+          toast(error.message);
+          if (state.adminOrganizationName) await loadAdminOrganizationDetail(state.adminOrganizationName).catch(() => {});
+        }
+        return;
+      }
+      const roleSelect = event.target.closest('[data-member-role]');
+      if (!roleSelect) return;
+      try {
+        const card = roleSelect.closest('[data-warehouse]');
+        const member = roleSelect.closest('[data-member]');
+        const data = await post('/api/warehouse-admin/member/role', { warehouse: card.dataset.warehouse, playerUuid: member.dataset.member, role: roleSelect.value });
+        toast(data.message);
+        await loadWarehouseAdminOrganizations();
+      } catch (error) {
+        toast(error.message);
+        await loadWarehouseAdminOrganizations().catch(() => {});
       }
     });
 

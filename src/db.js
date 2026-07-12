@@ -84,6 +84,14 @@ class StoreDb {
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
 
+      CREATE TABLE IF NOT EXISTS personal_warehouses (
+        owner_uuid TEXT PRIMARY KEY,
+        username TEXT NOT NULL,
+        created_by_uuid TEXT NOT NULL DEFAULT '',
+        created_by_username TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+
       CREATE TABLE IF NOT EXISTS custom_warehouses (
         name_lower TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -111,6 +119,15 @@ class StoreDb {
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
 
+      CREATE TABLE IF NOT EXISTS global_item_aliases (
+        alias_lower TEXT PRIMARY KEY,
+        alias TEXT NOT NULL,
+        item_key TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (item_key) REFERENCES items(item_key) ON DELETE CASCADE
+      );
+
       CREATE TABLE IF NOT EXISTS player_item_name_overrides (
         player_uuid TEXT NOT NULL,
         item_key TEXT NOT NULL,
@@ -120,6 +137,34 @@ class StoreDb {
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (player_uuid, item_key),
         FOREIGN KEY (item_key) REFERENCES items(item_key) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS player_item_aliases (
+        player_uuid TEXT NOT NULL,
+        alias_lower TEXT NOT NULL,
+        alias TEXT NOT NULL,
+        item_key TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (player_uuid, alias_lower),
+        FOREIGN KEY (item_key) REFERENCES items(item_key) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS player_item_display_names (
+        player_uuid TEXT NOT NULL,
+        item_key TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (player_uuid, item_key),
+        FOREIGN KEY (item_key) REFERENCES items(item_key) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS player_disabled_global_aliases (
+        player_uuid TEXT NOT NULL,
+        alias_lower TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (player_uuid, alias_lower),
+        FOREIGN KEY (alias_lower) REFERENCES global_item_aliases(alias_lower) ON DELETE CASCADE
       );
 
       CREATE TABLE IF NOT EXISTS item_key_aliases (
@@ -195,7 +240,10 @@ class StoreDb {
       CREATE INDEX IF NOT EXISTS idx_chest_slots_item_key ON chest_slots(item_key);
       CREATE INDEX IF NOT EXISTS idx_custom_warehouse_members_player ON custom_warehouse_members(player_uuid);
       CREATE INDEX IF NOT EXISTS idx_item_key_aliases_item_key ON item_key_aliases(item_key);
+      CREATE INDEX IF NOT EXISTS idx_global_item_aliases_item_key ON global_item_aliases(item_key);
       CREATE INDEX IF NOT EXISTS idx_player_item_name_overrides_item ON player_item_name_overrides(item_key);
+      CREATE INDEX IF NOT EXISTS idx_player_item_aliases_item ON player_item_aliases(player_uuid, item_key);
+      CREATE INDEX IF NOT EXISTS idx_player_item_display_names_item ON player_item_display_names(item_key);
       CREATE INDEX IF NOT EXISTS idx_shulker_contents_contained_key ON shulker_contents(contained_item_key);
       CREATE INDEX IF NOT EXISTS idx_shulker_contents_contained_id ON shulker_contents(contained_item_id);
       CREATE INDEX IF NOT EXISTS idx_web_login_tokens_hash ON web_login_tokens(token_hash);
@@ -207,6 +255,8 @@ class StoreDb {
     this.ensureColumn('active_recovery_tasks', 'items_json', "TEXT NOT NULL DEFAULT '[]'")
     this.ensureColumn('players', 'default_owner_uuid', "TEXT NOT NULL DEFAULT ''")
     this.migrateManualItemNamesToOverrides()
+    this.migratePlayerItemNameOverridesToAliases()
+    this.migrateExistingPersonalWarehouses()
 
     for (const username of this.config.admins || []) {
       this.addAdmin(username)
@@ -291,6 +341,8 @@ class StoreDb {
           updated_at = CURRENT_TIMESTAMP
       `)
       const deletePlayerOverrides = this.db.prepare('DELETE FROM player_item_name_overrides WHERE item_key = ?')
+      const movePlayerAliases = this.db.prepare('UPDATE player_item_aliases SET item_key = ?, updated_at = CURRENT_TIMESTAMP WHERE item_key = ?')
+      const movePlayerDisplayNames = this.db.prepare('UPDATE player_item_display_names SET item_key = ?, updated_at = CURRENT_TIMESTAMP WHERE item_key = ?')
       const oldItemKeyAliases = this.db.prepare(`
         SELECT short_code AS shortCode, reason
         FROM item_key_aliases
@@ -301,6 +353,7 @@ class StoreDb {
         VALUES (?, ?, ?)
       `)
       const deleteItemKeyAliases = this.db.prepare('DELETE FROM item_key_aliases WHERE item_key = ?')
+      const moveGlobalAliases = this.db.prepare('UPDATE global_item_aliases SET item_key = ?, updated_at = CURRENT_TIMESTAMP WHERE item_key = ?')
       const deleteOldItem = this.db.prepare('DELETE FROM items WHERE item_key = ?')
       const manualOverrideStmt = this.db.prepare(`
         UPDATE item_name_overrides
@@ -323,11 +376,14 @@ class StoreDb {
           insertPlayerOverride.run(override.playerUuid, move.canonical.itemKey, move.canonical.itemId, override.displayName)
         }
         deletePlayerOverrides.run(move.old.itemKey)
+        movePlayerAliases.run(move.canonical.itemKey, move.old.itemKey)
+        movePlayerDisplayNames.run(move.canonical.itemKey, move.old.itemKey)
         const aliases = oldItemKeyAliases.all(move.old.itemKey)
         deleteItemKeyAliases.run(move.old.itemKey)
         for (const alias of aliases) {
           insertItemKeyAlias.run(alias.shortCode, move.canonical.itemKey, alias.reason || 'canonicalized_item_key')
         }
+        moveGlobalAliases.run(move.canonical.itemKey, move.old.itemKey)
 
         const oldCode = this.shortCodeForItemKey(move.old.itemKey)
         const newCode = this.shortCodeForItemKey(move.canonical.itemKey)
@@ -429,7 +485,11 @@ class StoreDb {
         WHERE uuid LIKE 'name:%'
           AND uuid NOT IN (SELECT owner_uuid FROM balances)
           AND uuid NOT IN (SELECT owner_uuid FROM web_login_tokens)
+          AND uuid NOT IN (SELECT owner_uuid FROM personal_warehouses)
           AND uuid NOT IN (SELECT player_uuid FROM player_item_name_overrides)
+          AND uuid NOT IN (SELECT player_uuid FROM player_item_aliases)
+          AND uuid NOT IN (SELECT player_uuid FROM player_item_display_names)
+          AND uuid NOT IN (SELECT player_uuid FROM player_disabled_global_aliases)
           AND uuid NOT IN (SELECT player_uuid FROM custom_warehouse_members)
           AND uuid NOT IN (SELECT owner_uuid FROM player_quotas)
           AND uuid NOT IN (SELECT COALESCE(uuid, '') FROM admin_users)
@@ -469,6 +529,121 @@ class StoreDb {
       return [row.shortCode, row.itemKey, row.itemId, row.displayName, row.nbtJson, row.metaJson]
         .some(value => String(value || '').toLowerCase().includes(text))
     })
+  }
+
+  listGlobalItemAliases (query = '') {
+    const rows = this.db.prepare(`
+      SELECT a.alias, a.item_key AS itemKey, a.created_at AS createdAt, a.updated_at AS updatedAt,
+             i.item_id AS itemId, i.display_name AS displayName,
+             i.nbt_json AS nbtJson, i.meta_json AS metaJson
+      FROM global_item_aliases a
+      JOIN items i ON i.item_key = a.item_key
+      ORDER BY i.display_name COLLATE NOCASE ASC, a.alias COLLATE NOCASE ASC
+    `).all()
+    const text = String(query || '').trim().toLowerCase()
+    return rows.filter(row => !text || [
+      row.alias, row.itemKey, row.itemId, row.displayName,
+      this.shortCodeForItemKey(row.itemKey), row.nbtJson, row.metaJson
+    ].some(value => String(value || '').toLowerCase().includes(text)))
+  }
+
+  getGlobalAliasesForItems (itemKeys = [], playerUuid = '') {
+    const keys = [...new Set((itemKeys || []).filter(Boolean))]
+    const result = new Map()
+    if (!keys.length) return result
+    const placeholders = keys.map(() => '?').join(',')
+    const rows = this.db.prepare(`
+      SELECT a.item_key AS itemKey, a.alias
+      FROM global_item_aliases a
+      WHERE a.item_key IN (${placeholders})
+        AND (? = '' OR NOT EXISTS (
+          SELECT 1 FROM player_disabled_global_aliases d
+          WHERE d.player_uuid = ? AND d.alias_lower = a.alias_lower
+        ))
+      ORDER BY alias COLLATE NOCASE ASC
+    `).all(...keys, playerUuid, playerUuid)
+    for (const row of rows) {
+      if (!result.has(row.itemKey)) result.set(row.itemKey, [])
+      result.get(row.itemKey).push(row.alias)
+    }
+    return result
+  }
+
+  findItemByGlobalAlias (alias, playerUuid = '') {
+    const text = String(alias || '').trim().toLowerCase()
+    if (!text) return null
+    return this.db.prepare(`
+      SELECT i.item_key AS itemKey, i.item_id AS itemId, i.display_name AS displayName,
+             i.nbt_json AS nbtJson, i.meta_json AS metaJson
+      FROM global_item_aliases a
+      JOIN items i ON i.item_key = a.item_key
+      WHERE a.alias_lower = ?
+        AND (? = '' OR NOT EXISTS (
+          SELECT 1 FROM player_disabled_global_aliases d
+          WHERE d.player_uuid = ? AND d.alias_lower = a.alias_lower
+        ))
+      LIMIT 1
+    `).get(text, playerUuid, playerUuid) || null
+  }
+
+  saveGlobalItemAlias (itemKey, alias) {
+    const item = this.getItemByKey(itemKey)
+    if (!item) throw new Error(`找不到物品：${itemKey}`)
+    const nextAlias = String(alias || '').trim()
+    if (!nextAlias) throw new Error('全局别名不能为空。')
+    if ([...nextAlias].length > 40) throw new Error('全局别名不能超过 40 个字。')
+    const aliasLower = nextAlias.toLowerCase()
+    const existing = this.db.prepare(`
+      SELECT item_key AS itemKey FROM global_item_aliases WHERE alias_lower = ?
+    `).get(aliasLower)
+    if (existing && existing.itemKey !== itemKey) throw new Error('这个全局别名已经被其他物品使用。')
+    this.db.prepare(`
+      INSERT INTO global_item_aliases (alias_lower, alias, item_key, updated_at)
+      VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(alias_lower) DO UPDATE SET
+        alias = excluded.alias,
+        item_key = excluded.item_key,
+        updated_at = CURRENT_TIMESTAMP
+    `).run(aliasLower, nextAlias, itemKey)
+    return { ...item, alias: nextAlias, shortCode: this.shortCodeForItemKey(itemKey) }
+  }
+
+  deleteGlobalItemAlias (alias) {
+    const text = String(alias || '').trim()
+    if (!text) throw new Error('缺少要删除的全局别名。')
+    const changed = this.db.prepare('DELETE FROM global_item_aliases WHERE alias_lower = ?').run(text.toLowerCase()).changes
+    return { changed, alias: text }
+  }
+
+  listGlobalItemAliasesForPlayer (playerUuid, query = '') {
+    const rows = this.listGlobalItemAliases(query)
+    const disabled = new Set(this.db.prepare(`
+      SELECT alias_lower AS aliasLower FROM player_disabled_global_aliases WHERE player_uuid = ?
+    `).all(playerUuid).map(row => row.aliasLower))
+    return rows.map(row => ({ ...row, enabled: !disabled.has(String(row.alias || '').toLowerCase()) }))
+  }
+
+  setGlobalItemAliasEnabled (playerUuid, alias, enabled) {
+    const player = String(playerUuid || '').trim()
+    const text = String(alias || '').trim()
+    const aliasLower = text.toLowerCase()
+    if (!player || !aliasLower) throw new Error('缺少玩家或全局别名。')
+    if (!this.db.prepare('SELECT 1 FROM global_item_aliases WHERE alias_lower = ?').get(aliasLower)) throw new Error('找不到这个全局别名。')
+    if (enabled) {
+      this.db.prepare('DELETE FROM player_disabled_global_aliases WHERE player_uuid = ? AND alias_lower = ?').run(player, aliasLower)
+    } else {
+      this.db.prepare(`INSERT OR IGNORE INTO player_disabled_global_aliases (player_uuid, alias_lower) VALUES (?, ?)`).run(player, aliasLower)
+    }
+    return { alias: text, enabled: Boolean(enabled) }
+  }
+
+  isGlobalItemAliasDisabled (playerUuid, alias) {
+    const text = String(alias || '').trim().toLowerCase()
+    if (!playerUuid || !text) return false
+    return Boolean(this.db.prepare(`
+      SELECT 1 FROM player_disabled_global_aliases
+      WHERE player_uuid = ? AND alias_lower = ? LIMIT 1
+    `).get(playerUuid, text))
   }
 
   saveItemNameOverride (itemKey, displayName) {
@@ -537,15 +712,55 @@ class StoreDb {
   }
 
   getPlayerItemNameOverrides (playerUuid, itemKeys = []) {
+    const aliases = this.getPlayerItemAliases(playerUuid, itemKeys)
+    return new Map([...aliases].map(([itemKey, names]) => [itemKey, names[0] || '']))
+  }
+
+  getPlayerItemAliases (playerUuid, itemKeys = []) {
     const uniqueKeys = [...new Set((itemKeys || []).filter(Boolean))]
     if (!playerUuid || !uniqueKeys.length) return new Map()
     const placeholders = uniqueKeys.map(() => '?').join(',')
     const rows = this.db.prepare(`
-      SELECT item_key AS itemKey, display_name AS displayName
-      FROM player_item_name_overrides
+      SELECT item_key AS itemKey, alias
+      FROM player_item_aliases
       WHERE player_uuid = ? AND item_key IN (${placeholders})
+      ORDER BY created_at ASC, alias COLLATE NOCASE ASC
     `).all(playerUuid, ...uniqueKeys)
+    const result = new Map()
+    for (const row of rows) {
+      if (!result.has(row.itemKey)) result.set(row.itemKey, [])
+      result.get(row.itemKey).push(row.alias)
+    }
+    return result
+  }
+
+  getPlayerItemDisplayNames (playerUuid, itemKeys = []) {
+    const keys = [...new Set((itemKeys || []).filter(Boolean))]
+    if (!playerUuid || !keys.length) return new Map()
+    const placeholders = keys.map(() => '?').join(',')
+    const rows = this.db.prepare(`
+      SELECT item_key AS itemKey, display_name AS displayName
+      FROM player_item_display_names
+      WHERE player_uuid = ? AND item_key IN (${placeholders})
+    `).all(playerUuid, ...keys)
     return new Map(rows.map(row => [row.itemKey, row.displayName]))
+  }
+
+  setPlayerItemDisplayName (playerUuid, itemKey, displayName) {
+    const player = String(playerUuid || '').trim()
+    const item = this.getItemByKey(itemKey)
+    if (!player || !item) throw new Error('找不到玩家或物品。')
+    const name = String(displayName || '').trim()
+    if (!name) {
+      this.db.prepare('DELETE FROM player_item_display_names WHERE player_uuid = ? AND item_key = ?').run(player, itemKey)
+      return ''
+    }
+    this.db.prepare(`
+      INSERT INTO player_item_display_names (player_uuid, item_key, display_name, updated_at)
+      VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(player_uuid, item_key) DO UPDATE SET display_name = excluded.display_name, updated_at = CURRENT_TIMESTAMP
+    `).run(player, itemKey, name)
+    return name
   }
 
   savePlayerItemNameOverride (playerUuid, itemKey, displayName) {
@@ -556,25 +771,72 @@ class StoreDb {
     const nextName = String(displayName || '').trim()
     const shortCode = this.shortCodeForItemKey(itemKey)
 
-    if (!nextName) {
-      const changed = this.db.prepare(`
-        DELETE FROM player_item_name_overrides
-        WHERE player_uuid = ? AND item_key = ?
-      `).run(player, itemKey).changes
-      return { ...item, displayName: item.displayName, personalAlias: '', shortCode, changed }
-    }
+    if (!nextName) throw new Error('个人别名不能为空。')
 
-    if ([...nextName].length > 80) throw new Error('别名不能超过 80 个字。')
+    if ([...nextName].length > 40) throw new Error('个人别名不能超过 40 个字。')
+    const aliasLower = nextName.toLowerCase()
+    const existing = this.db.prepare(`
+      SELECT item_key AS itemKey FROM player_item_aliases
+      WHERE player_uuid = ? AND alias_lower = ?
+    `).get(player, aliasLower)
+    if (existing && existing.itemKey !== itemKey) throw new Error('你已经把这个别名用于其他物品。')
     this.db.prepare(`
-      INSERT INTO player_item_name_overrides (player_uuid, item_key, item_id, display_name, updated_at)
+      INSERT INTO player_item_aliases (player_uuid, alias_lower, alias, item_key, updated_at)
       VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-      ON CONFLICT(player_uuid, item_key) DO UPDATE SET
-        item_id = excluded.item_id,
-        display_name = excluded.display_name,
+      ON CONFLICT(player_uuid, alias_lower) DO UPDATE SET
+        alias = excluded.alias,
+        item_key = excluded.item_key,
         updated_at = CURRENT_TIMESTAMP
-    `).run(player, item.itemKey, item.itemId, nextName)
+    `).run(player, aliasLower, nextName, item.itemKey)
 
-    return { ...item, displayName: nextName, personalAlias: nextName, shortCode, changed: 1 }
+    return { ...item, displayName: nextName, personalAlias: nextName, personalAliases: this.getPlayerItemAliases(player, [itemKey]).get(itemKey) || [], shortCode, changed: 1 }
+  }
+
+  deletePlayerItemAlias (playerUuid, alias) {
+    const player = String(playerUuid || '').trim()
+    const text = String(alias || '').trim()
+    if (!player || !text) throw new Error('缺少玩家或个人别名。')
+    const row = this.db.prepare(`SELECT item_key AS itemKey FROM player_item_aliases WHERE player_uuid = ? AND alias_lower = ?`).get(player, text.toLowerCase())
+    const changed = this.db.prepare(`
+      DELETE FROM player_item_aliases WHERE player_uuid = ? AND alias_lower = ?
+    `).run(player, text.toLowerCase()).changes
+    return { changed, alias: text, itemKey: row?.itemKey || '' }
+  }
+
+  listPlayerItemAliases (playerUuid, query = '') {
+    const rows = this.db.prepare(`
+      SELECT a.alias, a.item_key AS itemKey, a.created_at AS createdAt, a.updated_at AS updatedAt,
+             i.item_id AS itemId, i.display_name AS displayName, i.nbt_json AS nbtJson, i.meta_json AS metaJson
+      FROM player_item_aliases a JOIN items i ON i.item_key = a.item_key
+      WHERE a.player_uuid = ?
+      ORDER BY i.display_name COLLATE NOCASE ASC, a.created_at ASC
+    `).all(playerUuid)
+    const text = String(query || '').trim().toLowerCase()
+    return rows.filter(row => !text || [row.alias, row.itemKey, row.itemId, row.displayName, this.shortCodeForItemKey(row.itemKey)]
+      .some(value => String(value || '').toLowerCase().includes(text)))
+  }
+
+  findItemByPlayerAlias (playerUuid, alias) {
+    const text = String(alias || '').trim().toLowerCase()
+    if (!playerUuid || !text) return null
+    return this.db.prepare(`
+      SELECT i.item_key AS itemKey, i.item_id AS itemId, i.display_name AS displayName,
+             i.nbt_json AS nbtJson, i.meta_json AS metaJson
+      FROM player_item_aliases a JOIN items i ON i.item_key = a.item_key
+      WHERE a.player_uuid = ? AND a.alias_lower = ? LIMIT 1
+    `).get(playerUuid, text) || null
+  }
+
+  migratePlayerItemNameOverridesToAliases () {
+    this.transaction(() => {
+      this.db.prepare(`
+        INSERT OR IGNORE INTO player_item_aliases (player_uuid, alias_lower, alias, item_key, created_at, updated_at)
+        SELECT player_uuid, lower(display_name), display_name, item_key, created_at, updated_at
+        FROM player_item_name_overrides
+        WHERE trim(display_name) <> ''
+      `).run()
+      this.db.prepare('DELETE FROM player_item_name_overrides').run()
+    })
   }
 
   migrateManualItemNamesToOverrides () {
@@ -622,6 +884,7 @@ class StoreDb {
         SET uuid = COALESCE(uuid, ?)
         WHERE username_lower = ?
       `).run(cleanUuid, cleanUsername.toLowerCase())
+      this.db.prepare('UPDATE personal_warehouses SET username = ? WHERE owner_uuid = ?').run(cleanUsername, cleanUuid)
     })
   }
 
@@ -664,8 +927,11 @@ class StoreDb {
     for (const ghostUuid of ghostUuids) {
       if (!ghostUuid || ghostUuid === uuid || !ghostUuid.startsWith('name:')) continue
       this.migrateGhostPlayerDefaults(ghostUuid, uuid)
+      this.migrateGhostPersonalWarehouse(ghostUuid, uuid, username)
       this.migrateGhostCustomWarehouseMembers(ghostUuid, uuid, username)
+      this.db.prepare('UPDATE custom_warehouses SET creator_uuid = ?, creator_username = ? WHERE creator_uuid = ?').run(uuid, username, ghostUuid)
       this.migrateGhostPlayerItemAliases(ghostUuid, uuid)
+      this.migrateGhostPlayerAliases(ghostUuid, uuid)
       this.migrateGhostWebLoginToken(ghostUuid, uuid, username)
       this.migrateGhostPlayerQuota(ghostUuid, uuid)
       this.db.prepare('UPDATE web_sessions SET owner_uuid = ?, username = ? WHERE owner_uuid = ?').run(uuid, username, ghostUuid)
@@ -691,6 +957,16 @@ class StoreDb {
       END
       WHERE uuid = ?
     `).run(ghostDefault, uuid)
+  }
+
+  migrateGhostPersonalWarehouse (ghostUuid, uuid, username) {
+    const ghost = this.db.prepare('SELECT 1 FROM personal_warehouses WHERE owner_uuid = ?').get(ghostUuid)
+    if (!ghost) return
+    if (this.hasPersonalWarehouse(uuid)) {
+      this.db.prepare('DELETE FROM personal_warehouses WHERE owner_uuid = ?').run(ghostUuid)
+    } else {
+      this.db.prepare('UPDATE personal_warehouses SET owner_uuid = ?, username = ? WHERE owner_uuid = ?').run(uuid, username, ghostUuid)
+    }
   }
 
   migrateGhostCustomWarehouseMembers (ghostUuid, uuid, username) {
@@ -763,6 +1039,25 @@ class StoreDb {
     }
   }
 
+  migrateGhostPlayerAliases (ghostUuid, uuid) {
+    this.db.prepare(`
+      INSERT OR IGNORE INTO player_item_aliases (player_uuid, alias_lower, alias, item_key, created_at, updated_at)
+      SELECT ?, alias_lower, alias, item_key, created_at, updated_at
+      FROM player_item_aliases WHERE player_uuid = ?
+    `).run(uuid, ghostUuid)
+    this.db.prepare('DELETE FROM player_item_aliases WHERE player_uuid = ?').run(ghostUuid)
+    this.db.prepare(`
+      INSERT OR IGNORE INTO player_item_display_names (player_uuid, item_key, display_name, updated_at)
+      SELECT ?, item_key, display_name, updated_at FROM player_item_display_names WHERE player_uuid = ?
+    `).run(uuid, ghostUuid)
+    this.db.prepare('DELETE FROM player_item_display_names WHERE player_uuid = ?').run(ghostUuid)
+    this.db.prepare(`
+      INSERT OR IGNORE INTO player_disabled_global_aliases (player_uuid, alias_lower, created_at)
+      SELECT ?, alias_lower, created_at FROM player_disabled_global_aliases WHERE player_uuid = ?
+    `).run(uuid, ghostUuid)
+    this.db.prepare('DELETE FROM player_disabled_global_aliases WHERE player_uuid = ?').run(ghostUuid)
+  }
+
   migrateGhostWebLoginToken (ghostUuid, uuid, username) {
     const ghost = this.db.prepare(`
       SELECT 1
@@ -814,8 +1109,12 @@ class StoreDb {
         AND uuid LIKE 'name:%'
         AND uuid NOT IN (SELECT owner_uuid FROM balances)
         AND uuid NOT IN (SELECT owner_uuid FROM web_login_tokens)
+        AND uuid NOT IN (SELECT owner_uuid FROM personal_warehouses)
         AND uuid NOT IN (SELECT owner_uuid FROM web_sessions)
         AND uuid NOT IN (SELECT player_uuid FROM player_item_name_overrides)
+        AND uuid NOT IN (SELECT player_uuid FROM player_item_aliases)
+        AND uuid NOT IN (SELECT player_uuid FROM player_item_display_names)
+        AND uuid NOT IN (SELECT player_uuid FROM player_disabled_global_aliases)
         AND uuid NOT IN (SELECT player_uuid FROM custom_warehouse_members)
         AND uuid NOT IN (SELECT owner_uuid FROM player_quotas)
         AND uuid NOT IN (SELECT player_uuid FROM transactions)
@@ -874,6 +1173,53 @@ class StoreDb {
       ORDER BY last_seen_at DESC
       LIMIT 1
     `).get(username) || null
+  }
+
+  migrateExistingPersonalWarehouses () {
+    this.db.prepare(`
+      INSERT OR IGNORE INTO personal_warehouses (owner_uuid, username, created_by_username)
+      SELECT DISTINCT b.owner_uuid, COALESCE(p.username, b.owner_uuid), '历史库存迁移'
+      FROM balances b
+      LEFT JOIN players p ON p.uuid = b.owner_uuid
+      WHERE b.amount > 0
+        AND b.owner_uuid <> ?
+        AND b.owner_uuid NOT LIKE 'vault:%'
+    `).run(this.momoOwner)
+  }
+
+  hasPersonalWarehouse (ownerUuid) {
+    return Boolean(this.db.prepare('SELECT 1 FROM personal_warehouses WHERE owner_uuid = ? LIMIT 1').get(ownerUuid))
+  }
+
+  createPersonalWarehouse (ownerUuid, username, createdBy = {}) {
+    const uuid = String(ownerUuid || '').trim()
+    const name = String(username || '').trim()
+    if (!uuid || !name) throw new Error('缺少个人仓库所属玩家。')
+    const changed = this.db.prepare(`
+      INSERT OR IGNORE INTO personal_warehouses (
+        owner_uuid, username, created_by_uuid, created_by_username
+      ) VALUES (?, ?, ?, ?)
+    `).run(uuid, name, String(createdBy.uuid || ''), String(createdBy.username || '')).changes
+    return { changed, ownerUuid: uuid, username: name }
+  }
+
+  listPersonalWarehouses () {
+    return this.db.prepare(`
+      SELECT owner_uuid AS ownerUuid, username, created_by_uuid AS createdByUuid,
+             created_by_username AS createdByUsername, created_at AS createdAt
+      FROM personal_warehouses ORDER BY username COLLATE NOCASE ASC
+    `).all()
+  }
+
+  deletePersonalWarehouseToMomo (ownerUuid, adminUsername = '') {
+    const warehouse = this.db.prepare(`
+      SELECT owner_uuid AS ownerUuid, username
+      FROM personal_warehouses WHERE owner_uuid = ? LIMIT 1
+    `).get(ownerUuid)
+    if (!warehouse) throw new Error('找不到个人仓库。')
+    return this.deleteOwnerWarehouseToMomo(warehouse.ownerUuid, warehouse.username, 'personal', adminUsername, () => {
+      this.db.prepare('DELETE FROM personal_warehouses WHERE owner_uuid = ?').run(warehouse.ownerUuid)
+    })
   }
 
   getPlayerDefaultOwnerUuid (playerUuid) {
@@ -1017,6 +1363,13 @@ class StoreDb {
     `).run(this.normalizeWarehouseName(name), playerUuid).changes
   }
 
+  removeCustomWarehouseMemberAny (name, playerUuid) {
+    return this.db.prepare(`
+      DELETE FROM custom_warehouse_members
+      WHERE warehouse_name_lower = ? AND player_uuid = ?
+    `).run(this.normalizeWarehouseName(name), playerUuid).changes
+  }
+
   listCustomWarehouseMembers (name) {
     return this.db.prepare(`
       SELECT player_uuid AS playerUuid, username, role, added_at AS addedAt
@@ -1024,6 +1377,74 @@ class StoreDb {
       WHERE warehouse_name_lower = ?
       ORDER BY role = 'admin' DESC, username COLLATE NOCASE ASC
     `).all(this.normalizeWarehouseName(name))
+  }
+
+  deleteCustomWarehouseToMomo (name, adminUsername = '') {
+    const warehouse = this.getCustomWarehouse(name)
+    if (!warehouse) throw new Error(`找不到组织仓库：${name}`)
+    const ownerUuid = `vault:${warehouse.nameLower}`
+    return this.deleteOwnerWarehouseToMomo(ownerUuid, `仓库:${warehouse.name}`, 'custom', adminUsername, () => {
+      this.db.prepare('DELETE FROM custom_warehouses WHERE name_lower = ?').run(warehouse.nameLower)
+    })
+  }
+
+  deleteOwnerWarehouseToMomo (ownerUuid, ownerUsername, warehouseType, adminUsername, deleteWarehouse) {
+    if (!ownerUuid || ownerUuid === this.momoOwner) throw new Error('不能删除该仓库。')
+    const items = this.getOwnerBalances(ownerUuid)
+    const totalAmount = items.reduce((sum, item) => sum + Number(item.amount || 0), 0)
+    this.transaction(() => {
+      for (const item of items) this.adjustBalance(this.momoOwner, item.itemKey, Number(item.amount || 0))
+      this.db.prepare('DELETE FROM balances WHERE owner_uuid = ?').run(ownerUuid)
+      const message = `admin=${adminUsername}; deletedOwner=${ownerUuid}; warehouseType=${warehouseType}`
+      this.addTransaction('warehouse_delete_transfer_out', 'ok', ownerUuid, ownerUsername, items, `${message}; to=${this.momoOwner}`)
+      this.addTransaction('warehouse_delete_transfer_in', 'ok', this.momoOwner, 'momo', items, `${message}; from=${ownerUuid}`)
+      this.db.prepare('DELETE FROM player_quotas WHERE owner_uuid = ?').run(ownerUuid)
+      this.db.prepare("UPDATE players SET default_owner_uuid = '' WHERE default_owner_uuid = ?").run(ownerUuid)
+      this.db.prepare(`
+        UPDATE inventory_mismatches
+        SET status = 'resolved', resolved_at = CURRENT_TIMESTAMP,
+            note = CASE WHEN note = '' THEN ? ELSE note || '; ' || ? END
+        WHERE owner_uuid = ? AND status = 'open'
+      `).run(`仓库删除，库存已转入momo，操作人=${adminUsername}`, `仓库删除，库存已转入momo，操作人=${adminUsername}`, ownerUuid)
+      deleteWarehouse()
+    })
+    return { ownerUuid, ownerUsername, itemTypes: items.length, totalAmount, items }
+  }
+
+  renameCustomWarehouse (name, newName) {
+    const warehouse = this.getCustomWarehouse(name)
+    if (!warehouse) throw new Error(`找不到仓库：${name}`)
+    const nextName = String(newName || '').trim()
+    const nextLower = this.normalizeWarehouseName(nextName)
+    if (!nextLower) throw new Error('新仓库名不能为空。')
+    if (nextLower === warehouse.nameLower) {
+      const ownerUuid = `vault:${warehouse.nameLower}`
+      this.transaction(() => {
+        this.db.prepare('UPDATE custom_warehouses SET name = ? WHERE name_lower = ?').run(nextName, warehouse.nameLower)
+        this.db.prepare('UPDATE transactions SET username = ? WHERE player_uuid = ?').run(`仓库:${nextName}`, ownerUuid)
+        this.db.prepare('UPDATE inventory_mismatches SET username = ? WHERE owner_uuid = ?').run(`仓库:${nextName}`, ownerUuid)
+        this.db.prepare('UPDATE active_recovery_tasks SET owner_username = ?, vault_name = ? WHERE owner_uuid = ?').run(`仓库:${nextName}`, nextName, ownerUuid)
+      })
+      return { ...warehouse, name: nextName }
+    }
+    if (this.getCustomWarehouse(nextName)) throw new Error(`仓库名已存在：${nextName}`)
+    const oldOwner = `vault:${warehouse.nameLower}`
+    const newOwner = `vault:${nextLower}`
+    this.transaction(() => {
+      this.db.prepare(`
+        INSERT INTO custom_warehouses (name_lower, name, creator_uuid, creator_username, created_at)
+        SELECT ?, ?, creator_uuid, creator_username, created_at FROM custom_warehouses WHERE name_lower = ?
+      `).run(nextLower, nextName, warehouse.nameLower)
+      this.db.prepare('UPDATE custom_warehouse_members SET warehouse_name_lower = ? WHERE warehouse_name_lower = ?').run(nextLower, warehouse.nameLower)
+      this.db.prepare('UPDATE balances SET owner_uuid = ? WHERE owner_uuid = ?').run(newOwner, oldOwner)
+      this.db.prepare('UPDATE player_quotas SET owner_uuid = ? WHERE owner_uuid = ?').run(newOwner, oldOwner)
+      this.db.prepare('UPDATE transactions SET player_uuid = ?, username = ? WHERE player_uuid = ?').run(newOwner, `仓库:${nextName}`, oldOwner)
+      this.db.prepare('UPDATE inventory_mismatches SET owner_uuid = ?, username = ? WHERE owner_uuid = ?').run(newOwner, `仓库:${nextName}`, oldOwner)
+      this.db.prepare('UPDATE active_recovery_tasks SET owner_uuid = ?, owner_username = ?, vault_name = ? WHERE owner_uuid = ?').run(newOwner, `仓库:${nextName}`, nextName, oldOwner)
+      this.db.prepare('UPDATE players SET default_owner_uuid = ? WHERE default_owner_uuid = ?').run(newOwner, oldOwner)
+      this.db.prepare('DELETE FROM custom_warehouses WHERE name_lower = ?').run(warehouse.nameLower)
+    })
+    return this.getCustomWarehouse(nextName)
   }
 
   upsertItem (item, options = {}) {
@@ -1209,7 +1630,7 @@ class StoreDb {
 
   isPlayerOwnerAccessible (playerUuid, ownerUuid) {
     if (!ownerUuid) return false
-    if (ownerUuid === playerUuid) return true
+    if (ownerUuid === playerUuid) return this.hasPersonalWarehouse(playerUuid)
     if (ownerUuid.startsWith('vault:')) {
       return this.isCustomWarehouseMember(ownerUuid.slice(6), playerUuid)
     }
@@ -1218,52 +1639,30 @@ class StoreDb {
 
   getEffectiveDefaultOwnerUuid (playerUuid) {
     const configured = this.getPlayerDefaultOwnerUuid(playerUuid)
-    return this.isPlayerOwnerAccessible(playerUuid, configured) ? configured : playerUuid
+    if (this.isPlayerOwnerAccessible(playerUuid, configured)) return configured
+    if (this.hasPersonalWarehouse(playerUuid)) return playerUuid
+    const warehouse = this.db.prepare(`
+      SELECT 'vault:' || warehouse_name_lower AS ownerUuid
+      FROM custom_warehouse_members WHERE player_uuid = ?
+      ORDER BY added_at ASC LIMIT 1
+    `).get(playerUuid)
+    return warehouse?.ownerUuid || ''
   }
 
   listWebOwnersForUser (user) {
-    const isAdmin = this.isAdmin(user.username, user.uuid)
     const defaultOwnerUuid = this.getEffectiveDefaultOwnerUuid(user.uuid)
     const markDefault = owner => ({ ...owner, isDefault: owner.ownerUuid === defaultOwnerUuid })
     const owners = []
 
-    if (isAdmin) {
-      for (const row of this.db.prepare(`
-        SELECT p.uuid, p.username, COALESCE(SUM(b.amount), 0) AS totalAmount
-        FROM players p
-        JOIN balances b ON b.owner_uuid = p.uuid AND b.amount > 0
-        GROUP BY p.uuid
-        HAVING totalAmount > 0
-        ORDER BY p.username COLLATE NOCASE ASC
-      `).all()) {
-        owners.push(markDefault({ ownerUuid: row.uuid, label: row.username, type: 'personal', role: 'admin', totalAmount: row.totalAmount }))
-      }
-
-      const momoTotal = this.ownerTotalAmount(this.momoOwner)
-      if (momoTotal > 0) {
-        owners.push(markDefault({ ownerUuid: this.momoOwner, label: 'momo', type: 'system', role: 'admin', totalAmount: momoTotal }))
-      }
-
-      for (const row of this.db.prepare(`
-        SELECT w.name_lower AS nameLower, w.name, COALESCE(SUM(b.amount), 0) AS totalAmount
-        FROM custom_warehouses w
-        JOIN balances b ON b.owner_uuid = 'vault:' || w.name_lower AND b.amount > 0
-        GROUP BY w.name_lower
-        HAVING totalAmount > 0
-        ORDER BY w.name COLLATE NOCASE ASC
-      `).all()) {
-        owners.push(markDefault({ ownerUuid: `vault:${row.nameLower}`, label: `仓库:${row.name}`, type: 'custom', role: 'admin', totalAmount: row.totalAmount }))
-      }
-      return owners
+    if (this.hasPersonalWarehouse(user.uuid)) {
+      owners.push(markDefault({
+        ownerUuid: user.uuid,
+        label: user.username,
+        type: 'personal',
+        role: 'owner',
+        totalAmount: this.ownerTotalAmount(user.uuid)
+      }))
     }
-
-    owners.push(markDefault({
-      ownerUuid: user.uuid,
-      label: user.username,
-      type: 'personal',
-      role: 'owner',
-      totalAmount: this.ownerTotalAmount(user.uuid)
-    }))
 
     for (const row of this.db.prepare(`
       SELECT w.name_lower AS nameLower, w.name, m.role, COALESCE(SUM(b.amount), 0) AS totalAmount
@@ -1272,7 +1671,6 @@ class StoreDb {
       LEFT JOIN balances b ON b.owner_uuid = 'vault:' || w.name_lower AND b.amount > 0
       WHERE m.player_uuid = ?
       GROUP BY w.name_lower
-      HAVING totalAmount > 0
       ORDER BY w.name COLLATE NOCASE ASC
     `).all(user.uuid)) {
       owners.push(markDefault({ ownerUuid: `vault:${row.nameLower}`, label: `仓库:${row.name}`, type: 'custom', role: row.role, totalAmount: row.totalAmount }))
@@ -1282,8 +1680,7 @@ class StoreDb {
   }
 
   canWebUserAccessOwner (user, ownerUuid) {
-    if (this.isAdmin(user.username, user.uuid)) return true
-    if (ownerUuid === user.uuid) return true
+    if (ownerUuid === user.uuid) return this.hasPersonalWarehouse(user.uuid)
     if (ownerUuid.startsWith('vault:')) {
       return this.isCustomWarehouseMember(ownerUuid.slice(6), user.uuid)
     }
@@ -1304,7 +1701,9 @@ class StoreDb {
     const shulkerKeys = rows.filter(row => row.itemId.endsWith('shulker_box')).map(row => row.itemKey)
     const shulkerContents = this.getShulkerContentsByBox(shulkerKeys)
     const contentKeys = [...shulkerContents.values()].flat().map(item => item.itemKey)
-    const personalAliases = this.getPlayerItemNameOverrides(viewerUuid, [...rows.map(row => row.itemKey), ...contentKeys])
+    const personalAliasLists = this.getPlayerItemAliases(viewerUuid, [...rows.map(row => row.itemKey), ...contentKeys])
+    const personalDisplayNames = this.getPlayerItemDisplayNames(viewerUuid, [...rows.map(row => row.itemKey), ...contentKeys])
+    const globalAliases = this.getGlobalAliasesForItems([...rows.map(row => row.itemKey), ...contentKeys], viewerUuid)
     const totalAmount = rows.reduce((sum, row) => sum + row.amount, 0)
 
     return {
@@ -1315,21 +1714,31 @@ class StoreDb {
         itemTypes: rows.length
       },
       items: rows.map(row => {
-        const personalAlias = personalAliases.get(row.itemKey) || ''
+        const personalAliases = personalAliasLists.get(row.itemKey) || []
+        const personalAlias = personalAliases[0] || ''
+        const personalDisplayName = personalDisplayNames.get(row.itemKey) || ''
         const contents = (shulkerContents.get(row.itemKey) || []).map(item => {
-          const contentAlias = personalAliases.get(item.itemKey) || ''
+          const contentAliases = personalAliasLists.get(item.itemKey) || []
+          const contentAlias = contentAliases[0] || ''
+          const contentDisplayName = personalDisplayNames.get(item.itemKey) || ''
           return {
             ...item,
             adminDisplayName: item.displayName,
+            globalAliases: globalAliases.get(item.itemKey) || [],
+            personalAliases: contentAliases,
             personalAlias: contentAlias,
-            displayName: contentAlias || item.displayName
+            personalDisplayName: contentDisplayName,
+            displayName: contentDisplayName || item.displayName
           }
         })
         return {
           ...this.rowToItem(row),
           adminDisplayName: row.displayName,
+          globalAliases: globalAliases.get(row.itemKey) || [],
+          personalAliases,
           personalAlias,
-          displayName: personalAlias || row.displayName,
+          personalDisplayName,
+          displayName: personalDisplayName || row.displayName,
           amount: row.amount,
           shortCode: this.shortCodeForItemKey(row.itemKey),
           shulkerContents: contents
@@ -1340,27 +1749,32 @@ class StoreDb {
 
   getShulkerContentsByBox (shulkerKeys) {
     const result = new Map()
-    if (!shulkerKeys.length) return result
-    const placeholders = shulkerKeys.map(() => '?').join(',')
-    const rows = this.db.prepare(`
-      SELECT sc.shulker_item_key AS shulkerItemKey,
-             sc.amount, sc.slot_count AS slotCount,
-             i.item_key AS itemKey, i.item_id AS itemId, i.display_name AS displayName,
-             i.nbt_json AS nbtJson, i.meta_json AS metaJson
-      FROM shulker_contents sc
-      JOIN items i ON i.item_key = sc.contained_item_key
-      WHERE sc.shulker_item_key IN (${placeholders})
-      ORDER BY i.display_name COLLATE NOCASE ASC
-    `).all(...shulkerKeys)
-    for (const row of rows) {
-      const item = {
-        ...this.rowToItem(row),
-        amount: row.amount,
-        slotCount: row.slotCount,
-        shortCode: this.shortCodeForItemKey(row.itemKey)
+    const keys = [...new Set(shulkerKeys || [])].filter(Boolean)
+    if (!keys.length) return result
+    const chunkSize = 500
+    for (let offset = 0; offset < keys.length; offset += chunkSize) {
+      const chunk = keys.slice(offset, offset + chunkSize)
+      const placeholders = chunk.map(() => '?').join(',')
+      const rows = this.db.prepare(`
+        SELECT sc.shulker_item_key AS shulkerItemKey,
+               sc.amount, sc.slot_count AS slotCount,
+               i.item_key AS itemKey, i.item_id AS itemId, i.display_name AS displayName,
+               i.nbt_json AS nbtJson, i.meta_json AS metaJson
+        FROM shulker_contents sc
+        JOIN items i ON i.item_key = sc.contained_item_key
+        WHERE sc.shulker_item_key IN (${placeholders})
+        ORDER BY i.display_name COLLATE NOCASE ASC
+      `).all(...chunk)
+      for (const row of rows) {
+        const item = {
+          ...this.rowToItem(row),
+          amount: row.amount,
+          slotCount: row.slotCount,
+          shortCode: this.shortCodeForItemKey(row.itemKey)
+        }
+        if (!result.has(row.shulkerItemKey)) result.set(row.shulkerItemKey, [])
+        result.get(row.shulkerItemKey).push(item)
       }
-      if (!result.has(row.shulkerItemKey)) result.set(row.shulkerItemKey, [])
-      result.get(row.shulkerItemKey).push(item)
     }
     return result
   }
@@ -1532,7 +1946,7 @@ class StoreDb {
     `).all(ownerUuid, text, text, text, text)
   }
 
-  findItemsByDisplayQuery (query) {
+  findItemsByDisplayQuery (query, playerUuid = '') {
     const text = String(query || '').trim()
     if (!text) return []
     return this.db.prepare(`
@@ -1542,12 +1956,26 @@ class StoreDb {
       WHERE lower(display_name) = lower(?)
          OR lower(display_name) LIKE '%' || lower(?) || '%'
          OR lower(item_id) = lower(?)
+         OR EXISTS (
+           SELECT 1 FROM global_item_aliases a
+           WHERE a.item_key = items.item_key
+             AND (a.alias_lower = lower(?) OR a.alias_lower LIKE '%' || lower(?) || '%')
+             AND (? = '' OR NOT EXISTS (
+               SELECT 1 FROM player_disabled_global_aliases d
+               WHERE d.player_uuid = ? AND d.alias_lower = a.alias_lower
+             ))
+         )
+         OR EXISTS (
+           SELECT 1 FROM player_item_aliases pa
+           WHERE pa.player_uuid = ? AND pa.item_key = items.item_key
+             AND (pa.alias_lower = lower(?) OR pa.alias_lower LIKE '%' || lower(?) || '%')
+         )
       ORDER BY lower(display_name) = lower(?) DESC, created_at ASC
       LIMIT 10
-    `).all(text, text, text, text)
+    `).all(text, text, text, text, text, playerUuid, playerUuid, playerUuid, text, text, text)
   }
 
-  findOwnerItemsByDisplayQuery (ownerUuid, query) {
+  findOwnerItemsByDisplayQuery (ownerUuid, query, playerUuid = '') {
     const text = String(query || '').trim()
     if (!text) return []
     return this.db.prepare(`
@@ -1562,10 +1990,24 @@ class StoreDb {
           lower(i.display_name) = lower(?)
           OR lower(i.display_name) LIKE '%' || lower(?) || '%'
           OR lower(i.item_id) = lower(?)
+          OR EXISTS (
+            SELECT 1 FROM global_item_aliases a
+            WHERE a.item_key = i.item_key
+              AND (a.alias_lower = lower(?) OR a.alias_lower LIKE '%' || lower(?) || '%')
+              AND (? = '' OR NOT EXISTS (
+                SELECT 1 FROM player_disabled_global_aliases d
+                WHERE d.player_uuid = ? AND d.alias_lower = a.alias_lower
+              ))
+          )
+          OR EXISTS (
+            SELECT 1 FROM player_item_aliases pa
+            WHERE pa.player_uuid = ? AND pa.item_key = i.item_key
+              AND (pa.alias_lower = lower(?) OR pa.alias_lower LIKE '%' || lower(?) || '%')
+          )
         )
       ORDER BY lower(i.display_name) = lower(?) DESC, i.created_at ASC
       LIMIT 10
-    `).all(ownerUuid, text, text, text, text)
+    `).all(ownerUuid, text, text, text, text, text, playerUuid, playerUuid, playerUuid, text, text, text)
   }
 
   findItemByShortCode (code) {
@@ -1643,6 +2085,9 @@ class StoreDb {
       this.db.prepare('DELETE FROM inventory_mismatches').run()
       this.db.prepare('DELETE FROM transactions').run()
       this.db.prepare('DELETE FROM player_item_name_overrides').run()
+      this.db.prepare('DELETE FROM player_item_aliases').run()
+      this.db.prepare('DELETE FROM player_item_display_names').run()
+      this.db.prepare('DELETE FROM player_disabled_global_aliases').run()
       this.db.prepare('DELETE FROM items').run()
     })
 

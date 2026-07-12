@@ -1144,6 +1144,64 @@ class Warehouse {
     return this.mergeItems(dropped)
   }
 
+  async dropItemsToPlayer (username, requestedItems) {
+    const requested = this.mergeItems(requestedItems || [])
+    const dropped = []
+    if (this.bot.currentWindow) {
+      this.debug(`closing open window before dropping selected items: ${this.bot.currentWindow.type || this.bot.currentWindow.id}`)
+      this.bot.closeWindow(this.bot.currentWindow)
+      await sleep(150)
+    }
+
+    for (const request of requested) {
+      let remaining = Number(request.amount || 0)
+      while (remaining > 0) {
+        const item = this.bot.inventory.items().find(entry => {
+          const normalized = this.catalog.fromPrismarineItem(entry)
+          return normalized.itemKey === request.itemKey
+        })
+        if (!item) break
+
+        const normalized = this.catalog.fromPrismarineItem(item)
+        const amount = Math.min(remaining, item.count)
+        const before = this.inventoryCountByItemKey(normalized.itemKey)
+        const startedAt = Date.now()
+        this.debug(`drop selected ${normalized.displayName} x${amount} slot=${item.slot} to ${username}`)
+        await this.lookAtPlayer(username)
+        await this.dropSlotAmountFast(item, amount)
+        const moved = await this.waitForInventoryDecrease(normalized.itemKey, before)
+        if (moved <= 0) {
+          throw new Error(`丢出 ${normalized.displayName} 超时，背包数量没有减少。`)
+        }
+        const credited = Math.min(remaining, moved)
+        dropped.push({ ...normalized, amount: credited })
+        remaining -= credited
+        this.debug(`drop selected done ${normalized.displayName} x${credited} in ${Date.now() - startedAt}ms`)
+        await sleep(this.config.timing.dropIntervalMs)
+      }
+    }
+
+    return this.mergeItems(dropped)
+  }
+
+  async dropSlotAmountFast (item, amount) {
+    const count = Math.max(0, Math.min(Number(amount || 0), Number(item.count || 0)))
+    if (count <= 0) return
+    if (count >= item.count) {
+      await this.dropStackFast(item)
+      return
+    }
+
+    const timeoutMs = Number(this.config.timing.dropConfirmTimeoutMs || 5000)
+    for (let index = 0; index < count; index++) {
+      await this.withTimeout(
+        this.bot.clickWindow(item.slot, 0, 4),
+        timeoutMs,
+        `逐个丢出物品超时 slot=${item.slot}`
+      )
+    }
+  }
+
   async dropStackFast (item) {
     const timeoutMs = Number(this.config.timing.dropConfirmTimeoutMs || 5000)
     try {
