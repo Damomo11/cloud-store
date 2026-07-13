@@ -1,5 +1,6 @@
 const fs = require('node:fs')
 const path = require('node:path')
+const crypto = require('node:crypto')
 const mineflayer = require('mineflayer')
 const nbt = require('prismarine-nbt')
 const { pathfinder } = require('mineflayer-pathfinder')
@@ -9,19 +10,20 @@ const ItemCatalog = require('./itemCatalog')
 const Warehouse = require('./warehouse')
 const CloudStoreService = require('./service')
 const CloudStoreWebServer = require('./webServer')
+const { BotTaskPool } = require('./taskPool')
 
-function createBot (config) {
+function createBot (config, onMsaCode) {
   const options = {
     host: config.server.host,
     port: config.server.port,
     username: config.server.username,
-    auth: config.server.auth,
+    auth: 'microsoft',
     version: config.server.version,
     locale: config.server.locale || 'zh_CN',
-    logErrors: false
+    logErrors: false,
+    onMsaCode
   }
 
-  if (config.server.password) options.password = config.server.password
   if (config.server.profilesFolder) {
     options.profilesFolder = path.resolve(process.cwd(), config.server.profilesFolder)
   }
@@ -60,11 +62,11 @@ function shouldFallbackProtocol (error) {
   return /SlotComponent|array size is abnormally large|Read error.*intArray|play\.toClient/i.test(message)
 }
 
-function advanceProtocolFallback (reason) {
-  if (protocolVersionIndex >= protocolVersions.length - 1) return false
-  const previous = protocolVersions[protocolVersionIndex]
-  protocolVersionIndex += 1
-  console.error(`[protocol] ${previous} 启动失败，切换到 ${protocolVersions[protocolVersionIndex]}。原因：${reason}`)
+function advanceProtocolFallback (state, reason) {
+  if (state.protocolVersionIndex >= protocolVersions.length - 1) return false
+  const previous = protocolVersions[state.protocolVersionIndex]
+  state.protocolVersionIndex += 1
+  console.error(`[protocol:${state.account.botName}] ${previous} 启动失败，切换到 ${protocolVersions[state.protocolVersionIndex]}。原因：${reason}`)
   return true
 }
 
@@ -95,41 +97,165 @@ function isSocketDisconnectError (error) {
 const config = loadConfig(path.resolve(process.cwd(), 'config.json'), { autoUpdate: true })
 const db = new StoreDb(path.resolve(process.cwd(), 'data', 'cloud-store.sqlite'), config)
 const protocolVersions = buildProtocolVersionList(config)
-let protocolVersionIndex = 0
-let catalog = createCatalogForVersion(protocolVersions[protocolVersionIndex] || config.server.version)
+let catalog = createCatalogForVersion(protocolVersions[0] || config.server.version)
 attachCatalog(catalog)
 
-console.log(`Starting cloud store bot: ${config.server.username}@${config.server.host}:${config.server.port}`)
-console.log(`Minecraft version: ${config.server.version}, auth: ${config.server.auth}`)
+const configuredAccounts = (Array.isArray(config.bots) && config.bots.length ? config.bots : [config.server])
+  .map((account, index) => ({
+    username: String(account.username || '').trim(),
+    botName: String(account.botName || account.username || `bot-${index + 1}`).trim(),
+    profilesFolder: String(account.profilesFolder || `auth-cache/bot-${index + 1}`).trim()
+  }))
+  .filter(account => account.username)
+
+if (!db.listBotAccounts().length) {
+  for (const account of configuredAccounts) {
+    db.createBotAccount({ id: crypto.randomUUID(), ...account, enabled: true })
+  }
+}
+
+const accounts = db.listBotAccounts()
+if (!accounts.length) throw new Error('没有配置微软机器人账号，请在 config.json 的 server.username 或 bots[] 中填写账号。')
+console.log(`Configured ${accounts.length} Microsoft OAuth2 bot account(s)`)
+console.log(`Minecraft version: ${config.server.version}, auth: microsoft`)
 if (protocolVersions.length > 1) {
   console.log(`Protocol fallback versions: ${protocolVersions.join(' -> ')}`)
 }
 
-let currentBot = null
-let currentService = null
 let shuttingDown = false
-let reconnectTimer = null
-let reconnectAttempt = 0
-const webServer = new CloudStoreWebServer(db, config, () => currentService)
+const taskPool = new BotTaskPool(config)
+const states = new Map(accounts.map(account => [account.id, createBotState(account)]))
+const currentService = () => [...states.values()].find(state => state.service)?.service || null
+const botManager = {
+  list: listManagedAccounts,
+  add: addManagedAccount,
+  setEnabled: setManagedAccountEnabled,
+  remove: removeManagedAccount
+}
+const webServer = new CloudStoreWebServer(db, config, currentService, () => botManager)
 webServer.start()
 
-launchBot()
+for (const state of states.values()) {
+  if (state.account.enabled) launchBot(state)
+}
 
-function launchBot () {
-  if (shuttingDown) return
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer)
-    reconnectTimer = null
+function createBotState (account) {
+  return {
+    account,
+    bot: null,
+    service: null,
+    reconnectTimer: null,
+    drainTimer: null,
+    reconnectAttempt: 0,
+    protocolVersionIndex: 0,
+    desiredEnabled: Boolean(account.enabled),
+    status: account.enabled ? 'starting' : 'disabled',
+    lastError: '',
+    deviceCode: null
+  }
+}
+
+function listManagedAccounts () {
+  return db.listBotAccounts().map(account => {
+    const state = states.get(account.id)
+    return {
+      ...account,
+      status: state?.status || (account.enabled ? 'offline' : 'disabled'),
+      minecraftName: state?.bot?.username || '',
+      activeTask: state?.service?.active
+        ? { type: state.service.active.type, username: state.service.active.username, phase: state.service.active.phase }
+        : null,
+      lastError: state?.lastError || '',
+      deviceCode: state?.deviceCode && state.deviceCode.expiresAt > Date.now() ? state.deviceCode : null
+    }
+  })
+}
+
+function addManagedAccount (input) {
+  const username = String(input.username || '').trim()
+  const botName = String(input.botName || '').trim()
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(username)) throw new Error('请输入有效的微软账号邮箱。')
+  if (!/^[A-Za-z0-9_-]{2,32}$/.test(botName)) throw new Error('Bot 标识只能包含字母、数字、下划线和连字符，长度 2-32。')
+  const id = crypto.randomUUID()
+  const account = db.createBotAccount({
+    id,
+    username,
+    botName,
+    profilesFolder: path.join('auth-cache', 'bots', id),
+    enabled: true
+  })
+  const state = createBotState(account)
+  states.set(id, state)
+  launchBot(state)
+  return account
+}
+
+function setManagedAccountEnabled (id, enabled) {
+  const account = db.setBotAccountEnabled(id, enabled)
+  let state = states.get(account.id)
+  if (!state) {
+    state = createBotState(account)
+    states.set(account.id, state)
+  }
+  state.account = account
+  state.desiredEnabled = Boolean(enabled)
+  if (enabled) {
+    state.status = 'starting'
+    state.lastError = ''
+    if (!state.bot) launchBot(state)
+  } else {
+    drainBot(state)
+  }
+  return account
+}
+
+function removeManagedAccount (id) {
+  const account = db.deleteBotAccount(id)
+  const state = states.get(account.id)
+  if (state) {
+    state.desiredEnabled = false
+    state.removeAfterStop = true
+    drainBot(state)
+  }
+  return account
+}
+
+function drainBot (state) {
+  if (state.reconnectTimer) clearTimeout(state.reconnectTimer)
+  state.reconnectTimer = null
+  if (state.service) taskPool.unregister(state.service)
+  if (state.service?.active) {
+    state.status = 'draining'
+    if (!state.drainTimer) {
+      state.drainTimer = setTimeout(() => {
+        state.drainTimer = null
+        drainBot(state)
+      }, 500)
+    }
+    return
+  }
+  state.status = state.removeAfterStop ? 'removing' : 'disabled'
+  if (state.bot) state.bot.quit('disabled from web admin')
+  else if (state.removeAfterStop) states.delete(state.account.id)
+}
+
+function launchBot (state) {
+  if (shuttingDown || !state.desiredEnabled || state.bot) return
+  if (state.reconnectTimer) {
+    clearTimeout(state.reconnectTimer)
+    state.reconnectTimer = null
   }
 
-  reconnectAttempt += 1
-  if (reconnectAttempt > 1) {
-    console.log(`[reconnect] attempt ${reconnectAttempt}`)
+  state.reconnectAttempt += 1
+  state.status = 'connecting'
+  state.deviceCode = null
+  if (state.reconnectAttempt > 1) {
+    console.log(`[reconnect:${state.account.botName}] attempt ${state.reconnectAttempt}`)
   }
 
-  const activeVersion = protocolVersions[protocolVersionIndex] || config.server.version
+  const activeVersion = protocolVersions[state.protocolVersionIndex] || config.server.version
   if (activeVersion !== config.server.version) {
-    console.log(`[protocol] launching with fallback Minecraft version ${activeVersion}`)
+    console.log(`[protocol:${state.account.botName}] launching with fallback Minecraft version ${activeVersion}`)
   }
   if (catalog.version !== activeVersion) {
     catalog = createCatalogForVersion(activeVersion)
@@ -140,19 +266,30 @@ function launchBot () {
     ...config,
     server: {
       ...config.server,
+      ...state.account,
       version: activeVersion
     }
   }
 
-  const bot = createBot(launchConfig)
-  currentBot = bot
+  const bot = createBot(launchConfig, code => {
+    const expiresIn = Number(code?.expires_in || code?.expiresIn || 900)
+    state.deviceCode = {
+      userCode: String(code?.user_code || code?.userCode || ''),
+      verificationUri: String(code?.verification_uri || code?.verificationUri || 'https://microsoft.com/link'),
+      directUri: String(code?.verification_uri_complete || code?.verificationUriComplete || ''),
+      expiresAt: Date.now() + (expiresIn * 1000)
+    }
+    state.status = 'auth_required'
+    console.log(`[oauth:${state.account.botName}] open ${state.deviceCode.verificationUri} and enter ${state.deviceCode.userCode}`)
+  })
+  state.bot = bot
   let loggedIn = false
   let spawned = false
   let lastDisconnectReason = ''
   const acceptedResourcePacks = new Set()
 
-  const warehouse = new Warehouse(bot, db, catalog, launchConfig)
-  const service = new CloudStoreService(bot, db, catalog, warehouse, launchConfig)
+  const warehouse = new Warehouse(bot, db, catalog, launchConfig, taskPool.warehouseMutex)
+  const service = new CloudStoreService(bot, db, catalog, warehouse, launchConfig, taskPool)
   service.setWebAuth(webServer)
   setupRegistryExport(bot, catalog, db)
 
@@ -166,16 +303,21 @@ function launchBot () {
 
   bot.once('login', () => {
     loggedIn = true
+    state.status = 'logging_in'
+    state.deviceCode = null
     bot.setSettings?.({ locale: config.server.locale || 'zh_CN' })
     console.log('Bot logged in, waiting for spawn...')
   })
 
   bot.once('spawn', () => {
     spawned = true
-    reconnectAttempt = 0
+    state.reconnectAttempt = 0
+    state.status = 'online'
+    state.lastError = ''
     clearInterval(loginWatchdog)
     console.log(`Cloud store bot spawned as ${bot.username}`)
-    currentService = service
+    state.service = service
+    taskPool.register(service)
     service.start()
   })
 
@@ -228,24 +370,26 @@ function launchBot () {
     console.error('Bot kicked:', reason)
     const kickReason = formatKickReason(reason)
     lastDisconnectReason = kickReason
+    state.lastError = kickReason
     if (!spawned && /outdated|version|protocol|版本|协议/i.test(kickReason)) {
-      advanceProtocolFallback(`kick before spawn: ${kickReason}`)
+      advanceProtocolFallback(state, `kick before spawn: ${kickReason}`)
     }
   })
 
   bot.on('error', error => {
+    state.lastError = String(error?.message || error)
     if (isSocketDisconnectError(error)) {
       console.warn(`[network] ${error.code}: socket 已断开，等待重连。${lastDisconnectReason ? `lastReason=${lastDisconnectReason}` : '通常是服务器/代理主动断开或网络抖动。'}`)
       return
     }
     if (!spawned && shouldFallbackProtocol(error)) {
-      const advanced = advanceProtocolFallback(error.message)
+      const advanced = advanceProtocolFallback(state, error.message)
       if (advanced) {
-        console.error(`[protocol] Slot/NBT 解析失败，准备用 ${protocolVersions[protocolVersionIndex]} 重连：${error.message}`)
+        console.error(`[protocol:${state.account.botName}] Slot/NBT 解析失败，准备用 ${protocolVersions[state.protocolVersionIndex]} 重连：${error.message}`)
         try {
           bot._client?.end('protocol fallback')
         } catch {}
-        scheduleReconnect(1000)
+        scheduleReconnect(state, 1000)
         return
       }
     }
@@ -255,9 +399,15 @@ function launchBot () {
   bot.on('end', () => {
     clearInterval(loginWatchdog)
     console.log(`Bot disconnected${lastDisconnectReason ? `: ${lastDisconnectReason}` : ''}`)
-    if (currentBot === bot) currentBot = null
-    if (currentService === service) currentService = null
-    scheduleReconnect()
+    taskPool.unregister(service)
+    if (state.bot === bot) state.bot = null
+    if (state.service === service) state.service = null
+    state.status = state.desiredEnabled ? 'offline' : (state.removeAfterStop ? 'removed' : 'disabled')
+    if (state.removeAfterStop) {
+      states.delete(state.account.id)
+      return
+    }
+    if (state.desiredEnabled) scheduleReconnect(state)
   })
 }
 
@@ -343,17 +493,17 @@ function registryEnchantmentDisplayName (data, name, catalog) {
   return catalog.getEnchantmentDisplayName(name)
 }
 
-function scheduleReconnect (delayOverrideMs = null) {
-  if (shuttingDown || reconnectTimer) return
+function scheduleReconnect (state, delayOverrideMs = null) {
+  if (shuttingDown || !state.desiredEnabled || state.reconnectTimer) return
   const delay = Math.max(1000, Number(delayOverrideMs || config.timing?.reconnectDelayMs || 10000))
-  console.log(`[reconnect] will reconnect in ${delay}ms`)
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null
+  console.log(`[reconnect:${state.account.botName}] will reconnect in ${delay}ms`)
+  state.reconnectTimer = setTimeout(() => {
+    state.reconnectTimer = null
     try {
-      launchBot()
+      launchBot(state)
     } catch (error) {
-      console.error('[reconnect] failed to launch bot:', error)
-      scheduleReconnect()
+      console.error(`[reconnect:${state.account.botName}] failed to launch bot:`, error)
+      scheduleReconnect(state)
     }
   }, delay)
 }
@@ -390,8 +540,10 @@ function acceptResourcePackDirect (bot, uuid) {
 
 process.on('SIGINT', () => {
   shuttingDown = true
-  if (reconnectTimer) clearTimeout(reconnectTimer)
+  for (const state of states.values()) {
+    if (state.reconnectTimer) clearTimeout(state.reconnectTimer)
+    state.bot?.quit('shutdown')
+  }
   db.close()
-  currentBot?.quit('shutdown')
   process.exit(0)
 })

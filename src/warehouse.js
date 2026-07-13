@@ -4,13 +4,18 @@ const Vec3 = require('vec3')
 const { sleep, sumBy } = require('./utils')
 
 class Warehouse {
-  constructor (bot, db, catalog, config) {
+  constructor (bot, db, catalog, config, warehouseMutex = null) {
     this.bot = bot
     this.db = db
     this.catalog = catalog
     this.config = config
+    this.warehouseMutex = warehouseMutex
     this.chestNames = new Set(config.warehouse.chestBlockNames || ['barrel'])
     this.homePosition = null
+  }
+
+  withWarehouseLock (fn) {
+    return this.warehouseMutex ? this.warehouseMutex.run(fn) : fn()
   }
 
   debug (message) {
@@ -93,6 +98,10 @@ class Warehouse {
   }
 
   async depositInventoryForOwner (ownerUuid, username) {
+    return this.withWarehouseLock(() => this.depositInventoryForOwnerLocked(ownerUuid, username))
+  }
+
+  async depositInventoryForOwnerLocked (ownerUuid, username) {
     const before = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
     if (!before.length) return { deposited: [], leftover: [] }
 
@@ -122,6 +131,10 @@ class Warehouse {
   }
 
   async depositInventoryWithoutBalance (type = 'recovery', message = '') {
+    return this.withWarehouseLock(() => this.depositInventoryWithoutBalanceLocked(type, message))
+  }
+
+  async depositInventoryWithoutBalanceLocked (type = 'recovery', message = '') {
     const before = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
     if (!before.length) return { deposited: [], leftover: [] }
 
@@ -357,6 +370,10 @@ class Warehouse {
   }
 
   async withdrawAllocations (allocations) {
+    return this.withWarehouseLock(() => this.withdrawAllocationsLocked(allocations))
+  }
+
+  async withdrawAllocationsLocked (allocations) {
     const withdrawn = []
     const missing = []
 
@@ -529,6 +546,10 @@ class Warehouse {
   }
 
   async syncWarehouse (radius) {
+    return this.withWarehouseLock(() => this.syncWarehouseLocked(radius))
+  }
+
+  async syncWarehouseLocked (radius) {
     this.debug(`sync start radius=${radius}`)
     await this.goHome({ requireWarehouse: this.db.listChests().length > 0 })
     const blocks = this.findContainerBlocks(radius)

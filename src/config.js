@@ -2,6 +2,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 
 const DEFAULT_CONFIG = {
+  bots: [],
   server: {
     host: '127.0.0.1',
     port: 25565,
@@ -145,6 +146,10 @@ function stripJsonComments (text) {
 }
 
 function normalizeConfig (config) {
+  if (config?.server && config.server.auth !== 'microsoft') {
+    console.warn('[config] only Microsoft OAuth2 is supported; auth has been set to microsoft in memory')
+    config.server.auth = 'microsoft'
+  }
   if (config?.web && typeof config.web.dashboardUrl === 'string' && !config.web.dashboardUrl.trim()) {
     delete config.web.dashboardUrl
   }

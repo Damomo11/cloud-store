@@ -562,8 +562,6 @@ class ItemCatalog {
 
   describePrismarineItem (item, itemId) {
     const baseName = this.getDisplayName(itemId) || item.displayName || item.name
-    const fireworkName = this.describeFireworkRocket(itemId, item.components)
-    if (fireworkName) return fireworkName
 
     const customName = this.extractCustomName(item.components)
     if (customName) return customName
@@ -584,9 +582,6 @@ class ItemCatalog {
   describeStoredItem (itemId, metaJson = '', nbtJson = '') {
     const baseName = this.getDisplayName(itemId)
     const meta = this.parseStoredJson(metaJson, {})
-
-    const fireworkName = this.describeFireworkRocket(itemId, meta.components)
-    if (fireworkName) return fireworkName
 
     const customName = this.extractCustomName(meta.components)
     if (customName) return customName
@@ -619,23 +614,6 @@ class ItemCatalog {
 
   repairUndefinedJsonValues (text) {
     return String(text).replace(/:([,}\]])/g, ':null$1')
-  }
-
-  describeFireworkRocket (itemId, components) {
-    if (this.normalizeItemId(itemId) !== 'minecraft:firework_rocket') return ''
-    const flightDuration = this.extractFireworkFlightDuration(components)
-    return `${this.getDisplayName(itemId)}${this.levelName(flightDuration || 1)}`
-  }
-
-  extractFireworkFlightDuration (components) {
-    let duration = 0
-    this.walkValue(components, value => {
-      if (duration > 0 || !value || typeof value !== 'object') return
-      const raw = value.flightDuration ?? value.flight_duration ?? value.flight
-      const parsed = Number.parseInt(raw, 10)
-      if (Number.isFinite(parsed) && parsed > 0) duration = parsed
-    })
-    return Math.max(1, Math.min(3, duration || 1))
   }
 
   describeBeeContainer (itemId, components) {

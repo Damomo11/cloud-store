@@ -1,6 +1,7 @@
 const fs = require('node:fs')
 const path = require('node:path')
 const crypto = require('node:crypto')
+const { AsyncLocalStorage } = require('node:async_hooks')
 const Database = require('better-sqlite3')
 
 class StoreDb {
@@ -10,6 +11,7 @@ class StoreDb {
     this.config = config
     this.momoOwner = config.momoOwner || '__momo__'
     this.catalog = null
+    this.transactionContext = new AsyncLocalStorage()
     this.init()
   }
 
@@ -68,6 +70,8 @@ class StoreDb {
         username TEXT NOT NULL,
         items_json TEXT NOT NULL,
         message TEXT NOT NULL DEFAULT '',
+        bot_id TEXT NOT NULL DEFAULT '',
+        bot_name TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
 
@@ -123,6 +127,7 @@ class StoreDb {
         alias_lower TEXT PRIMARY KEY,
         alias TEXT NOT NULL,
         item_key TEXT NOT NULL,
+        category TEXT NOT NULL DEFAULT 'normal',
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (item_key) REFERENCES items(item_key) ON DELETE CASCADE
@@ -235,6 +240,63 @@ class StoreDb {
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
 
+      CREATE TABLE IF NOT EXISTS bot_recovery_tasks (
+        bot_id TEXT PRIMARY KEY,
+        type TEXT NOT NULL,
+        actor_username TEXT NOT NULL DEFAULT '',
+        owner_uuid TEXT NOT NULL DEFAULT '',
+        owner_username TEXT NOT NULL DEFAULT '',
+        owner_scope TEXT NOT NULL DEFAULT 'personal',
+        vault_name TEXT NOT NULL DEFAULT '',
+        target_username TEXT NOT NULL DEFAULT '',
+        phase TEXT NOT NULL DEFAULT '',
+        items_json TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS inventory_reservations (
+        reservation_id TEXT NOT NULL,
+        owner_uuid TEXT NOT NULL,
+        item_key TEXT NOT NULL,
+        amount INTEGER NOT NULL CHECK (amount > 0),
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (reservation_id, owner_uuid, item_key),
+        FOREIGN KEY (item_key) REFERENCES items(item_key) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS bot_accounts (
+        id TEXT PRIMARY KEY,
+        username TEXT NOT NULL UNIQUE,
+        bot_name TEXT NOT NULL UNIQUE,
+        profiles_folder TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS command_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL,
+        command_text TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        receiver_bot_id TEXT NOT NULL DEFAULT '',
+        receiver_bot_name TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS command_log_replies (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        command_log_id INTEGER NOT NULL,
+        target_username TEXT NOT NULL DEFAULT '',
+        channel TEXT NOT NULL DEFAULT 'private',
+        bot_id TEXT NOT NULL DEFAULT '',
+        bot_name TEXT NOT NULL DEFAULT '',
+        message TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (command_log_id) REFERENCES command_logs(id) ON DELETE CASCADE
+      );
+
       CREATE INDEX IF NOT EXISTS idx_items_item_id ON items(item_id);
       CREATE INDEX IF NOT EXISTS idx_balances_item_key ON balances(item_key);
       CREATE INDEX IF NOT EXISTS idx_chest_slots_item_key ON chest_slots(item_key);
@@ -249,14 +311,22 @@ class StoreDb {
       CREATE INDEX IF NOT EXISTS idx_web_login_tokens_hash ON web_login_tokens(token_hash);
       CREATE INDEX IF NOT EXISTS idx_inventory_mismatches_status ON inventory_mismatches(status, kind, created_at);
       CREATE INDEX IF NOT EXISTS idx_inventory_mismatches_item_key ON inventory_mismatches(item_key);
+      CREATE INDEX IF NOT EXISTS idx_inventory_reservations_item ON inventory_reservations(owner_uuid, item_key);
+      CREATE INDEX IF NOT EXISTS idx_command_logs_created ON command_logs(id DESC);
+      CREATE INDEX IF NOT EXISTS idx_command_log_replies_command ON command_log_replies(command_log_id, id);
     `)
 
     this.ensureColumn('items', 'display_name_manual', 'INTEGER NOT NULL DEFAULT 0')
+    this.ensureColumn('transactions', 'bot_id', "TEXT NOT NULL DEFAULT ''")
+    this.ensureColumn('transactions', 'bot_name', "TEXT NOT NULL DEFAULT ''")
+    this.ensureColumn('global_item_aliases', 'category', "TEXT NOT NULL DEFAULT 'normal'")
     this.ensureColumn('active_recovery_tasks', 'items_json', "TEXT NOT NULL DEFAULT '[]'")
     this.ensureColumn('players', 'default_owner_uuid', "TEXT NOT NULL DEFAULT ''")
     this.migrateManualItemNamesToOverrides()
     this.migratePlayerItemNameOverridesToAliases()
     this.migrateExistingPersonalWarehouses()
+    const staleReservations = this.db.prepare('DELETE FROM inventory_reservations').run().changes
+    if (staleReservations) console.log(`Released ${staleReservations} stale inventory reservation(s) from the previous process`)
 
     for (const username of this.config.admins || []) {
       this.addAdmin(username)
@@ -409,15 +479,15 @@ class StoreDb {
     return this.db.transaction(fn)()
   }
 
-  saveRecoveryTask (task) {
+  saveRecoveryTask (task, botId = 'legacy') {
     this.db.prepare(`
-      INSERT INTO active_recovery_tasks (
-        id, type, actor_username, owner_uuid, owner_username, owner_scope,
+      INSERT INTO bot_recovery_tasks (
+        bot_id, type, actor_username, owner_uuid, owner_username, owner_scope,
         vault_name, target_username, phase, items_json, updated_at
       )
-      VALUES (1, @type, @actorUsername, @ownerUuid, @ownerUsername, @ownerScope,
+      VALUES (@botId, @type, @actorUsername, @ownerUuid, @ownerUsername, @ownerScope,
         @vaultName, @targetUsername, @phase, @itemsJson, CURRENT_TIMESTAMP)
-      ON CONFLICT(id) DO UPDATE SET
+      ON CONFLICT(bot_id) DO UPDATE SET
         type = excluded.type,
         actor_username = excluded.actor_username,
         owner_uuid = excluded.owner_uuid,
@@ -429,6 +499,7 @@ class StoreDb {
         items_json = excluded.items_json,
         updated_at = CURRENT_TIMESTAMP
     `).run({
+      botId: String(botId || 'legacy'),
       type: String(task.type || ''),
       actorUsername: String(task.actorUsername || ''),
       ownerUuid: String(task.ownerUuid || ''),
@@ -441,15 +512,15 @@ class StoreDb {
     })
   }
 
-  getRecoveryTask () {
+  getRecoveryTask (botId = 'legacy') {
     const row = this.db.prepare(`
       SELECT type, actor_username AS actorUsername, owner_uuid AS ownerUuid,
              owner_username AS ownerUsername, owner_scope AS ownerScope,
              vault_name AS vaultName, target_username AS targetUsername,
              phase, items_json AS itemsJson, created_at AS createdAt, updated_at AS updatedAt
-      FROM active_recovery_tasks
-      WHERE id = 1
-    `).get()
+      FROM bot_recovery_tasks
+      WHERE bot_id = ?
+    `).get(String(botId || 'legacy'))
     if (!row) return null
     try {
       row.items = JSON.parse(row.itemsJson || '[]')
@@ -459,8 +530,125 @@ class StoreDb {
     return row
   }
 
-  clearRecoveryTask () {
-    this.db.prepare('DELETE FROM active_recovery_tasks WHERE id = 1').run()
+  clearRecoveryTask (botId = 'legacy') {
+    this.db.prepare('DELETE FROM bot_recovery_tasks WHERE bot_id = ?').run(String(botId || 'legacy'))
+  }
+
+  listRecoveryTasks () {
+    return this.db.prepare(`
+      SELECT bot_id AS botId, type, actor_username AS actorUsername,
+             owner_uuid AS ownerUuid, target_username AS targetUsername, phase
+      FROM bot_recovery_tasks
+    `).all()
+  }
+
+  listBotAccounts () {
+    return this.db.prepare(`
+      SELECT id, username, bot_name AS botName, profiles_folder AS profilesFolder,
+             enabled, created_at AS createdAt, updated_at AS updatedAt
+      FROM bot_accounts ORDER BY created_at, bot_name COLLATE NOCASE
+    `).all().map(row => ({ ...row, enabled: Boolean(row.enabled) }))
+  }
+
+  getBotAccount (id) {
+    const row = this.db.prepare(`
+      SELECT id, username, bot_name AS botName, profiles_folder AS profilesFolder,
+             enabled, created_at AS createdAt, updated_at AS updatedAt
+      FROM bot_accounts WHERE id = ?
+    `).get(String(id || ''))
+    return row ? { ...row, enabled: Boolean(row.enabled) } : null
+  }
+
+  createBotAccount ({ id, username, botName, profilesFolder, enabled = true }) {
+    this.db.prepare(`
+      INSERT INTO bot_accounts (id, username, bot_name, profiles_folder, enabled)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(String(id), String(username), String(botName), String(profilesFolder), enabled ? 1 : 0)
+    return this.getBotAccount(id)
+  }
+
+  setBotAccountEnabled (id, enabled) {
+    const result = this.db.prepare(`
+      UPDATE bot_accounts SET enabled = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?
+    `).run(enabled ? 1 : 0, String(id || ''))
+    if (!result.changes) throw new Error('找不到机器人账号。')
+    return this.getBotAccount(id)
+  }
+
+  deleteBotAccount (id) {
+    const account = this.getBotAccount(id)
+    if (!account) throw new Error('找不到机器人账号。')
+    this.db.prepare('DELETE FROM bot_accounts WHERE id = ?').run(account.id)
+    return account
+  }
+
+  claimLegacyRecoveryTask (botId) {
+    return this.transaction(() => {
+      const existing = this.getRecoveryTask(botId)
+      if (existing) return existing
+      const legacy = this.db.prepare(`
+        SELECT type, actor_username AS actorUsername, owner_uuid AS ownerUuid,
+               owner_username AS ownerUsername, owner_scope AS ownerScope,
+               vault_name AS vaultName, target_username AS targetUsername,
+               phase, items_json AS itemsJson
+        FROM active_recovery_tasks WHERE id = 1
+      `).get()
+      if (!legacy) return null
+      try {
+        legacy.items = JSON.parse(legacy.itemsJson || '[]')
+      } catch {
+        legacy.items = []
+      }
+      this.saveRecoveryTask(legacy, botId)
+      this.db.prepare('DELETE FROM active_recovery_tasks WHERE id = 1').run()
+      return this.getRecoveryTask(botId)
+    })
+  }
+
+  reserveInventory (reservationId, items) {
+    const grouped = new Map()
+    for (const item of items || []) {
+      const ownerUuid = String(item.ownerUuid || '')
+      const itemKey = String(item.itemKey || '')
+      const amount = Number(item.amount || 0)
+      if (!ownerUuid || !itemKey || amount <= 0) continue
+      const key = `${ownerUuid}\u0000${itemKey}`
+      const current = grouped.get(key) || { ownerUuid, itemKey, amount: 0 }
+      current.amount += amount
+      grouped.set(key, current)
+    }
+
+    this.transaction(() => {
+      for (const item of grouped.values()) {
+        const row = this.db.prepare(`
+          SELECT b.amount - COALESCE(SUM(r.amount), 0) AS available
+          FROM balances b
+          LEFT JOIN inventory_reservations r
+            ON r.owner_uuid = b.owner_uuid AND r.item_key = b.item_key
+          WHERE b.owner_uuid = ? AND b.item_key = ?
+          GROUP BY b.owner_uuid, b.item_key
+        `).get(item.ownerUuid, item.itemKey)
+        if (Number(row?.available || 0) < item.amount) {
+          throw new Error(`库存已被其他任务占用：${this.ownerLabel(item.ownerUuid)} ${item.itemKey}`)
+        }
+      }
+      const insert = this.db.prepare(`
+        INSERT INTO inventory_reservations (reservation_id, owner_uuid, item_key, amount)
+        VALUES (?, ?, ?, ?)
+      `)
+      for (const item of grouped.values()) insert.run(String(reservationId), item.ownerUuid, item.itemKey, item.amount)
+    })
+  }
+
+  releaseInventoryReservation (reservationId) {
+    this.db.prepare('DELETE FROM inventory_reservations WHERE reservation_id = ?').run(String(reservationId))
+  }
+
+  consumeInventoryReservation (reservationId, ownerUuid, items) {
+    this.transaction(() => {
+      for (const item of items || []) this.adjustBalance(ownerUuid, item.itemKey, -Number(item.amount || 0))
+      this.releaseInventoryReservation(reservationId)
+    })
   }
 
   cleanupGhostOwners () {
@@ -533,7 +721,7 @@ class StoreDb {
 
   listGlobalItemAliases (query = '') {
     const rows = this.db.prepare(`
-      SELECT a.alias, a.item_key AS itemKey, a.created_at AS createdAt, a.updated_at AS updatedAt,
+      SELECT a.alias, a.category, a.item_key AS itemKey, a.created_at AS createdAt, a.updated_at AS updatedAt,
              i.item_id AS itemId, i.display_name AS displayName,
              i.nbt_json AS nbtJson, i.meta_json AS metaJson
       FROM global_item_aliases a
@@ -586,26 +774,34 @@ class StoreDb {
     `).get(text, playerUuid, playerUuid) || null
   }
 
-  saveGlobalItemAlias (itemKey, alias) {
+  normalizeGlobalAliasCategory (category) {
+    const value = String(category || 'normal').trim().toLowerCase()
+    if (!['normal', 'variant'].includes(value)) throw new Error('全局别名分类无效。')
+    return value
+  }
+
+  saveGlobalItemAlias (itemKey, alias, category = 'normal') {
     const item = this.getItemByKey(itemKey)
     if (!item) throw new Error(`找不到物品：${itemKey}`)
     const nextAlias = String(alias || '').trim()
     if (!nextAlias) throw new Error('全局别名不能为空。')
     if ([...nextAlias].length > 40) throw new Error('全局别名不能超过 40 个字。')
     const aliasLower = nextAlias.toLowerCase()
+    const nextCategory = this.normalizeGlobalAliasCategory(category)
     const existing = this.db.prepare(`
       SELECT item_key AS itemKey FROM global_item_aliases WHERE alias_lower = ?
     `).get(aliasLower)
     if (existing && existing.itemKey !== itemKey) throw new Error('这个全局别名已经被其他物品使用。')
     this.db.prepare(`
-      INSERT INTO global_item_aliases (alias_lower, alias, item_key, updated_at)
-      VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+      INSERT INTO global_item_aliases (alias_lower, alias, item_key, category, updated_at)
+      VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
       ON CONFLICT(alias_lower) DO UPDATE SET
         alias = excluded.alias,
         item_key = excluded.item_key,
+        category = excluded.category,
         updated_at = CURRENT_TIMESTAMP
-    `).run(aliasLower, nextAlias, itemKey)
-    return { ...item, alias: nextAlias, shortCode: this.shortCodeForItemKey(itemKey) }
+    `).run(aliasLower, nextAlias, itemKey, nextCategory)
+    return { ...item, alias: nextAlias, category: nextCategory, shortCode: this.shortCodeForItemKey(itemKey) }
   }
 
   deleteGlobalItemAlias (alias) {
@@ -1424,6 +1620,7 @@ class StoreDb {
         this.db.prepare('UPDATE transactions SET username = ? WHERE player_uuid = ?').run(`仓库:${nextName}`, ownerUuid)
         this.db.prepare('UPDATE inventory_mismatches SET username = ? WHERE owner_uuid = ?').run(`仓库:${nextName}`, ownerUuid)
         this.db.prepare('UPDATE active_recovery_tasks SET owner_username = ?, vault_name = ? WHERE owner_uuid = ?').run(`仓库:${nextName}`, nextName, ownerUuid)
+        this.db.prepare('UPDATE bot_recovery_tasks SET owner_username = ?, vault_name = ? WHERE owner_uuid = ?').run(`仓库:${nextName}`, nextName, ownerUuid)
       })
       return { ...warehouse, name: nextName }
     }
@@ -1441,6 +1638,7 @@ class StoreDb {
       this.db.prepare('UPDATE transactions SET player_uuid = ?, username = ? WHERE player_uuid = ?').run(newOwner, `仓库:${nextName}`, oldOwner)
       this.db.prepare('UPDATE inventory_mismatches SET owner_uuid = ?, username = ? WHERE owner_uuid = ?').run(newOwner, `仓库:${nextName}`, oldOwner)
       this.db.prepare('UPDATE active_recovery_tasks SET owner_uuid = ?, owner_username = ?, vault_name = ? WHERE owner_uuid = ?').run(newOwner, `仓库:${nextName}`, nextName, oldOwner)
+      this.db.prepare('UPDATE bot_recovery_tasks SET owner_uuid = ?, owner_username = ?, vault_name = ? WHERE owner_uuid = ?').run(newOwner, `仓库:${nextName}`, nextName, oldOwner)
       this.db.prepare('UPDATE players SET default_owner_uuid = ? WHERE default_owner_uuid = ?').run(newOwner, oldOwner)
       this.db.prepare('DELETE FROM custom_warehouses WHERE name_lower = ?').run(warehouse.nameLower)
     })
@@ -1527,10 +1725,97 @@ class StoreDb {
   }
 
   addTransaction (type, status, playerUuid, username, items, message = '') {
+    const context = this.transactionContext.getStore() || {}
     this.db.prepare(`
-      INSERT INTO transactions (type, status, player_uuid, username, items_json, message)
+      INSERT INTO transactions (type, status, player_uuid, username, items_json, message, bot_id, bot_name)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(type, status, playerUuid, username, JSON.stringify(items), message, String(context.botId || ''), String(context.botName || ''))
+  }
+
+  runWithBotContext (bot, fn) {
+    const current = this.transactionContext.getStore() || {}
+    return this.transactionContext.run({
+      ...current,
+      botId: String(bot?.botId || ''),
+      botName: String(bot?.botName || '')
+    }, fn)
+  }
+
+  runWithCommandContext (commandLogId, fn) {
+    const current = this.transactionContext.getStore() || {}
+    return this.transactionContext.run({ ...current, commandLogId: Number(commandLogId || current.commandLogId || 0) }, fn)
+  }
+
+  currentCommandLogId () {
+    return Number(this.transactionContext.getStore()?.commandLogId || 0)
+  }
+
+  createCommandLog ({ username, commandText, channel, receiverBotId, receiverBotName }) {
+    const result = this.db.prepare(`
+      INSERT INTO command_logs (username, command_text, channel, receiver_bot_id, receiver_bot_name)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(String(username || ''), String(commandText || ''), String(channel || 'private'), String(receiverBotId || ''), String(receiverBotName || ''))
+    return Number(result.lastInsertRowid)
+  }
+
+  addCommandReply ({ commandLogId, targetUsername, channel = 'private', botId = '', botName = '', message }) {
+    const id = Number(commandLogId || this.currentCommandLogId())
+    if (!id) return 0
+    const context = this.transactionContext.getStore() || {}
+    return this.db.prepare(`
+      INSERT INTO command_log_replies (command_log_id, target_username, channel, bot_id, bot_name, message)
       VALUES (?, ?, ?, ?, ?, ?)
-    `).run(type, status, playerUuid, username, JSON.stringify(items), message)
+    `).run(id, String(targetUsername || ''), String(channel || 'private'), String(botId || context.botId || ''), String(botName || context.botName || ''), String(message || '')).changes
+  }
+
+  listCommandLogs ({ page = 1, pageSize = 30, query = '', channel = '' } = {}) {
+    const currentPage = Math.max(1, Number.parseInt(page, 10) || 1)
+    const limit = Math.max(1, Math.min(100, Number.parseInt(pageSize, 10) || 30))
+    const text = String(query || '').trim().toLowerCase()
+    const channelText = String(channel || '').trim().toLowerCase()
+    const where = []
+    const params = []
+    if (channelText) {
+      where.push('c.channel = ?')
+      params.push(channelText)
+    }
+    if (text) {
+      where.push(`(
+        lower(c.username) LIKE ? OR lower(c.command_text) LIKE ? OR
+        lower(c.receiver_bot_name) LIKE ? OR EXISTS (
+          SELECT 1 FROM command_log_replies qr
+          WHERE qr.command_log_id = c.id AND (lower(qr.bot_name) LIKE ? OR lower(qr.message) LIKE ?)
+        )
+      )`)
+      const like = `%${text}%`
+      params.push(like, like, like, like, like)
+    }
+    const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : ''
+    const total = Number(this.db.prepare(`SELECT COUNT(*) AS count FROM command_logs c ${whereSql}`).get(...params).count || 0)
+    const totalPages = Math.max(1, Math.ceil(total / limit))
+    const safePage = Math.min(currentPage, totalPages)
+    const rows = this.db.prepare(`
+      SELECT c.id, c.username, c.command_text AS commandText, c.channel,
+             c.receiver_bot_id AS receiverBotId, c.receiver_bot_name AS receiverBotName,
+             c.created_at AS createdAt
+      FROM command_logs c ${whereSql}
+      ORDER BY c.id DESC LIMIT ? OFFSET ?
+    `).all(...params, limit, (safePage - 1) * limit)
+    if (rows.length) {
+      const placeholders = rows.map(() => '?').join(',')
+      const replies = this.db.prepare(`
+        SELECT command_log_id AS commandLogId, target_username AS targetUsername,
+               channel, bot_id AS botId, bot_name AS botName, message, created_at AS createdAt
+        FROM command_log_replies WHERE command_log_id IN (${placeholders}) ORDER BY id
+      `).all(...rows.map(row => row.id))
+      const repliesByCommand = new Map()
+      for (const reply of replies) {
+        if (!repliesByCommand.has(reply.commandLogId)) repliesByCommand.set(reply.commandLogId, [])
+        repliesByCommand.get(reply.commandLogId).push(reply)
+      }
+      for (const row of rows) row.replies = repliesByCommand.get(row.id) || []
+    }
+    return { page: safePage, pageSize: limit, total, totalPages, rows }
   }
 
   getBalance (ownerUuid, itemKey) {
@@ -1574,24 +1859,32 @@ class StoreDb {
 
   getOwnerItemsByItemId (ownerUuid, itemId) {
     return this.db.prepare(`
-      SELECT b.owner_uuid AS ownerUuid, b.item_key AS itemKey, b.amount,
+      SELECT b.owner_uuid AS ownerUuid, b.item_key AS itemKey,
+             b.amount - COALESCE((SELECT SUM(r.amount) FROM inventory_reservations r
+               WHERE r.owner_uuid = b.owner_uuid AND r.item_key = b.item_key), 0) AS amount,
              i.item_id AS itemId, i.display_name AS displayName,
              i.nbt_json AS nbtJson, i.meta_json AS metaJson
       FROM balances b
       JOIN items i ON i.item_key = b.item_key
-      WHERE b.owner_uuid = ? AND i.item_id = ? AND b.amount > 0
+      WHERE b.owner_uuid = ? AND i.item_id = ?
+        AND b.amount - COALESCE((SELECT SUM(r.amount) FROM inventory_reservations r
+          WHERE r.owner_uuid = b.owner_uuid AND r.item_key = b.item_key), 0) > 0
       ORDER BY i.nbt_json = '' DESC, i.created_at ASC
     `).all(ownerUuid, itemId)
   }
 
   getOwnerItemsByItemKey (ownerUuid, itemKey) {
     return this.db.prepare(`
-      SELECT b.owner_uuid AS ownerUuid, b.item_key AS itemKey, b.amount,
+      SELECT b.owner_uuid AS ownerUuid, b.item_key AS itemKey,
+             b.amount - COALESCE((SELECT SUM(r.amount) FROM inventory_reservations r
+               WHERE r.owner_uuid = b.owner_uuid AND r.item_key = b.item_key), 0) AS amount,
              i.item_id AS itemId, i.display_name AS displayName,
              i.nbt_json AS nbtJson, i.meta_json AS metaJson
       FROM balances b
       JOIN items i ON i.item_key = b.item_key
-      WHERE b.owner_uuid = ? AND i.item_key = ? AND b.amount > 0
+      WHERE b.owner_uuid = ? AND i.item_key = ?
+        AND b.amount - COALESCE((SELECT SUM(r.amount) FROM inventory_reservations r
+          WHERE r.owner_uuid = b.owner_uuid AND r.item_key = b.item_key), 0) > 0
       ORDER BY i.created_at ASC
     `).all(ownerUuid, itemKey)
   }
@@ -1782,7 +2075,8 @@ class StoreDb {
   listWebTransactions (ownerUuid, limit = 80) {
     return this.db.prepare(`
       SELECT id, type, status, player_uuid AS playerUuid, username,
-             items_json AS itemsJson, message, created_at AS createdAt
+             items_json AS itemsJson, message, bot_id AS botId, bot_name AS botName,
+             created_at AS createdAt
       FROM transactions
       WHERE player_uuid = ?
       ORDER BY id DESC
@@ -1853,7 +2147,8 @@ class StoreDb {
              box.display_name AS shulkerDisplayName,
              box.nbt_json AS shulkerNbtJson,
              box.meta_json AS shulkerMetaJson,
-             b.amount AS shulkerAmount,
+             b.amount - COALESCE((SELECT SUM(r.amount) FROM inventory_reservations r
+               WHERE r.owner_uuid = b.owner_uuid AND r.item_key = b.item_key), 0) AS shulkerAmount,
              sc.contained_item_id AS containedItemId,
              GROUP_CONCAT(DISTINCT contained.display_name) AS containedDisplayNames,
              SUM(sc.amount) AS containedAmount,
@@ -1864,13 +2159,15 @@ class StoreDb {
              (SELECT COALESCE(SUM(all_sc.amount), 0)
               FROM shulker_contents all_sc
               WHERE all_sc.shulker_item_key = sc.shulker_item_key) AS boxContainedAmount,
-             SUM(sc.amount) * b.amount AS totalContainedAmount
+             SUM(sc.amount) * (b.amount - COALESCE((SELECT SUM(r.amount) FROM inventory_reservations r
+               WHERE r.owner_uuid = b.owner_uuid AND r.item_key = b.item_key), 0)) AS totalContainedAmount
       FROM shulker_contents sc
       JOIN balances b ON b.item_key = sc.shulker_item_key
       JOIN items box ON box.item_key = sc.shulker_item_key
       JOIN items contained ON contained.item_key = sc.contained_item_key
       WHERE b.owner_uuid = ?
-        AND b.amount > 0
+        AND b.amount - COALESCE((SELECT SUM(r.amount) FROM inventory_reservations r
+          WHERE r.owner_uuid = b.owner_uuid AND r.item_key = b.item_key), 0) > 0
         AND sc.contained_item_id = ?
         AND sc.amount > 0
       GROUP BY b.owner_uuid, sc.shulker_item_key
@@ -1886,7 +2183,8 @@ class StoreDb {
              box.display_name AS shulkerDisplayName,
              box.nbt_json AS shulkerNbtJson,
              box.meta_json AS shulkerMetaJson,
-             b.amount AS shulkerAmount,
+             b.amount - COALESCE((SELECT SUM(r.amount) FROM inventory_reservations r
+               WHERE r.owner_uuid = b.owner_uuid AND r.item_key = b.item_key), 0) AS shulkerAmount,
              sc.contained_item_id AS containedItemId,
              contained.display_name AS containedDisplayNames,
              sc.amount AS containedAmount,
@@ -1897,13 +2195,15 @@ class StoreDb {
              (SELECT COALESCE(SUM(all_sc.amount), 0)
               FROM shulker_contents all_sc
               WHERE all_sc.shulker_item_key = sc.shulker_item_key) AS boxContainedAmount,
-             sc.amount * b.amount AS totalContainedAmount
+             sc.amount * (b.amount - COALESCE((SELECT SUM(r.amount) FROM inventory_reservations r
+               WHERE r.owner_uuid = b.owner_uuid AND r.item_key = b.item_key), 0)) AS totalContainedAmount
       FROM shulker_contents sc
       JOIN balances b ON b.item_key = sc.shulker_item_key
       JOIN items box ON box.item_key = sc.shulker_item_key
       JOIN items contained ON contained.item_key = sc.contained_item_key
       WHERE b.owner_uuid = ?
-        AND b.amount > 0
+        AND b.amount - COALESCE((SELECT SUM(r.amount) FROM inventory_reservations r
+          WHERE r.owner_uuid = b.owner_uuid AND r.item_key = b.item_key), 0) > 0
         AND sc.contained_item_key = ?
         AND sc.amount > 0
       ORDER BY totalContainedAmount DESC, box.display_name COLLATE NOCASE ASC
@@ -1920,18 +2220,21 @@ class StoreDb {
              box.display_name AS shulkerDisplayName,
              box.nbt_json AS shulkerNbtJson,
              box.meta_json AS shulkerMetaJson,
-             b.amount AS shulkerAmount,
+             b.amount - COALESCE((SELECT SUM(r.amount) FROM inventory_reservations r
+               WHERE r.owner_uuid = b.owner_uuid AND r.item_key = b.item_key), 0) AS shulkerAmount,
              sc.contained_item_id AS containedItemId,
              GROUP_CONCAT(DISTINCT contained.display_name) AS containedDisplayNames,
              SUM(sc.amount) AS containedAmount,
              SUM(sc.slot_count) AS slotCount,
-             SUM(sc.amount) * b.amount AS totalContainedAmount
+             SUM(sc.amount) * (b.amount - COALESCE((SELECT SUM(r.amount) FROM inventory_reservations r
+               WHERE r.owner_uuid = b.owner_uuid AND r.item_key = b.item_key), 0)) AS totalContainedAmount
       FROM shulker_contents sc
       JOIN balances b ON b.item_key = sc.shulker_item_key
       JOIN items box ON box.item_key = sc.shulker_item_key
       JOIN items contained ON contained.item_key = sc.contained_item_key
       WHERE b.owner_uuid = ?
-        AND b.amount > 0
+        AND b.amount - COALESCE((SELECT SUM(r.amount) FROM inventory_reservations r
+          WHERE r.owner_uuid = b.owner_uuid AND r.item_key = b.item_key), 0) > 0
         AND sc.amount > 0
         AND (
           lower(contained.display_name) = lower(?)

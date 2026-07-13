@@ -1,0 +1,113 @@
+class AsyncMutex {
+  constructor () {
+    this.tail = Promise.resolve()
+  }
+
+  async run (fn) {
+    const previous = this.tail
+    let release
+    this.tail = new Promise(resolve => { release = resolve })
+    await previous
+    try {
+      return await fn()
+    } finally {
+      release()
+    }
+  }
+}
+
+class BotTaskPool {
+  constructor (config = {}) {
+    this.config = config
+    this.workers = new Set()
+    this.queue = []
+    this.sequence = 0
+    this.seenMessages = new Map()
+    this.warehouseMutex = new AsyncMutex()
+  }
+
+  register (service) {
+    this.workers.add(service)
+    this.dispatch()
+  }
+
+  unregister (service) {
+    this.workers.delete(service)
+  }
+
+  acceptIncoming (username, message, source = '') {
+    if (!String(message || '').trim().startsWith('!')) return true
+    const now = Date.now()
+    const ttl = Math.max(500, Number(this.config.timing?.commandDedupeMs || 1500))
+    const key = `${String(username).toLowerCase()}|${source}|${String(message).trim()}`
+    const seenAt = this.seenMessages.get(key) || 0
+    if (now - seenAt < ttl) return false
+    this.seenMessages.set(key, now)
+    for (const [entry, timestamp] of this.seenMessages) {
+      if (now - timestamp > ttl * 4) this.seenMessages.delete(entry)
+    }
+    return true
+  }
+
+  enqueue (task) {
+    return new Promise((resolve, reject) => {
+      const queued = {
+        ...task,
+        id: ++this.sequence,
+        resolve,
+        reject,
+        enqueuedAt: Date.now()
+      }
+      this.queue.push(queued)
+      task.onQueued?.(this.queue.length)
+      this.dispatch()
+    })
+  }
+
+  snapshot () {
+    const active = [...this.workers]
+      .filter(worker => worker.active)
+      .map(worker => ({ ...worker.active, botName: worker.bot.username }))
+    return {
+      queued: this.queue.map(task => ({ id: task.id, type: task.type, username: task.username })),
+      active,
+      onlineBots: this.workers.size
+    }
+  }
+
+  dispatch () {
+    if ([...this.workers].some(worker => worker.active?.exclusive)) return
+    if (this.queue[0]?.exclusive) {
+      if ([...this.workers].some(worker => worker.active)) return
+      const worker = [...this.workers].find(candidate => candidate.ready && !candidate.recoveringFromDeath)
+      if (!worker) return
+      this.run(worker, this.queue.shift())
+      return
+    }
+    for (const worker of this.workers) {
+      if (!this.queue.length) break
+      if (this.queue[0].exclusive) break
+      if (!worker.ready || worker.active || worker.recoveringFromDeath) continue
+      const task = this.queue.shift()
+      this.run(worker, task)
+    }
+  }
+
+  async run (worker, task) {
+    try {
+      const result = await worker.runExclusive(task.username, task.type, () => task.run(worker), {
+        taskId: task.id,
+        commandLogId: task.commandLogId || 0,
+        exclusive: Boolean(task.exclusive)
+      })
+      task.resolve(result)
+    } catch (error) {
+      worker.handleCommandError(task.username, error)
+      task.resolve(null)
+    } finally {
+      this.dispatch()
+    }
+  }
+}
+
+module.exports = { AsyncMutex, BotTaskPool }

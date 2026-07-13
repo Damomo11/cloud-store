@@ -1,6 +1,6 @@
 # Cloud Store Bot
 
-基于 mineflayer 的 Minecraft 云仓库机器人。机器人一次只服务一名玩家，所有反馈默认通过 `/msg` 私聊发送，玩家库存以正版 UUID 记账。
+基于 mineflayer 的 Minecraft 云仓库机器人。支持多个机器人账号共享任务池，所有反馈默认通过 `/msg` 私聊发送，玩家库存以正版 UUID 记账。
 
 ## 环境
 
@@ -36,7 +36,8 @@ copy config.example.json config.json
 
 关键配置：
 
-- `server`: 服务器地址、端口、机器人账号、认证方式和 MC 版本
+- `server`: 服务器地址、端口、兼容旧版的首个微软账号和 MC 版本；机器人认证固定为 Microsoft OAuth2 设备码，不支持离线或密码登录
+- `bots`: 首次启动时可选的机器人账号数组；账号初始化后由 Web 管理页维护。每个账号使用独立 Microsoft OAuth2 设备码和令牌缓存
 - `admins`: 管理员用户名，按你的服务器玩家名填写
 - `commands.home`: 默认 `/home ck`
 - `commands.tpa`: 默认 `/tpa {player}`，机器人主动请求传送到玩家身边
@@ -70,6 +71,27 @@ npm start
 ## 内置 Web 面板
 
 `npm start` 会同时启动机器人和 Web 面板。
+
+配置多个账号时，每个在线机器人都是一个任务 Worker。游戏命令和 Web 请求进入同一个任务池，由空闲机器人领取。取货任务开始执行时会先在 SQLite 中原子预留库存；其他任务只能看到扣除预留后的可用量，因此不会把同一份库存分给两个机器人。木桶存取和同步也使用共享互斥锁，避免并发刷新同一木桶快照。
+
+管理员可以在 Web 管理面板的“机器人账号”页动态添加、启用、停用和删除账号。添加账号后，页面会显示 Microsoft OAuth2 验证地址和设备码；登录令牌只保存在本机对应的缓存目录中，不会写入数据库。停用账号会先让它完成当前任务，再停止领取新任务。
+
+多账号配置示例：
+
+```jsonc
+"bots": [
+  {
+    "username": "bot1@example.com",
+    "botName": "WarehouseBot1",
+    "profilesFolder": "auth-cache/bot-1"
+  },
+  {
+    "username": "bot2@example.com",
+    "botName": "WarehouseBot2",
+    "profilesFolder": "auth-cache/bot-2"
+  }
+]
+```
 
 默认地址：
 

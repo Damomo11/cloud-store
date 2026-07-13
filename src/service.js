@@ -1,12 +1,15 @@
 const { clampInt, sleep, sumBy } = require('./utils')
 
 class CloudStoreService {
-  constructor (bot, db, catalog, warehouse, config) {
+  constructor (bot, db, catalog, warehouse, config, taskPool = null) {
     this.bot = bot
     this.db = db
     this.catalog = catalog
     this.warehouse = warehouse
     this.config = config
+    this.taskPool = taskPool
+    this.botId = String(config.server?.botName || config.server?.username || bot.username || 'bot').toLowerCase()
+    this.ready = false
     this.active = null
     this.deathContext = null
     this.recoveringFromDeath = false
@@ -20,14 +23,15 @@ class CloudStoreService {
   }
 
   start () {
+    this.db.claimLegacyRecoveryTask(this.botId)
     this.bot.on('chat', (username, message) => {
       if (username === this.bot.username) return
-      this.handleIncoming(username, message, 'chat')
+      this.handleIncoming(username, message, 'chat', { channel: 'public' })
     })
 
     this.bot.on('whisper', (username, message) => {
       if (username === this.bot.username) return
-      this.handleIncoming(username, message, 'whisper')
+      this.handleIncoming(username, message, 'whisper', { channel: 'private' })
     })
 
     this.bot.on('messagestr', (message, position, originalMessage, sender) => {
@@ -47,14 +51,17 @@ class CloudStoreService {
     })
 
     this.bot.on('respawn', () => {
-      this.handleRespawn().catch(error => {
+      this.withBotContext(() => this.handleRespawn()).catch(error => {
         console.error('[death-recovery] failed:', error)
       })
     })
 
     setTimeout(() => {
-      this.recoverPersistedTaskOnSpawn().catch(error => {
+      this.withBotContext(() => this.recoverPersistedTaskOnSpawn()).catch(error => {
         console.error('[disconnect-recovery] failed:', error)
+      }).finally(() => {
+        this.ready = true
+        this.taskPool?.dispatch()
       })
     }, 1500)
   }
@@ -105,7 +112,7 @@ class CloudStoreService {
         }
       }
 
-      this.db.clearRecoveryTask()
+      this.db.clearRecoveryTask(this.botId)
       if (this.active?.dead) this.active = null
     } finally {
       this.recoveringFromDeath = false
@@ -123,14 +130,14 @@ class CloudStoreService {
       targetUsername,
       phase,
       items: this.mergeItems(items || [])
-    })
+    }, this.botId)
   }
 
   clearRecoveryTaskIfInventoryEmpty () {
-    const task = this.db.getRecoveryTask()
+    const task = this.db.getRecoveryTask(this.botId)
     if (task?.type === 'withdraw' && this.isWithdrawDeliveryPhase(task.phase)) return
     const held = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
-    if (!held.length) this.db.clearRecoveryTask()
+    if (!held.length) this.db.clearRecoveryTask(this.botId)
   }
 
   isWithdrawDeliveryPhase (phase) {
@@ -147,14 +154,14 @@ class CloudStoreService {
   }
 
   async recoverPersistedTaskOnSpawn () {
-    const task = this.db.getRecoveryTask()
+    const task = this.db.getRecoveryTask(this.botId)
     if (!task) return
 
     const held = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
     const owner = this.recoveryOwnerFromTask(task)
     if (!held.length && !(task.type === 'withdraw' && this.isWithdrawDeliveryPhase(task.phase) && task.items?.length)) {
       console.warn(`[disconnect-recovery] clearing stale recovery task without held items: ${task.type}:${task.actorUsername}:${task.phase}`)
-      this.db.clearRecoveryTask()
+      this.db.clearRecoveryTask(this.botId)
       return
     }
 
@@ -194,7 +201,7 @@ class CloudStoreService {
       return
     }
 
-    this.db.clearRecoveryTask()
+    this.db.clearRecoveryTask(this.botId)
   }
 
   handlePlayerChatPacket (packet) {
@@ -204,7 +211,7 @@ class CloudStoreService {
       console.log(`[packet:player_chat] uuid=${packet.senderUuid} username=${username || '?'} plain=${message}`)
     }
     if (!username || !message || this.isSelfUsername(username)) return
-    this.handleIncoming(username, message, 'packet:player_chat')
+    this.handleIncoming(username, message, 'packet:player_chat', { channel: 'public' })
   }
 
   handleSystemChatPacket (packet) {
@@ -215,7 +222,7 @@ class CloudStoreService {
     if (!message) return
     const parsed = this.parseCustomCommandMessage(message, null)
     if (!parsed) return
-    this.handleIncoming(parsed.username, parsed.command, 'packet:system_chat')
+    this.handleIncoming(parsed.username, parsed.command, 'packet:system_chat', { channel: 'private' })
   }
 
   handleIncoming (username, message, source, context = {}) {
@@ -226,8 +233,19 @@ class CloudStoreService {
     if (this.config.debugRawChat) console.log(`[chat:${source}] ${username}: ${message}`)
 
     const commandMessage = this.normalizePrivateCommandText(message, source)
-    if (this.isDuplicateCommand(username, commandMessage, source)) return
-    this.handleChat(username, commandMessage, { ...context, source }).catch(error => this.handleCommandError(username, error))
+    if (this.taskPool && !this.taskPool.acceptIncoming(username, commandMessage)) return
+    if (!this.taskPool && this.isDuplicateCommand(username, commandMessage, source)) return
+    const normalizedCommand = this.normalizeCommandText(commandMessage)
+    if (!normalizedCommand.startsWith('!')) return
+    const commandLogId = this.db.createCommandLog({
+      username,
+      commandText: this.redactSensitiveText(normalizedCommand),
+      channel: context.channel || 'private',
+      receiverBotId: this.botId,
+      receiverBotName: this.bot.username || this.config.server?.botName || this.botId
+    })
+    this.db.runWithCommandContext(commandLogId, () => this.withBotContext(() => this.handleChat(username, normalizedCommand, { ...context, source })))
+      .catch(error => this.db.runWithCommandContext(commandLogId, () => this.withBotContext(() => this.handleCommandError(username, error))))
   }
 
   isDuplicateCommand (username, message, source) {
@@ -257,13 +275,13 @@ class CloudStoreService {
 
     const whisper = this.parsePrivateMessage(message)
     if (whisper) {
-      this.handleIncoming(whisper.username, whisper.message, 'messagestr:private')
+      this.handleIncoming(whisper.username, whisper.message, 'messagestr:private', { channel: 'private' })
       return
     }
 
     const parsed = this.parseCustomCommandMessage(message, sender)
     if (!parsed) return
-    this.handleIncoming(parsed.username, parsed.command, 'messagestr')
+    this.handleIncoming(parsed.username, parsed.command, 'messagestr', { channel: 'public' })
   }
 
   parsePrivateMessage (message) {
@@ -525,47 +543,64 @@ class CloudStoreService {
       return
     }
 
-    if (this.active) {
-      this.msg(username, `机器人忙，玩家${this.active.username}使用中，请稍后再试。`)
-      return
-    }
-
     if (text === '!存物品' || text === '!存') {
       const owner = this.defaultStorageOwnerForPlayer(this.getPlayer(username))
-      await this.runExclusive(username, 'deposit', () => this.handleDeposit(username, owner))
+      await this.enqueueTask(username, 'deposit', worker => worker.handleDeposit(username, owner))
       return
     }
 
     if (/^!(存取|取存)(?:\s|$)/.test(text)) {
       const owner = this.defaultStorageOwnerForPlayer(this.getPlayer(username))
       const withdrawText = text.replace(/^!(存取|取存)/, '!取')
-      await this.runExclusive(username, 'withdraw', () => this.handleWithdraw(username, withdrawText, owner, null, username, { continueWithDeposit: true }))
+      await this.enqueueTask(username, 'withdraw', worker => worker.handleWithdraw(username, withdrawText, owner, null, username, { continueWithDeposit: true }))
       return
     }
 
     if (text.startsWith('!取物品') || text.startsWith('!取')) {
       const owner = this.defaultStorageOwnerForPlayer(this.getPlayer(username))
-      await this.runExclusive(username, 'withdraw', () => this.handleWithdraw(username, text, owner))
+      await this.enqueueTask(username, 'withdraw', worker => worker.handleWithdraw(username, text, owner))
     }
   }
 
-  async runExclusive (username, type, fn) {
-    this.active = { type, username, cancelled: false, dead: false, phase: 'start', player: null }
+  async runExclusive (username, type, fn, extra = {}) {
+    const active = { type, username, cancelled: false, dead: false, phase: 'start', player: null, ...extra }
+    this.active = active
     try {
-      await fn()
+      await this.db.runWithCommandContext(active.commandLogId, () => this.withBotContext(fn))
     } finally {
-      this.active = null
+      if (active.reservationId) this.db.releaseInventoryReservation(active.reservationId)
+      if (this.active === active) this.active = null
     }
+  }
+
+  withBotContext (fn) {
+    return this.db.runWithBotContext({
+      botId: this.botId,
+      botName: this.bot.username || this.config.server?.botName || this.botId
+    }, fn)
+  }
+
+  enqueueTask (username, type, run, options = {}) {
+    if (!this.taskPool) return this.runExclusive(username, type, () => run(this))
+    return this.taskPool.enqueue({
+      username,
+      type,
+      run,
+      commandLogId: this.db.currentCommandLogId(),
+      exclusive: Boolean(options.exclusive),
+      onQueued: position => {
+        if (position > 1 || ![...this.taskPool.workers].some(worker => worker.ready && !worker.active)) {
+          this.msg(username, `任务已加入队列，前面还有 ${Math.max(0, position - 1)} 个任务。`)
+        }
+      }
+    })
   }
 
   startWebDeposit (user, ownerUuid) {
     const owner = this.resolveWebStorageOwner(user, ownerUuid)
-    if (this.active) {
-      throw new Error(`机器人忙，玩家${this.active.username}使用中，请稍后再试。`)
-    }
-    this.runExclusive(user.username, 'deposit', () => this.handleDeposit(user.username, owner))
+    this.enqueueTask(user.username, 'deposit', worker => worker.handleDeposit(user.username, owner))
       .catch(error => this.handleCommandError(user.username, error))
-    return `已开始准备存入${this.ownerScopeName(owner)}，请在游戏内接受传送请求。`
+    return `存货任务已提交到${this.ownerScopeName(owner)}，空闲机器人会自动处理。`
   }
 
   startWebWithdraw (user, ownerUuid, itemText, amount, targetUsername = '') {
@@ -575,9 +610,6 @@ class CloudStoreService {
   startWebWithdrawMany (user, ownerUuid, webRequests, targetUsername = '') {
     const owner = this.resolveWebStorageOwner(user, ownerUuid)
     if (!Array.isArray(webRequests) || !webRequests.length) throw new Error('请先选择要取出的物品。')
-    if (this.active) {
-      throw new Error(`机器人忙，玩家${this.active.username}使用中，请稍后再试。`)
-    }
     const target = String(targetUsername || user.username || '').trim()
     if (!/^[A-Za-z0-9_]{3,16}$/.test(target)) throw new Error('目标玩家 ID 格式不正确。')
 
@@ -596,11 +628,11 @@ class CloudStoreService {
       return { ...resolved, amount: count }
     })
 
-    this.runExclusive(user.username, 'withdraw', () => this.handleWithdraw(user.username, '', owner, requests, target))
+    this.enqueueTask(user.username, 'withdraw', worker => worker.handleWithdraw(user.username, '', owner, requests, target))
       .catch(error => this.handleCommandError(user.username, error))
     return target === user.username
-      ? `已开始准备从${this.ownerScopeName(owner)}取出 ${requests.length} 种物品，请在游戏内接受传送请求。`
-      : `已开始准备从${this.ownerScopeName(owner)}取出 ${requests.length} 种物品，并交给 ${target}。`
+      ? `取货任务已提交，将从${this.ownerScopeName(owner)}取出 ${requests.length} 种物品。`
+      : `取货任务已提交，将从${this.ownerScopeName(owner)}取出 ${requests.length} 种物品并交给 ${target}。`
   }
 
   resolveWebStorageOwner (user, ownerUuid) {
@@ -707,7 +739,7 @@ class CloudStoreService {
               const reason = result.stopReason ? `${result.stopReason} ` : '仓库空间不足，'
               this.msg(username, `${reason}剩余${this.formatDepositSummary(result.leftover)}已转记为 momo，避免影响下一个玩家。`)
             }
-            this.db.clearRecoveryTask()
+            this.db.clearRecoveryTask(this.botId)
             return
           }
           logSession('teleport_timeout', [], {
@@ -784,7 +816,7 @@ class CloudStoreService {
         const reason = result.stopReason ? `${result.stopReason} ` : '仓库空间不足，'
         this.msg(username, `${reason}剩余${this.formatDepositSummary(result.leftover)}已转记为 momo，避免影响下一个玩家。`)
       }
-      this.db.clearRecoveryTask()
+      this.db.clearRecoveryTask(this.botId)
     } catch (error) {
       const held = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
       logSession('error', held, {
@@ -854,6 +886,10 @@ class CloudStoreService {
       return
     }
 
+    const reservationId = `${this.botId}:${this.active?.taskId || Date.now()}`
+    this.db.reserveInventory(reservationId, plan.allocations)
+    if (this.active) this.active.reservationId = reservationId
+
     const batches = this.splitAllocationsIntoInventoryBatches(plan.allocations, 36)
 
     const teleportNotice = deliveryToOther
@@ -894,7 +930,7 @@ class CloudStoreService {
             : `${this.ownerActionPrefix(storageOwner)}已分批取出部分物品：${this.formatWithdrawSummary(partial)}。剩余取货因未接受传送请求已取消。`
           deliveryToOther ? msgTarget(summary) : this.msg(username, summary)
         }
-        this.db.clearRecoveryTask()
+        this.db.clearRecoveryTask(this.botId)
         return
       }
 
@@ -947,7 +983,7 @@ class CloudStoreService {
       }
       if (deliveryToOther) msgTarget(`${username} 给你的取货失败：仓库实物取出失败，请稍后再试。`)
       else this.msg(username, `账本有库存，但按本地木桶记录没有成功取出：${this.formatItemList(plan.allocations)}。请管理员执行 !同步 后再试。`)
-      this.db.clearRecoveryTask()
+      this.db.clearRecoveryTask(this.botId)
       return
     }
 
@@ -967,7 +1003,7 @@ class CloudStoreService {
       await this.handleDeposit(username, storageOwner, { alreadyAtPlayer: stayedWithPlayerForDeposit })
       return
     }
-    this.db.clearRecoveryTask()
+    this.db.clearRecoveryTask(this.botId)
   }
 
   async dropWithdrawItemsToPlayer (username, requestedItems) {
@@ -1138,17 +1174,12 @@ class CloudStoreService {
       return
     }
 
-    if (this.active) {
-      this.msg(username, `机器人忙，玩家${this.active.username}使用中，请稍后再试。`)
-      return
-    }
-
     if (command.action === '存') {
       if (command.rest) {
         this.msg(username, '格式：个人 存')
         return
       }
-      await this.runExclusive(username, 'deposit', () => this.handleDeposit(username, owner))
+      await this.enqueueTask(username, 'deposit', worker => worker.handleDeposit(username, owner))
       return
     }
 
@@ -1157,7 +1188,7 @@ class CloudStoreService {
         this.msg(username, '格式：个人 取 石头64')
         return
       }
-      await this.runExclusive(username, 'withdraw', () => this.handleWithdraw(username, `!个人 取 ${command.rest}`, owner))
+      await this.enqueueTask(username, 'withdraw', worker => worker.handleWithdraw(username, `!个人 取 ${command.rest}`, owner))
     }
   }
 
@@ -1274,17 +1305,12 @@ class CloudStoreService {
       return
     }
 
-    if (this.active) {
-      this.msg(username, `机器人忙，玩家${this.active.username}使用中，请稍后再试。`)
-      return
-    }
-
     if (command.action === '存') {
       if (command.rest) {
         this.msg(username, `格式：!${warehouse.name} 存`)
         return
       }
-      await this.runExclusive(username, 'deposit', () => this.handleDeposit(username, owner))
+      await this.enqueueTask(username, 'deposit', worker => worker.handleDeposit(username, owner))
       return
     }
 
@@ -1293,7 +1319,7 @@ class CloudStoreService {
         this.msg(username, `格式：!${warehouse.name} 取 石头64`)
         return
       }
-      await this.runExclusive(username, 'withdraw', () => this.handleWithdraw(username, `!${warehouse.name} 取 ${command.rest}`, owner))
+      await this.enqueueTask(username, 'withdraw', worker => worker.handleWithdraw(username, `!${warehouse.name} 取 ${command.rest}`, owner))
     }
   }
 
@@ -1508,12 +1534,7 @@ class CloudStoreService {
       return
     }
 
-    if (this.active) {
-      this.msg(username, `机器人忙，玩家${this.active.username}使用中，请稍后再试。`)
-      return
-    }
-
-    await this.runExclusive(username, 'sync', async () => {
+    await this.enqueueTask(username, 'sync', async worker => {
       const parts = text.split(/\s+/).filter(Boolean)
       const radius = clampInt(
         parts[1],
@@ -1522,12 +1543,12 @@ class CloudStoreService {
         this.config.warehouse.maxSyncRadius
       )
       this.msg(username, `开始同步仓库，半径 ${radius}。`)
-      const result = await this.warehouse.syncWarehouse(radius)
+      const result = await worker.warehouse.syncWarehouse(radius)
       const addedAmount = this.totalAmount(result.addedToMomo)
       const unresolvedAmount = this.totalAmount(result.unresolved)
       const failureText = result.failures.length ? `，失败${result.failures.length}` : ''
       this.msg(username, `同步完成：木桶${result.chestCount}，打开${result.openedChestCount}${failureText}，多余${addedAmount}/${this.itemTypeCount(result.addedToMomo)}种，缺失${unresolvedAmount}/${this.itemTypeCount(result.unresolved)}种。详情见Web管理页。`)
-    })
+    }, { exclusive: true })
   }
 
   async handleClearInventory (username, text) {
@@ -1536,8 +1557,9 @@ class CloudStoreService {
       return
     }
 
-    if (this.active) {
-      this.msg(username, `机器人忙，玩家${this.active.username}使用中，请稍后再试。`)
+    const poolState = this.taskPool?.snapshot()
+    if (this.active || poolState?.active?.length || poolState?.queued?.length) {
+      this.msg(username, '当前仍有存取或同步任务，不能清空库存记录。')
       return
     }
 
@@ -2216,7 +2238,7 @@ class CloudStoreService {
     const held = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
     if (!held.length) return
 
-    const task = this.db.getRecoveryTask()
+    const task = this.db.getRecoveryTask(this.botId)
     if (task?.type === 'deposit') {
       const owner = this.recoveryOwnerFromTask(task)
       console.warn(`[residual-recovery] continuing pending deposit before task: actor=${task.actorUsername}, owner=${owner.uuid}, held=${this.formatItemList(held)}`)
@@ -2225,7 +2247,7 @@ class CloudStoreService {
         throw new Error(`机器人背包里还有上次 ${task.actorUsername || owner.username} 存入的物品未能入库：${this.formatItemList(result.leftover)}。请先检查仓库路径或空间。`)
       }
       this.db.addTransaction('deposit_residual_recovery', result.deposited.length ? 'ok' : 'empty', owner.uuid, owner.username, result.deposited, `actor=${task.actorUsername}, phase=${task.phase}`)
-      this.db.clearRecoveryTask()
+      this.db.clearRecoveryTask(this.botId)
       return
     }
 
@@ -2242,7 +2264,7 @@ class CloudStoreService {
       if (delivered.length) {
         this.recordWithdrawDeduction(owner, delivered, `actor=${task.actorUsername}, target=${task.targetUsername}, phase=${task.phase}, recovery=residual`)
       }
-      this.db.clearRecoveryTask()
+      this.db.clearRecoveryTask(this.botId)
       return
     }
 
@@ -2502,10 +2524,24 @@ class CloudStoreService {
       const privateCommand = template.replace('{player}', username).replace('{message}', chunk)
       if (this.config.debugChat) console.log(`[reply] ${this.redactSensitiveText(privateCommand)}`)
       this.bot.chat(privateCommand)
+      this.db.addCommandReply({
+        targetUsername: username,
+        channel: 'private',
+        botId: this.botId,
+        botName: this.bot.username || this.config.server?.botName || this.botId,
+        message: this.redactSensitiveText(chunk)
+      })
       if (this.config.commands.publicFallback) {
         const publicMessage = `@${username} ${chunk}`
         if (this.config.debugChat) console.log(`[reply:publicFallback] ${this.redactSensitiveText(publicMessage)}`)
         this.bot.chat(publicMessage)
+        this.db.addCommandReply({
+          targetUsername: username,
+          channel: 'public',
+          botId: this.botId,
+          botName: this.bot.username || this.config.server?.botName || this.botId,
+          message: this.redactSensitiveText(publicMessage)
+        })
       }
     }
   }

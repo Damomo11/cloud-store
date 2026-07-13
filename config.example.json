@@ -1,4 +1,19 @@
 {
+  // Optional bot account pool. When empty, the legacy server account below is used.
+  // Each entry inherits host, port, auth, version and timing-independent server fields.
+  "bots": [
+    // {
+    //   "username": "first-microsoft-email@example.com",
+    //   "botName": "WarehouseBot1",
+    //   "profilesFolder": "auth-cache/bot-1"
+    // },
+    // {
+    //   "username": "second-microsoft-email@example.com",
+    //   "botName": "WarehouseBot2",
+    //   "profilesFolder": "auth-cache/bot-2"
+    // }
+  ],
+
   // Minecraft server and bot account settings.
   "server": {
     // Server address and port.
@@ -9,13 +24,10 @@
     "username": "your-microsoft-email@example.com",
     "botName": "NanKinz1",
 
-    // Supported values usually are "microsoft" or "offline".
+    // Only Microsoft OAuth2 device-code login is supported.
     "auth": "microsoft",
 
-    // Only needed for auth modes that require a password. Leave empty for Microsoft auth.
-    "password": "",
-
-    // Local auth cache folder for Microsoft login tokens.
+    // Legacy single-account auth cache folder for Microsoft OAuth2 tokens.
     "profilesFolder": "auth-cache",
 
     // Main Minecraft protocol version. The server may still negotiate a nearby protocol.

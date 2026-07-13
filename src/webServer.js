@@ -4,10 +4,11 @@ const path = require('node:path')
 const { parseLitematicData } = require('../scripts/litematic-materials')
 
 class CloudStoreWebServer {
-  constructor (db, config, serviceProvider) {
+  constructor (db, config, serviceProvider, botManagerProvider = null) {
     this.db = db
     this.config = config
     this.serviceProvider = serviceProvider
+    this.botManagerProvider = botManagerProvider
     this.sessions = new Map()
     this.loginFailures = new Map()
     this.loginChallenges = new Map()
@@ -68,10 +69,12 @@ class CloudStoreWebServer {
       if (req.method === 'GET' && url.pathname === '/api/admin/inventory') return this.sendJson(res, this.apiAdminInventory(session, url))
       if (req.method === 'GET' && url.pathname === '/api/admin/mismatches') return this.sendJson(res, this.apiAdminMismatches(session, url))
       if (req.method === 'GET' && url.pathname === '/api/admin/transactions') return this.sendJson(res, this.apiAdminTransactions(session, url))
+      if (req.method === 'GET' && url.pathname === '/api/admin/commands') return this.sendJson(res, this.apiAdminCommands(session, url))
       if (req.method === 'GET' && url.pathname === '/api/admin/chests') return this.sendJson(res, this.apiAdminChests(session, url))
       if (req.method === 'GET' && url.pathname === '/api/admin/chest') return this.sendJson(res, this.apiAdminChest(session, url))
       if (req.method === 'GET' && url.pathname === '/api/admin/aliases') return this.sendJson(res, this.apiAdminAliases(session, url))
       if (req.method === 'GET' && url.pathname === '/api/admin/quotas') return this.sendJson(res, this.apiAdminQuotas(session, url))
+      if (req.method === 'GET' && url.pathname === '/api/admin/bots') return this.sendJson(res, this.apiAdminBots(session))
       if (req.method === 'POST' && url.pathname === '/api/login') {
         const body = await this.readBody(req)
         return this.sendJson(res, this.apiLogin(session, body, this.clientIp(req)))
@@ -191,6 +194,18 @@ class CloudStoreWebServer {
         const body = await this.readBody(req)
         return this.sendJson(res, this.apiAdminQuotaSave(session, body))
       }
+      if (req.method === 'POST' && url.pathname === '/api/admin/bots/add') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiAdminBotAdd(session, body))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/admin/bots/enabled') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiAdminBotEnabled(session, body))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/admin/bots/delete') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiAdminBotDelete(session, body))
+      }
       this.sendText(res, 404, 'Not found')
     } catch (error) {
       this.sendJson(res, { ok: false, error: error.message }, error.status || 400)
@@ -258,7 +273,8 @@ class CloudStoreWebServer {
     const dateTo = String(url.searchParams.get('dateTo') || '').trim()
     const rows = this.db.db.prepare(`
       SELECT id, type, status, player_uuid AS playerUuid, username,
-             items_json AS itemsJson, message, created_at AS createdAt
+             items_json AS itemsJson, message, bot_id AS botId, bot_name AS botName,
+             created_at AS createdAt
       FROM transactions WHERE player_uuid = ? ORDER BY id DESC LIMIT 10000
     `).all(ownerUuid)
     const transactionItems = this.prepareTransactionItems(rows)
@@ -266,6 +282,7 @@ class CloudStoreWebServer {
     for (const row of rows) {
       const details = this.transactionDetails(row.message)
       const operator = this.transactionOperator(row, details)
+      const botOperator = row.botName || row.botId || ''
       const items = this.decorateTransactionItems(transactionItems.itemsById.get(row.id) || [], transactionItems.contentsByBox)
       const createdAtLabel = this.formatBeijingTime(row.createdAt)
       const createdDate = createdAtLabel.slice(0, 10)
@@ -275,13 +292,14 @@ class CloudStoreWebServer {
       if (dateFrom && createdDate < dateFrom) continue
       if (dateTo && createdDate > dateTo) continue
       if (itemQ && !items.some(item => this.adminTransactionItemMatches(item, itemQ))) continue
-      if (q && !this.textMatches(row.message, q) && !this.textMatches(operator, q) && !items.some(item => this.adminTransactionItemMatches(item, q))) continue
+      if (q && !this.textMatches(row.message, q) && !this.textMatches(operator, q) && !this.textMatches(botOperator, q) && !items.some(item => this.adminTransactionItemMatches(item, q))) continue
       result.push({
         ...row,
         typeLabel: this.transactionTypeLabel(row.type),
         statusLabel: this.transactionStatusLabel(row.status),
         ownerLabel: this.db.ownerLabel(row.playerUuid),
         operator,
+        botOperator,
         details,
         messageLabel: this.transactionMessageLabel(row.message),
         createdAtLabel,
@@ -365,7 +383,7 @@ class CloudStoreWebServer {
     return {
       ok: true,
       personal: [...personalByItem.values()].filter(row => !q || this.adminItemMatches(row, q) || row.aliases.some(alias => this.textMatches(alias, q))),
-      global: globalRows.filter(row => !q || matchingGlobalKeys.has(row.itemKey)).map(row => ({ ...this.adminItem(row), alias: row.alias, enabled: row.enabled }))
+      global: globalRows.filter(row => !q || matchingGlobalKeys.has(row.itemKey)).map(row => ({ ...this.adminItem(row), alias: row.alias, category: row.category, enabled: row.enabled }))
     }
   }
 
@@ -453,7 +471,6 @@ class CloudStoreWebServer {
     const user = this.requireUser(session)
     const ownerUuid = String(body.ownerUuid || user.uuid)
     this.requireOwnerAccess(user, ownerUuid)
-    this.assertBotIdleForWebAction()
     const service = this.requireService()
     const message = service.startWebDeposit(user, ownerUuid)
     return { ok: true, message, active: this.activeSnapshot() }
@@ -463,7 +480,6 @@ class CloudStoreWebServer {
     const user = this.requireUser(session)
     const ownerUuid = String(body.ownerUuid || user.uuid)
     this.requireOwnerAccess(user, ownerUuid)
-    this.assertBotIdleForWebAction()
     const service = this.requireService()
     const message = Array.isArray(body.items)
       ? service.startWebWithdrawMany(user, ownerUuid, body.items, body.targetUsername)
@@ -848,6 +864,44 @@ class CloudStoreWebServer {
     return { ok: true, rows: [...owners.values()].sort((a, b) => a.label.localeCompare(b.label, 'zh-CN')) }
   }
 
+  apiAdminBots (session) {
+    this.requireAdmin(session)
+    const manager = this.requireBotManager()
+    return { ok: true, rows: manager.list(), auth: 'microsoft_oauth2_device_code' }
+  }
+
+  apiAdminBotAdd (session, body) {
+    this.requireAdmin(session)
+    const account = this.requireBotManager().add({
+      username: body.username,
+      botName: body.botName
+    })
+    return { ok: true, account, message: '账号已添加，正在请求微软 OAuth2 登录。' }
+  }
+
+  apiAdminBotEnabled (session, body) {
+    this.requireAdmin(session)
+    const enabled = body.enabled === true || body.enabled === 1 || body.enabled === '1'
+    const account = this.requireBotManager().setEnabled(String(body.id || ''), enabled)
+    return {
+      ok: true,
+      account,
+      message: enabled ? '账号正在启动。' : '账号已停止领取新任务，当前任务完成后下线。'
+    }
+  }
+
+  apiAdminBotDelete (session, body) {
+    this.requireAdmin(session)
+    const account = this.requireBotManager().remove(String(body.id || ''))
+    return { ok: true, account, message: '账号已删除，当前任务完成后下线。' }
+  }
+
+  requireBotManager () {
+    const manager = this.botManagerProvider?.()
+    if (!manager) throw new Error('机器人账号管理器尚未启动。')
+    return manager
+  }
+
   resolveProvisionPlayer (value) {
     const raw = String(value || '').trim()
     if (!/^[A-Za-z0-9_]{3,16}$/.test(raw)) throw new Error('玩家 ID 格式不正确。')
@@ -964,10 +1018,13 @@ class CloudStoreWebServer {
 
   ensureWarehouseDeletionSafe (ownerUuid) {
     const service = this.serviceProvider()
-    const activeOwnerUuid = service?.active?.owner?.uuid || service?.active?.player?.uuid || ''
-    if (activeOwnerUuid === ownerUuid) throw new Error('该仓库正在进行存取操作，暂时不能删除。')
-    const recovery = this.db.getRecoveryTask()
-    if (recovery?.ownerUuid === ownerUuid) throw new Error('该仓库存在未完成的恢复任务，暂时不能删除。')
+    const activeTasks = service?.taskPool?.snapshot()?.active || (service?.active ? [service.active] : [])
+    if (activeTasks.some(active => (active.owner?.uuid || active.player?.uuid || '') === ownerUuid)) {
+      throw new Error('该仓库正在进行存取操作，暂时不能删除。')
+    }
+    if (this.db.listRecoveryTasks().some(recovery => recovery.ownerUuid === ownerUuid)) {
+      throw new Error('该仓库存在未完成的恢复任务，暂时不能删除。')
+    }
   }
 
   apiAdminDeletePersonalWarehouse (session, body) {
@@ -1097,7 +1154,8 @@ class CloudStoreWebServer {
     const fetchLimit = 10000
     const rows = this.db.db.prepare(`
       SELECT id, type, status, player_uuid AS playerUuid, username,
-             items_json AS itemsJson, message, created_at AS createdAt
+             items_json AS itemsJson, message, bot_id AS botId, bot_name AS botName,
+             created_at AS createdAt
       FROM transactions
       ORDER BY id DESC
       LIMIT ?
@@ -1110,6 +1168,7 @@ class CloudStoreWebServer {
       const decoratedItems = this.decorateTransactionItems(transactionItems.itemsById.get(row.id) || [], transactionItems.contentsByBox)
       const details = this.transactionDetails(row.message)
       const operator = this.transactionOperator(row, details)
+      const botOperator = row.botName || row.botId || ''
       const createdAtLabel = this.formatBeijingTime(row.createdAt)
       const createdDate = createdAtLabel.slice(0, 10)
       if (typeQ && !this.textMatches(row.type, typeQ) && !this.textMatches(this.transactionTypeLabel(row.type), typeQ)) continue
@@ -1119,7 +1178,7 @@ class CloudStoreWebServer {
       if (dateFrom && createdDate < dateFrom) continue
       if (dateTo && createdDate > dateTo) continue
       if (itemQ && !decoratedItems.some(item => this.adminTransactionItemMatches(item, itemQ))) continue
-      if (q && !this.textMatches(ownerLabel, q) && !this.textMatches(operator, q) && !this.textMatches(row.username, q) && !this.textMatches(row.type, q) && !this.textMatches(row.message, q) && !decoratedItems.some(item => this.adminTransactionItemMatches(item, q))) continue
+      if (q && !this.textMatches(ownerLabel, q) && !this.textMatches(operator, q) && !this.textMatches(botOperator, q) && !this.textMatches(row.username, q) && !this.textMatches(row.type, q) && !this.textMatches(row.message, q) && !decoratedItems.some(item => this.adminTransactionItemMatches(item, q))) continue
       result.push({
         id: row.id,
         type: row.type,
@@ -1130,6 +1189,7 @@ class CloudStoreWebServer {
         username: row.username,
         ownerLabel,
         operator,
+        botOperator,
         message: row.message,
         messageLabel: this.transactionMessageLabel(row.message),
         createdAt: row.createdAt,
@@ -1143,6 +1203,30 @@ class CloudStoreWebServer {
     const currentPage = Math.min(page, totalPages)
     const offset = (currentPage - 1) * pageSize
     return { ok: true, page: currentPage, pageSize, total, totalPages, rows: result.slice(offset, offset + pageSize) }
+  }
+
+  apiAdminCommands (session, url) {
+    this.requireAdmin(session)
+    const result = this.db.listCommandLogs({
+      page: url.searchParams.get('page'),
+      pageSize: url.searchParams.get('pageSize'),
+      query: url.searchParams.get('q'),
+      channel: url.searchParams.get('channel')
+    })
+    return {
+      ok: true,
+      ...result,
+      rows: result.rows.map(row => ({
+        ...row,
+        channelLabel: row.channel === 'public' ? '公屏' : '私信',
+        createdAtLabel: this.formatBeijingTime(row.createdAt),
+        replies: (row.replies || []).map(reply => ({
+          ...reply,
+          channelLabel: reply.channel === 'public' ? '公屏' : '私信',
+          createdAtLabel: this.formatBeijingTime(reply.createdAt)
+        }))
+      }))
+    }
   }
 
   apiAdminChests (session, url) {
@@ -1190,9 +1274,12 @@ class CloudStoreWebServer {
     const q = String(url.searchParams.get('q') || '').trim()
     const aliasRows = this.db.listGlobalItemAliases('')
     const aliases = new Map()
+    const aliasEntries = new Map()
     for (const row of aliasRows) {
       if (!aliases.has(row.itemKey)) aliases.set(row.itemKey, [])
       aliases.get(row.itemKey).push(row.alias)
+      if (!aliasEntries.has(row.itemKey)) aliasEntries.set(row.itemKey, [])
+      aliasEntries.get(row.itemKey).push({ alias: row.alias, category: row.category || 'normal' })
     }
     const items = new Map()
     for (const row of aliasRows) {
@@ -1200,7 +1287,7 @@ class CloudStoreWebServer {
     }
     return {
       ok: true,
-      rows: [...items.values()].map(row => ({ ...row, aliases: aliases.get(row.itemKey) || [] }))
+      rows: [...items.values()].map(row => ({ ...row, aliases: aliases.get(row.itemKey) || [], aliasEntries: aliasEntries.get(row.itemKey) || [] }))
         .filter(row => !q || this.adminItemMatches(row, q) || row.aliases.some(alias => this.textMatches(alias, q)))
     }
   }
@@ -1476,10 +1563,12 @@ class CloudStoreWebServer {
     const user = this.requireAdmin(session)
     const itemKey = String(body.itemKey || '').trim()
     const alias = String(body.alias || body.displayName || '').trim()
-    const item = this.db.saveGlobalItemAlias(itemKey, alias)
+    const category = String(body.category || 'normal').trim()
+    const item = this.db.saveGlobalItemAlias(itemKey, alias, category)
     if (body.updateDisplayName) this.db.saveItemNameOverride(itemKey, alias)
-    this.db.addTransaction('web_admin_alias_save', 'ok', this.config.momoOwner, user.username, [{ ...item, amount: 0 }], `global_alias=${item.alias}; item=${item.shortCode}`)
-    return { ok: true, message: `已添加全局别名：${item.alias} -> ${item.displayName}。${body.updateDisplayName ? '库存显示名称也已更新。' : ''}` }
+    this.db.addTransaction('web_admin_alias_save', 'ok', this.config.momoOwner, user.username, [{ ...item, amount: 0 }], `global_alias=${item.alias}; category=${item.category}; item=${item.shortCode}`)
+    const categoryLabel = item.category === 'variant' ? '同 ID 物品' : '正常物品'
+    return { ok: true, category: item.category, message: `已添加${categoryLabel}全局别名：${item.alias} -> ${item.displayName}。${body.updateDisplayName ? '库存显示名称也已更新。' : ''}` }
   }
 
   apiAdminAliasDelete (session, body) {
@@ -1799,8 +1888,22 @@ class CloudStoreWebServer {
   }
 
   activeSnapshot () {
-    const active = this.serviceProvider()?.active
-    if (!active) return null
+    const service = this.serviceProvider()
+    const pool = service?.taskPool?.snapshot()
+    const active = pool?.active?.[0] || service?.active
+    if (!active && !pool?.queued?.length) return null
+    if (!active) {
+      const queued = pool.queued[0]
+      return {
+        type: queued.type,
+        username: queued.username,
+        targetUsername: queued.username,
+        phase: 'queued',
+        queuedCount: pool.queued.length,
+        botName: '',
+        message: `任务排队中（共 ${pool.queued.length} 个）`
+      }
+    }
     return {
       type: active.type,
       username: active.username,
@@ -1808,6 +1911,8 @@ class CloudStoreWebServer {
       phase: active.phase || 'running',
       batchIndex: active.batchIndex || 0,
       totalBatches: active.totalBatches || 0,
+      botName: active.botName || service?.bot?.username || '',
+      queuedCount: pool?.queued?.length || 0,
       message: this.activePhaseMessage(active)
     }
   }
@@ -1816,6 +1921,7 @@ class CloudStoreWebServer {
     const target = active.targetUsername || active.username
     const labels = {
       start: '任务启动中',
+      queued: '任务排队中',
       prepare_deposit: '准备存货',
       deposit_teleport_to_player: '发送 tpa 中',
       deposit_collecting: '收集物品中',
@@ -2581,7 +2687,7 @@ const HTML = `<!doctype html>
           <select id="txStatus"><option value="">全部状态</option><option value="ok">成功</option><option value="failed">失败</option></select>
           <input id="txFrom" type="date" title="开始日期">
           <input id="txTo" type="date" title="结束日期">
-          <input id="txQ" placeholder="备注/其他字段">
+          <input id="txQ" placeholder="Bot/备注/其他字段">
           <button id="txLoad" class="primary">查询</button>
           <button id="txRefresh" class="primary">刷新</button>
         </div>
@@ -2787,14 +2893,24 @@ const HTML = `<!doctype html>
           <button id="adminRefresh" class="primary">刷新</button>
         </div>
         <div class="subnav">
+          <button class="primary" data-admin-tab="bots">机器人账号</button>
           <button class="primary active" data-admin-tab="inventory">库存</button>
           <button class="primary" data-admin-tab="warehouses">组织管理</button>
           <button class="primary" data-admin-tab="mismatches">库存异常</button>
           <button class="primary" data-admin-tab="chests">木桶视图</button>
           <button class="primary" data-admin-tab="transactions">交易记录</button>
+          <button class="primary" data-admin-tab="commands">命令记录</button>
           <button class="primary" data-admin-tab="aliases">全局别名</button>
           <button class="primary" data-admin-tab="quotas">额度管理</button>
         </div>
+        <section id="adminBots" class="hidden">
+          <div class="panel" style="padding:14px;margin-bottom:14px">
+            <h3>添加微软机器人账号</h3>
+            <div class="alias-add"><input id="adminBotEmail" type="email" placeholder="Microsoft 账号邮箱"><input id="adminBotName" placeholder="Bot 标识"><button id="adminBotAdd" class="solid">添加并登录</button></div>
+            <p class="muted">仅支持 Microsoft OAuth2 设备码登录，不保存密码。添加后请按表格中的链接和验证码完成登录。</p>
+          </div>
+          <div id="adminBotsTable" class="panel tablewrap"></div>
+        </section>
         <section id="adminInventory">
           <div class="toolbar">
             <span id="adminInvStatus" class="muted">等待加载</span>
@@ -2848,11 +2964,20 @@ const HTML = `<!doctype html>
             <select id="adminTxStatus"><option value="">全部状态</option><option value="ok">成功</option><option value="failed">失败</option></select>
             <input id="adminTxFrom" type="date" title="开始日期">
             <input id="adminTxTo" type="date" title="结束日期">
-            <input id="adminTxQ" placeholder="备注/操作者/其他字段">
+            <input id="adminTxQ" placeholder="Bot/备注/操作者/其他字段">
             <button id="adminTxLoad" class="primary">查询</button>
           </div>
           <div id="adminTxTable" class="panel tablewrap"></div>
           <div class="pager"><button id="adminTxPrev">上一页</button><span id="adminTxPage">第 1 / 1 页</span><button id="adminTxNext">下一页</button></div>
+        </section>
+        <section id="adminCommands" class="hidden">
+          <div class="toolbar">
+            <select id="adminCommandChannel"><option value="">全部来源</option><option value="public">公屏</option><option value="private">私信</option></select>
+            <input id="adminCommandQ" placeholder="玩家/命令/Bot/回复内容">
+            <button id="adminCommandLoad" class="primary">查询</button>
+          </div>
+          <div id="adminCommandTable" class="panel tablewrap"></div>
+          <div class="pager"><button id="adminCommandPrev">上一页</button><span id="adminCommandPage">第 1 / 1 页</span><button id="adminCommandNext">下一页</button></div>
         </section>
         <section id="adminAliases" class="hidden">
           <div class="toolbar">
@@ -2888,6 +3013,7 @@ const HTML = `<!doctype html>
         </div>
         <div id="globalAliasEditor" class="alias-form hidden">
           <input id="globalAliasInput" placeholder="新增一个全局别名">
+          <select id="globalAliasCategory"><option value="normal">正常物品</option><option value="variant">同 ID 物品</option></select>
           <button id="globalAliasSave" class="solid">添加全局别名</button>
           <div id="globalAliasExisting" class="alias-tags"></div>
           <label class="check-label"><input id="globalAliasUseDisplayName" type="checkbox"> 同时修改所有库存中的显示名称</label>
@@ -3672,10 +3798,10 @@ const HTML = `<!doctype html>
       $('txPrev').disabled = state.txPage <= 1;
       $('txNext').disabled = state.txPage >= state.txTotalPages;
       const tooltipItems = new Map();
-      renderTable('transactions', ['时间', '类型', '操作者', '归属', '物品', '备注'], state.tx.map(row => {
+      renderTable('transactions', ['时间', '类型', '操作者', 'Bot', '归属', '物品', '备注'], state.tx.map(row => {
         const items = transactionItemsHtml(row.items, tooltipItems);
         const details = row.messageLabel ? '<span class="alias-tag">' + esc(row.messageLabel) + '</span>' : '';
-        return '<tr><td>' + esc(row.createdAtLabel || row.createdAt) + '</td><td>' + esc(row.typeLabel || row.type) + '<div class="muted">' + esc(row.statusLabel || row.status) + '</div></td><td>' + esc(row.operator || '') + '</td><td>' + esc(row.ownerLabel || '') + '</td><td class="wrap">' + items + '</td><td class="wrap muted">' + details + '</td></tr>';
+        return '<tr><td>' + esc(row.createdAtLabel || row.createdAt) + '</td><td>' + esc(row.typeLabel || row.type) + '<div class="muted">' + esc(row.statusLabel || row.status) + '</div></td><td>' + esc(row.operator || '') + '</td><td>' + esc(row.botOperator || '-') + '</td><td>' + esc(row.ownerLabel || '') + '</td><td class="wrap">' + items + '</td><td class="wrap muted">' + details + '</td></tr>';
       }), '没有交易记录。');
       bindTransactionTooltips('transactions', tooltipItems);
     }
@@ -3779,6 +3905,7 @@ const HTML = `<!doctype html>
       $('aliasEditor').classList.add('hidden');
       $('globalAliasEditor').classList.remove('hidden');
       $('globalAliasInput').value = '';
+      $('globalAliasCategory').value = 'normal';
       $('globalAliasUseDisplayName').checked = false;
       $('globalAliasExisting').innerHTML = (item.globalAliases || []).length
         ? item.globalAliases.map(alias => '<span class="alias-tag">' + esc(alias) + '<button data-admin-alias-delete="' + esc(alias) + '">×</button></span>').join('')
@@ -3844,12 +3971,12 @@ const HTML = `<!doctype html>
       if (!state.adminGlobalAliasItem) return;
       const alias = $('globalAliasInput').value.trim();
       if (!alias) throw new Error('请填写全局别名。');
-      const data = await post('/api/admin/alias/save', { itemKey: state.adminGlobalAliasItem.itemKey, alias, updateDisplayName: $('globalAliasUseDisplayName').checked });
+      const data = await post('/api/admin/alias/save', { itemKey: state.adminGlobalAliasItem.itemKey, alias, category: $('globalAliasCategory').value, updateDisplayName: $('globalAliasUseDisplayName').checked });
       const itemKey = state.adminGlobalAliasItem.itemKey;
       toast(data.message);
       await loadAdminInventory();
       const updated = [...state.adminInventoryRows.values()].find(row => row.itemKey === itemKey);
-      if (updated) openGlobalAliasModal(updated);
+      if (updated) { openGlobalAliasModal(updated); $('globalAliasCategory').value = data.category || 'normal'; }
     }
 
     async function loadMyOrganizations() {
@@ -3873,11 +4000,15 @@ const HTML = `<!doctype html>
       const globalMap = new Map();
       for (const row of data.global || []) {
         if (!globalMap.has(row.itemKey)) globalMap.set(row.itemKey, { ...row, aliases: [] });
-        globalMap.get(row.itemKey).aliases.push({ alias: row.alias, enabled: row.enabled });
+        globalMap.get(row.itemKey).aliases.push({ alias: row.alias, category: row.category || 'normal', enabled: row.enabled });
       }
       const globals = [...globalMap.values()];
       state.myGlobalAliasRows = globalMap;
-      $('myGlobalAliases').innerHTML = globals.length ? '<div class="compact-admin-grid">' + globals.map(row => aliasGridItemHtml(row, 'my-global-alias-card', state.myGlobalAliasItemKey === row.itemKey, row.aliases.length + ' 个别名')).join('') + '</div>' : '<p class="muted">管理员还没有设置全局别名。</p>';
+      const globalCategory = (category, title) => {
+        const rows = globals.filter(row => row.aliases.some(alias => alias.category === category));
+        return '<h3 class="section-title">' + title + '</h3>' + (rows.length ? '<div class="compact-admin-grid">' + rows.map(row => aliasGridItemHtml(row, 'my-global-alias-card', state.myGlobalAliasItemKey === row.itemKey, row.aliases.filter(alias => alias.category === category).length + ' 个别名')).join('') + '</div>' : '<p class="muted">这一类还没有全局别名。</p>');
+      };
+      $('myGlobalAliases').innerHTML = globalCategory('normal', '正常物品') + globalCategory('variant', '同 ID 物品');
 
       if (state.myPersonalAliasItemKey && state.myPersonalAliasRows.has(state.myPersonalAliasItemKey)) renderMyPersonalAliasDetail(state.myPersonalAliasRows.get(state.myPersonalAliasItemKey));
       else { state.myPersonalAliasItemKey = ''; $('myPersonalAliasDetail').innerHTML = '<p class="muted">点击物品图标管理个人别名。</p>'; }
@@ -3898,7 +4029,8 @@ const HTML = `<!doctype html>
     function renderMyGlobalAliasDetail(row) {
       state.myGlobalAliasItemKey = row.itemKey;
       document.querySelectorAll('[data-my-global-alias-card]').forEach(card => card.classList.toggle('selected', card.dataset.myGlobalAliasCard === row.itemKey));
-      $('myGlobalAliasDetail').innerHTML = '<div class="alias-detail-head"><div class="admin-item-icon"><img src="' + esc(iconUrl(row.itemId, 'item')) + '" alt=""></div><div><div class="admin-item-name">' + esc(row.displayName) + '</div><div class="admin-item-meta">#' + esc(row.shortCode) + ' · ' + esc(row.itemId) + '</div></div></div><div class="global-alias-toggle-list">' + row.aliases.map(item => '<div class="global-alias-toggle-row"><span>' + esc(item.alias) + '</span><span class="muted">' + (item.enabled ? '已启用' : '已禁用') + '</span><button class="switch' + (item.enabled ? ' on' : '') + '" data-global-alias-toggle="' + esc(item.alias) + '" data-enabled="' + (item.enabled ? '1' : '0') + '"></button></div>').join('') + '</div>';
+      const aliasRows = (category, title) => '<div class="muted" style="margin-top:8px">' + title + '</div><div class="global-alias-toggle-list">' + row.aliases.filter(item => item.category === category).map(item => '<div class="global-alias-toggle-row"><span>' + esc(item.alias) + '</span><span class="muted">' + (item.enabled ? '已启用' : '已禁用') + '</span><button class="switch' + (item.enabled ? ' on' : '') + '" data-global-alias-toggle="' + esc(item.alias) + '" data-enabled="' + (item.enabled ? '1' : '0') + '"></button></div>').join('') + '</div>';
+      $('myGlobalAliasDetail').innerHTML = '<div class="alias-detail-head"><div class="admin-item-icon"><img src="' + esc(iconUrl(row.itemId, 'item')) + '" alt=""></div><div><div class="admin-item-name">' + esc(row.displayName) + '</div><div class="admin-item-meta">#' + esc(row.shortCode) + ' · ' + esc(row.itemId) + '</div></div></div>' + aliasRows('normal', '正常物品') + aliasRows('variant', '同 ID 物品');
     }
 
     function loadMyCurrent() {
@@ -4105,21 +4237,39 @@ const HTML = `<!doctype html>
       $('adminTxPrev').disabled = state.adminTxPage <= 1;
       $('adminTxNext').disabled = state.adminTxPage >= state.adminTxTotalPages;
       const tooltipItems = new Map();
-      renderTable('adminTxTable', ['时间', '类型', '操作者', '归属', '物品', '备注'], (data.rows || []).map(row => {
+      renderTable('adminTxTable', ['时间', '类型', '操作者', 'Bot', '归属', '物品', '备注'], (data.rows || []).map(row => {
         const items = transactionItemsHtml(row.items, tooltipItems);
         const details = row.messageLabel ? '<span class="alias-tag">' + esc(row.messageLabel) + '</span>' : '';
-        return '<tr><td>' + esc(row.createdAtLabel || row.createdAt) + '</td><td>' + esc(row.typeLabel || row.type) + '<div class="muted">' + esc(row.statusLabel || row.status) + '</div></td><td>' + esc(row.operator || '') + '</td><td>' + esc(row.ownerLabel || row.username || '') + '</td><td class="wrap">' + items + '</td><td class="wrap muted">' + details + '</td></tr>';
+        return '<tr><td>' + esc(row.createdAtLabel || row.createdAt) + '</td><td>' + esc(row.typeLabel || row.type) + '<div class="muted">' + esc(row.statusLabel || row.status) + '</div></td><td>' + esc(row.operator || '') + '</td><td>' + esc(row.botOperator || '-') + '</td><td>' + esc(row.ownerLabel || row.username || '') + '</td><td class="wrap">' + items + '</td><td class="wrap muted">' + details + '</td></tr>';
       }), '没有交易记录。');
       bindTransactionTooltips('adminTxTable', tooltipItems);
+    }
+
+    async function loadAdminCommands() {
+      const data = await api('/api/admin/commands', { q: $('adminCommandQ').value, channel: $('adminCommandChannel').value, page: state.adminCommandPage || 1, pageSize: 30 });
+      state.adminCommandPage = data.page || 1;
+      state.adminCommandTotalPages = data.totalPages || 1;
+      $('adminCommandPage').textContent = '第 ' + state.adminCommandPage + ' / ' + state.adminCommandTotalPages + ' 页，共 ' + num(data.total || 0) + ' 条';
+      $('adminCommandPrev').disabled = state.adminCommandPage <= 1;
+      $('adminCommandNext').disabled = state.adminCommandPage >= state.adminCommandTotalPages;
+      renderTable('adminCommandTable', ['时间', '玩家', '来源', '命令', '接收 Bot', '回复'], (data.rows || []).map(row => {
+        const replies = (row.replies || []).length ? '<div class="command-replies">' + row.replies.map(reply => '<div><span class="alias-tag">' + esc(reply.botName || reply.botId || '-') + '</span> <span class="muted">' + esc(reply.channelLabel) + ' → ' + esc(reply.targetUsername || row.username) + '</span><div class="wrap">' + esc(reply.message) + '</div></div>').join('') + '</div>' : '<span class="muted">暂无回复</span>';
+        return '<tr><td>' + esc(row.createdAtLabel || row.createdAt) + '</td><td>' + esc(row.username) + '</td><td>' + esc(row.channelLabel) + '</td><td class="wrap"><code>' + esc(row.commandText) + '</code></td><td>' + esc(row.receiverBotName || row.receiverBotId || '-') + '</td><td class="wrap">' + replies + '</td></tr>';
+      }), '没有命令记录。');
     }
 
     async function loadAdminAliases() {
       const data = await api('/api/admin/aliases', { q: $('adminAliasQ').value });
       const rows = data.rows || [];
       state.adminAliasRows = new Map(rows.map(row => [row.itemKey, row]));
-      $('adminAliasGrid').innerHTML = rows.length ? '<div class="compact-admin-grid">' + rows.map(row =>
-        '<div class="item' + (state.adminAliasItem?.itemKey === row.itemKey ? ' selected' : '') + '" data-admin-alias-card="' + esc(row.itemKey) + '" title="' + esc(row.displayName + ' · ' + row.aliases.join('、')) + '"><div class="icon"><img src="' + esc(iconUrl(row.itemId, 'item')) + '" alt=""><span class="fallback">' + esc((row.displayName || row.itemId).slice(0, 4)) + '</span></div><div class="name">' + esc(row.displayName) + '</div></div>'
-      ).join('') + '</div>' : '<p class="muted">没有已设置的全局别名。</p>';
+      const renderCategory = (category, title) => {
+        const categoryRows = rows.filter(row => (row.aliasEntries || []).some(entry => entry.category === category));
+        return '<h3 class="section-title">' + title + '</h3>' + (categoryRows.length ? '<div class="compact-admin-grid">' + categoryRows.map(row => {
+          const names = (row.aliasEntries || []).filter(entry => entry.category === category).map(entry => entry.alias);
+          return '<div class="item' + (state.adminAliasItem?.itemKey === row.itemKey ? ' selected' : '') + '" data-admin-alias-card="' + esc(row.itemKey) + '" title="' + esc(row.displayName + ' · ' + names.join('、')) + '"><div class="icon"><img src="' + esc(iconUrl(row.itemId, 'item')) + '" alt=""><span class="fallback">' + esc((row.displayName || row.itemId).slice(0, 4)) + '</span></div><div class="name">' + esc(row.displayName) + '</div></div>';
+        }).join('') + '</div>' : '<p class="muted">这一类还没有全局别名。</p>');
+      };
+      $('adminAliasGrid').innerHTML = renderCategory('normal', '正常物品') + renderCategory('variant', '同 ID 物品');
       if (state.adminAliasItem && state.adminAliasRows.has(state.adminAliasItem.itemKey)) {
         renderAdminAliasDetail(state.adminAliasRows.get(state.adminAliasItem.itemKey));
       } else {
@@ -4131,7 +4281,30 @@ const HTML = `<!doctype html>
     function renderAdminAliasDetail(row) {
       state.adminAliasItem = row;
       document.querySelectorAll('[data-admin-alias-card]').forEach(card => card.classList.toggle('selected', card.dataset.adminAliasCard === row.itemKey));
-      $('adminAliasDetail').innerHTML = '<div class="alias-detail-head"><div class="admin-item-icon"><img src="' + esc(iconUrl(row.itemId, 'item')) + '" alt=""></div><div><div class="admin-item-name">' + esc(row.displayName) + '</div><div class="admin-item-meta">#' + esc(row.shortCode) + ' · ' + esc(row.itemId) + '</div></div></div><div class="alias-tags">' + row.aliases.map(alias => '<span class="alias-tag">' + esc(alias) + '<button data-admin-alias-delete="' + esc(alias) + '">×</button></span>').join('') + '</div><div class="alias-add" style="margin-top:10px"><input id="adminAliasDetailInput" placeholder="新增全局别名"><button data-admin-alias-detail-save>添加别名</button></div><label class="check-label" style="margin-top:8px"><input id="adminAliasDetailUseDisplayName" type="checkbox"> 同时修改所有库存中的显示名称</label>';
+      const entries = row.aliasEntries || row.aliases.map(alias => ({ alias, category: 'normal' }));
+      const aliasGroup = (category, title) => '<div class="muted" style="margin-top:8px">' + title + '</div><div class="alias-tags">' + entries.filter(entry => entry.category === category).map(entry => '<span class="alias-tag">' + esc(entry.alias) + '<button data-admin-alias-delete="' + esc(entry.alias) + '">×</button></span>').join('') + '</div>';
+      $('adminAliasDetail').innerHTML = '<div class="alias-detail-head"><div class="admin-item-icon"><img src="' + esc(iconUrl(row.itemId, 'item')) + '" alt=""></div><div><div class="admin-item-name">' + esc(row.displayName) + '</div><div class="admin-item-meta">#' + esc(row.shortCode) + ' · ' + esc(row.itemId) + '</div></div></div>' + aliasGroup('normal', '正常物品') + aliasGroup('variant', '同 ID 物品') + '<div class="alias-add" style="margin-top:10px"><input id="adminAliasDetailInput" placeholder="新增全局别名"><select id="adminAliasDetailCategory"><option value="normal">正常物品</option><option value="variant">同 ID 物品</option></select><button data-admin-alias-detail-save>添加别名</button></div><label class="check-label" style="margin-top:8px"><input id="adminAliasDetailUseDisplayName" type="checkbox"> 同时修改所有库存中的显示名称</label>';
+    }
+
+    function botStatusLabel(status) {
+      return { online: '在线', connecting: '连接中', logging_in: '登录中', auth_required: '等待微软登录', draining: '任务完成后下线', offline: '离线', disabled: '已停用', starting: '启动中', removing: '删除中' }[status] || status || '未知';
+    }
+
+    async function loadAdminBots() {
+      const data = await api('/api/admin/bots');
+      const rows = data.rows || [];
+      $('adminBotsTable').innerHTML = rows.length ? '<table><thead><tr><th>账号</th><th>状态</th><th>OAuth2 登录</th><th>当前任务</th><th>操作</th></tr></thead><tbody>' + rows.map(row => {
+        const device = row.deviceCode ? '<a href="' + esc(row.deviceCode.verificationUri) + '" target="_blank" rel="noreferrer">打开微软登录</a><div class="codebox" style="margin-top:6px">' + esc(row.deviceCode.userCode) + '</div>' : '<span class="muted">' + (row.status === 'online' ? '已完成' : '等待验证码') + '</span>';
+        const action = row.enabled ? '<button data-bot-toggle="' + esc(row.id) + '">停用</button>' : '<button data-bot-toggle="' + esc(row.id) + '">启用</button>';
+        return '<tr><td>' + esc(row.botName) + '<div class="muted">' + esc(row.username) + '</div><div class="muted">' + esc(row.minecraftName || '') + '</div></td><td>' + esc(botStatusLabel(row.status)) + (row.lastError ? '<div class="muted wrap">' + esc(row.lastError) + '</div>' : '') + '</td><td>' + device + '</td><td>' + (row.activeTask ? esc(row.activeTask.type + ' / ' + row.activeTask.username + ' / ' + row.activeTask.phase) : '<span class="muted">空闲</span>') + '</td><td>' + action + ' <button data-bot-delete="' + esc(row.id) + '">删除</button></td></tr>';
+      }).join('') + '</tbody></table>' : '<p class="muted">暂无机器人账号。</p>';
+      document.querySelectorAll('[data-bot-toggle]').forEach(button => button.addEventListener('click', async () => {
+        try { await post('/api/admin/bots/enabled', { id: button.dataset.botToggle, enabled: button.textContent === '启用' }); await loadAdminBots(); } catch (error) { toast(error.message); }
+      }));
+      document.querySelectorAll('[data-bot-delete]').forEach(button => button.addEventListener('click', async () => {
+        if (!window.confirm('确认删除这个机器人账号？')) return;
+        try { await post('/api/admin/bots/delete', { id: button.dataset.botDelete }); await loadAdminBots(); } catch (error) { toast(error.message); }
+      }));
     }
 
     async function loadAdminQuotas() {
@@ -4144,11 +4317,13 @@ const HTML = `<!doctype html>
 
     async function loadAdminCurrent() {
       if (!state.user?.isAdmin) return;
+      if (state.adminTab === 'bots') return loadAdminBots();
       if (state.adminTab === 'inventory') return loadAdminInventory();
       if (state.adminTab === 'warehouses') return loadAdminWarehouseProvisioning();
       if (state.adminTab === 'mismatches') return loadAdminMismatches();
       if (state.adminTab === 'chests') return Promise.resolve();
       if (state.adminTab === 'transactions') return loadAdminTransactions();
+      if (state.adminTab === 'commands') return loadAdminCommands();
       if (state.adminTab === 'aliases') return loadAdminAliases();
       if (state.adminTab === 'quotas') return loadAdminQuotas();
     }
@@ -4158,13 +4333,17 @@ const HTML = `<!doctype html>
       state.adminTab = tab;
       document.querySelectorAll('[data-admin-tab]').forEach(btn => btn.classList.toggle('active', btn.dataset.adminTab === tab));
       $('adminInventory').classList.toggle('hidden', tab !== 'inventory');
+      $('adminBots').classList.toggle('hidden', tab !== 'bots');
       $('adminWarehouses').classList.toggle('hidden', tab !== 'warehouses');
       $('adminMismatches').classList.toggle('hidden', tab !== 'mismatches');
       $('adminChests').classList.toggle('hidden', tab !== 'chests');
       $('adminTransactions').classList.toggle('hidden', tab !== 'transactions');
+      $('adminCommands').classList.toggle('hidden', tab !== 'commands');
       $('adminAliases').classList.toggle('hidden', tab !== 'aliases');
       $('adminQuotas').classList.toggle('hidden', tab !== 'quotas');
       loadAdminCurrent().catch(error => toast(error.message));
+      if (state.adminBotsTimer) { clearInterval(state.adminBotsTimer); state.adminBotsTimer = null; }
+      if (tab === 'bots') state.adminBotsTimer = setInterval(() => loadAdminBots().catch(() => {}), 2000);
     }
 
     function setView(view) {
@@ -4219,6 +4398,12 @@ const HTML = `<!doctype html>
     $('adminRefresh').addEventListener('click', event => {
       runButtonTask(event.currentTarget, '刷新中...', '管理数据已刷新', () => loadAdminCurrent()).catch(error => toast(error.message));
     });
+    $('adminBotAdd').addEventListener('click', async event => {
+      try {
+        await runButtonTask(event.currentTarget, '添加中...', '账号已添加', () => post('/api/admin/bots/add', { username: $('adminBotEmail').value.trim(), botName: $('adminBotName').value.trim() }));
+        $('adminBotEmail').value = ''; $('adminBotName').value = ''; await loadAdminBots();
+      } catch (error) { toast(error.message); }
+    });
     $('adminInvLoad').addEventListener('click', () => loadAdminInventory({ owner: $('adminInvOwner').value }).catch(error => toast(error.message)));
     $('adminInvOwner').addEventListener('change', event => loadAdminInventory({ owner: event.currentTarget.value }).catch(error => toast(error.message)));
     $('adminMmLoad').addEventListener('click', () => loadAdminMismatches().catch(error => toast(error.message)));
@@ -4231,6 +4416,10 @@ const HTML = `<!doctype html>
     $('adminTxLoad').addEventListener('click', () => { state.adminTxPage = 1; loadAdminTransactions().catch(error => toast(error.message)); });
     $('adminTxPrev').addEventListener('click', () => { if (state.adminTxPage > 1) state.adminTxPage--; loadAdminTransactions().catch(error => toast(error.message)); });
     $('adminTxNext').addEventListener('click', () => { if (state.adminTxPage < state.adminTxTotalPages) state.adminTxPage++; loadAdminTransactions().catch(error => toast(error.message)); });
+    $('adminCommandLoad').addEventListener('click', () => { state.adminCommandPage = 1; loadAdminCommands().catch(error => toast(error.message)); });
+    $('adminCommandChannel').addEventListener('change', () => { state.adminCommandPage = 1; loadAdminCommands().catch(error => toast(error.message)); });
+    $('adminCommandPrev').addEventListener('click', () => { if ((state.adminCommandPage || 1) > 1) state.adminCommandPage--; loadAdminCommands().catch(error => toast(error.message)); });
+    $('adminCommandNext').addEventListener('click', () => { if ((state.adminCommandPage || 1) < (state.adminCommandTotalPages || 1)) state.adminCommandPage++; loadAdminCommands().catch(error => toast(error.message)); });
     $('adminAliasLoad').addEventListener('click', () => loadAdminAliases().catch(error => toast(error.message)));
     $('adminQuotaLoad').addEventListener('click', () => loadAdminQuotas().catch(error => toast(error.message)));
     $('myRefresh').addEventListener('click', () => loadMyCurrent().catch(error => toast(error.message)));
@@ -4429,7 +4618,7 @@ const HTML = `<!doctype html>
         } else if (aliasDetailSave) {
           if (!state.adminAliasItem) throw new Error('请先选择物品。');
           const input = $('adminAliasDetailInput');
-          const data = await post('/api/admin/alias/save', { itemKey: state.adminAliasItem.itemKey, alias: input.value, updateDisplayName: $('adminAliasDetailUseDisplayName').checked });
+          const data = await post('/api/admin/alias/save', { itemKey: state.adminAliasItem.itemKey, alias: input.value, category: $('adminAliasDetailCategory').value, updateDisplayName: $('adminAliasDetailUseDisplayName').checked });
           toast(data.message);
           await loadAdminAliases();
         } else if (aliasSave) {
