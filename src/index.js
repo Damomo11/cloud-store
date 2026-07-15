@@ -108,10 +108,13 @@ const configuredAccounts = (Array.isArray(config.bots) && config.bots.length ? c
   }))
   .filter(account => account.username)
 
-if (!db.listBotAccounts().length) {
+const existingAccounts = db.listBotAccounts()
+if (!existingAccounts.length) {
   for (const account of configuredAccounts) {
     db.createBotAccount({ id: crypto.randomUUID(), ...account, enabled: true })
   }
+} else if (configuredAccounts.length) {
+  console.log('Bot accounts are loaded from the database; config.json server/bots are only used for first initialization.')
 }
 
 const accounts = db.listBotAccounts()
@@ -295,9 +298,13 @@ function launchBot (state) {
 
   const loginWatchdog = setInterval(() => {
     if (!loggedIn) {
-      console.log('[login] 仍在等待登录完成。如果使用 microsoft 且首次登录，请查看是否出现 microsoft.com/link 验证码。')
+      if (state.deviceCode && state.deviceCode.expiresAt > Date.now()) {
+        console.log(`[login:${state.account.botName}] 仍在等待 Microsoft OAuth 验证。打开 ${state.deviceCode.verificationUri} 输入 ${state.deviceCode.userCode}`)
+      } else {
+        console.log(`[login:${state.account.botName}] 仍在等待登录完成。如果首次登录，请查看是否出现 microsoft.com/link 验证码。`)
+      }
     } else if (!spawned) {
-      console.log('[login] 已登录，仍在等待 spawn。可能正在等待服务器资源包确认、服务器队列或插件验证。')
+      console.log(`[login:${state.account.botName}] 已登录，仍在等待 spawn。可能正在等待服务器资源包确认、服务器队列或插件验证。`)
     }
   }, 15000)
 
@@ -306,7 +313,7 @@ function launchBot (state) {
     state.status = 'logging_in'
     state.deviceCode = null
     bot.setSettings?.({ locale: config.server.locale || 'zh_CN' })
-    console.log('Bot logged in, waiting for spawn...')
+    console.log(`[login:${state.account.botName}] Bot logged in as ${bot.username}, waiting for spawn...`)
   })
 
   bot.once('spawn', () => {
@@ -315,7 +322,7 @@ function launchBot (state) {
     state.status = 'online'
     state.lastError = ''
     clearInterval(loginWatchdog)
-    console.log(`Cloud store bot spawned as ${bot.username}`)
+    console.log(`[login:${state.account.botName}] Cloud store bot spawned as ${bot.username}`)
     state.service = service
     taskPool.register(service)
     service.start()
@@ -367,7 +374,7 @@ function launchBot (state) {
 
   bot.on('kicked', reason => {
     clearInterval(loginWatchdog)
-    console.error('Bot kicked:', reason)
+    console.error(`[login:${state.account.botName}] Bot kicked:`, reason)
     const kickReason = formatKickReason(reason)
     lastDisconnectReason = kickReason
     state.lastError = kickReason
@@ -393,12 +400,12 @@ function launchBot (state) {
         return
       }
     }
-    console.error('Bot error:', error)
+    console.error(`[login:${state.account.botName}] Bot error:`, error)
   })
 
   bot.on('end', () => {
     clearInterval(loginWatchdog)
-    console.log(`Bot disconnected${lastDisconnectReason ? `: ${lastDisconnectReason}` : ''}`)
+    console.log(`[login:${state.account.botName}] Bot disconnected${lastDisconnectReason ? `: ${lastDisconnectReason}` : ''}`)
     taskPool.unregister(service)
     if (state.bot === bot) state.bot = null
     if (state.service === service) state.service = null

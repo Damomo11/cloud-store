@@ -74,6 +74,7 @@ class CloudStoreWebServer {
       if (req.method === 'GET' && url.pathname === '/api/admin/chest') return this.sendJson(res, this.apiAdminChest(session, url))
       if (req.method === 'GET' && url.pathname === '/api/admin/aliases') return this.sendJson(res, this.apiAdminAliases(session, url))
       if (req.method === 'GET' && url.pathname === '/api/admin/quotas') return this.sendJson(res, this.apiAdminQuotas(session, url))
+      if (req.method === 'GET' && url.pathname === '/api/admin/users') return this.sendJson(res, this.apiAdminUsers(session))
       if (req.method === 'GET' && url.pathname === '/api/admin/bots') return this.sendJson(res, this.apiAdminBots(session))
       if (req.method === 'POST' && url.pathname === '/api/login') {
         const body = await this.readBody(req)
@@ -193,6 +194,14 @@ class CloudStoreWebServer {
       if (req.method === 'POST' && url.pathname === '/api/admin/quota/save') {
         const body = await this.readBody(req)
         return this.sendJson(res, this.apiAdminQuotaSave(session, body))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/admin/users/add') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiAdminUserAdd(session, body))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/admin/users/remove') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiAdminUserRemove(session, body))
       }
       if (req.method === 'POST' && url.pathname === '/api/admin/bots/add') {
         const body = await this.readBody(req)
@@ -868,6 +877,43 @@ class CloudStoreWebServer {
     this.requireAdmin(session)
     const manager = this.requireBotManager()
     return { ok: true, rows: manager.list(), auth: 'microsoft_oauth2_device_code' }
+  }
+
+  apiAdminUsers (session) {
+    this.requireAdmin(session)
+    const configAdmins = new Set((this.config.admins || []).map(name => String(name || '').toLowerCase()))
+    return {
+      ok: true,
+      rows: this.db.listAdmins().map(row => ({
+        ...row,
+        createdAtLabel: this.formatBeijingTime(row.createdAt),
+        fromConfig: configAdmins.has(String(row.username || '').toLowerCase())
+      }))
+    }
+  }
+
+  apiAdminUserAdd (session, body) {
+    const admin = this.requireAdmin(session)
+    const player = this.resolveProvisionPlayer(body.username)
+    this.db.addAdmin(player.username, player.uuid.startsWith('name:') ? null : player.uuid)
+    this.db.addTransaction('web_admin_user_add', 'ok', this.config.momoOwner, admin.username, [], `admin=${admin.username}; target=${player.username}`)
+    return { ok: true, message: `已添加系统管理员：${player.username}` }
+  }
+
+  apiAdminUserRemove (session, body) {
+    const admin = this.requireAdmin(session)
+    const username = String(body.username || '').trim()
+    const uuid = String(body.uuid || '').trim()
+    if (!username && !uuid) throw new Error('缺少要删除的管理员。')
+    if (this.isSameUsername(username, admin.username) || (uuid && uuid === admin.uuid)) {
+      throw new Error('不能删除当前登录的管理员。')
+    }
+    if (this.db.listAdmins().length <= 1) throw new Error('至少需要保留一个系统管理员。')
+    const result = this.db.removeAdmin(username, uuid)
+    if (result.changed) {
+      this.db.addTransaction('web_admin_user_remove', 'ok', this.config.momoOwner, admin.username, [], `admin=${admin.username}; target=${result.admin.username}`)
+    }
+    return { ok: true, message: result.changed ? `已删除系统管理员：${result.admin.username}` : '没有找到这个系统管理员。' }
   }
 
   apiAdminBotAdd (session, body) {
@@ -2894,6 +2940,7 @@ const HTML = `<!doctype html>
         </div>
         <div class="subnav">
           <button class="primary" data-admin-tab="bots">机器人账号</button>
+          <button class="primary" data-admin-tab="admins">系统管理员</button>
           <button class="primary active" data-admin-tab="inventory">库存</button>
           <button class="primary" data-admin-tab="warehouses">组织管理</button>
           <button class="primary" data-admin-tab="mismatches">库存异常</button>
@@ -2910,6 +2957,14 @@ const HTML = `<!doctype html>
             <p class="muted">仅支持 Microsoft OAuth2 设备码登录，不保存密码。添加后请按表格中的链接和验证码完成登录。</p>
           </div>
           <div id="adminBotsTable" class="panel tablewrap"></div>
+        </section>
+        <section id="adminUsers" class="hidden">
+          <div class="panel" style="padding:14px;margin-bottom:14px">
+            <h3>系统管理员</h3>
+            <div class="alias-add"><input id="adminUserName" placeholder="玩家 ID"><button id="adminUserAdd" class="solid">添加管理员</button></div>
+            <p class="muted">系统管理员可以使用管理员命令、进入 Web 管理面板，并通过 !指令 让机器人发送游戏内内容。</p>
+          </div>
+          <div id="adminUsersTable" class="panel tablewrap"></div>
         </section>
         <section id="adminInventory">
           <div class="toolbar">
@@ -4307,6 +4362,23 @@ const HTML = `<!doctype html>
       }));
     }
 
+    async function loadAdminUsers() {
+      const data = await api('/api/admin/users');
+      renderTable('adminUsersTable', ['玩家', 'UUID', '来源', '添加时间', '操作'], (data.rows || []).map(row => {
+        const source = row.fromConfig ? 'config.json / 数据库' : '数据库';
+        const action = row.username === state.user?.username ? '<span class="muted">当前账号</span>' : '<button data-admin-user-remove="' + esc(row.username) + '" data-admin-user-uuid="' + esc(row.uuid || '') + '">删除</button>';
+        return '<tr><td>' + esc(row.username) + '</td><td class="wrap">' + esc(row.uuid || '-') + '</td><td>' + esc(source) + '</td><td>' + esc(row.createdAtLabel || row.createdAt || '') + '</td><td>' + action + '</td></tr>';
+      }), '暂无系统管理员。');
+      document.querySelectorAll('[data-admin-user-remove]').forEach(button => button.addEventListener('click', async () => {
+        if (!window.confirm('确认删除这个系统管理员？')) return;
+        try {
+          const data = await post('/api/admin/users/remove', { username: button.dataset.adminUserRemove, uuid: button.dataset.adminUserUuid });
+          toast(data.message);
+          await loadAdminUsers();
+        } catch (error) { toast(error.message); }
+      }));
+    }
+
     async function loadAdminQuotas() {
       const data = await api('/api/admin/quotas', { q: $('adminQuotaQ').value });
       renderStats('adminQuotaOverall', { '木桶数量': data.overall?.chestCount || 0, '已用物理格数': data.overall?.usedSlots || 0, '总物理格数': data.overall?.totalSlots || 0, '整体使用率 %': data.overall?.usagePercent || 0 });
@@ -4318,6 +4390,7 @@ const HTML = `<!doctype html>
     async function loadAdminCurrent() {
       if (!state.user?.isAdmin) return;
       if (state.adminTab === 'bots') return loadAdminBots();
+      if (state.adminTab === 'admins') return loadAdminUsers();
       if (state.adminTab === 'inventory') return loadAdminInventory();
       if (state.adminTab === 'warehouses') return loadAdminWarehouseProvisioning();
       if (state.adminTab === 'mismatches') return loadAdminMismatches();
@@ -4334,6 +4407,7 @@ const HTML = `<!doctype html>
       document.querySelectorAll('[data-admin-tab]').forEach(btn => btn.classList.toggle('active', btn.dataset.adminTab === tab));
       $('adminInventory').classList.toggle('hidden', tab !== 'inventory');
       $('adminBots').classList.toggle('hidden', tab !== 'bots');
+      $('adminUsers').classList.toggle('hidden', tab !== 'admins');
       $('adminWarehouses').classList.toggle('hidden', tab !== 'warehouses');
       $('adminMismatches').classList.toggle('hidden', tab !== 'mismatches');
       $('adminChests').classList.toggle('hidden', tab !== 'chests');
@@ -4403,6 +4477,15 @@ const HTML = `<!doctype html>
         await runButtonTask(event.currentTarget, '添加中...', '账号已添加', () => post('/api/admin/bots/add', { username: $('adminBotEmail').value.trim(), botName: $('adminBotName').value.trim() }));
         $('adminBotEmail').value = ''; $('adminBotName').value = ''; await loadAdminBots();
       } catch (error) { toast(error.message); }
+    });
+    $('adminUserAdd').addEventListener('click', async event => {
+      try {
+        await runButtonTask(event.currentTarget, '添加中...', '管理员已添加', () => post('/api/admin/users/add', { username: $('adminUserName').value.trim() }));
+        $('adminUserName').value = ''; await loadAdminUsers();
+      } catch (error) { toast(error.message); }
+    });
+    $('adminUserName').addEventListener('keydown', event => {
+      if (event.key === 'Enter') $('adminUserAdd').click();
     });
     $('adminInvLoad').addEventListener('click', () => loadAdminInventory({ owner: $('adminInvOwner').value }).catch(error => toast(error.message)));
     $('adminInvOwner').addEventListener('change', event => loadAdminInventory({ owner: event.currentTarget.value }).catch(error => toast(error.message)));

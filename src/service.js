@@ -233,9 +233,11 @@ class CloudStoreService {
     if (this.config.debugRawChat) console.log(`[chat:${source}] ${username}: ${message}`)
 
     const commandMessage = this.normalizePrivateCommandText(message, source)
-    if (this.taskPool && !this.taskPool.acceptIncoming(username, commandMessage)) return
-    if (!this.taskPool && this.isDuplicateCommand(username, commandMessage, source)) return
     const normalizedCommand = this.normalizeCommandText(commandMessage)
+    const botGameCommand = this.isBotGameCommand(normalizedCommand)
+    if (botGameCommand && this.isDuplicateCommand(username, normalizedCommand, source)) return
+    if (this.taskPool && !botGameCommand && !this.taskPool.acceptIncoming(username, normalizedCommand)) return
+    if (!this.taskPool && !botGameCommand && this.isDuplicateCommand(username, normalizedCommand, source)) return
     if (!normalizedCommand.startsWith('!')) return
     const commandLogId = this.db.createCommandLog({
       username,
@@ -470,6 +472,11 @@ class CloudStoreService {
     if (!text.startsWith('!')) return
     if (this.config.debugChat) console.log(`[command] ${username} -> ${this.redactSensitiveText(text)}`)
     this.touchPlayer(username)
+
+    if (this.isBotGameCommand(text)) {
+      await this.handleBotGameCommand(username, text, context)
+      return
+    }
 
     if (this.isWebLoginTokenCommand(text)) {
       await this.handleWebLoginToken(username, text, context)
@@ -1377,6 +1384,26 @@ class CloudStoreService {
     const target = this.resolvePlayer(parts[1])
     this.db.addAdmin(target.username, target.uuid.startsWith('name:') ? null : target.uuid)
     this.msg(username, `已添加管理员：${target.username}`)
+  }
+
+  isBotGameCommand (text) {
+    return /^!指令(?:\s|$)/.test(String(text || ''))
+  }
+
+  async handleBotGameCommand (username, text, context = {}) {
+    const command = String(text || '').replace(/^!指令(?:\s+)?/, '').trim()
+    const privateSource = this.isPrivateSource(context.source)
+    if (!this.isAdmin(username)) {
+      if (privateSource) this.msg(username, '你没有权限让机器人发送游戏内指令。')
+      return
+    }
+    if (!command) {
+      if (privateSource) this.msg(username, '格式：!指令 要让机器人发送的内容')
+      return
+    }
+    if (this.config.debugChat) console.log(`[bot-command:${this.bot.username}] ${username} -> ${this.redactSensitiveText(command)}`)
+    this.bot.chat(command)
+    if (privateSource) this.msg(username, `已执行：${command}`)
   }
 
   isWebLoginTokenCommand (text) {
@@ -2582,6 +2609,7 @@ class CloudStoreService {
       '额度',
       '加管理员',
       '加管理',
+      '指令',
       '设置密钥',
       '设置密码',
       '登录',

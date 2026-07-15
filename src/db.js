@@ -1446,6 +1446,29 @@ class StoreDb {
     `).run(username.toLowerCase(), username, uuid)
   }
 
+  listAdmins () {
+    return this.db.prepare(`
+      SELECT username_lower AS usernameLower, username, uuid, created_at AS createdAt
+      FROM admin_users
+      ORDER BY username COLLATE NOCASE ASC
+    `).all()
+  }
+
+  removeAdmin (username, uuid = null) {
+    const usernameLower = String(username || '').trim().toLowerCase()
+    const playerUuid = String(uuid || '').trim()
+    if (!usernameLower && !playerUuid) return { changed: false }
+    const row = this.db.prepare(`
+      SELECT username_lower AS usernameLower, username, uuid
+      FROM admin_users
+      WHERE username_lower = ? OR (? != '' AND uuid = ?)
+      LIMIT 1
+    `).get(usernameLower, playerUuid, playerUuid)
+    if (!row) return { changed: false }
+    const changes = this.db.prepare('DELETE FROM admin_users WHERE username_lower = ?').run(row.usernameLower).changes
+    return { changed: changes > 0, admin: row }
+  }
+
   isAdmin (username, uuid = null) {
     const row = this.db.prepare(`
       SELECT 1
