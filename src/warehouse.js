@@ -1159,8 +1159,8 @@ class Warehouse {
         throw new Error(`丢出 ${normalized.displayName} 超时，背包数量没有减少。`)
       }
       dropped.push({ ...normalized, amount: moved })
-      this.debug(`drop done ${normalized.displayName} x${moved} in ${Date.now() - startedAt}ms`)
-      await sleep(this.config.timing.dropIntervalMs)
+      this.debug(`drop done ${normalized.displayName} x${moved} confirm=${Date.now() - startedAt}ms cooldown=${this.dropIntervalMs()}ms`)
+      await this.waitDropCooldown(startedAt)
     }
     return this.mergeItems(dropped)
   }
@@ -1197,12 +1197,54 @@ class Warehouse {
         const credited = Math.min(remaining, moved)
         dropped.push({ ...normalized, amount: credited })
         remaining -= credited
-        this.debug(`drop selected done ${normalized.displayName} x${credited} in ${Date.now() - startedAt}ms`)
-        await sleep(this.config.timing.dropIntervalMs)
+        this.debug(`drop selected done ${normalized.displayName} x${credited} confirm=${Date.now() - startedAt}ms cooldown=${this.dropIntervalMs()}ms`)
+        await this.waitDropCooldown(startedAt)
       }
     }
 
     return this.mergeItems(dropped)
+  }
+
+  async repairPlayerWithExperienceBottles (username, options = {}) {
+    const itemId = String(options.itemId || 'minecraft:experience_bottle')
+    const maxDistance = Number(options.maxDistance ?? 4)
+    const used = []
+    if (this.bot.currentWindow) {
+      this.debug(`closing open window before repairing: ${this.bot.currentWindow.type || this.bot.currentWindow.id}`)
+      this.bot.closeWindow(this.bot.currentWindow)
+      await sleep(150)
+    }
+
+    while (true) {
+      const target = this.bot.players[username]?.entity
+      const botPos = this.bot.entity?.position
+      if (!target?.position || !botPos) {
+        this.debug(`repair stop ${username}: player entity unavailable`)
+        break
+      }
+      const distance = target.position.distanceTo(botPos)
+      if (distance > maxDistance) {
+        this.debug(`repair stop ${username}: distance=${distance.toFixed(2)} > ${maxDistance}`)
+        break
+      }
+
+      const item = this.bot.inventory.items().find(entry => this.catalog.fromPrismarineItem(entry).itemId === itemId)
+      if (!item) break
+
+      const normalized = this.catalog.fromPrismarineItem(item)
+      const before = this.inventoryCountByItemKey(normalized.itemKey)
+      const startedAt = Date.now()
+      await this.equipItemInHand(item)
+      await this.lookAtPlayer(username, 0.35)
+      await this.useHeldItemOnce()
+      const moved = await this.waitForInventoryDecrease(normalized.itemKey, before, { intervalMs: this.inventoryConfirmPollMs() })
+      if (moved <= 0) throw new Error(`repair item use timed out: ${normalized.displayName}`)
+      used.push({ ...normalized, amount: moved })
+      this.debug(`repair throw ${normalized.displayName} x${moved} at ${username} confirm=${Date.now() - startedAt}ms cooldown=${this.dropIntervalMs()}ms`)
+      await this.waitDropCooldown(startedAt)
+    }
+
+    return this.mergeItems(used)
   }
 
   async dropSlotAmountFast (item, amount) {
@@ -1242,9 +1284,9 @@ class Warehouse {
     }
   }
 
-  async waitForInventoryDecrease (itemKey, before) {
+  async waitForInventoryDecrease (itemKey, before, options = {}) {
     const timeoutMs = Number(this.config.timing.dropConfirmTimeoutMs || 5000)
-    const intervalMs = 100
+    const intervalMs = Math.max(10, Number(options.intervalMs ?? this.inventoryConfirmPollMs()))
     const startedAt = Date.now()
     while (Date.now() - startedAt < timeoutMs) {
       const after = this.inventoryCountByItemKey(itemKey)
@@ -1254,15 +1296,53 @@ class Warehouse {
     return Math.max(0, before - this.inventoryCountByItemKey(itemKey))
   }
 
-  async lookAtPlayer (username) {
+  async lookAtPlayer (username, yOffset = 1.4) {
     const entity = this.bot.players[username]?.entity
     if (!entity) {
       this.debug(`cannot look at player ${username}: entity not found`)
       return
     }
-    const target = entity.position.offset(0, 1.4, 0)
+    const target = entity.position.offset(0, yOffset, 0)
     await this.bot.lookAt(target, true)
     await sleep(100)
+  }
+
+  async equipItemInHand (item) {
+    if (!item) return
+    if (this.bot.heldItem?.slot === item.slot) return
+    if (typeof this.bot.equip === 'function') {
+      await this.bot.equip(item, 'hand')
+      await sleep(50)
+      return
+    }
+    const quickBarStart = this.bot.QUICK_BAR_START || 36
+    if (typeof this.bot.setQuickBarSlot === 'function' && item.slot >= quickBarStart && item.slot < quickBarStart + 9) {
+      this.bot.setQuickBarSlot(item.slot - quickBarStart)
+      await sleep(50)
+      return
+    }
+    throw new Error(`cannot equip item in hand: ${item.name || item.itemId || 'item'}`)
+  }
+
+  async useHeldItemOnce () {
+    await this.withTimeout(Promise.resolve().then(async () => {
+      this.bot.activateItem(false)
+      await sleep(75)
+      this.bot.deactivateItem?.()
+    }), Number(this.config.timing.useItemTimeoutMs || 3000), 'held item use timed out')
+  }
+
+  dropIntervalMs () {
+    return Math.max(0, Number(this.config.timing?.dropIntervalMs ?? 250))
+  }
+
+  inventoryConfirmPollMs () {
+    return Math.max(10, Math.min(25, this.dropIntervalMs() || 25))
+  }
+
+  async waitDropCooldown (startedAt) {
+    const remaining = this.dropIntervalMs() - (Date.now() - startedAt)
+    if (remaining > 0) await sleep(remaining)
   }
 
   mergeItems (items) {
