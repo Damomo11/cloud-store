@@ -1,5 +1,9 @@
 const { clampInt, sleep, sumBy } = require('./utils')
 
+const REPAIR_BOTTLE_ITEM_ID = 'minecraft:experience_bottle'
+const REPAIR_BOTTLE_AMOUNT = 64
+const REPAIR_MAX_DISTANCE = 4
+
 class CloudStoreService {
   constructor (bot, db, catalog, warehouse, config, taskPool = null) {
     this.bot = bot
@@ -141,7 +145,7 @@ class CloudStoreService {
   }
 
   isWithdrawDeliveryPhase (phase) {
-    return phase === 'withdraw_dropping' || phase === 'withdraw_return_home'
+    return phase === 'withdraw_dropping' || phase === 'withdraw_repairing' || phase === 'withdraw_return_home'
   }
 
   recoveryOwnerFromTask (task) {
@@ -550,6 +554,11 @@ class CloudStoreService {
       return
     }
 
+    if (/^!修装备(?:\s|$)?/.test(text)) {
+      await this.handleRepairCommand(username, text)
+      return
+    }
+
     if (text === '!存物品' || text === '!存') {
       const owner = this.defaultStorageOwnerForPlayer(this.getPlayer(username))
       await this.enqueueTask(username, 'deposit', worker => worker.handleDeposit(username, owner))
@@ -849,10 +858,41 @@ class CloudStoreService {
     this.db.addTransaction('deposit_session', status, owner.uuid, owner.username, items, message)
   }
 
+  async handleRepairCommand (username, text) {
+    const actor = this.getPlayer(username)
+    const storageOwner = this.defaultStorageOwnerForPlayer(actor)
+    const targetUsername = this.parseRepairTarget(text, username)
+    const request = this.buildRepairBottleRequest()
+    await this.enqueueTask(username, 'withdraw', worker => worker.handleWithdraw(
+      username,
+      '',
+      storageOwner,
+      [request],
+      targetUsername,
+      { deliveryMode: 'repair' }
+    ))
+  }
+
+  parseRepairTarget (text, fallbackUsername) {
+    const raw = String(text || '').replace(/^!修装备(?:\s+)?/, '').trim()
+    if (!raw) return fallbackUsername
+    if (!/^[A-Za-z0-9_]{3,16}$/.test(raw)) throw new Error('目标玩家 ID 格式不正确。')
+    return raw
+  }
+
+  buildRepairBottleRequest () {
+    return {
+      itemId: REPAIR_BOTTLE_ITEM_ID,
+      displayName: this.catalog.getDisplayName(REPAIR_BOTTLE_ITEM_ID) || '经验瓶',
+      amount: REPAIR_BOTTLE_AMOUNT
+    }
+  }
+
   async handleWithdraw (username, text, owner = null, prebuiltRequests = null, targetUsername = username, options = {}) {
     const player = this.getPlayer(username)
     const storageOwner = owner || { ...player, scope: 'personal' }
     const continueWithDeposit = Boolean(options.continueWithDeposit)
+    const deliveryMode = options.deliveryMode === 'repair' ? 'repair' : 'drop'
     const parsedWithdraw = prebuiltRequests
       ? { requests: prebuiltRequests, targetUsername: String(targetUsername || username).trim() }
       : this.parseWithdrawCommand(text, storageOwner, targetUsername || username, player.uuid)
@@ -899,9 +939,11 @@ class CloudStoreService {
 
     const batches = this.splitAllocationsIntoInventoryBatches(plan.allocations, 36)
 
-    const teleportNotice = deliveryToOther
-      ? `${username} 正在从${this.ownerScopeName(storageOwner)}给你取物品${this.withdrawBatchNoticeSuffix(batches.length)}，请${batches.length > 1 ? '每次' : '稍后'}接受机器人的传送请求。`
-      : `正在从${this.ownerScopeName(storageOwner)}给你取物品${this.withdrawBatchNoticeSuffix(batches.length)}，请${batches.length > 1 ? '每次' : '稍后'}接受机器人的传送请求。`
+    const teleportNotice = deliveryMode === 'repair'
+      ? `正在从${this.ownerScopeName(storageOwner)}取经验瓶给你修装备，离开4格后自动结束。`
+      : (deliveryToOther
+          ? `${username} 正在从${this.ownerScopeName(storageOwner)}给你取物品${this.withdrawBatchNoticeSuffix(batches.length)}，请${batches.length > 1 ? '每次' : '稍后'}接受机器人的传送请求。`
+          : `正在从${this.ownerScopeName(storageOwner)}给你取物品${this.withdrawBatchNoticeSuffix(batches.length)}，请${batches.length > 1 ? '每次' : '稍后'}接受机器人的传送请求。`)
     if (deliveryToOther) msgTarget(teleportNotice)
     else msgActor(teleportNotice)
 
@@ -942,11 +984,17 @@ class CloudStoreService {
       }
 
       if (this.isActiveCancelled()) return
-      this.setWithdrawBatchProgress(index + 1, batches.length, 'withdraw_dropping')
-      this.saveRecoveryTask('withdraw', username, storageOwner, deliveryTarget, 'withdraw_dropping', delivered)
-      const dropped = continueWithDeposit
-        ? await this.dropWithdrawItemsToPlayer(deliveryTarget, delivered)
-        : await this.warehouse.dropInventoryToPlayer(deliveryTarget)
+      const deliveryPhase = deliveryMode === 'repair' ? 'withdraw_repairing' : 'withdraw_dropping'
+      this.setWithdrawBatchProgress(index + 1, batches.length, deliveryPhase)
+      this.saveRecoveryTask('withdraw', username, storageOwner, deliveryTarget, deliveryPhase, delivered)
+      const dropped = deliveryMode === 'repair'
+        ? await this.warehouse.repairPlayerWithExperienceBottles(deliveryTarget, {
+            itemId: REPAIR_BOTTLE_ITEM_ID,
+            maxDistance: REPAIR_MAX_DISTANCE
+          })
+        : (continueWithDeposit
+            ? await this.dropWithdrawItemsToPlayer(deliveryTarget, delivered)
+            : await this.warehouse.dropInventoryToPlayer(deliveryTarget))
       if (this.isActiveCancelled()) return
 
       const leftoverAfterDrop = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
@@ -977,7 +1025,9 @@ class CloudStoreService {
       if (residual.deposited.length) {
         msgActor(continueWithDeposit
           ? `取货期间收到的物品已先存入${this.ownerScopeName(storageOwner)}：${this.formatDepositSummary(residual.deposited)}。`
-          : `有未成功丢出的物品已回收入库；这部分没有从${this.ownerSubjectName(storageOwner)}扣除。`)
+          : (deliveryMode === 'repair'
+              ? `有未用完的经验瓶已回收入库；这部分没有从${this.ownerSubjectName(storageOwner)}扣除。`
+              : `有未成功丢出的物品已回收入库；这部分没有从${this.ownerSubjectName(storageOwner)}扣除。`))
       }
     }
 
@@ -988,8 +1038,14 @@ class CloudStoreService {
       if (returned.leftover.length) {
         msgActor(`机器人身上仍有未能放回仓库的物品：${this.formatItemList(returned.leftover)}`)
       }
-      if (deliveryToOther) msgTarget(`${username} 给你的取货失败：仓库实物取出失败，请稍后再试。`)
-      else this.msg(username, `账本有库存，但按本地木桶记录没有成功取出：${this.formatItemList(plan.allocations)}。请管理员执行 !同步 后再试。`)
+      if (deliveryMode === 'repair') {
+        if (deliveryToOther) msgTarget(`${username} 想给你修装备，但你离开太远或未能成功使用经验瓶，本次已取消。`)
+        this.msg(username, `${this.ownerActionPrefix(storageOwner)}修装备未开始或未成功使用经验瓶，已把经验瓶回收入库，本次不会扣除库存。`)
+      } else if (deliveryToOther) {
+        msgTarget(`${username} 给你的取货失败：仓库实物取出失败，请稍后再试。`)
+      } else {
+        this.msg(username, `账本有库存，但按本地木桶记录没有成功取出：${this.formatItemList(plan.allocations)}。请管理员执行 !同步 后再试。`)
+      }
       this.db.clearRecoveryTask(this.botId)
       return
     }
@@ -1001,9 +1057,13 @@ class CloudStoreService {
 
     if (deliveryToOther) {
       const suffix = missingByItem.length ? '，部分物品仓库实物不足，未取到。' : '。'
-      msgTarget(`${username} 给你的取货已送达：${this.formatWithdrawSummary(deliveredTotal)}${suffix}`)
+      msgTarget(deliveryMode === 'repair'
+        ? `${username} 给你修装备已完成：共用了 ${this.totalAmount(deliveredTotal)} 个${this.buildRepairBottleRequest().displayName}${suffix}`
+        : `${username} 给你的取货已送达：${this.formatWithdrawSummary(deliveredTotal)}${suffix}`)
     } else {
-      this.msg(username, `${this.ownerActionPrefix(storageOwner)}取货完成：${this.formatWithdrawSummary(deliveredTotal)}。`)
+      this.msg(username, deliveryMode === 'repair'
+        ? `${this.ownerActionPrefix(storageOwner)}修装备完成：共用了 ${this.totalAmount(deliveredTotal)} 个${this.buildRepairBottleRequest().displayName}。`
+        : `${this.ownerActionPrefix(storageOwner)}取货完成：${this.formatWithdrawSummary(deliveredTotal)}。`)
     }
 
     if (continueWithDeposit) {
@@ -1399,6 +1459,10 @@ class CloudStoreService {
     }
     if (!command) {
       if (privateSource) this.msg(username, '格式：!指令 要让机器人发送的内容')
+      return
+    }
+    if (this.active?.type === 'deposit' || this.active?.type === 'withdraw') {
+      this.msg(username, `机器人正在为 ${this.active.username} 执行${this.active.type === 'deposit' ? '存货' : '取货'}任务，暂时不允许使用 !指令，以免打断返回 /home。`)
       return
     }
     if (this.config.debugChat) console.log(`[bot-command:${this.bot.username}] ${username} -> ${this.redactSensitiveText(command)}`)
@@ -2597,6 +2661,7 @@ class CloudStoreService {
   normalizePrivateCommandText (message, source) {
     const text = this.normalizeCommandText(message)
     if (!this.isPrivateSource(source) || text.startsWith('!')) return text
+    if (text === '修装备' || text.startsWith('修装备 ')) return `!${text}`
 
     const commandNames = [
       '创建仓库',
