@@ -1,7 +1,10 @@
 const http = require('node:http')
+const https = require('node:https')
 const crypto = require('node:crypto')
+const fs = require('node:fs')
 const path = require('node:path')
 const { parseLitematicData } = require('../scripts/litematic-materials')
+const { signCloudStoreToken } = require('./botPlatformSso')
 
 class CloudStoreWebServer {
   constructor (db, config, serviceProvider, botManagerProvider = null) {
@@ -55,6 +58,7 @@ class CloudStoreWebServer {
     const url = new URL(req.url, 'http://localhost')
     const session = this.getSession(req, res)
     try {
+      if (req.method === 'GET' && url.pathname === '/bot-platform') return await this.openBotPlatform(res, session)
       if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/admin')) return this.sendHtml(res, HTML)
       if (req.method === 'GET' && url.pathname === '/api/me') return this.sendJson(res, this.apiMe(session))
       if (req.method === 'GET' && url.pathname === '/api/inventory') return this.sendJson(res, this.apiInventory(session, url))
@@ -240,6 +244,43 @@ class CloudStoreWebServer {
       defaultOwnerUuid: this.db.getEffectiveDefaultOwnerUuid(user.uuid),
       active: this.activeSnapshot()
     }
+  }
+
+  botPlatformUrl () {
+    return String(this.config.web?.botPlatformUrl || 'http://127.0.0.1:8788').replace(/\/+$/, '')
+  }
+
+  botPlatformHealthUrl () {
+    return String(this.config.web?.botPlatformHealthUrl || this.botPlatformUrl()).replace(/\/+$/, '')
+  }
+
+  botPlatformSsoSecret () {
+    const file = path.resolve(process.cwd(), this.config.web?.botPlatformSsoSecretFile || 'data/bot-platform-sso.key')
+    return fs.readFileSync(file, 'utf8').trim()
+  }
+
+  botPlatformAvailable () {
+    return new Promise(resolve => {
+      let target
+      try { target = new URL('/api/health', `${this.botPlatformHealthUrl()}/`) } catch { return resolve(false) }
+      const client = target.protocol === 'https:' ? https : http
+      const request = client.get(target, { headers: { accept: 'application/json' } }, response => {
+        response.resume()
+        resolve(response.statusCode === 200)
+      })
+      request.setTimeout(800, () => { request.destroy(); resolve(false) })
+      request.on('error', () => resolve(false))
+    })
+  }
+
+  async openBotPlatform (res, session) {
+    const user = this.requireUser(session)
+    if (!await this.botPlatformAvailable()) return this.sendText(res, 404, 'Bot 自托管平台未启动。')
+    const token = signCloudStoreToken(user, this.botPlatformSsoSecret())
+    const target = new URL('/auth/cloud-store', `${this.botPlatformUrl()}/`)
+    target.searchParams.set('token', token)
+    res.writeHead(302, { location: target.toString(), 'cache-control': 'no-store' })
+    res.end()
   }
 
   apiInventory (session, url) {
@@ -2688,6 +2729,7 @@ const HTML = `<!doctype html>
         <button class="navbtn" data-view="my">☺　我的</button>
         <button id="warehouseAdminLink" class="navbtn hidden" data-view="warehouseAdmin">♜　组织管理</button>
         <button class="navbtn" data-view="help">？　帮助</button>
+        <button id="botPlatformLink" class="navbtn" type="button">⌘　Bot 自托管平台</button>
         <button id="adminLink" class="navbtn hidden" data-view="admin">▣　管理</button>
       </nav>
       <div class="userbox">
@@ -4560,7 +4602,8 @@ const HTML = `<!doctype html>
       } catch (error) { toast(error.message); }
     });
     $('logout').addEventListener('click', async () => { await post('/api/logout'); location.reload(); });
-    document.querySelectorAll('.navbtn').forEach(btn => btn.addEventListener('click', () => setView(btn.dataset.view)));
+    $('botPlatformLink').addEventListener('click', () => { location.href = '/bot-platform'; });
+    document.querySelectorAll('.navbtn[data-view]').forEach(btn => btn.addEventListener('click', () => setView(btn.dataset.view)));
     document.addEventListener('click', async event => {
       const onlinePlayer = event.target.closest('[data-online-player]');
       if (onlinePlayer) {

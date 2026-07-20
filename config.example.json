@@ -80,7 +80,11 @@
     "loginCodeTtlMs": 120000,
 
     // Web session lifetime. This is sliding-renewed while the page is in use.
-    "sessionTtlMs": 2592000000
+    "sessionTtlMs": 2592000000,
+    // Independent Bot Self-Hosting Platform URL. The cloud store only checks it when the user clicks the entry.
+    "botPlatformUrl": "http://127.0.0.1:8788",
+    // Local HMAC key file. Copy the same key into the Bot platform's configured key file.
+    "botPlatformSsoSecretFile": "data/bot-platform-sso.key"
   },
 
   // Storage quota and custom warehouse limits.

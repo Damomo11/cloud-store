@@ -11,6 +11,7 @@ const Warehouse = require('./warehouse')
 const CloudStoreService = require('./service')
 const CloudStoreWebServer = require('./webServer')
 const { BotTaskPool } = require('./taskPool')
+const { invalidateMinecraftAccessTokenCache, isMinecraftProfileAuthError } = require('./authCache')
 
 function createBot (config, onMsaCode) {
   const options = {
@@ -150,6 +151,7 @@ function createBotState (account) {
     reconnectTimer: null,
     drainTimer: null,
     reconnectAttempt: 0,
+    lastProfileAuthRecoveryAt: 0,
     protocolVersionIndex: 0,
     desiredEnabled: Boolean(account.enabled),
     status: account.enabled ? 'starting' : 'disabled',
@@ -385,6 +387,15 @@ function launchBot (state) {
 
   bot.on('error', error => {
     state.lastError = String(error?.message || error)
+    if (!spawned && isMinecraftProfileAuthError(error) && Date.now() - state.lastProfileAuthRecoveryAt >= 5 * 60 * 1000) {
+      state.lastProfileAuthRecoveryAt = Date.now()
+      const profilesFolder = path.resolve(process.cwd(), String(state.account.profilesFolder || config.server.profilesFolder || ''))
+      const cleared = invalidateMinecraftAccessTokenCache(profilesFolder)
+      console.warn(`[auth:${state.account.botName}] profile token rejected; cleared ${cleared} Minecraft access-token cache file(s) and will retry`)
+      try { bot._client?.end('refresh minecraft access token') } catch {}
+      scheduleReconnect(state, 1000)
+      return
+    }
     if (isSocketDisconnectError(error)) {
       console.warn(`[network] ${error.code}: socket 已断开，等待重连。${lastDisconnectReason ? `lastReason=${lastDisconnectReason}` : '通常是服务器/代理主动断开或网络抖动。'}`)
       return

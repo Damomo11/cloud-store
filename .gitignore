@@ -13,6 +13,7 @@ data/*.db
 data/*.db-*
 data/*.sqlite3
 data/*.sqlite3-*
+data/bot-platform-sso.key
 *.log
 __pycache__/
 *.pyc

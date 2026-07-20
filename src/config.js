@@ -26,7 +26,9 @@ const DEFAULT_CONFIG = {
     loginFailWindowMs: 600000,
     loginBlockMs: 600000,
     loginCodeTtlMs: 120000,
-    sessionTtlMs: 2592000000
+    sessionTtlMs: 2592000000,
+    botPlatformUrl: 'http://127.0.0.1:8788',
+    botPlatformSsoSecretFile: 'data/bot-platform-sso.key'
   },
   storage: {
     defaultQuotaSlots: 270,
