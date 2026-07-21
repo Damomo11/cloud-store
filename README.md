@@ -54,6 +54,7 @@ copy config.example.json config.json
 - `timing.homeWaitMs` / `timing.homeTimeoutMs`: `/home` 后的最短等待和最长等待；服务器 home 有读秒或延迟时调大 `homeTimeoutMs`
 - `timing.dropConfirmTimeoutMs`: 取货交付时等待背包数量减少的时间；服务器背包同步慢时可调大
 - `timing.inventoryUpdateTimeoutMs`: 取物品点击后等待背包更新的时间，服务器卡顿时可调大
+- `timing.containerClickIntervalMs`: 散装拆堆时连续容器点击的间隔；服务器延迟较高时可适当调大
 - `warehouse.defaultSyncRadius`: `!同步仓库` 的默认半径
 - `warehouse.homeSkipRadius`: bot 已在已同步木桶附近时跳过 `/home` 的判定半径，默认 8
 - `warehouse.layoutMode`: 仓库开箱站位模式，默认 `normal`；圆柱形仓库可设为 `cylinder`

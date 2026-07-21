@@ -520,10 +520,17 @@ class Warehouse {
     if (destSlot === null) throw new Error('机器人背包没有空槽，无法拆分取物')
 
     await this.bot.clickWindow(sourceSlot, 0, 0)
+    await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
     for (let i = 0; i < count; i++) {
       await this.bot.clickWindow(destSlot, 1, 0)
+      const intervalMs = Math.max(0, Number(this.config.timing?.containerClickIntervalMs ?? 50))
+      if (intervalMs > 0) await sleep(intervalMs)
     }
     await this.bot.clickWindow(sourceSlot, 0, 0)
+    await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
+    if (container.selectedItem) {
+      throw new Error(`拆分取物后鼠标仍持有 ${container.selectedItem.name || '物品'} x${container.selectedItem.count || 0}`)
+    }
   }
 
   countContainerItem (container, itemKey) {

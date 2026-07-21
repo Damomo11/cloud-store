@@ -947,13 +947,20 @@ class CloudStoreService {
     if (deliveryToOther) msgTarget(teleportNotice)
     else msgActor(teleportNotice)
 
+    const allWithdrawn = []
     const allDeducted = []
     let stayedWithPlayerForDeposit = false
     for (let index = 0; index < batches.length; index++) {
       const batch = batches[index]
       this.setWithdrawBatchProgress(index + 1, batches.length, 'withdraw_from_chests')
       this.saveRecoveryTask('withdraw', username, storageOwner, deliveryTarget, 'withdraw_from_chests')
-      const physical = await this.warehouse.withdrawAllocations(batch)
+      const physical = await this.withdrawBatchWithQuantityGuard(batch, {
+        username,
+        storageOwner,
+        deliveryTarget,
+        batchIndex: index + 1,
+        totalBatches: batches.length
+      })
       if (this.isActiveCancelled()) return
 
       const delivered = this.allocateWithdrawnToPlanned(batch, physical.withdrawn)
@@ -961,6 +968,7 @@ class CloudStoreService {
       if (!delivered.length) {
         continue
       }
+      allWithdrawn.push(...delivered)
 
       this.setWithdrawBatchProgress(index + 1, batches.length, 'withdraw_teleport_to_player')
       const teleported = await this.teleportToPlayer(deliveryTarget, { notify: false })
@@ -992,15 +1000,10 @@ class CloudStoreService {
             itemId: REPAIR_BOTTLE_ITEM_ID,
             maxDistance: REPAIR_MAX_DISTANCE
           })
-        : (continueWithDeposit
-            ? await this.dropWithdrawItemsToPlayer(deliveryTarget, delivered)
-            : await this.warehouse.dropInventoryToPlayer(deliveryTarget))
+        : await this.dropWithdrawItemsToPlayer(deliveryTarget, delivered)
       if (this.isActiveCancelled()) return
 
-      const leftoverAfterDrop = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
-      const deduct = continueWithDeposit
-        ? this.allocateWithdrawnToPlanned(delivered, dropped)
-        : (leftoverAfterDrop.length ? this.subtractLeftoverFromDelivered(delivered, leftoverAfterDrop) : delivered)
+      const deduct = this.allocateWithdrawnToPlanned(delivered, dropped)
 
       if (deduct.length) {
         this.recordWithdrawDeduction(storageOwner, deduct, `actor=${username}, target=${deliveryTarget}, batch=${index + 1}/${batches.length}`)
@@ -1050,7 +1053,7 @@ class CloudStoreService {
       return
     }
 
-    const missingByItem = this.groupMissingByDisplay(plan.allocations, allDeducted)
+    const missingByItem = this.groupMissingByDisplay(plan.allocations, allWithdrawn)
     if (!deliveryToOther) {
       for (const notice of missingByItem) this.msg(username, notice)
     }
@@ -1121,6 +1124,44 @@ class CloudStoreService {
     }
 
     return this.mergeItems(dropped)
+  }
+
+  async withdrawBatchWithQuantityGuard (batch, context = {}) {
+    const maxAttempts = 2
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const physical = await this.warehouse.withdrawAllocations(batch)
+      const settleMs = Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250))
+      if (settleMs > 0) await sleep(settleMs)
+
+      const held = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
+      const excess = this.itemsExceedingPlan(held, batch)
+      if (!excess.length) {
+        return {
+          ...physical,
+          withdrawn: held
+        }
+      }
+
+      const details = [
+        `actor=${context.username || ''}`,
+        `owner=${context.storageOwner?.uuid || ''}`,
+        `target=${context.deliveryTarget || ''}`,
+        `batch=${context.batchIndex || 1}/${context.totalBatches || 1}`,
+        `attempt=${attempt}/${maxAttempts}`,
+        `excess=${this.formatItemList(excess)}`
+      ].join(', ')
+      console.warn(`[withdraw-quantity-guard] ${details}`)
+
+      const returned = await this.warehouse.depositInventoryWithoutBalance('withdraw_overage_return', details)
+      if (returned.leftover?.length) {
+        throw new Error(`取货数量异常，且多取物品未能全部回库：${this.formatItemList(returned.leftover)}`)
+      }
+      if (attempt === maxAttempts) {
+        throw new Error(`散装取货数量连续异常，已将本批物品回库并终止任务：${this.formatItemList(excess)}`)
+      }
+    }
+
+    return { withdrawn: [], missing: batch }
   }
 
   async handleQuery (username, text, storageOwner = null) {
@@ -1862,6 +1903,17 @@ class CloudStoreService {
       }
     }
     return delivered
+  }
+
+  itemsExceedingPlan (actual, planned) {
+    const plannedByKey = sumBy(planned || [], item => item.itemKey)
+    const excess = []
+    for (const item of this.mergeItems(actual || [])) {
+      const allowed = Number(plannedByKey.get(item.itemKey) || 0)
+      const amount = Math.max(0, Number(item.amount || 0) - allowed)
+      if (amount > 0) excess.push({ ...item, amount })
+    }
+    return excess
   }
 
   recordWithdrawDeduction (fallbackOwner, items, message) {
