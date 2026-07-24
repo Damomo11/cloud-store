@@ -12,6 +12,7 @@ const CloudStoreService = require('./service')
 const CloudStoreWebServer = require('./webServer')
 const { BotTaskPool } = require('./taskPool')
 const { invalidateMinecraftAccessTokenCache, isMinecraftProfileAuthError } = require('./authCache')
+const { releaseBotConnection, terminateBotTransport } = require('./botConnection')
 
 function createBot (config, onMsaCode) {
   const options = {
@@ -240,7 +241,12 @@ function drainBot (state) {
     return
   }
   state.status = state.removeAfterStop ? 'removing' : 'disabled'
-  if (state.bot) state.bot.quit('disabled from web admin')
+  if (state.bot) {
+    const bot = state.bot
+    const service = state.service
+    releaseBotConnection(state, bot, service, taskPool, 'disabled from web admin')
+    if (state.removeAfterStop) states.delete(state.account.id)
+  }
   else if (state.removeAfterStop) states.delete(state.account.id)
 }
 
@@ -276,7 +282,9 @@ function launchBot (state) {
     }
   }
 
-  const bot = createBot(launchConfig, code => {
+  let bot
+  bot = createBot(launchConfig, code => {
+    if (bot && state.bot !== bot) return
     const expiresIn = Number(code?.expires_in || code?.expiresIn || 900)
     state.deviceCode = {
       userCode: String(code?.user_code || code?.userCode || ''),
@@ -299,6 +307,10 @@ function launchBot (state) {
   setupRegistryExport(bot, catalog, db)
 
   const loginWatchdog = setInterval(() => {
+    if (state.bot !== bot) {
+      clearInterval(loginWatchdog)
+      return
+    }
     if (!loggedIn) {
       if (state.deviceCode && state.deviceCode.expiresAt > Date.now()) {
         console.log(`[login:${state.account.botName}] 仍在等待 Microsoft OAuth 验证。打开 ${state.deviceCode.verificationUri} 输入 ${state.deviceCode.userCode}`)
@@ -311,6 +323,10 @@ function launchBot (state) {
   }, 15000)
 
   bot.once('login', () => {
+    if (state.bot !== bot) {
+      terminateBotTransport(bot, 'stale bot instance')
+      return
+    }
     loggedIn = true
     state.status = 'logging_in'
     state.deviceCode = null
@@ -319,6 +335,10 @@ function launchBot (state) {
   })
 
   bot.once('spawn', () => {
+    if (state.bot !== bot) {
+      terminateBotTransport(bot, 'stale bot instance')
+      return
+    }
     spawned = true
     state.reconnectAttempt = 0
     state.status = 'online'
@@ -376,6 +396,7 @@ function launchBot (state) {
 
   bot.on('kicked', reason => {
     clearInterval(loginWatchdog)
+    if (state.bot !== bot) return
     console.error(`[login:${state.account.botName}] Bot kicked:`, reason)
     const kickReason = formatKickReason(reason)
     lastDisconnectReason = kickReason
@@ -386,14 +407,23 @@ function launchBot (state) {
   })
 
   bot.on('error', error => {
+    if (state.bot !== bot) return
     state.lastError = String(error?.message || error)
-    if (!spawned && isMinecraftProfileAuthError(error) && Date.now() - state.lastProfileAuthRecoveryAt >= 5 * 60 * 1000) {
-      state.lastProfileAuthRecoveryAt = Date.now()
-      const profilesFolder = path.resolve(process.cwd(), String(state.account.profilesFolder || config.server.profilesFolder || ''))
-      const cleared = invalidateMinecraftAccessTokenCache(profilesFolder)
-      console.warn(`[auth:${state.account.botName}] profile token rejected; cleared ${cleared} Minecraft access-token cache file(s) and will retry`)
-      try { bot._client?.end('refresh minecraft access token') } catch {}
-      scheduleReconnect(state, 1000)
+    if (!spawned && isMinecraftProfileAuthError(error)) {
+      let cleared = 0
+      let cacheReset = false
+      if (Date.now() - state.lastProfileAuthRecoveryAt >= 5 * 60 * 1000) {
+        state.lastProfileAuthRecoveryAt = Date.now()
+        cacheReset = true
+        const profilesFolder = path.resolve(process.cwd(), String(state.account.profilesFolder || config.server.profilesFolder || ''))
+        cleared = invalidateMinecraftAccessTokenCache(profilesFolder)
+      }
+      console.warn(`[auth:${state.account.botName}] profile token rejected; cleared ${cleared} Minecraft access-token cache file(s), released the failed bot instance and will retry`)
+      clearInterval(loginWatchdog)
+      if (releaseBotConnection(state, bot, service, taskPool, 'refresh minecraft access token')) {
+        state.status = state.desiredEnabled ? 'offline' : 'disabled'
+        if (state.desiredEnabled) scheduleReconnect(state, cacheReset ? 1000 : null)
+      }
       return
     }
     if (isSocketDisconnectError(error)) {
@@ -404,10 +434,11 @@ function launchBot (state) {
       const advanced = advanceProtocolFallback(state, error.message)
       if (advanced) {
         console.error(`[protocol:${state.account.botName}] Slot/NBT 解析失败，准备用 ${protocolVersions[state.protocolVersionIndex]} 重连：${error.message}`)
-        try {
-          bot._client?.end('protocol fallback')
-        } catch {}
-        scheduleReconnect(state, 1000)
+        clearInterval(loginWatchdog)
+        if (releaseBotConnection(state, bot, service, taskPool, 'protocol fallback')) {
+          state.status = state.desiredEnabled ? 'offline' : 'disabled'
+          if (state.desiredEnabled) scheduleReconnect(state, 1000)
+        }
         return
       }
     }
@@ -417,9 +448,7 @@ function launchBot (state) {
   bot.on('end', () => {
     clearInterval(loginWatchdog)
     console.log(`[login:${state.account.botName}] Bot disconnected${lastDisconnectReason ? `: ${lastDisconnectReason}` : ''}`)
-    taskPool.unregister(service)
-    if (state.bot === bot) state.bot = null
-    if (state.service === service) state.service = null
+    if (!releaseBotConnection(state, bot, service, taskPool, 'connection ended', { terminate: false })) return
     state.status = state.desiredEnabled ? 'offline' : (state.removeAfterStop ? 'removed' : 'disabled')
     if (state.removeAfterStop) {
       states.delete(state.account.id)
