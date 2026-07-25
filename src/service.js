@@ -5,13 +5,14 @@ const REPAIR_BOTTLE_AMOUNT = 64
 const REPAIR_MAX_DISTANCE = 4
 
 class CloudStoreService {
-  constructor (bot, db, catalog, warehouse, config, taskPool = null) {
+  constructor (bot, db, catalog, warehouse, config, taskPool = null, subscriptions = null) {
     this.bot = bot
     this.db = db
     this.catalog = catalog
     this.warehouse = warehouse
     this.config = config
     this.taskPool = taskPool
+    this.subscriptions = subscriptions
     this.botId = String(config.server?.botName || config.server?.username || bot.username || 'bot').toLowerCase()
     this.ready = false
     this.active = null
@@ -277,6 +278,11 @@ class CloudStoreService {
       console.log(`[messagestr:${position}]${senderInfo} ${message}`)
     }
 
+    if (String(position || '').toLowerCase() === 'system' && this.subscriptions) {
+      const payment = this.subscriptions.handleSystemMessage(message, this.bot.username || this.config.server?.botName || this.botId,
+        (username, notice) => this.msg(username, notice))
+      if (payment.matched) return
+    }
     if (this.handleTeleportRequestMessage(message)) return
 
     const whisper = this.parsePrivateMessage(message)
@@ -560,13 +566,17 @@ class CloudStoreService {
     }
 
     if (text === '!存物品' || text === '!存') {
-      const owner = this.defaultStorageOwnerForPlayer(this.getPlayer(username))
+      const player = this.getPlayer(username)
+      if (!this.db.hasPersonalWarehouse(player.uuid) && this.subscriptions) this.subscriptions.maybeAutoRegister(player, 'deposit')
+      const owner = this.defaultStorageOwnerForPlayer(player)
       await this.enqueueTask(username, 'deposit', worker => worker.handleDeposit(username, owner))
       return
     }
 
     if (/^!(存取|取存)(?:\s|$)/.test(text)) {
-      const owner = this.defaultStorageOwnerForPlayer(this.getPlayer(username))
+      const player = this.getPlayer(username)
+      if (!this.db.hasPersonalWarehouse(player.uuid) && this.subscriptions) this.subscriptions.maybeAutoRegister(player, 'deposit')
+      const owner = this.defaultStorageOwnerForPlayer(player)
       const withdrawText = text.replace(/^!(存取|取存)/, '!取')
       await this.enqueueTask(username, 'withdraw', worker => worker.handleWithdraw(username, withdrawText, owner, null, username, { continueWithDeposit: true }))
       return
@@ -1267,6 +1277,9 @@ class CloudStoreService {
 
   async handlePersonalWarehouseCommand (username, command) {
     const player = this.getPlayer(username)
+    if (!this.db.hasPersonalWarehouse(player.uuid) && command.action === '存' && this.subscriptions) {
+      this.subscriptions.maybeAutoRegister(player, 'deposit')
+    }
     if (!this.db.hasPersonalWarehouse(player.uuid)) {
       this.msg(username, '你没有个人仓库。请联系云仓库管理员创建，或使用你已加入的组织仓库。')
       return
@@ -2813,10 +2826,11 @@ class CloudStoreService {
   }
 
   getStorageQuota (ownerUuid, scope = 'personal') {
-    const defaultSlots = scope === 'custom'
-      ? (this.config.storage?.defaultCustomWarehouseQuotaSlots || this.config.storage?.defaultQuotaSlots || 270)
-      : (this.config.storage?.defaultQuotaSlots || 270)
-    const quotaSlots = this.db.getQuotaSlots(ownerUuid, defaultSlots)
+    const quotaSlots = this.subscriptions
+      ? this.subscriptions.getOwnerEntitlement(ownerUuid).quotaSlots
+      : this.db.getQuotaSlots(ownerUuid, scope === 'custom'
+        ? (this.config.storage?.defaultCustomWarehouseQuotaSlots || this.config.storage?.defaultQuotaSlots || 270)
+        : (this.config.storage?.defaultQuotaSlots || 270))
     const rows = this.db.getOwnerBalances(ownerUuid)
     let usedSlots = 0
     let usedItems = 0

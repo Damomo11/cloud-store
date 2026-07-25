@@ -1,5 +1,6 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
+const vm = require('node:vm')
 
 const CloudStoreWebServer = require('../src/webServer')
 
@@ -33,6 +34,13 @@ test('admin warehouse management includes quota controls without a separate quot
   assert.equal((html.match(/id="adminQuotaTable"/g) || []).length, 1)
   assert.match(html, /\.player-menu \{[\s\S]*?overflow-x: hidden;[\s\S]*?overflow-y: auto;/)
   assert.match(html, /\.player-option > span:first-child \{[^}]*text-overflow: ellipsis;/)
+  assert.match(html, /\.subscription-grid \{[^}]*grid-template-columns: repeat\(auto-fill, minmax\(260px, 300px\)\);[^}]*justify-content: start;/)
+  assert.match(html, /data-view="subscriptions">◇　订阅<\/button>/)
+  assert.match(html, /id="subscriptionsView"/)
+  assert.match(html, /data-admin-tab="players">玩家管理<\/button>/)
+  assert.match(html, /data-admin-tab="subscriptions">订阅管理<\/button>/)
+  assert.match(html, /<h3 class="section-title">全部充值记录<\/h3>/)
+  assert.match(html, /if \(entitlement\.quotaMode === 'custom'\) return '自定义版 · '/)
 })
 
 test('quota listing includes empty warehouses so their quota can be configured', () => {
@@ -55,4 +63,26 @@ test('quota listing includes empty warehouses so their quota can be configured',
   assert.equal(result.rows.length, 1)
   assert.equal(result.rows[0].quotaSlots, 270)
   assert.equal(result.rows[0].usedSlots, 0)
+})
+
+test('rendered browser script is valid JavaScript', async () => {
+  const db = {
+    db: {
+      prepare: () => ({ run: () => ({ changes: 0 }) })
+    }
+  }
+  const server = new CloudStoreWebServer(db, { web: {} }, () => null)
+  let html = ''
+  const req = { method: 'GET', url: '/', headers: {}, socket: {} }
+  const res = {
+    setHeader: () => {},
+    writeHead: status => assert.equal(status, 200),
+    end: data => { html = Buffer.from(data).toString('utf8') }
+  }
+
+  await server.handle(req, res)
+
+  const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1]
+  assert.ok(script)
+  assert.doesNotThrow(() => new vm.Script(script))
 })

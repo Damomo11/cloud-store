@@ -8,7 +8,7 @@
     "start": "node src/index.js",
     "test": "node --test test/*.test.js",
     "dashboard": "python inventory-dashboard/dashboard.py",
-    "check": "node --check src/index.js && node --check src/config.js && node --check src/db.js && node --check src/itemCatalog.js && node --check src/utils.js && node --check src/taskPool.js && node --check src/warehouse.js && node --check src/service.js && node --check src/webServer.js && node --check src/botPlatformSso.js && node --check src/authCache.js && node --check src/botConnection.js && node --check scripts/download-lang.js && node --check scripts/litematic-materials.js && node --check scripts/item-render-preview.js",
+    "check": "node --check src/index.js && node --check src/config.js && node --check src/db.js && node --check src/itemCatalog.js && node --check src/utils.js && node --check src/taskPool.js && node --check src/warehouse.js && node --check src/service.js && node --check src/webServer.js && node --check src/subscriptions.js && node --check src/networkTime.js && node --check src/botPlatformSso.js && node --check src/authCache.js && node --check src/botConnection.js && node --check scripts/download-lang.js && node --check scripts/litematic-materials.js && node --check scripts/item-render-preview.js",
     "download:lang": "node scripts/download-lang.js",
     "preview:item-render": "node scripts/item-render-preview.js"
   },

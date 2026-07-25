@@ -7,11 +7,12 @@ const { parseLitematicData } = require('../scripts/litematic-materials')
 const { signCloudStoreToken } = require('./botPlatformSso')
 
 class CloudStoreWebServer {
-  constructor (db, config, serviceProvider, botManagerProvider = null) {
+  constructor (db, config, serviceProvider, botManagerProvider = null, subscriptions = null) {
     this.db = db
     this.config = config
     this.serviceProvider = serviceProvider
     this.botManagerProvider = botManagerProvider
+    this.subscriptions = subscriptions
     this.sessions = new Map()
     this.loginFailures = new Map()
     this.loginChallenges = new Map()
@@ -66,6 +67,7 @@ class CloudStoreWebServer {
       if (req.method === 'GET' && url.pathname === '/api/transactions') return this.sendJson(res, this.apiTransactions(session, url))
       if (req.method === 'GET' && url.pathname === '/api/my/organizations') return this.sendJson(res, this.apiMyOrganizations(session))
       if (req.method === 'GET' && url.pathname === '/api/my/aliases') return this.sendJson(res, this.apiMyAliases(session, url))
+      if (req.method === 'GET' && url.pathname === '/api/subscriptions') return this.sendJson(res, this.apiSubscriptions(session))
       if (req.method === 'GET' && url.pathname === '/api/admin/owners') return this.sendJson(res, this.apiAdminOwners(session))
       if (req.method === 'GET' && url.pathname === '/api/admin/warehouse-provisioning') return this.sendJson(res, this.apiAdminWarehouseProvisioning(session))
       if (req.method === 'GET' && url.pathname === '/api/admin/organization-warehouse/detail') return this.sendJson(res, this.apiAdminOrganizationWarehouseDetail(session, url))
@@ -79,6 +81,11 @@ class CloudStoreWebServer {
       if (req.method === 'GET' && url.pathname === '/api/admin/aliases') return this.sendJson(res, this.apiAdminAliases(session, url))
       if (req.method === 'GET' && url.pathname === '/api/admin/quotas') return this.sendJson(res, this.apiAdminQuotas(session, url))
       if (req.method === 'GET' && url.pathname === '/api/admin/users') return this.sendJson(res, this.apiAdminUsers(session))
+      if (req.method === 'GET' && url.pathname === '/api/admin/subscription/users') return this.sendJson(res, this.apiAdminSubscriptionUsers(session, url))
+      if (req.method === 'GET' && url.pathname === '/api/admin/subscription/user') return this.sendJson(res, this.apiAdminSubscriptionUser(session, url))
+      if (req.method === 'GET' && url.pathname === '/api/admin/subscription/config') return this.sendJson(res, this.apiAdminSubscriptionConfig(session))
+      if (req.method === 'GET' && url.pathname === '/api/admin/subscription/logs') return this.sendJson(res, this.apiAdminSubscriptionLogs(session, url))
+      if (req.method === 'GET' && url.pathname === '/api/admin/subscription/payments') return this.sendJson(res, this.apiAdminSubscriptionPayments(session, url))
       if (req.method === 'GET' && url.pathname === '/api/admin/bots') return this.sendJson(res, this.apiAdminBots(session))
       if (req.method === 'POST' && url.pathname === '/api/login') {
         const body = await this.readBody(req)
@@ -110,6 +117,14 @@ class CloudStoreWebServer {
       if (req.method === 'POST' && url.pathname === '/api/default-owner') {
         const body = await this.readBody(req)
         return this.sendJson(res, this.apiDefaultOwner(session, body))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/subscriptions/purchase') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiSubscriptionPurchase(session, body))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/subscriptions/organization/create') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiSubscriptionOrganizationCreate(session, body))
       }
       if (req.method === 'POST' && url.pathname === '/api/litematic/plan') {
         const body = await this.readBody(req, 12 * 1024 * 1024)
@@ -199,6 +214,34 @@ class CloudStoreWebServer {
         const body = await this.readBody(req)
         return this.sendJson(res, this.apiAdminQuotaSave(session, body))
       }
+      if (req.method === 'POST' && url.pathname === '/api/admin/quota/restore') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiAdminQuotaRestore(session, body))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/admin/subscription/balance') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiAdminSubscriptionBalance(session, body))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/admin/subscription/cancel') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiAdminSubscriptionCancel(session, body))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/admin/subscription/config') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiAdminSubscriptionConfigSave(session, body))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/admin/subscription/plan') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiAdminSubscriptionPlanSave(session, body))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/admin/subscription/regex/test') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiAdminSubscriptionRegexTest(session, body))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/admin/subscription/time/sync') {
+        await this.readBody(req)
+        return this.sendJson(res, await this.apiAdminSubscriptionTimeSync(session))
+      }
       if (req.method === 'POST' && url.pathname === '/api/admin/users/add') {
         const body = await this.readBody(req)
         return this.sendJson(res, this.apiAdminUserAdd(session, body))
@@ -235,6 +278,8 @@ class CloudStoreWebServer {
       }
     }
     const user = this.decorateUser(session.user)
+    const autoRegistrationMessage = this.tryAutoRegisterOnWebLogin(user)
+    const subscriptionData = this.subscriptions ? this.subscriptions.mySubscriptionData(user) : null
     return {
       ok: true,
       loggedIn: true,
@@ -242,7 +287,61 @@ class CloudStoreWebServer {
       botName: this.botDisplayName(),
       owners: this.db.listWebOwnersForUser(user),
       defaultOwnerUuid: this.db.getEffectiveDefaultOwnerUuid(user.uuid),
-      active: this.activeSnapshot()
+      active: this.activeSnapshot(),
+      wallet: subscriptionData?.wallet || null,
+      subscriptions: subscriptionData,
+      autoRegistrationMessage
+    }
+  }
+
+  requireSubscriptions () {
+    if (!this.subscriptions) throw new Error('订阅服务尚未启用。')
+    return this.subscriptions
+  }
+
+  quotaEntitlement (ownerUuid) {
+    if (this.subscriptions) return this.subscriptions.getOwnerEntitlement(ownerUuid)
+    const isCustom = ownerUuid.startsWith('vault:')
+    const defaultSlots = isCustom
+      ? (this.config.storage?.defaultCustomWarehouseQuotaSlots || this.config.storage?.defaultQuotaSlots || 270)
+      : (this.config.storage?.defaultQuotaSlots || 270)
+    return { quotaSlots: this.db.getQuotaSlots(ownerUuid, defaultSlots), quotaMode: this.db.getQuotaOverride?.(ownerUuid) ? 'custom' : 'plan' }
+  }
+
+  apiSubscriptions (session) {
+    const user = this.requireUser(session)
+    const data = this.requireSubscriptions().mySubscriptionData(user)
+    const bots = this.botManagerProvider?.()?.list?.() || []
+    return {
+      ok: true,
+      ...data,
+      onlineBots: bots.filter(row => row.status === 'online').map(row => row.minecraftName || row.botName).filter(Boolean)
+    }
+  }
+
+  apiSubscriptionPurchase (session, body) {
+    const user = this.requireUser(session)
+    const result = this.requireSubscriptions().purchase(user, String(body.ownerUuid || '').trim(), String(body.planId || '').trim())
+    return {
+      ok: true,
+      ...result,
+      message: `订阅成功，已扣除 ${result.plan.price} TSLC，到期时间 ${this.formatTimestampMs(result.newExpiresAtMs)}。`
+    }
+  }
+
+  apiSubscriptionOrganizationCreate (session, body) {
+    const user = this.requireUser(session)
+    const warehouse = this.requireSubscriptions().createOrganization(user, body.name)
+    return { ok: true, warehouse, message: `已创建组织仓库 ${warehouse.name}，当前未订阅，额度为 0 格。` }
+  }
+
+  tryAutoRegisterOnWebLogin (user) {
+    if (!this.subscriptions || this.db.hasPersonalWarehouse(user.uuid)) return ''
+    try {
+      const result = this.subscriptions.maybeAutoRegister(user, 'web_login')
+      return result.changed ? '已自动创建个人仓库。' : ''
+    } catch (error) {
+      return error.message
     }
   }
 
@@ -288,16 +387,13 @@ class CloudStoreWebServer {
     const ownerUuid = url.searchParams.get('owner') || user.uuid
     this.requireOwnerAccess(user, ownerUuid)
     const startedAt = Date.now()
-    const isCustom = ownerUuid.startsWith('vault:')
-    const defaultSlots = isCustom
-      ? (this.config.storage?.defaultCustomWarehouseQuotaSlots || this.config.storage?.defaultQuotaSlots || 270)
-      : (this.config.storage?.defaultQuotaSlots || 270)
-    const quotaSlots = this.db.getQuotaSlots(ownerUuid, defaultSlots)
+    const entitlement = this.quotaEntitlement(ownerUuid)
+    const quotaSlots = entitlement.quotaSlots
     const usedSlots = this.adminOwnerUsedSlots(ownerUuid)
     const result = {
       ok: true,
       ...this.db.getWebInventory(ownerUuid, user.uuid),
-      quota: { usedSlots, quotaSlots, usagePercent: quotaSlots > 0 ? Math.round(usedSlots / quotaSlots * 1000) / 10 : 0 },
+      quota: { ...entitlement, usedSlots, quotaSlots, usagePercent: quotaSlots > 0 ? Math.round(usedSlots / quotaSlots * 1000) / 10 : 0 },
       active: this.activeSnapshot()
     }
     const elapsed = Date.now() - startedAt
@@ -366,14 +462,15 @@ class CloudStoreWebServer {
     const user = this.requireUser(session)
     const rows = this.db.listCustomWarehousesForPlayer(user.uuid).map(warehouse => {
       const ownerUuid = `vault:${warehouse.nameLower}`
-      const defaultSlots = this.config.storage?.defaultCustomWarehouseQuotaSlots || this.config.storage?.defaultQuotaSlots || 270
-      const quotaSlots = this.db.getQuotaSlots(ownerUuid, defaultSlots)
+      const entitlement = this.quotaEntitlement(ownerUuid)
+      const quotaSlots = entitlement.quotaSlots
       const usedSlots = this.adminOwnerUsedSlots(ownerUuid)
       return {
         ...warehouse,
         ownerUuid,
         isAdmin: warehouse.role === 'admin',
         usedSlots,
+        ...entitlement,
         quotaSlots,
         usagePercent: quotaSlots > 0 ? Math.round(usedSlots / quotaSlots * 1000) / 10 : 0,
         members: this.db.listCustomWarehouseMembers(warehouse.name)
@@ -392,13 +489,14 @@ class CloudStoreWebServer {
     }
     const rows = warehouses.map(warehouse => {
       const ownerUuid = `vault:${warehouse.nameLower}`
-      const defaultSlots = this.config.storage?.defaultCustomWarehouseQuotaSlots || this.config.storage?.defaultQuotaSlots || 270
-      const quotaSlots = this.db.getQuotaSlots(ownerUuid, defaultSlots)
+      const entitlement = this.quotaEntitlement(ownerUuid)
+      const quotaSlots = entitlement.quotaSlots
       const usedSlots = this.adminOwnerUsedSlots(ownerUuid)
       return {
         ...warehouse,
         ownerUuid,
         usedSlots,
+        ...entitlement,
         quotaSlots,
         usagePercent: quotaSlots > 0 ? Math.round(usedSlots / quotaSlots * 1000) / 10 : 0,
         members: this.db.listCustomWarehouseMembers(warehouse.name)
@@ -681,9 +779,11 @@ class CloudStoreWebServer {
     }
     session.loggedInAt = Date.now()
     this.persistWebSession(session)
+    const autoRegistrationMessage = this.tryAutoRegisterOnWebLogin(session.user)
     return {
       ok: true,
-      user: this.decorateUser(session.user)
+      user: this.decorateUser(session.user),
+      autoRegistrationMessage
     }
   }
 
@@ -725,7 +825,7 @@ class CloudStoreWebServer {
       this.persistWebSession(session)
       this.loginChallenges.delete(challenge.id)
       session.loginChallengeId = null
-      return { ok: true, status: 'approved', user: this.decorateUser(session.user) }
+      return { ok: true, status: 'approved', user: this.decorateUser(session.user), autoRegistrationMessage: this.tryAutoRegisterOnWebLogin(session.user) }
     }
     if (status !== 'pending') {
       this.loginChallenges.delete(challenge.id)
@@ -933,6 +1033,101 @@ class CloudStoreWebServer {
     }
   }
 
+  apiAdminSubscriptionUsers (session, url) {
+    this.requireAdmin(session)
+    return { ok: true, rows: this.requireSubscriptions().listAdminUsers(url.searchParams.get('q') || '') }
+  }
+
+  apiAdminSubscriptionUser (session, url) {
+    this.requireAdmin(session)
+    return { ok: true, ...this.requireSubscriptions().adminUserDetail(String(url.searchParams.get('uuid') || '').trim()) }
+  }
+
+  apiAdminSubscriptionConfig (session) {
+    this.requireAdmin(session)
+    const subscriptions = this.requireSubscriptions()
+    return {
+      ok: true,
+      settings: subscriptions.getSettings(),
+      plans: subscriptions.listPlans(),
+      time: subscriptions.networkTime.status(),
+      identityConflicts: subscriptions.listIdentityConflicts()
+    }
+  }
+
+  apiAdminSubscriptionLogs (session, url) {
+    this.requireAdmin(session)
+    return { ok: true, rows: this.requireSubscriptions().listUnrecognizedPaymentLogs(url.searchParams.get('limit')) }
+  }
+
+  apiAdminSubscriptionPayments (session, url) {
+    this.requireAdmin(session)
+    return {
+      ok: true,
+      ...this.requireSubscriptions().listPaymentRecords({
+        page: url.searchParams.get('page'),
+        pageSize: url.searchParams.get('pageSize')
+      })
+    }
+  }
+
+  apiAdminSubscriptionBalance (session, body) {
+    const admin = this.requireAdmin(session)
+    const playerUuid = String(body.playerUuid || '').trim()
+    const player = this.db.db.prepare('SELECT uuid, username FROM players WHERE uuid = ?').get(playerUuid)
+    if (!player) throw new Error('找不到玩家。')
+    const operation = String(body.operation || '').trim()
+    const cents = this.parseTsclCents(body.amount)
+    const subscriptions = this.requireSubscriptions()
+    const meta = { adminUuid: admin.uuid, adminUsername: admin.username, message: String(body.message || '') }
+    let wallet
+    if (operation === 'set') wallet = subscriptions.setBalance(player.uuid, player.username, cents, meta)
+    else if (operation === 'add') wallet = subscriptions.adjustBalance(player.uuid, player.username, cents, { ...meta, type: 'admin_balance_add' })
+    else if (operation === 'subtract') wallet = subscriptions.adjustBalance(player.uuid, player.username, -cents, { ...meta, type: 'admin_balance_subtract' })
+    else throw new Error('余额操作无效。')
+    return { ok: true, wallet, message: `已把 ${player.username} 的余额调整为 ${wallet.balance} TSLC。` }
+  }
+
+  apiAdminSubscriptionCancel (session, body) {
+    const admin = this.requireAdmin(session)
+    const ownerUuid = String(body.ownerUuid || '').trim()
+    const entitlement = this.requireSubscriptions().cancelSubscription(ownerUuid, admin)
+    return { ok: true, entitlement, message: `已取消 ${this.db.ownerLabel(ownerUuid)} 的付费订阅。` }
+  }
+
+  apiAdminSubscriptionConfigSave (session, body) {
+    this.requireAdmin(session)
+    const settings = this.requireSubscriptions().updateSettings(body)
+    return { ok: true, settings, message: '订阅设置已热更新。' }
+  }
+
+  apiAdminSubscriptionPlanSave (session, body) {
+    this.requireAdmin(session)
+    const plan = this.requireSubscriptions().updatePlan(String(body.id || ''), body)
+    return { ok: true, plan, message: `${plan.name} 已热更新，使用套餐额度的仓库已立即同步。` }
+  }
+
+  apiAdminSubscriptionRegexTest (session, body) {
+    this.requireAdmin(session)
+    const result = this.requireSubscriptions().testPaymentRegex(String(body.paymentRegex || ''), String(body.sample || ''))
+    return { ok: true, ...result }
+  }
+
+  async apiAdminSubscriptionTimeSync (session) {
+    this.requireAdmin(session)
+    const time = await this.requireSubscriptions().networkTime.sync()
+    return { ok: true, time, message: '网络时间同步成功。' }
+  }
+
+  parseTsclCents (value) {
+    const text = String(value ?? '').trim()
+    if (!/^\d+(?:\.\d{1,2})?$/.test(text)) throw new Error('TSLC 金额必须是非负数，最多两位小数。')
+    const [whole, fraction = ''] = text.split('.')
+    const cents = (Number.parseInt(whole, 10) * 100) + Number.parseInt(fraction.padEnd(2, '0') || '0', 10)
+    if (!Number.isSafeInteger(cents) || cents < 0) throw new Error('TSLC 金额无效。')
+    return cents
+  }
+
   apiAdminUserAdd (session, body) {
     const admin = this.requireAdmin(session)
     const player = this.resolveProvisionPlayer(body.username)
@@ -1028,14 +1223,15 @@ class CloudStoreWebServer {
     const warehouse = this.db.getCustomWarehouse(url.searchParams.get('name') || '')
     if (!warehouse) throw new Error('找不到组织仓库。')
     const ownerUuid = `vault:${warehouse.nameLower}`
-    const defaultSlots = this.config.storage?.defaultCustomWarehouseQuotaSlots || this.config.storage?.defaultQuotaSlots || 270
-    const quotaSlots = this.db.getQuotaSlots(ownerUuid, defaultSlots)
+    const entitlement = this.quotaEntitlement(ownerUuid)
+    const quotaSlots = entitlement.quotaSlots
     const usedSlots = this.adminOwnerUsedSlots(ownerUuid)
     return {
       ok: true,
       warehouse: {
         ...warehouse,
         ownerUuid,
+        ...entitlement,
         totalAmount: this.db.ownerTotalAmount(ownerUuid),
         usedSlots,
         quotaSlots,
@@ -1384,13 +1580,10 @@ class CloudStoreWebServer {
     const q = String(url.searchParams.get('q') || '').trim().toLowerCase()
     const owners = this.apiAdminOwners(session).rows
     const rows = owners.map(owner => {
-      const isCustom = owner.ownerUuid.startsWith('vault:')
-      const defaultSlots = isCustom
-        ? (this.config.storage?.defaultCustomWarehouseQuotaSlots || this.config.storage?.defaultQuotaSlots || 270)
-        : (this.config.storage?.defaultQuotaSlots || 270)
-      const quotaSlots = this.db.getQuotaSlots(owner.ownerUuid, defaultSlots)
+      const entitlement = this.quotaEntitlement(owner.ownerUuid)
+      const quotaSlots = entitlement.quotaSlots
       const usedSlots = this.adminOwnerUsedSlots(owner.ownerUuid)
-      return { ...owner, usedSlots, quotaSlots, usagePercent: quotaSlots > 0 ? Math.round(usedSlots / quotaSlots * 1000) / 10 : 0 }
+      return { ...owner, ...entitlement, usedSlots, quotaSlots, usagePercent: quotaSlots > 0 ? Math.round(usedSlots / quotaSlots * 1000) / 10 : 0 }
     }).filter(row => !q || this.textMatches(row.label, q) || this.textMatches(row.ownerUuid, q))
     const chestCount = Number(this.db.db.prepare('SELECT COUNT(*) AS count FROM chests').get().count || 0)
     const usedPhysicalSlots = Number(this.db.db.prepare('SELECT COUNT(*) AS count FROM chest_slots WHERE amount > 0').get().count || 0)
@@ -1679,6 +1872,15 @@ class CloudStoreWebServer {
     return { ok: true, message: `已把 ${this.db.ownerLabel(ownerUuid)} 的额度设置为 ${quotaSlots} 格。` }
   }
 
+  apiAdminQuotaRestore (session, body) {
+    const user = this.requireAdmin(session)
+    const ownerUuid = String(body.ownerUuid || '').trim()
+    if (!ownerUuid) throw new Error('缺少仓库。')
+    const entitlement = this.requireSubscriptions().restorePlanQuota(ownerUuid)
+    this.db.addTransaction('web_admin_quota_restore', 'ok', ownerUuid, this.db.ownerLabel(ownerUuid), [], `admin=${user.username}; quota_slots=${entitlement.quotaSlots}`)
+    return { ok: true, entitlement, message: `已恢复 ${this.db.ownerLabel(ownerUuid)} 的套餐额度。` }
+  }
+
   adminOwnerUsedSlots (ownerUuid) {
     const rows = this.db.db.prepare(`
       SELECT b.amount, i.item_id AS itemId
@@ -1810,6 +2012,16 @@ class CloudStoreWebServer {
       return result
     }, {})
     return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`
+  }
+
+  formatTimestampMs (value) {
+    const timestamp = Number(value)
+    if (!Number.isFinite(timestamp) || timestamp <= 0) return ''
+    return new Intl.DateTimeFormat('zh-CN', {
+      timeZone: 'Asia/Shanghai',
+      year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false
+    }).format(new Date(timestamp)).replaceAll('/', '-')
   }
 
   transactionTypeLabel (type) {
@@ -2585,6 +2797,33 @@ const HTML = `<!doctype html>
     .warehouse-create-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
     .warehouse-create-card { padding: 16px; }
     .warehouse-create-card h3 { color: var(--gold); margin: 0 0 6px; }
+    .subscription-hero { border: 1px solid #4a3921; background: linear-gradient(135deg, #211b12, #17171a 58%, #121214); border-radius: 14px; padding: 24px; margin-bottom: 18px; display: flex; gap: 20px; justify-content: space-between; align-items: center; flex-wrap: wrap; }
+    .subscription-balance { color: var(--gold); font-size: 30px; font-weight: 850; }
+    .subscription-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 300px)); gap: 14px; justify-content: start; align-items: stretch; }
+    .plan-card { width: 100%; border: 1px solid var(--line); border-radius: 14px; background: linear-gradient(160deg, #202024, #151518); padding: 20px; display: flex; flex-direction: column; min-height: 310px; }
+    .plan-card.featured { border-color: #765c2d; box-shadow: 0 14px 38px rgba(0,0,0,.28); }
+    .plan-card h3 { color: #fff; font-size: 22px; margin: 0 0 5px; }
+    .plan-price { color: var(--gold); font-size: 27px; font-weight: 850; margin: 14px 0; }
+    .plan-price small { color: var(--muted); font-size: 12px; font-weight: 400; }
+    .plan-features { display: grid; gap: 7px; color: #cbc7bd; margin: 0 0 18px; padding: 0; list-style: none; }
+    .plan-features li::before { content: '✓'; color: var(--gold); margin-right: 8px; }
+    .plan-card button { margin-top: auto; width: 100%; }
+    .subscription-block { margin-top: 24px; }
+    .subscription-block-head { display: flex; gap: 12px; justify-content: space-between; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+    .subscription-block-head h2 { margin: 0; color: var(--gold); }
+    .subscription-status { display: inline-flex; gap: 7px; align-items: center; border: 1px solid var(--line); border-radius: 99px; padding: 5px 10px; color: var(--muted); font-size: 12px; }
+    .subscription-status.active { color: var(--green); border-color: #285b31; }
+    .subscription-create { display: flex; gap: 8px; flex-wrap: wrap; padding: 16px; border: 1px dashed #5a4728; border-radius: 10px; background: #17140f; }
+    .subscription-create input { flex: 1; min-width: 180px; }
+    .user-subscription { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); font-size: 12px; color: var(--muted); cursor: pointer; }
+    .user-subscription strong { display: block; color: var(--gold); font-size: 14px; }
+    .admin-subscription-layout { display: grid; grid-template-columns: minmax(280px, .8fr) minmax(420px, 1.4fr); gap: 14px; }
+    .settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .settings-grid label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; }
+    .settings-grid .wide { grid-column: 1 / -1; }
+    .plan-editor { border-top: 1px solid var(--line); padding: 14px 0; display: grid; gap: 8px; }
+    .plan-editor:first-child { border-top: 0; }
+    .plan-editor textarea, .settings-grid textarea { min-height: 90px; resize: vertical; }
     .switch { width: 44px; height: 24px; border-radius: 99px; padding: 2px; background: #33343a; border: 0; }
     .switch::after { content: ''; display: block; width: 20px; height: 20px; border-radius: 50%; background: #aaa; transition: transform .15s; }
     .switch.on { background: #71582e; }
@@ -2685,6 +2924,8 @@ const HTML = `<!doctype html>
       .alias-row .alias-add { grid-column: 1 / -1; }
       .member-row { grid-template-columns: 1fr; }
       .warehouse-create-grid { grid-template-columns: 1fr; }
+      .subscription-grid { grid-template-columns: minmax(0, 1fr); }
+      .admin-subscription-layout, .settings-grid { grid-template-columns: 1fr; }
       .tip-grid { grid-template-columns: 1fr; }
       .litematicbar { grid-template-columns: 1fr; }
       .command-row { grid-template-columns: 1fr; }
@@ -2728,6 +2969,7 @@ const HTML = `<!doctype html>
       <nav>
         <button class="navbtn active" data-view="inventory">▦　库存</button>
         <button class="navbtn" data-view="transactions">▤　交易记录</button>
+        <button class="navbtn" data-view="subscriptions">◇　订阅</button>
         <button class="navbtn" data-view="my">☺　我的</button>
         <button id="warehouseAdminLink" class="navbtn hidden" data-view="warehouseAdmin">♜　组织管理</button>
         <button class="navbtn" data-view="help">？　帮助</button>
@@ -2736,6 +2978,7 @@ const HTML = `<!doctype html>
       </nav>
       <div class="userbox">
         <div><span class="dot"></span><span id="username">-</span></div>
+        <div id="sidebarSubscription" class="user-subscription"><strong>0.00 TSLC</strong><span>套餐信息加载中</span></div>
         <button id="logout" class="ghost" style="width:100%;margin-top:18px">登出</button>
       </div>
     </aside>
@@ -2783,6 +3026,24 @@ const HTML = `<!doctype html>
         </div>
         <div id="transactions" class="panel tablewrap"></div>
         <div class="pager"><button id="txPrev">上一页</button><span id="txPage">第 1 / 1 页</span><button id="txNext">下一页</button></div>
+      </section>
+      <section id="subscriptionsView" class="hidden">
+        <div class="toolbar"><div class="title">订阅中心</div><button id="subscriptionRefresh" class="primary">刷新</button></div>
+        <div class="subscription-hero">
+          <div><div class="muted">TSLC 可用余额</div><div id="subscriptionBalance" class="subscription-balance">0.00 TSLC</div><div id="subscriptionTimeStatus" class="muted"></div></div>
+          <div><strong>游戏内充值</strong><div id="subscriptionTopupBots" class="muted">正在获取在线 Bot...</div><div class="muted">使用服务器命令 /pay Bot名称 金额</div></div>
+        </div>
+        <div class="subscription-block">
+          <div class="subscription-block-head"><h2>个人仓库</h2><div id="personalSubscriptionStatus" class="subscription-status">加载中</div></div>
+          <div id="personalPlanGrid" class="subscription-grid"></div>
+        </div>
+        <div class="subscription-block">
+          <div class="subscription-block-head"><h2>组织仓库</h2><select id="subscriptionOrganization"></select></div>
+          <div id="subscriptionOrganizationCreate" class="subscription-create hidden"><input id="subscriptionOrganizationName" placeholder="组织仓库名，最多15个字"><button id="subscriptionOrganizationCreateButton" class="solid">创建组织仓库</button></div>
+          <div id="organizationSubscriptionStatus" class="subscription-status">未选择仓库</div>
+          <div id="organizationPlanGrid" class="subscription-grid" style="margin-top:10px"></div>
+        </div>
+        <div class="subscription-block"><div class="subscription-block-head"><h2>订购记录</h2></div><div id="subscriptionOrders" class="panel tablewrap"></div></div>
       </section>
       <section id="helpView" class="hidden">
         <div class="toolbar">
@@ -2985,6 +3246,8 @@ const HTML = `<!doctype html>
         <div class="subnav">
           <button class="primary" data-admin-tab="bots">机器人账号</button>
           <button class="primary" data-admin-tab="admins">系统管理员</button>
+          <button class="primary" data-admin-tab="players">玩家管理</button>
+          <button class="primary" data-admin-tab="subscriptions">订阅管理</button>
           <button class="primary active" data-admin-tab="inventory">库存</button>
           <button class="primary" data-admin-tab="warehouses">仓库管理</button>
           <button class="primary" data-admin-tab="mismatches">库存异常</button>
@@ -3008,6 +3271,28 @@ const HTML = `<!doctype html>
             <p class="muted">系统管理员可以使用管理员命令、进入 Web 管理面板，并通过 !指令 让机器人发送游戏内内容。</p>
           </div>
           <div id="adminUsersTable" class="panel tablewrap"></div>
+        </section>
+        <section id="adminPlayers" class="hidden">
+          <div class="toolbar"><input id="adminPlayerQ" placeholder="搜索玩家或 UUID"><button id="adminPlayerLoad" class="primary">查询</button></div>
+          <div id="adminPlayerTable" class="panel tablewrap"></div>
+          <div id="adminPlayerDetail" class="panel alias-detail-panel"><p class="muted">点击玩家右侧的“管理”查看余额、订阅和记录。</p></div>
+        </section>
+        <section id="adminSubscriptions" class="hidden">
+          <div class="admin-subscription-layout">
+            <div class="panel">
+              <h3>自动注册与系统设置</h3>
+              <div id="adminSubscriptionSettings" class="settings-grid"></div>
+              <div class="alias-add" style="margin-top:12px"><button id="adminSubscriptionSettingsSave" class="solid">保存并热更新</button><button id="adminSubscriptionTimeSync" class="primary">同步网络时间</button></div>
+              <div id="adminSubscriptionTime" class="muted" style="margin-top:10px"></div>
+            </div>
+            <div class="panel"><h3>套餐配置</h3><div id="adminSubscriptionPlans"></div></div>
+          </div>
+          <h3 class="section-title">充值正则测试</h3>
+          <div class="panel"><div class="settings-grid"><label class="wide">测试日志<textarea id="adminPaymentRegexSample">[12:36:38] [TSLLLLL] 你收到了来自 NanKinz1 的 1.00 C</textarea></label></div><div class="alias-add"><button id="adminPaymentRegexTest" class="primary">测试当前正则</button><span id="adminPaymentRegexResult" class="muted"></span></div></div>
+          <h3 class="section-title">全部充值记录</h3><div id="adminPaymentRecords" class="panel tablewrap"></div>
+          <div class="pager"><button id="adminPaymentPrev">上一页</button><span id="adminPaymentPage" class="muted"></span><button id="adminPaymentNext">下一页</button></div>
+          <h3 class="section-title">未识别到账日志</h3><div id="adminPaymentLogs" class="panel tablewrap"></div>
+          <h3 class="section-title">用户名合并异常</h3><div id="adminIdentityConflicts" class="panel tablewrap"></div>
         </section>
         <section id="adminInventory">
           <div class="toolbar">
@@ -3124,10 +3409,12 @@ const HTML = `<!doctype html>
   <div id="tooltip" class="tooltip"></div>
 
   <script>
-    const state = { view: 'inventory', myTab: 'organizations', myPersonalAliasItemKey: '', myGlobalAliasItemKey: '', user: null, owners: [], owner: '', items: [], tx: [], txPage: 1, txTotalPages: 1, selected: new Map(), aliasMode: false, aliasItem: null, adminTab: 'inventory', adminAliasMode: false, adminGlobalAliasItem: null, adminOrganizationName: '', adminInventoryLoadId: 0, adminOwners: [], adminInventoryRows: new Map(), adminSelected: new Map(), adminAliasItem: null, adminTxPage: 1, adminTxTotalPages: 1, actionCooldownUntil: 0, actionCooldownTimer: null, iconRenderId: 0, activePoll: null, iconCache: new Map(), inventoryCache: new Map(), inventoryLoadId: 0, iconScrollTimer: null, onlinePlayersTimer: null, loginChallengeTimer: null, loginChallengeExpiresAt: 0, loginChallengeCommand: '' };
+    const state = { view: 'inventory', myTab: 'organizations', myPersonalAliasItemKey: '', myGlobalAliasItemKey: '', user: null, owners: [], owner: '', items: [], tx: [], txPage: 1, txTotalPages: 1, selected: new Map(), aliasMode: false, aliasItem: null, adminTab: 'inventory', adminAliasMode: false, adminGlobalAliasItem: null, adminOrganizationName: '', adminInventoryLoadId: 0, adminOwners: [], adminInventoryRows: new Map(), adminSelected: new Map(), adminAliasItem: null, adminTxPage: 1, adminTxTotalPages: 1, adminPaymentPage: 1, adminPaymentTotalPages: 1, actionCooldownUntil: 0, actionCooldownTimer: null, iconRenderId: 0, activePoll: null, iconCache: new Map(), inventoryCache: new Map(), inventoryLoadId: 0, iconScrollTimer: null, onlinePlayersTimer: null, loginChallengeTimer: null, loginChallengeExpiresAt: 0, loginChallengeCommand: '', subscriptionData: null, subscriptionOrganizationOwner: '', adminSubscriptionUserUuid: '' };
     const $ = id => document.getElementById(id);
     const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
     const num = value => Number(value || 0).toLocaleString('zh-CN');
+    const money = cents => (Number(cents || 0) / 100).toFixed(2);
+    const dateTime = value => Number(value || 0) > 0 ? new Date(Number(value)).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }) : '';
     const toast = text => { $('toast').textContent = text || ''; };
 
     async function api(path, params = {}) {
@@ -3342,12 +3629,15 @@ const HTML = `<!doctype html>
       state.user = data.user;
       state.owners = data.owners || [];
       state.defaultOwnerUuid = data.defaultOwnerUuid || '';
+      state.subscriptionData = data.subscriptions || state.subscriptionData;
       updateBotNameLabels(data.botName || 'bot');
       $('username').textContent = state.user.username;
       $('heroName').textContent = state.user.username;
       $('adminLink').classList.toggle('hidden', !state.user.isAdmin);
       $('warehouseAdminLink').classList.toggle('hidden', !state.user.isWarehouseAdmin);
       renderOwners();
+      renderSidebarSubscription();
+      if (data.autoRegistrationMessage) toast(data.autoRegistrationMessage);
       await loadInventory();
       loadOnlinePlayers('').catch(error => toast(error.message));
       if (state.user.isAdmin && location.pathname === '/admin') setView('admin');
@@ -3477,6 +3767,7 @@ const HTML = `<!doctype html>
         $('deposit').disabled = true;
         $('withdraw').disabled = true;
         $('txOwner').innerHTML = '<option value="">没有可用仓库</option>';
+        renderSidebarSubscription();
         return;
       }
       $('owner').innerHTML = state.owners.map(owner => {
@@ -3496,6 +3787,7 @@ const HTML = `<!doctype html>
       }
       $('deposit').disabled = false;
       $('withdraw').disabled = false;
+      renderSidebarSubscription();
     }
 
     async function setDefaultOwner() {
@@ -3506,6 +3798,88 @@ const HTML = `<!doctype html>
       state.defaultOwnerUuid = data.defaultOwnerUuid || ownerUuid;
       renderOwners();
       toast(data.message || '已设置默认仓库。');
+    }
+
+    function subscriptionStatusText(entitlement) {
+      if (!entitlement) return '尚未创建';
+      if (entitlement.quotaMode === 'custom') return '自定义版 · ' + num(entitlement.quotaSlots) + ' 格';
+      const name = entitlement.plan?.name || (entitlement.scope === 'custom' ? '未订阅' : '免费版');
+      const expiry = entitlement.expiresAtMs ? ' · ' + dateTime(entitlement.expiresAtMs) + ' 到期' : (entitlement.scope === 'personal' ? ' · 长期有效' : '');
+      return name + ' · ' + num(entitlement.quotaSlots) + ' 格' + expiry;
+    }
+
+    function renderSidebarSubscription() {
+      const data = state.subscriptionData;
+      if (!data) return;
+      const entitlement = data.ownerEntitlements?.[state.owner] || (state.owner === state.user?.uuid ? data.personal : null);
+      $('sidebarSubscription').innerHTML = '<strong>' + money(data.wallet?.balanceCents) + ' TSLC</strong><span>' + esc(subscriptionStatusText(entitlement)) + '</span>';
+    }
+
+    function subscriptionPlanCard(plan, ownerUuid, entitlement) {
+      const active = entitlement?.activePlanId === plan.id && entitlement?.status === 'active';
+      const isFreeBase = plan.id === 'personal_free';
+      const insufficient = Number(state.subscriptionData?.wallet?.balanceCents || 0) < Number(plan.priceCents || 0);
+      const unavailable = !ownerUuid || isFreeBase || insufficient;
+      const buttonText = !ownerUuid ? '尚未创建仓库' : (isFreeBase ? '默认套餐' : (insufficient ? '余额不足' : (active ? '续费 30 天' : '订阅 30 天')));
+      return '<article class="plan-card' + (!isFreeBase ? ' featured' : '') + '">' +
+        '<div class="muted">' + esc(plan.scope === 'personal' ? '个人仓库' : '组织仓库') + '</div>' +
+        '<h3>' + esc(plan.name) + '</h3><div class="muted">' + esc(plan.description) + '</div>' +
+        '<div class="plan-price">' + (!isFreeBase ? money(plan.priceCents) + ' TSLC <small>/ 30天</small>' : '免费 <small>/ 长期</small>') + '</div>' +
+        '<ul class="plan-features">' + (plan.features || []).map(feature => '<li>' + esc(feature) + '</li>').join('') + '</ul>' +
+        '<button class="' + (!isFreeBase ? 'solid' : 'ghost') + '" data-subscription-purchase data-owner="' + esc(ownerUuid || '') + '" data-plan="' + esc(plan.id) + '"' + (unavailable ? ' disabled' : '') + '>' + buttonText + '</button>' +
+      '</article>';
+    }
+
+    async function loadSubscriptions() {
+      const data = await api('/api/subscriptions');
+      state.subscriptionData = data;
+      $('subscriptionBalance').textContent = money(data.wallet?.balanceCents) + ' TSLC';
+      $('subscriptionTimeStatus').textContent = data.time?.trusted ? '网络时间已同步 · ' + dateTime(data.time.now) : '网络时间未同步，购买与自动注册暂停';
+      $('subscriptionTopupBots').textContent = data.onlineBots?.length ? '在线收款 Bot：' + data.onlineBots.join('、') : '当前没有在线收款 Bot';
+      $('personalSubscriptionStatus').textContent = subscriptionStatusText(data.personal);
+      $('personalSubscriptionStatus').classList.toggle('active', data.personal?.status === 'active');
+      $('personalPlanGrid').innerHTML = (data.plans || []).filter(plan => plan.scope === 'personal').map(plan => subscriptionPlanCard(plan, state.user?.uuid && data.personal ? state.user.uuid : '', data.personal)).join('');
+
+      const organizations = data.organizations || [];
+      if (!state.subscriptionOrganizationOwner || !organizations.some(row => row.ownerUuid === state.subscriptionOrganizationOwner)) state.subscriptionOrganizationOwner = organizations[0]?.ownerUuid || '';
+      $('subscriptionOrganization').innerHTML = organizations.length
+        ? organizations.map(row => '<option value="' + esc(row.ownerUuid) + '">' + esc(row.name) + '</option>').join('')
+        : '<option value="">没有可管理的组织仓库</option>';
+      $('subscriptionOrganization').value = state.subscriptionOrganizationOwner;
+      $('subscriptionOrganizationCreate').classList.toggle('hidden', !data.canCreateOrganization);
+      const organization = organizations.find(row => row.ownerUuid === state.subscriptionOrganizationOwner);
+      $('organizationSubscriptionStatus').textContent = organization ? subscriptionStatusText(organization.entitlement) : '未选择仓库';
+      $('organizationSubscriptionStatus').classList.toggle('active', organization?.entitlement?.status === 'active');
+      $('organizationPlanGrid').innerHTML = (data.plans || []).filter(plan => plan.scope === 'custom').map(plan => subscriptionPlanCard(plan, organization?.ownerUuid || '', organization?.entitlement)).join('');
+      renderTable('subscriptionOrders', ['时间', '仓库', '套餐', '实付', '到期日'], (data.orders || []).map(row =>
+        '<tr><td>' + esc(dateTime(row.createdAtMs)) + '</td><td>' + esc(state.owners.find(owner => owner.ownerUuid === row.ownerUuid)?.label || row.ownerUuid) + '</td><td>' + esc(row.planName) + '</td><td>' + money(row.priceCents) + ' TSLC</td><td>' + esc(dateTime(row.newExpiresAtMs)) + '</td></tr>'
+      ), '还没有订购记录。');
+      renderSidebarSubscription();
+    }
+
+    async function purchaseSubscription(button) {
+      const plan = state.subscriptionData?.plans?.find(row => row.id === button.dataset.plan);
+      const ownerUuid = button.dataset.owner;
+      if (!plan || !ownerUuid) return;
+      const ownerLabel = state.owners.find(owner => owner.ownerUuid === ownerUuid)?.label || ownerUuid;
+      const balanceAfter = Number(state.subscriptionData?.wallet?.balanceCents || 0) - Number(plan.priceCents || 0);
+      if (!confirm('确认订阅？\\n仓库：' + ownerLabel + '\\n套餐：' + plan.name + '\\n扣款：' + money(plan.priceCents) + ' TSLC\\n购买后余额：' + money(balanceAfter) + ' TSLC\\n有效期：30天')) return;
+      const result = await post('/api/subscriptions/purchase', { ownerUuid, planId: plan.id });
+      toast(result.message);
+      await loadSubscriptions();
+      await loadMe();
+    }
+
+    async function createSubscriptionOrganization() {
+      const name = $('subscriptionOrganizationName').value.trim();
+      if (!name) throw new Error('请填写组织仓库名。');
+      if (!confirm('确认创建组织仓库“' + name + '”？创建免费，初始额度为 0 格，购买组织套餐后才能存入。')) return;
+      const result = await post('/api/subscriptions/organization/create', { name });
+      toast(result.message);
+      $('subscriptionOrganizationName').value = '';
+      state.subscriptionOrganizationOwner = 'vault:' + String(result.warehouse.nameLower || '');
+      await loadMe();
+      await loadSubscriptions();
     }
 
     function applyInventoryData(data) {
@@ -3909,6 +4283,11 @@ const HTML = `<!doctype html>
         return;
       }
       $(target).innerHTML = '<table><thead><tr>' + headers.map(header => '<th>' + esc(header) + '</th>').join('') + '</tr></thead><tbody>' + rows.join('') + '</tbody></table>';
+    }
+
+    function tableMarkup(headers, rows, emptyText = '没有数据。') {
+      if (!rows.length) return '<p class="muted" style="text-align:center;margin:24px 0">' + esc(emptyText) + '</p>';
+      return '<div class="tablewrap"><table><thead><tr>' + headers.map(header => '<th>' + esc(header) + '</th>').join('') + '</tr></thead><tbody>' + rows.join('') + '</tbody></table></div>';
     }
 
     function renderStats(target, stats) {
@@ -4424,9 +4803,108 @@ const HTML = `<!doctype html>
     async function loadAdminQuotas() {
       const data = await api('/api/admin/quotas', { q: $('adminQuotaQ').value });
       renderStats('adminQuotaOverall', { '木桶数量': data.overall?.chestCount || 0, '已用物理格数': data.overall?.usedSlots || 0, '总物理格数': data.overall?.totalSlots || 0, '整体使用率 %': data.overall?.usagePercent || 0 });
-      renderTable('adminQuotaTable', ['仓库', '使用情况', '额度', '操作'], (data.rows || []).map(row =>
-        '<tr data-owner="' + esc(row.ownerUuid) + '"><td>' + esc(row.label) + '<div class="muted">' + esc(row.ownerUuid) + '</div></td><td>' + num(row.usedSlots) + ' / ' + num(row.quotaSlots) + ' 格<div class="usage-track"><div class="usage-fill" style="width:' + Math.min(100, Number(row.usagePercent || 0)) + '%"></div></div><div class="muted">' + esc(row.usagePercent) + '%</div></td><td><input class="compact-input" type="number" min="0" value="' + esc(row.quotaSlots) + '" data-quota-value></td><td><button data-quota-save>保存</button></td></tr>'
+      renderTable('adminQuotaTable', ['仓库', '使用情况', '额度模式', '额度', '操作'], (data.rows || []).map(row =>
+        '<tr data-owner="' + esc(row.ownerUuid) + '"><td>' + esc(row.label) + '<div class="muted">' + esc(row.ownerUuid) + '</div></td><td>' + num(row.usedSlots) + ' / ' + num(row.quotaSlots) + ' 格<div class="usage-track"><div class="usage-fill" style="width:' + Math.min(100, Number(row.usagePercent || 0)) + '%"></div></div><div class="muted">' + esc(row.usagePercent) + '%</div></td><td>' + (row.quotaMode === 'custom' ? '自定义额度' : '套餐额度') + '</td><td><input class="compact-input" type="number" min="0" value="' + esc(row.quotaSlots) + '" data-quota-value></td><td><button data-quota-save>设为自定义</button>' + (row.quotaMode === 'custom' ? '<button data-admin-quota-restore="' + esc(row.ownerUuid) + '">恢复套餐</button>' : '') + '</td></tr>'
       ), '没有仓库额度。');
+    }
+
+    async function loadAdminSubscriptionUsers() {
+      const data = await api('/api/admin/subscription/users', { q: $('adminPlayerQ').value });
+      renderTable('adminPlayerTable', ['玩家', '余额', '个人仓库', '当前套餐', '操作'], (data.rows || []).map(row =>
+        '<tr><td>' + esc(row.username) + '<div class="muted">' + esc(row.uuid) + '</div></td><td>' + money(row.balanceCents) + ' TSLC</td><td>' + (row.hasPersonalWarehouse ? '已创建' : '无') + '</td><td>' + esc(subscriptionStatusText(row.personal)) + '</td><td><button data-admin-sub-user="' + esc(row.uuid) + '">管理</button></td></tr>'
+      ), '没有玩家。');
+      if (state.adminSubscriptionUserUuid && data.rows?.some(row => row.uuid === state.adminSubscriptionUserUuid)) await loadAdminSubscriptionUser(state.adminSubscriptionUserUuid);
+    }
+
+    function adminEntitlementCard(label, ownerUuid, entitlement) {
+      if (!entitlement) return '<div class="organization-card"><strong>' + esc(label) + '</strong><div class="muted">没有仓库</div></div>';
+      return '<div class="organization-card"><div class="organization-head"><div><strong>' + esc(label) + '</strong><div class="muted">' + esc(subscriptionStatusText(entitlement)) + '</div></div><div class="organization-actions">' +
+        (entitlement.status === 'active' ? '<button class="danger" data-admin-sub-cancel="' + esc(ownerUuid) + '">取消订阅</button>' : '') +
+        (entitlement.quotaMode === 'custom' ? '<button data-admin-quota-restore="' + esc(ownerUuid) + '">恢复套餐额度</button>' : '') +
+      '</div></div></div>';
+    }
+
+    async function loadAdminSubscriptionUser(uuid) {
+      const data = await api('/api/admin/subscription/user', { uuid });
+      state.adminSubscriptionUserUuid = data.player.uuid;
+      const ledgerRows = (data.ledger || []).map(row => '<tr><td>' + esc(dateTime(row.createdAtMs)) + '</td><td>' + esc(row.type) + '</td><td>' + (row.amountCents >= 0 ? '+' : '') + money(row.amountCents) + '</td><td>' + money(row.balanceAfterCents) + '</td><td>' + esc(row.adminUsername || '') + '</td></tr>');
+      const orderRows = (data.orders || []).map(row => '<tr><td>' + esc(dateTime(row.createdAtMs)) + '</td><td>' + esc(row.ownerUuid) + '</td><td>' + esc(row.planName) + '</td><td>' + money(row.priceCents) + '</td><td>' + esc(dateTime(row.newExpiresAtMs)) + '</td></tr>');
+      $('adminPlayerDetail').innerHTML =
+        '<h3>' + esc(data.player.username) + '</h3><div class="subscription-balance">' + money(data.wallet.balanceCents) + ' TSLC</div>' +
+        '<div class="alias-add"><select data-admin-wallet-operation><option value="add">增加</option><option value="subtract">扣除</option><option value="set">设置为</option></select><input data-admin-wallet-amount placeholder="TSLC 金额，例如 1.00"><button class="solid" data-admin-wallet-save="' + esc(data.player.uuid) + '">调整余额</button></div>' +
+        '<h3 class="section-title">订阅</h3>' + adminEntitlementCard('个人仓库', data.player.uuid, data.personal) +
+        (data.organizations || []).map(row => adminEntitlementCard('组织仓库：' + row.name, row.ownerUuid, row.entitlement)).join('') +
+        '<h3 class="section-title">余额流水</h3>' + tableMarkup(['时间', '类型', '变动', '余额', '管理员'], ledgerRows, '没有余额流水。') +
+        '<h3 class="section-title">订购记录</h3>' + tableMarkup(['时间', '仓库', '套餐', '实付', '到期日'], orderRows, '没有订购记录。');
+    }
+
+    async function loadAdminSubscriptionConfig() {
+      const data = await api('/api/admin/subscription/config');
+      const settings = data.settings || {};
+      $('adminSubscriptionSettings').innerHTML =
+        '<label><span>存命令自动注册</span><input type="checkbox" data-sub-setting="autoRegisterOnDeposit"' + (settings.autoRegisterOnDeposit ? ' checked' : '') + '></label>' +
+        '<label><span>网页登录自动注册</span><input type="checkbox" data-sub-setting="autoRegisterOnWebLogin"' + (settings.autoRegisterOnWebLogin ? ' checked' : '') + '></label>' +
+        '<label><span>每日自动注册上限（-1无限）</span><input type="number" min="-1" data-sub-setting="dailyAutoRegistrationLimit" value="' + esc(settings.dailyAutoRegistrationLimit) + '"></label>' +
+        '<label><span>每人组织仓库上限</span><input type="number" min="0" data-sub-setting="maxCustomWarehousesPerPlayer" value="' + esc(settings.maxCustomWarehousesPerPlayer) + '"></label>' +
+        '<label><span>到账汇总窗口 ms</span><input type="number" data-sub-setting="paymentSummaryWindowMs" value="' + esc(settings.paymentSummaryWindowMs) + '"></label>' +
+        '<label><span>私信发送间隔 ms</span><input type="number" data-sub-setting="paymentMessageIntervalMs" value="' + esc(settings.paymentMessageIntervalMs) + '"></label>' +
+        '<label><span>未识别日志保留天数</span><input type="number" data-sub-setting="paymentLogRetentionDays" value="' + esc(settings.paymentLogRetentionDays) + '"></label>' +
+        '<label><span>网络时间同步间隔 ms</span><input type="number" data-sub-setting="networkTimeSyncIntervalMs" value="' + esc(settings.networkTimeSyncIntervalMs) + '"></label>' +
+        '<label class="wide"><span>到账正则</span><textarea data-sub-setting="paymentRegex">' + esc(settings.paymentRegex) + '</textarea></label>' +
+        '<label class="wide"><span>NTP 时间源（每行一个）</span><textarea data-sub-setting="networkTimeSources">' + esc((settings.networkTimeSources || []).join('\\n')) + '</textarea></label>';
+      $('adminSubscriptionPlans').innerHTML = (data.plans || []).map(plan =>
+        '<div class="plan-editor" data-plan-editor="' + esc(plan.id) + '"><strong>' + esc(plan.id) + '</strong>' +
+        '<input data-plan-name value="' + esc(plan.name) + '" placeholder="套餐名"><input data-plan-description value="' + esc(plan.description) + '" placeholder="简介">' +
+        '<div class="alias-add"><input type="number" min="0" data-plan-quota value="' + esc(plan.quotaSlots) + '" placeholder="额度格数"><input type="number" min="0" step="0.01" data-plan-price value="' + money(plan.priceCents) + '" placeholder="价格（TSLC）"><label class="check-label"><input type="checkbox" data-plan-visible' + (plan.visible ? ' checked' : '') + (plan.id === 'personal_free' ? ' disabled' : '') + '> 展示</label></div>' +
+        '<textarea data-plan-features placeholder="每行一条权益">' + esc((plan.features || []).join('\\n')) + '</textarea><button class="primary" data-plan-save>保存此套餐</button></div>'
+      ).join('');
+      $('adminSubscriptionTime').textContent = data.time?.trusted
+        ? '网络时间：' + dateTime(data.time.now) + ' · 来源 ' + data.time.source + ' · 偏差 ' + data.time.offsetMs + 'ms · 上次同步 ' + dateTime(data.time.lastSyncedAt)
+        : '网络时间未同步：' + (data.time?.lastError || '等待同步');
+      renderTable('adminIdentityConflicts', ['时间', '用户名', '临时账户', '冲突 UUID'], (data.identityConflicts || []).map(row => '<tr><td>' + esc(dateTime(row.createdAtMs)) + '</td><td>' + esc(row.username) + '</td><td>' + esc(row.ghostUuid) + '</td><td class="wrap">' + esc(row.realUuid) + '</td></tr>'), '没有用户名合并异常。');
+      const logs = await api('/api/admin/subscription/logs');
+      renderTable('adminPaymentLogs', ['时间', 'Bot', '完整消息'], (logs.rows || []).map(row => '<tr><td>' + esc(dateTime(row.createdAtMs)) + '</td><td>' + esc(row.botName) + '</td><td class="wrap">' + esc(row.message) + '</td></tr>'), '没有未识别到账日志。');
+      await loadAdminPaymentRecords();
+    }
+
+    async function loadAdminPaymentRecords() {
+      const data = await api('/api/admin/subscription/payments', { page: state.adminPaymentPage, pageSize: 100 });
+      state.adminPaymentPage = Number(data.page || 1);
+      state.adminPaymentTotalPages = Number(data.totalPages || 1);
+      renderTable('adminPaymentRecords', ['到账时间', '玩家', '金额', '到账后余额', '收款 Bot', '完整日志'], (data.rows || []).map(row =>
+        '<tr><td>' + esc(dateTime(row.createdAtMs)) + '</td><td>' + esc(row.username) + '<div class="muted">' + esc(row.playerUuid) + '</div></td><td>+' + money(row.amountCents) + ' TSLC</td><td>' + money(row.balanceAfterCents) + ' TSLC</td><td>' + esc(row.botName || '-') + '</td><td class="wrap">' + esc(row.message) + '</td></tr>'
+      ), '还没有充值记录。');
+      $('adminPaymentPage').textContent = '第 ' + state.adminPaymentPage + ' / ' + state.adminPaymentTotalPages + ' 页 · 共 ' + Number(data.total || 0) + ' 条';
+      $('adminPaymentPrev').disabled = state.adminPaymentPage <= 1;
+      $('adminPaymentNext').disabled = state.adminPaymentPage >= state.adminPaymentTotalPages;
+    }
+
+    function collectAdminSubscriptionSettings() {
+      const result = {};
+      document.querySelectorAll('[data-sub-setting]').forEach(input => {
+        if (input.type === 'checkbox') result[input.dataset.subSetting] = input.checked;
+        else if (input.dataset.subSetting === 'networkTimeSources') result[input.dataset.subSetting] = input.value.split(/\\r?\\n/).map(value => value.trim()).filter(Boolean);
+        else result[input.dataset.subSetting] = input.value;
+      });
+      return result;
+    }
+
+    async function saveAdminSubscriptionSettings() {
+      const data = await post('/api/admin/subscription/config', collectAdminSubscriptionSettings());
+      toast(data.message); await loadAdminSubscriptionConfig();
+    }
+
+    async function saveAdminSubscriptionPlan(editor) {
+      const data = await post('/api/admin/subscription/plan', {
+        id: editor.dataset.planEditor,
+        name: editor.querySelector('[data-plan-name]').value,
+        description: editor.querySelector('[data-plan-description]').value,
+        quotaSlots: editor.querySelector('[data-plan-quota]').value,
+        priceCents: Math.round(Number(editor.querySelector('[data-plan-price]').value || 0) * 100),
+        visible: editor.querySelector('[data-plan-visible]').checked,
+        features: editor.querySelector('[data-plan-features]').value.split(/\\r?\\n/)
+      });
+      toast(data.message); await loadAdminSubscriptionConfig();
     }
 
     async function loadAdminWarehouses() {
@@ -4437,6 +4915,8 @@ const HTML = `<!doctype html>
       if (!state.user?.isAdmin) return;
       if (state.adminTab === 'bots') return loadAdminBots();
       if (state.adminTab === 'admins') return loadAdminUsers();
+      if (state.adminTab === 'players') return loadAdminSubscriptionUsers();
+      if (state.adminTab === 'subscriptions') return loadAdminSubscriptionConfig();
       if (state.adminTab === 'inventory') return loadAdminInventory();
       if (state.adminTab === 'warehouses') return loadAdminWarehouses();
       if (state.adminTab === 'mismatches') return loadAdminMismatches();
@@ -4453,6 +4933,8 @@ const HTML = `<!doctype html>
       $('adminInventory').classList.toggle('hidden', tab !== 'inventory');
       $('adminBots').classList.toggle('hidden', tab !== 'bots');
       $('adminUsers').classList.toggle('hidden', tab !== 'admins');
+      $('adminPlayers').classList.toggle('hidden', tab !== 'players');
+      $('adminSubscriptions').classList.toggle('hidden', tab !== 'subscriptions');
       $('adminWarehouses').classList.toggle('hidden', tab !== 'warehouses');
       $('adminMismatches').classList.toggle('hidden', tab !== 'mismatches');
       $('adminChests').classList.toggle('hidden', tab !== 'chests');
@@ -4472,11 +4954,13 @@ const HTML = `<!doctype html>
       $('inventoryView').classList.toggle('hidden', view !== 'inventory');
       $('inventoryHero').classList.toggle('hidden', view !== 'inventory');
       $('transactionsView').classList.toggle('hidden', view !== 'transactions');
+      $('subscriptionsView').classList.toggle('hidden', view !== 'subscriptions');
       $('myView').classList.toggle('hidden', view !== 'my');
       $('warehouseAdminView').classList.toggle('hidden', view !== 'warehouseAdmin');
       $('helpView').classList.toggle('hidden', view !== 'help');
       $('adminView').classList.toggle('hidden', view !== 'admin');
       if (view === 'transactions') loadTransactions().catch(error => toast(error.message));
+      if (view === 'subscriptions') loadSubscriptions().catch(error => toast(error.message));
       if (view === 'my') loadMyCurrent().catch(error => toast(error.message));
       if (view === 'warehouseAdmin') loadWarehouseAdminOrganizations().catch(error => toast(error.message));
       if (view === 'admin') loadAdminCurrent().catch(error => toast(error.message));
@@ -4549,6 +5033,16 @@ const HTML = `<!doctype html>
     $('adminCommandNext').addEventListener('click', () => { if ((state.adminCommandPage || 1) < (state.adminCommandTotalPages || 1)) state.adminCommandPage++; loadAdminCommands().catch(error => toast(error.message)); });
     $('adminAliasLoad').addEventListener('click', () => loadAdminAliases().catch(error => toast(error.message)));
     $('adminQuotaLoad').addEventListener('click', () => loadAdminQuotas().catch(error => toast(error.message)));
+    $('subscriptionRefresh').addEventListener('click', () => loadSubscriptions().catch(error => toast(error.message)));
+    $('sidebarSubscription').addEventListener('click', () => setView('subscriptions'));
+    $('subscriptionOrganization').addEventListener('change', event => { state.subscriptionOrganizationOwner = event.currentTarget.value; loadSubscriptions().catch(error => toast(error.message)); });
+    $('subscriptionOrganizationCreateButton').addEventListener('click', () => createSubscriptionOrganization().catch(error => toast(error.message)));
+    $('adminPlayerLoad').addEventListener('click', () => loadAdminSubscriptionUsers().catch(error => toast(error.message)));
+    $('adminSubscriptionSettingsSave').addEventListener('click', () => saveAdminSubscriptionSettings().catch(error => toast(error.message)));
+    $('adminSubscriptionTimeSync').addEventListener('click', async () => { try { const data = await post('/api/admin/subscription/time/sync'); toast(data.message); await loadAdminSubscriptionConfig(); } catch (error) { toast(error.message); } });
+    $('adminPaymentRegexTest').addEventListener('click', async () => { try { const settings = collectAdminSubscriptionSettings(); const data = await post('/api/admin/subscription/regex/test', { paymentRegex: settings.paymentRegex, sample: $('adminPaymentRegexSample').value }); $('adminPaymentRegexResult').textContent = data.matched ? '匹配成功：' + data.player + ' / ' + data.amount + ' TSLC' : '未匹配'; } catch (error) { toast(error.message); } });
+    $('adminPaymentPrev').addEventListener('click', () => { if (state.adminPaymentPage > 1) state.adminPaymentPage--; loadAdminPaymentRecords().catch(error => toast(error.message)); });
+    $('adminPaymentNext').addEventListener('click', () => { if (state.adminPaymentPage < state.adminPaymentTotalPages) state.adminPaymentPage++; loadAdminPaymentRecords().catch(error => toast(error.message)); });
     $('myRefresh').addEventListener('click', () => loadMyCurrent().catch(error => toast(error.message)));
     $('warehouseAdminRefresh').addEventListener('click', () => loadWarehouseAdminOrganizations().catch(error => toast(error.message)));
     $('myAliasLoad').addEventListener('click', () => loadMyAliases().catch(error => toast(error.message)));
@@ -4637,8 +5131,37 @@ const HTML = `<!doctype html>
       const adminOrgMemberRemove = event.target.closest('[data-admin-org-member-remove]');
       const adminPersonalDelete = event.target.closest('[data-admin-personal-delete]');
       const adminOrgDelete = event.target.closest('[data-admin-org-delete]');
+      const subscriptionPurchase = event.target.closest('[data-subscription-purchase]');
+      const adminSubscriptionUser = event.target.closest('[data-admin-sub-user]');
+      const adminWalletSave = event.target.closest('[data-admin-wallet-save]');
+      const adminSubscriptionCancel = event.target.closest('[data-admin-sub-cancel]');
+      const adminQuotaRestore = event.target.closest('[data-admin-quota-restore]');
+      const adminPlanSave = event.target.closest('[data-plan-save]');
       try {
-        if (adminPickRemove) {
+        if (subscriptionPurchase) {
+          await purchaseSubscription(subscriptionPurchase);
+        } else if (adminSubscriptionUser) {
+          await loadAdminSubscriptionUser(adminSubscriptionUser.dataset.adminSubUser);
+        } else if (adminWalletSave) {
+          const detail = adminWalletSave.closest('#adminPlayerDetail');
+          const operation = detail.querySelector('[data-admin-wallet-operation]').value;
+          const amount = detail.querySelector('[data-admin-wallet-amount]').value;
+          if (!confirm('确认对该玩家执行余额“' + operation + '”操作，金额 ' + amount + ' TSLC？')) return;
+          const data = await post('/api/admin/subscription/balance', { playerUuid: adminWalletSave.dataset.adminWalletSave, operation, amount });
+          toast(data.message); await loadAdminSubscriptionUser(adminWalletSave.dataset.adminWalletSave); await loadAdminSubscriptionUsers();
+        } else if (adminSubscriptionCancel) {
+          if (!confirm('确认立即取消这个仓库的付费订阅？不会自动退款，仓库将立即恢复默认套餐额度。')) return;
+          const data = await post('/api/admin/subscription/cancel', { ownerUuid: adminSubscriptionCancel.dataset.adminSubCancel });
+          toast(data.message); await loadAdminSubscriptionUser(state.adminSubscriptionUserUuid); await loadAdminSubscriptionUsers();
+        } else if (adminQuotaRestore) {
+          if (!confirm('确认清除自定义额度并恢复当前套餐额度？')) return;
+          const data = await post('/api/admin/quota/restore', { ownerUuid: adminQuotaRestore.dataset.adminQuotaRestore });
+          toast(data.message);
+          if (state.adminTab === 'players' && state.adminSubscriptionUserUuid) await loadAdminSubscriptionUser(state.adminSubscriptionUserUuid);
+          if (state.adminTab === 'warehouses') await loadAdminWarehouses();
+        } else if (adminPlanSave) {
+          await saveAdminSubscriptionPlan(adminPlanSave.closest('[data-plan-editor]'));
+        } else if (adminPickRemove) {
           state.adminSelected.delete(adminPickRemove.closest('[data-admin-pick]').dataset.adminPick);
           renderAdminTransferSelection();
           loadAdminInventorySelectionState();

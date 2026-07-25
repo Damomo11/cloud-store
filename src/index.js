@@ -10,6 +10,7 @@ const ItemCatalog = require('./itemCatalog')
 const Warehouse = require('./warehouse')
 const CloudStoreService = require('./service')
 const CloudStoreWebServer = require('./webServer')
+const SubscriptionManager = require('./subscriptions')
 const { BotTaskPool } = require('./taskPool')
 const { invalidateMinecraftAccessTokenCache, isMinecraftProfileAuthError } = require('./authCache')
 const { releaseBotConnection, terminateBotTransport } = require('./botConnection')
@@ -98,6 +99,7 @@ function isSocketDisconnectError (error) {
 
 const config = loadConfig(path.resolve(process.cwd(), 'config.json'), { autoUpdate: true })
 const db = new StoreDb(path.resolve(process.cwd(), 'data', 'cloud-store.sqlite'), config)
+const subscriptions = new SubscriptionManager(db, config)
 const protocolVersions = buildProtocolVersionList(config)
 let catalog = createCatalogForVersion(protocolVersions[0] || config.server.version)
 attachCatalog(catalog)
@@ -137,7 +139,7 @@ const botManager = {
   setEnabled: setManagedAccountEnabled,
   remove: removeManagedAccount
 }
-const webServer = new CloudStoreWebServer(db, config, currentService, () => botManager)
+const webServer = new CloudStoreWebServer(db, config, currentService, () => botManager, subscriptions)
 webServer.start()
 
 for (const state of states.values()) {
@@ -302,7 +304,7 @@ function launchBot (state) {
   const acceptedResourcePacks = new Set()
 
   const warehouse = new Warehouse(bot, db, catalog, launchConfig, taskPool.warehouseMutex)
-  const service = new CloudStoreService(bot, db, catalog, warehouse, launchConfig, taskPool)
+  const service = new CloudStoreService(bot, db, catalog, warehouse, launchConfig, taskPool, subscriptions)
   service.setWebAuth(webServer)
   setupRegistryExport(bot, catalog, db)
 
@@ -591,6 +593,7 @@ process.on('SIGINT', () => {
     if (state.reconnectTimer) clearTimeout(state.reconnectTimer)
     state.bot?.quit('shutdown')
   }
+  subscriptions.close()
   db.close()
   process.exit(0)
 })
