@@ -1383,7 +1383,7 @@ class CloudStoreWebServer {
     this.requireAdmin(session)
     const q = String(url.searchParams.get('q') || '').trim().toLowerCase()
     const owners = this.apiAdminOwners(session).rows
-    const rows = owners.filter(owner => Number(owner.totalAmount || 0) > 0).map(owner => {
+    const rows = owners.map(owner => {
       const isCustom = owner.ownerUuid.startsWith('vault:')
       const defaultSlots = isCustom
         ? (this.config.storage?.defaultCustomWarehouseQuotaSlots || this.config.storage?.defaultQuotaSlots || 270)
@@ -2417,7 +2417,8 @@ const HTML = `<!doctype html>
       right: 0;
       top: calc(100% + 6px);
       max-height: 230px;
-      overflow: auto;
+      overflow-x: hidden;
+      overflow-y: auto;
       border: 1px solid #4b3d28;
       border-radius: 8px;
       background: #141416;
@@ -2438,7 +2439,8 @@ const HTML = `<!doctype html>
       border-radius: 6px;
     }
     .player-option:hover, .player-option.active { background: #2a251e; color: var(--gold); }
-    .player-option .ping { color: var(--muted); font-size: 12px; }
+    .player-option > span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .player-option .ping { flex: 0 0 auto; color: var(--muted); font-size: 12px; white-space: nowrap; }
     .player-empty { padding: 9px; color: var(--muted); font-size: 13px; }
     .litematicbar { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 10px; align-items: start; margin: -6px 0 14px; }
     .litematic-result {
@@ -2984,13 +2986,12 @@ const HTML = `<!doctype html>
           <button class="primary" data-admin-tab="bots">机器人账号</button>
           <button class="primary" data-admin-tab="admins">系统管理员</button>
           <button class="primary active" data-admin-tab="inventory">库存</button>
-          <button class="primary" data-admin-tab="warehouses">组织管理</button>
+          <button class="primary" data-admin-tab="warehouses">仓库管理</button>
           <button class="primary" data-admin-tab="mismatches">库存异常</button>
           <button class="primary" data-admin-tab="chests">木桶视图</button>
           <button class="primary" data-admin-tab="transactions">交易记录</button>
           <button class="primary" data-admin-tab="commands">命令记录</button>
           <button class="primary" data-admin-tab="aliases">全局别名</button>
-          <button class="primary" data-admin-tab="quotas">额度管理</button>
         </div>
         <section id="adminBots" class="hidden">
           <div class="panel" style="padding:14px;margin-bottom:14px">
@@ -3035,6 +3036,10 @@ const HTML = `<!doctype html>
           <h3 class="section-title">已创建的个人仓库</h3><div id="adminPersonalWarehouseList" class="panel tablewrap"></div>
           <h3 class="section-title">已有组织仓库</h3><div id="adminOrganizationWarehouseList" class="panel tablewrap"></div>
           <div id="adminOrganizationWarehouseDetail" class="panel alias-detail-panel"><p class="muted">点击组织仓库右侧的“查看”管理详情、成员与管理员。</p></div>
+          <h3 class="section-title">仓库容量与额度</h3>
+          <div class="toolbar"><input id="adminQuotaQ" placeholder="筛选仓库"><button id="adminQuotaLoad" class="primary">查询</button></div>
+          <div id="adminQuotaOverall" class="stats"></div>
+          <div id="adminQuotaTable" class="panel tablewrap"></div>
         </section>
         <section id="adminMismatches" class="hidden">
           <div class="toolbar">
@@ -3083,11 +3088,6 @@ const HTML = `<!doctype html>
           </div>
           <div id="adminAliasGrid" class="panel admin-grid-panel"></div>
           <div id="adminAliasDetail" class="panel alias-detail-panel"><p class="muted">点击上方物品图标管理全局别名。</p></div>
-        </section>
-        <section id="adminQuotas" class="hidden">
-          <div class="toolbar"><input id="adminQuotaQ" placeholder="筛选仓库"><button id="adminQuotaLoad" class="primary">查询</button></div>
-          <div id="adminQuotaOverall" class="stats"></div>
-          <div id="adminQuotaTable" class="panel tablewrap"></div>
         </section>
       </section>
       <p id="toast" class="toast"></p>
@@ -4281,12 +4281,12 @@ const HTML = `<!doctype html>
 
     async function createAdminPersonalWarehouse() {
       const data = await post('/api/admin/personal-warehouse/create', { username: $('adminPersonalWarehousePlayer').value });
-      toast(data.message); $('adminPersonalWarehousePlayer').value = ''; state.adminOwners = []; await loadAdminWarehouseProvisioning();
+      toast(data.message); $('adminPersonalWarehousePlayer').value = ''; state.adminOwners = []; await loadAdminWarehouses();
     }
 
     async function createAdminOrganizationWarehouse() {
       const data = await post('/api/admin/organization-warehouse/create', { name: $('adminOrganizationWarehouseName').value, creatorUsername: $('adminOrganizationWarehouseCreator').value });
-      toast(data.message); $('adminOrganizationWarehouseName').value = ''; $('adminOrganizationWarehouseCreator').value = ''; state.adminOwners = []; await loadAdminWarehouseProvisioning();
+      toast(data.message); $('adminOrganizationWarehouseName').value = ''; $('adminOrganizationWarehouseCreator').value = ''; state.adminOwners = []; await loadAdminWarehouses();
     }
 
     async function loadWarehouseAdminOrganizations() {
@@ -4429,18 +4429,21 @@ const HTML = `<!doctype html>
       ), '没有仓库额度。');
     }
 
+    async function loadAdminWarehouses() {
+      await Promise.all([loadAdminWarehouseProvisioning(), loadAdminQuotas()]);
+    }
+
     async function loadAdminCurrent() {
       if (!state.user?.isAdmin) return;
       if (state.adminTab === 'bots') return loadAdminBots();
       if (state.adminTab === 'admins') return loadAdminUsers();
       if (state.adminTab === 'inventory') return loadAdminInventory();
-      if (state.adminTab === 'warehouses') return loadAdminWarehouseProvisioning();
+      if (state.adminTab === 'warehouses') return loadAdminWarehouses();
       if (state.adminTab === 'mismatches') return loadAdminMismatches();
       if (state.adminTab === 'chests') return Promise.resolve();
       if (state.adminTab === 'transactions') return loadAdminTransactions();
       if (state.adminTab === 'commands') return loadAdminCommands();
       if (state.adminTab === 'aliases') return loadAdminAliases();
-      if (state.adminTab === 'quotas') return loadAdminQuotas();
     }
 
     function setAdminTab(tab) {
@@ -4456,7 +4459,6 @@ const HTML = `<!doctype html>
       $('adminTransactions').classList.toggle('hidden', tab !== 'transactions');
       $('adminCommands').classList.toggle('hidden', tab !== 'commands');
       $('adminAliases').classList.toggle('hidden', tab !== 'aliases');
-      $('adminQuotas').classList.toggle('hidden', tab !== 'quotas');
       loadAdminCurrent().catch(error => toast(error.message));
       if (state.adminBotsTimer) { clearInterval(state.adminBotsTimer); state.adminBotsTimer = null; }
       if (tab === 'bots') state.adminBotsTimer = setInterval(() => loadAdminBots().catch(() => {}), 2000);
@@ -4700,7 +4702,7 @@ const HTML = `<!doctype html>
           const data = await post('/api/admin/personal-warehouse/delete', { ownerUuid, confirmOwnerUuid: ownerUuid });
           toast(data.message); state.adminOwners = []; state.owners = []; state.inventoryCache.clear();
           const me = await api('/api/me'); state.owners = me.owners || []; state.defaultOwnerUuid = me.defaultOwnerUuid; renderOwners();
-          await loadAdminWarehouseProvisioning();
+          await loadAdminWarehouses();
         } else if (adminOrgDelete) {
           const card = adminOrgDelete.closest('[data-admin-org-detail]');
           const warehouse = card.dataset.adminOrgDetail;
@@ -4709,7 +4711,7 @@ const HTML = `<!doctype html>
           const data = await post('/api/admin/organization-warehouse/delete', { warehouse, confirmName: confirmation });
           toast(data.message); state.adminOrganizationName = ''; state.adminOwners = []; state.owners = []; state.inventoryCache.clear();
           const me = await api('/api/me'); state.owners = me.owners || []; state.defaultOwnerUuid = me.defaultOwnerUuid; renderOwners();
-          await loadAdminWarehouseProvisioning();
+          await loadAdminWarehouses();
         } else if (orgRename) {
           const card = orgRename.closest('[data-warehouse]');
           const data = await post('/api/warehouse-admin/rename', { warehouse: card.dataset.warehouse, newName: card.querySelector('[data-org-new-name]').value });
@@ -4771,7 +4773,7 @@ const HTML = `<!doctype html>
           const row = quotaSave.closest('tr');
           const data = await post('/api/admin/quota/save', { ownerUuid: row.dataset.owner, quotaSlots: row.querySelector('[data-quota-value]').value });
           toast(data.message);
-          await loadAdminQuotas();
+          await loadAdminWarehouses();
         } else if (adminCard) {
           const key = adminCard.dataset.adminCard;
           const row = state.adminInventoryRows.get(key);
