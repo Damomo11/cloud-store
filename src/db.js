@@ -297,6 +297,111 @@ class StoreDb {
         FOREIGN KEY (command_log_id) REFERENCES command_logs(id) ON DELETE CASCADE
       );
 
+      CREATE TABLE IF NOT EXISTS subscription_settings (
+        key TEXT PRIMARY KEY,
+        value_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS subscription_plans (
+        id TEXT PRIMARY KEY,
+        scope TEXT NOT NULL,
+        name TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        quota_slots INTEGER NOT NULL,
+        price_cents INTEGER NOT NULL,
+        features_json TEXT NOT NULL DEFAULT '[]',
+        visible INTEGER NOT NULL DEFAULT 1,
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS wallet_accounts (
+        player_uuid TEXT PRIMARY KEY,
+        username TEXT NOT NULL,
+        balance_cents INTEGER NOT NULL DEFAULT 0 CHECK (balance_cents >= 0),
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS wallet_ledger (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        player_uuid TEXT NOT NULL,
+        username TEXT NOT NULL,
+        type TEXT NOT NULL,
+        amount_cents INTEGER NOT NULL,
+        balance_before_cents INTEGER NOT NULL,
+        balance_after_cents INTEGER NOT NULL,
+        reference_type TEXT NOT NULL DEFAULT '',
+        reference_id TEXT NOT NULL DEFAULT '',
+        admin_uuid TEXT NOT NULL DEFAULT '',
+        admin_username TEXT NOT NULL DEFAULT '',
+        message TEXT NOT NULL DEFAULT '',
+        created_at_ms INTEGER NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS warehouse_subscriptions (
+        owner_uuid TEXT PRIMARY KEY,
+        plan_id TEXT NOT NULL,
+        expires_at_ms INTEGER NOT NULL,
+        cancelled_at_ms INTEGER NOT NULL DEFAULT 0,
+        updated_at_ms INTEGER NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (plan_id) REFERENCES subscription_plans(id)
+      );
+
+      CREATE TABLE IF NOT EXISTS subscription_orders (
+        id TEXT PRIMARY KEY,
+        owner_uuid TEXT NOT NULL,
+        plan_id TEXT NOT NULL,
+        payer_uuid TEXT NOT NULL,
+        payer_username TEXT NOT NULL,
+        price_cents INTEGER NOT NULL,
+        duration_ms INTEGER NOT NULL,
+        previous_expires_at_ms INTEGER NOT NULL,
+        new_expires_at_ms INTEGER NOT NULL,
+        plan_name_snapshot TEXT NOT NULL,
+        quota_slots_snapshot INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'paid',
+        created_at_ms INTEGER NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS subscription_cancellations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner_uuid TEXT NOT NULL,
+        plan_id TEXT NOT NULL,
+        previous_expires_at_ms INTEGER NOT NULL,
+        admin_uuid TEXT NOT NULL DEFAULT '',
+        admin_username TEXT NOT NULL DEFAULT '',
+        created_at_ms INTEGER NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS auto_registration_daily (
+        day_key TEXT PRIMARY KEY,
+        registration_count INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS unrecognized_payment_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        bot_name TEXT NOT NULL DEFAULT '',
+        message TEXT NOT NULL,
+        created_at_ms INTEGER NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS wallet_identity_conflicts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL,
+        ghost_uuid TEXT NOT NULL,
+        real_uuid TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'open',
+        created_at_ms INTEGER NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+
       CREATE INDEX IF NOT EXISTS idx_items_item_id ON items(item_id);
       CREATE INDEX IF NOT EXISTS idx_balances_item_key ON balances(item_key);
       CREATE INDEX IF NOT EXISTS idx_chest_slots_item_key ON chest_slots(item_key);
@@ -314,6 +419,11 @@ class StoreDb {
       CREATE INDEX IF NOT EXISTS idx_inventory_reservations_item ON inventory_reservations(owner_uuid, item_key);
       CREATE INDEX IF NOT EXISTS idx_command_logs_created ON command_logs(id DESC);
       CREATE INDEX IF NOT EXISTS idx_command_log_replies_command ON command_log_replies(command_log_id, id);
+      CREATE INDEX IF NOT EXISTS idx_wallet_ledger_player ON wallet_ledger(player_uuid, id DESC);
+      CREATE INDEX IF NOT EXISTS idx_wallet_ledger_created ON wallet_ledger(created_at_ms DESC);
+      CREATE INDEX IF NOT EXISTS idx_subscription_orders_payer ON subscription_orders(payer_uuid, created_at_ms DESC);
+      CREATE INDEX IF NOT EXISTS idx_subscription_orders_owner ON subscription_orders(owner_uuid, created_at_ms DESC);
+      CREATE INDEX IF NOT EXISTS idx_unrecognized_payment_created ON unrecognized_payment_logs(created_at_ms DESC);
     `)
 
     this.ensureColumn('items', 'display_name_manual', 'INTEGER NOT NULL DEFAULT 0')
@@ -680,6 +790,8 @@ class StoreDb {
           AND uuid NOT IN (SELECT player_uuid FROM player_disabled_global_aliases)
           AND uuid NOT IN (SELECT player_uuid FROM custom_warehouse_members)
           AND uuid NOT IN (SELECT owner_uuid FROM player_quotas)
+          AND uuid NOT IN (SELECT player_uuid FROM wallet_accounts)
+          AND uuid NOT IN (SELECT payer_uuid FROM subscription_orders)
           AND uuid NOT IN (SELECT COALESCE(uuid, '') FROM admin_users)
       `).run().changes
     })
@@ -1087,6 +1199,26 @@ class StoreDb {
   migrateGhostPlayerIdentity (uuid, username) {
     if (uuid.startsWith('name:')) return
 
+    const realIdentities = this.db.prepare(`
+      SELECT uuid FROM players
+      WHERE uuid NOT LIKE 'name:%' AND lower(username) = lower(?)
+    `).all(username)
+    if (realIdentities.length > 1) {
+      const ghostUuid = `name:${username}`
+      const exists = this.db.prepare(`
+        SELECT 1 FROM wallet_identity_conflicts
+        WHERE lower(username) = lower(?) AND ghost_uuid = ? AND status = 'open'
+        LIMIT 1
+      `).get(username, ghostUuid)
+      if (!exists) {
+        this.db.prepare(`
+          INSERT INTO wallet_identity_conflicts (username, ghost_uuid, real_uuid, created_at_ms)
+          VALUES (?, ?, ?, ?)
+        `).run(username, ghostUuid, realIdentities.map(row => row.uuid).join(','), Date.now())
+      }
+      return
+    }
+
     const ghostUuids = new Set([`name:${username}`])
     const addRows = rows => {
       for (const row of rows) {
@@ -1130,6 +1262,7 @@ class StoreDb {
       this.migrateGhostPlayerAliases(ghostUuid, uuid)
       this.migrateGhostWebLoginToken(ghostUuid, uuid, username)
       this.migrateGhostPlayerQuota(ghostUuid, uuid)
+      this.migrateGhostWalletIdentity(ghostUuid, uuid, username)
       this.db.prepare('UPDATE web_sessions SET owner_uuid = ?, username = ? WHERE owner_uuid = ?').run(uuid, username, ghostUuid)
       this.db.prepare('UPDATE transactions SET player_uuid = ?, username = ? WHERE player_uuid = ?').run(uuid, username, ghostUuid)
       this.deleteOrphanGhostPlayer(ghostUuid)
@@ -1298,6 +1431,45 @@ class StoreDb {
     }
   }
 
+  migrateGhostWalletIdentity (ghostUuid, uuid, username) {
+    const ghost = this.db.prepare('SELECT balance_cents AS balanceCents FROM wallet_accounts WHERE player_uuid = ?').get(ghostUuid)
+    if (ghost) {
+      const real = this.db.prepare('SELECT balance_cents AS balanceCents FROM wallet_accounts WHERE player_uuid = ?').get(uuid)
+      const mergedBalance = Number(real?.balanceCents || 0) + Number(ghost.balanceCents || 0)
+      this.db.prepare(`
+        INSERT INTO wallet_accounts (player_uuid, username, balance_cents, updated_at)
+        VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(player_uuid) DO UPDATE SET
+          username = excluded.username,
+          balance_cents = excluded.balance_cents,
+          updated_at = CURRENT_TIMESTAMP
+      `).run(uuid, username, mergedBalance)
+      this.db.prepare('DELETE FROM wallet_accounts WHERE player_uuid = ?').run(ghostUuid)
+    }
+    this.db.prepare('UPDATE wallet_ledger SET player_uuid = ?, username = ? WHERE player_uuid = ?').run(uuid, username, ghostUuid)
+    this.db.prepare('UPDATE subscription_orders SET payer_uuid = ?, payer_username = ? WHERE payer_uuid = ?').run(uuid, username, ghostUuid)
+    const ghostSubscription = this.db.prepare(`
+      SELECT plan_id AS planId, expires_at_ms AS expiresAtMs, cancelled_at_ms AS cancelledAtMs,
+             updated_at_ms AS updatedAtMs
+      FROM warehouse_subscriptions WHERE owner_uuid = ?
+    `).get(ghostUuid)
+    if (ghostSubscription) {
+      const realSubscription = this.db.prepare('SELECT expires_at_ms AS expiresAtMs FROM warehouse_subscriptions WHERE owner_uuid = ?').get(uuid)
+      if (!realSubscription) {
+        this.db.prepare('UPDATE warehouse_subscriptions SET owner_uuid = ? WHERE owner_uuid = ?').run(uuid, ghostUuid)
+      } else {
+        if (Number(ghostSubscription.expiresAtMs) > Number(realSubscription.expiresAtMs)) {
+          this.db.prepare(`
+            UPDATE warehouse_subscriptions
+            SET plan_id = ?, expires_at_ms = ?, cancelled_at_ms = ?, updated_at_ms = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE owner_uuid = ?
+          `).run(ghostSubscription.planId, ghostSubscription.expiresAtMs, ghostSubscription.cancelledAtMs, ghostSubscription.updatedAtMs, uuid)
+        }
+        this.db.prepare('DELETE FROM warehouse_subscriptions WHERE owner_uuid = ?').run(ghostUuid)
+      }
+    }
+  }
+
   deleteOrphanGhostPlayer (ghostUuid) {
     this.db.prepare(`
       DELETE FROM players
@@ -1314,6 +1486,8 @@ class StoreDb {
         AND uuid NOT IN (SELECT player_uuid FROM custom_warehouse_members)
         AND uuid NOT IN (SELECT owner_uuid FROM player_quotas)
         AND uuid NOT IN (SELECT player_uuid FROM transactions)
+        AND uuid NOT IN (SELECT player_uuid FROM wallet_accounts)
+        AND uuid NOT IN (SELECT payer_uuid FROM subscription_orders)
         AND uuid NOT IN (SELECT COALESCE(uuid, '') FROM admin_users)
     `).run(ghostUuid)
   }
@@ -1396,6 +1570,7 @@ class StoreDb {
         owner_uuid, username, created_by_uuid, created_by_username
       ) VALUES (?, ?, ?, ?)
     `).run(uuid, name, String(createdBy.uuid || ''), String(createdBy.username || '')).changes
+    if (changed) this.db.prepare('DELETE FROM player_quotas WHERE owner_uuid = ?').run(uuid)
     return { changed, ownerUuid: uuid, username: name }
   }
 
@@ -1618,6 +1793,7 @@ class StoreDb {
       this.addTransaction('warehouse_delete_transfer_out', 'ok', ownerUuid, ownerUsername, items, `${message}; to=${this.momoOwner}`)
       this.addTransaction('warehouse_delete_transfer_in', 'ok', this.momoOwner, 'momo', items, `${message}; from=${ownerUuid}`)
       this.db.prepare('DELETE FROM player_quotas WHERE owner_uuid = ?').run(ownerUuid)
+      this.db.prepare('DELETE FROM warehouse_subscriptions WHERE owner_uuid = ?').run(ownerUuid)
       this.db.prepare("UPDATE players SET default_owner_uuid = '' WHERE default_owner_uuid = ?").run(ownerUuid)
       this.db.prepare(`
         UPDATE inventory_mismatches
@@ -1658,6 +1834,9 @@ class StoreDb {
       this.db.prepare('UPDATE custom_warehouse_members SET warehouse_name_lower = ? WHERE warehouse_name_lower = ?').run(nextLower, warehouse.nameLower)
       this.db.prepare('UPDATE balances SET owner_uuid = ? WHERE owner_uuid = ?').run(newOwner, oldOwner)
       this.db.prepare('UPDATE player_quotas SET owner_uuid = ? WHERE owner_uuid = ?').run(newOwner, oldOwner)
+      this.db.prepare('UPDATE warehouse_subscriptions SET owner_uuid = ? WHERE owner_uuid = ?').run(newOwner, oldOwner)
+      this.db.prepare('UPDATE subscription_orders SET owner_uuid = ? WHERE owner_uuid = ?').run(newOwner, oldOwner)
+      this.db.prepare('UPDATE subscription_cancellations SET owner_uuid = ? WHERE owner_uuid = ?').run(newOwner, oldOwner)
       this.db.prepare('UPDATE transactions SET player_uuid = ?, username = ? WHERE player_uuid = ?').run(newOwner, `仓库:${nextName}`, oldOwner)
       this.db.prepare('UPDATE inventory_mismatches SET owner_uuid = ?, username = ? WHERE owner_uuid = ?').run(newOwner, `仓库:${nextName}`, oldOwner)
       this.db.prepare('UPDATE active_recovery_tasks SET owner_uuid = ?, owner_username = ?, vault_name = ? WHERE owner_uuid = ?').run(newOwner, `仓库:${nextName}`, nextName, oldOwner)
@@ -2131,6 +2310,18 @@ class StoreDb {
       WHERE owner_uuid = ?
     `).get(ownerUuid)
     return row ? row.quotaSlots : defaultSlots
+  }
+
+  getQuotaOverride (ownerUuid) {
+    const row = this.db.prepare(`
+      SELECT quota_slots AS quotaSlots, updated_at AS updatedAt
+      FROM player_quotas WHERE owner_uuid = ?
+    `).get(ownerUuid)
+    return row || null
+  }
+
+  clearQuotaSlots (ownerUuid) {
+    return this.db.prepare('DELETE FROM player_quotas WHERE owner_uuid = ?').run(ownerUuid).changes
   }
 
   setQuotaSlots (ownerUuid, slots) {
