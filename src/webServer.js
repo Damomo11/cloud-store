@@ -4770,7 +4770,10 @@ const HTML = `<!doctype html>
       const data = await api('/api/admin/bots');
       const rows = data.rows || [];
       $('adminBotsTable').innerHTML = rows.length ? '<table><thead><tr><th>账号</th><th>状态</th><th>OAuth2 登录</th><th>当前任务</th><th>操作</th></tr></thead><tbody>' + rows.map(row => {
-        const device = row.deviceCode ? '<a href="' + esc(row.deviceCode.verificationUri) + '" target="_blank" rel="noreferrer">打开微软登录</a><div class="codebox" style="margin-top:6px">' + esc(row.deviceCode.userCode) + '</div>' : '<span class="muted">' + (row.status === 'online' ? '已完成' : '等待验证码') + '</span>';
+        const oauthStatus = row.status === 'online' || row.status === 'logging_in'
+          ? '已完成'
+          : (row.status === 'auth_required' ? '等待验证码' : (row.status === 'connecting' || row.status === 'starting' ? '正在登录' : '无需操作'));
+        const device = row.deviceCode ? '<a href="' + esc(row.deviceCode.verificationUri) + '" target="_blank" rel="noreferrer">打开微软登录</a><div class="codebox" style="margin-top:6px">' + esc(row.deviceCode.userCode) + '</div>' : '<span class="muted">' + oauthStatus + '</span>';
         const action = row.enabled ? '<button data-bot-toggle="' + esc(row.id) + '">停用</button>' : '<button data-bot-toggle="' + esc(row.id) + '">启用</button>';
         return '<tr><td>' + esc(row.botName) + '<div class="muted">' + esc(row.username) + '</div><div class="muted">' + esc(row.minecraftName || '') + '</div></td><td>' + esc(botStatusLabel(row.status)) + (row.lastError ? '<div class="muted wrap">' + esc(row.lastError) + '</div>' : '') + '</td><td>' + device + '</td><td>' + (row.activeTask ? esc(row.activeTask.type + ' / ' + row.activeTask.username + ' / ' + row.activeTask.phase) : '<span class="muted">空闲</span>') + '</td><td>' + action + ' <button data-bot-delete="' + esc(row.id) + '">删除</button></td></tr>';
       }).join('') + '</tbody></table>' : '<p class="muted">暂无机器人账号。</p>';

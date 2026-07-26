@@ -12,7 +12,12 @@ const CloudStoreService = require('./service')
 const CloudStoreWebServer = require('./webServer')
 const SubscriptionManager = require('./subscriptions')
 const { BotTaskPool } = require('./taskPool')
-const { invalidateMinecraftAccessTokenCache, isMinecraftProfileAuthError } = require('./authCache')
+const {
+  invalidateMinecraftAccessTokenCache,
+  isMinecraftProfileAuthError,
+  isMicrosoftAuthRateLimitError,
+  microsoftAuthRetryDelayMs
+} = require('./authCache')
 const { releaseBotConnection, terminateBotTransport } = require('./botConnection')
 
 function createBot (config, onMsaCode) {
@@ -411,6 +416,16 @@ function launchBot (state) {
   bot.on('error', error => {
     if (state.bot !== bot) return
     state.lastError = String(error?.message || error)
+    if (!spawned && isMicrosoftAuthRateLimitError(error)) {
+      const retryDelay = microsoftAuthRetryDelayMs(state.reconnectAttempt, config.timing?.reconnectDelayMs)
+      console.warn(`[auth:${state.account.botName}] Microsoft/Xbox login was rate limited; released the failed bot instance and will retry in ${retryDelay}ms`)
+      clearInterval(loginWatchdog)
+      if (releaseBotConnection(state, bot, service, taskPool, 'retry rate-limited microsoft authentication')) {
+        state.status = state.desiredEnabled ? 'offline' : 'disabled'
+        if (state.desiredEnabled) scheduleReconnect(state, retryDelay)
+      }
+      return
+    }
     if (!spawned && isMinecraftProfileAuthError(error)) {
       let cleared = 0
       let cacheReset = false
