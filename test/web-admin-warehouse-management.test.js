@@ -85,4 +85,13 @@ test('rendered browser script is valid JavaScript', async () => {
   const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1]
   assert.ok(script)
   assert.doesNotThrow(() => new vm.Script(script))
+  assert.match(html, /\.tip-grid \{[^}]*grid-template-columns: repeat\(9, minmax\(0, 1fr\)\);[^}]*\}/)
+  assert.doesNotMatch(html, /\.tip-grid \{[^}]*overflow:\s*(?:auto|scroll)/)
+  assert.match(script, /Math\.max\(0, 27 - shulker\.length\)/)
+  assert.doesNotMatch(script, /shulker\.slice\(0, 21\)|种未显示/)
+  assert.match(html, /\.tooltip\.locked \{[^}]*pointer-events: auto;/)
+  assert.match(script, /data-tip-name=/)
+  assert.match(script, /event\.key === 'Control' && !event\.repeat\) lockTip\(\)/)
+  assert.match(script, /event\.key === 'Control' && state\.tipLocked\) closeTip\(\)/)
+  assert.match(script, /if \(state\.tipLocked\) closeTip\(\)/)
 })
