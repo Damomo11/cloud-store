@@ -2706,29 +2706,31 @@ const HTML = `<!doctype html>
       box-shadow: 0 12px 36px rgba(0,0,0,.45);
       display: none;
     }
+    .tooltip.shulker-tip { width: min(540px, calc(100vw - 18px)); }
+    .tooltip.locked { pointer-events: auto; border-color: var(--gold); }
     .tooltip .tip-title { color: var(--gold); font-weight: 800; margin-bottom: 4px; }
     .tooltip .tip-line { color: #d8d4ca; font-size: 13px; margin-top: 2px; }
     .tip-text-list { display: grid; gap: 4px; margin-top: 8px; min-width: 230px; max-height: 360px; overflow: auto; }
     .tip-text-row { display: flex; justify-content: space-between; gap: 18px; border-bottom: 1px solid #2c2c31; padding: 5px 2px; color: #eeeae1; font-size: 13px; }
     .tip-text-row:last-child { border-bottom: 0; }
     .tip-text-row span:last-child { color: var(--gold); white-space: nowrap; }
-    .tip-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; margin-top: 8px; max-height: 360px; overflow: auto; }
+    .tip-grid { display: grid; grid-template-columns: repeat(9, minmax(0, 1fr)); gap: 4px; margin-top: 8px; }
     .tip-slot {
       min-width: 0;
-      height: 54px;
+      aspect-ratio: 1;
       display: grid;
-      grid-template-columns: 42px minmax(0, 1fr) auto;
-      align-items: center;
-      gap: 7px;
+      place-items: center;
+      position: relative;
       background: #242428;
       border: 1px solid #33343a;
-      border-radius: 6px;
-      padding: 5px 7px 5px 5px;
+      border-radius: 5px;
+      padding: 3px;
       overflow: hidden;
     }
-    .tip-slot img { width: 40px; height: 40px; object-fit: contain; image-rendering: pixelated; }
-    .tip-slot-name { min-width: 0; color: #f1efe8; font-size: 12px; line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .tip-slot span { color: #fff; font-size: 12px; font-weight: 700; text-shadow: 1px 1px #000; }
+    .tip-slot.empty { background: #18181b; border-color: #29292e; }
+    .tip-slot img { width: 100%; height: 100%; max-width: 42px; max-height: 42px; object-fit: contain; image-rendering: pixelated; }
+    .tip-slot span { position: absolute; right: 3px; bottom: 1px; color: #fff; font-size: 12px; font-weight: 800; line-height: 1; text-shadow: 1px 1px 1px #000, -1px -1px 1px #000; }
+    .tip-slot-detail { min-height: 22px; margin-top: 7px; padding-top: 5px; border-top: 1px solid #2c2c31; color: #f1efe8; font-size: 13px; overflow-wrap: anywhere; }
     table { width: 100%; border-collapse: collapse; }
     th, td { border-bottom: 1px solid var(--line); padding: 11px 9px; text-align: left; vertical-align: top; }
     th { color: var(--gold); font-weight: 700; }
@@ -2926,7 +2928,6 @@ const HTML = `<!doctype html>
       .warehouse-create-grid { grid-template-columns: 1fr; }
       .subscription-grid { grid-template-columns: minmax(0, 1fr); }
       .admin-subscription-layout, .settings-grid { grid-template-columns: 1fr; }
-      .tip-grid { grid-template-columns: 1fr; }
       .litematicbar { grid-template-columns: 1fr; }
       .command-row { grid-template-columns: 1fr; }
     }
@@ -3409,7 +3410,7 @@ const HTML = `<!doctype html>
   <div id="tooltip" class="tooltip"></div>
 
   <script>
-    const state = { view: 'inventory', myTab: 'organizations', myPersonalAliasItemKey: '', myGlobalAliasItemKey: '', user: null, owners: [], owner: '', items: [], tx: [], txPage: 1, txTotalPages: 1, selected: new Map(), aliasMode: false, aliasItem: null, adminTab: 'inventory', adminAliasMode: false, adminGlobalAliasItem: null, adminOrganizationName: '', adminInventoryLoadId: 0, adminOwners: [], adminInventoryRows: new Map(), adminSelected: new Map(), adminAliasItem: null, adminTxPage: 1, adminTxTotalPages: 1, adminPaymentPage: 1, adminPaymentTotalPages: 1, actionCooldownUntil: 0, actionCooldownTimer: null, iconRenderId: 0, activePoll: null, iconCache: new Map(), inventoryCache: new Map(), inventoryLoadId: 0, iconScrollTimer: null, onlinePlayersTimer: null, loginChallengeTimer: null, loginChallengeExpiresAt: 0, loginChallengeCommand: '', subscriptionData: null, subscriptionOrganizationOwner: '', adminSubscriptionUserUuid: '' };
+    const state = { view: 'inventory', myTab: 'organizations', myPersonalAliasItemKey: '', myGlobalAliasItemKey: '', user: null, owners: [], owner: '', items: [], tx: [], txPage: 1, txTotalPages: 1, selected: new Map(), aliasMode: false, aliasItem: null, adminTab: 'inventory', adminAliasMode: false, adminGlobalAliasItem: null, adminOrganizationName: '', adminInventoryLoadId: 0, adminOwners: [], adminInventoryRows: new Map(), adminSelected: new Map(), adminAliasItem: null, adminTxPage: 1, adminTxTotalPages: 1, adminPaymentPage: 1, adminPaymentTotalPages: 1, actionCooldownUntil: 0, actionCooldownTimer: null, iconRenderId: 0, activePoll: null, iconCache: new Map(), inventoryCache: new Map(), inventoryLoadId: 0, iconScrollTimer: null, tipLocked: false, onlinePlayersTimer: null, loginChallengeTimer: null, loginChallengeExpiresAt: 0, loginChallengeCommand: '', subscriptionData: null, subscriptionOrganizationOwner: '', adminSubscriptionUserUuid: '' };
     const $ = id => document.getElementById(id);
     const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
     const num = value => Number(value || 0).toLocaleString('zh-CN');
@@ -3994,29 +3995,56 @@ const HTML = `<!doctype html>
       ].filter(Boolean);
       if (shulker.length) {
         lines.push('<div class="tip-line">潜影盒内容：</div>');
-        lines.push('<div class="tip-grid">' + shulker.slice(0, 21).map(x =>
-          '<div class="tip-slot" title="' + esc(x.displayName || x.itemId) + '">' +
+        const emptySlots = Array.from({ length: Math.max(0, 27 - shulker.length) }, () => '<div class="tip-slot empty" aria-hidden="true"></div>').join('');
+        lines.push('<div class="tip-grid">' + shulker.map(x =>
+          '<div class="tip-slot" role="img" data-tip-name="' + esc(x.displayName || x.itemId) + '" data-tip-amount="' + esc(x.amount) + '" aria-label="' + esc((x.displayName || x.itemId) + '，数量 ' + num(x.amount)) + '">' +
           '<img data-tip-icon="' + esc(x.itemId) + '" alt="">' +
-          '<div class="tip-slot-name">' + esc(x.displayName || x.itemId) + '</div>' +
           '<span>' + esc(shortCount(x.amount)) + '</span>' +
           '</div>'
-        ).join('') + '</div>');
-        if (shulker.length > 21) lines.push('<div class="tip-line">还有 ' + (shulker.length - 21) + ' 种未显示</div>');
+        ).join('') + emptySlots + '</div><div class="tip-slot-detail" data-tip-slot-detail aria-live="polite"></div>');
       }
       return lines.join('');
     }
 
+    function bindTipSlotNames(tip) {
+      const detail = tip.querySelector('[data-tip-slot-detail]');
+      if (!detail) return;
+      for (const slot of tip.querySelectorAll('[data-tip-name]')) {
+        slot.addEventListener('mouseenter', () => {
+          detail.textContent = slot.dataset.tipName + ' ×' + num(slot.dataset.tipAmount);
+        });
+      }
+    }
+
+    function lockTip() {
+      const tip = $('tooltip');
+      if (tip.style.display !== 'block' || !tip.classList.contains('shulker-tip')) return;
+      state.tipLocked = true;
+      tip.classList.add('locked');
+    }
+
+    function closeTip() {
+      state.tipLocked = false;
+      const tip = $('tooltip');
+      tip.classList.remove('locked');
+      tip.style.display = 'none';
+    }
+
     function showTip(event, item) {
       if (!canHoverTooltip()) return;
+      if (state.tipLocked) return;
       const tip = $('tooltip');
       tip.innerHTML = tooltipHtml(item);
+      tip.classList.toggle('shulker-tip', Boolean(item.shulkerContents?.length));
       tip.style.display = 'block';
       moveTip(event);
+      bindTipSlotNames(tip);
       for (const img of tip.querySelectorAll('[data-tip-icon]')) {
         const itemId = img.dataset.tipIcon;
         img.src = iconUrl(itemId, 'item');
         img.onerror = () => { img.style.display = 'none'; };
       }
+      if (event.ctrlKey) lockTip();
     }
 
     function transactionTooltipHtml(item) {
@@ -4038,8 +4066,10 @@ const HTML = `<!doctype html>
 
     function showTransactionTip(event, item) {
       if (!canHoverTooltip()) return;
+      if (state.tipLocked) return;
       const tip = $('tooltip');
       tip.innerHTML = transactionTooltipHtml(item);
+      tip.classList.remove('shulker-tip');
       tip.style.display = 'block';
       moveTip(event);
     }
@@ -4057,6 +4087,7 @@ const HTML = `<!doctype html>
 
     function moveTip(event) {
       if (!canHoverTooltip()) return;
+      if (state.tipLocked) return;
       const tip = $('tooltip');
       if (tip.style.display === 'none') return;
       const pad = 14;
@@ -4067,10 +4098,12 @@ const HTML = `<!doctype html>
       if (y + rect.height > window.innerHeight - 8) y = window.innerHeight - rect.height - 8;
       tip.style.left = Math.max(8, x) + 'px';
       tip.style.top = Math.max(8, y) + 'px';
+      if (event.ctrlKey) lockTip();
     }
 
     function hideTip() {
-      $('tooltip').style.display = 'none';
+      if (state.tipLocked) return;
+      closeTip();
     }
 
     function canHoverTooltip() {
@@ -4988,6 +5021,15 @@ const HTML = `<!doctype html>
       runButtonTask(event.currentTarget, '刷新中...', '库存已刷新', () => loadInventory({ force: true })).catch(error => toast(error.message));
     });
     $('aliasMode').addEventListener('click', () => setAliasMode(!state.aliasMode));
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Control' && !event.repeat) lockTip();
+    });
+    document.addEventListener('keyup', event => {
+      if (event.key === 'Control' && state.tipLocked) closeTip();
+    });
+    window.addEventListener('blur', () => {
+      if (state.tipLocked) closeTip();
+    });
     const handleInventoryScroll = () => {
       hideTip();
       if (state.iconScrollTimer) clearTimeout(state.iconScrollTimer);
