@@ -85,4 +85,7 @@ test('rendered browser script is valid JavaScript', async () => {
   const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1]
   assert.ok(script)
   assert.doesNotThrow(() => new vm.Script(script))
+  assert.match(script, /const queue = rows\.filter\(row => visibleKeys\.has\(row\.itemKey\)\);/)
+  assert.doesNotMatch(script, /visibleKeys\.has\(row\.itemKey\)\)\.slice\(0, 180\)/)
+  assert.match(script, /document\.querySelector\('main'\)\.addEventListener\('scroll', handleInventoryScroll/)
 })
