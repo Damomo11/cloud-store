@@ -94,4 +94,7 @@ test('rendered browser script is valid JavaScript', async () => {
   assert.match(script, /event\.key === 'Control' && !event\.repeat\) lockTip\(\)/)
   assert.match(script, /event\.key === 'Control' && state\.tipLocked\) closeTip\(\)/)
   assert.match(script, /if \(state\.tipLocked\) closeTip\(\)/)
+  assert.match(script, /const queue = rows\.filter\(row => visibleKeys\.has\(row\.itemKey\)\);/)
+  assert.doesNotMatch(script, /visibleKeys\.has\(row\.itemKey\)\)\.slice\(0, 180\)/)
+  assert.match(script, /document\.querySelector\('main'\)\.addEventListener\('scroll', handleInventoryScroll/)
 })
