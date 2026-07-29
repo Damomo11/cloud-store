@@ -3557,7 +3557,10 @@ const HTML = `<!doctype html>
         const rect = img.getBoundingClientRect();
         if (rect.top <= viewportBottom && rect.bottom >= -160) visibleKeys.add(img.dataset.key);
       }
-      const queue = rows.filter(row => visibleKeys.has(row.itemKey)).slice(0, 180);
+      // Only enqueue items near the viewport, but do not cap the number of
+      // visible items. The main content can show more than 180 icons on wide
+      // screens, and a hard cap leaves the rest without a src forever.
+      const queue = rows.filter(row => visibleKeys.has(row.itemKey));
       let active = 0;
       const limit = 4;
       const pump = () => {
@@ -4985,11 +4988,15 @@ const HTML = `<!doctype html>
       runButtonTask(event.currentTarget, '刷新中...', '库存已刷新', () => loadInventory({ force: true })).catch(error => toast(error.message));
     });
     $('aliasMode').addEventListener('click', () => setAliasMode(!state.aliasMode));
-    window.addEventListener('scroll', () => {
+    const handleInventoryScroll = () => {
       hideTip();
       if (state.iconScrollTimer) clearTimeout(state.iconScrollTimer);
       state.iconScrollTimer = setTimeout(() => scheduleIconLoading(currentInventoryRows()), 80);
-    }, { passive: true });
+    };
+    // On desktop the page scrolls inside <main>; on narrow layouts it falls
+    // back to the document, so listen to both scroll containers.
+    document.querySelector('main').addEventListener('scroll', handleInventoryScroll, { passive: true });
+    window.addEventListener('scroll', handleInventoryScroll, { passive: true });
     window.addEventListener('touchstart', hideTip, { passive: true });
     $('litematicPick').addEventListener('click', () => $('litematicFile').click());
     $('litematicFile').addEventListener('change', uploadLitematic);
