@@ -1873,10 +1873,7 @@ class CloudStoreService {
       requestIndex: index,
       requestedAmount: Number(request.amount || 0)
     }))
-    const owners = [
-      storageOwner,
-      ...this.db.listCustomWarehousesForPlayer(player.uuid).map(row => this.resolveCustomWarehouseOwner(row))
-    ]
+    const owners = this.withdrawSourceOwners(player, storageOwner)
 
     const allocations = []
     const supplementNames = []
@@ -1908,6 +1905,16 @@ class CloudStoreService {
     }
 
     return { notices, allocations }
+  }
+
+  withdrawSourceOwners (player, storageOwner) {
+    if (storageOwner.scope !== 'personal' || storageOwner.uuid !== player.uuid || storageOwner.strictPersonal) {
+      return [storageOwner]
+    }
+    return [
+      storageOwner,
+      ...this.db.listCustomWarehousesForPlayer(player.uuid).map(row => this.resolveCustomWarehouseOwner(row))
+    ]
   }
 
   withWithdrawOwner (allocations, owner) {
@@ -2144,6 +2151,52 @@ class CloudStoreService {
     }
   }
 
+  resolveStoredItemForWithdraw (name, playerUuid = '', storageOwner = null) {
+    try {
+      return this.resolveStoredItem(name, playerUuid)
+    } catch (error) {
+      const enchantedBook = this.resolveHighestStockedEnchantedBook(name, playerUuid, storageOwner)
+      if (enchantedBook) return enchantedBook
+      throw error
+    }
+  }
+
+  resolveHighestStockedEnchantedBook (name, playerUuid = '', storageOwner = null) {
+    const query = String(name || '').trim()
+    if (!query || !storageOwner || typeof this.db.findItemsByDisplayQuery !== 'function') return null
+
+    const ownerUuids = this.withdrawSourceOwners({ uuid: playerUuid }, storageOwner).map(owner => owner.uuid)
+    const candidates = this.db.findItemsByDisplayQuery(query, playerUuid)
+      .filter(item => item.itemId === 'minecraft:enchanted_book')
+      .map(item => {
+        const meta = this.catalog.parseStoredJson(item.metaJson, {})
+        const enchantment = this.catalog.extractEnchantments(meta.components)
+          .find(entry => String(entry.displayName || '').toLowerCase() === query.toLowerCase())
+        return enchantment ? { item, level: Number(enchantment.level || 0) } : null
+      })
+      .filter(Boolean)
+      .filter(candidate => ownerUuids.some(ownerUuid => {
+        const loose = this.db.getOwnerItemsByItemKey(ownerUuid, candidate.item.itemKey)
+        if (loose.length) return true
+        const shulkers = this.db.getOwnerShulkersContainingItemKey(ownerUuid, candidate.item.itemKey)
+        return shulkers.length > 0
+      }))
+      .sort((a, b) => b.level - a.level)
+
+    if (!candidates.length) return null
+    const highest = candidates.filter(candidate => candidate.level === candidates[0].level)
+    if (highest.length > 1) {
+      const names = highest.map(candidate => this.formatCandidateForWithdraw(candidate.item)).slice(0, 5).join('，')
+      throw new Error(`最高等级附魔书不够精确：${query}，匹配到 ${names}`)
+    }
+    const item = highest[0].item
+    return {
+      itemKey: item.itemKey,
+      itemId: item.itemId,
+      displayName: item.displayName
+    }
+  }
+
   resolveStoredItemForOwnerQuery (ownerUuid, name, playerUuid = '') {
     const items = this.resolveStoredItemsForOwnerQuery(ownerUuid, name, playerUuid)
     if (!items.length) return null
@@ -2332,15 +2385,31 @@ class CloudStoreService {
     return items.map(item => `${this.formatItemNameWithCode(item)} x${item.amount}盒`).join('，')
   }
 
-  parseWithdraw (text, playerUuid = '') {
+  parseWithdraw (text, playerUuid = '', storageOwner = null) {
     const tokens = text.split(/\s+/).filter(Boolean)
     const requests = []
     let nameParts = []
 
-    const addRequest = (name, amountText, source) => {
-      const item = this.resolveStoredItem(name, playerUuid)
+    const addRequest = (name, amountText = '1', source = name) => {
+      const item = this.resolveStoredItemForWithdraw(name, playerUuid, storageOwner)
       const amount = this.parsePositiveAmount(amountText, `数量：${source}`)
       requests.push({ ...item, amount })
+    }
+
+    const canResolve = name => {
+      try {
+        this.resolveStoredItemForWithdraw(name, playerUuid, storageOwner)
+        return true
+      } catch {
+        return false
+      }
+    }
+
+    const flushDefaultRequest = () => {
+      if (!nameParts.length) return
+      const name = nameParts.join(' ')
+      addRequest(name, '1', name)
+      nameParts = []
     }
 
     for (const token of tokens) {
@@ -2372,17 +2441,21 @@ class CloudStoreService {
       const combined = token.match(/^(.+?)(\d+)$/)
       if (combined) {
         const name = [...nameParts, combined[1]].join(' ')
-        addRequest(name, combined[2], `${name}${combined[2]}`)
+        if (!nameParts.length || canResolve(name)) {
+          addRequest(name, combined[2], `${name}${combined[2]}`)
+        } else {
+          flushDefaultRequest()
+          addRequest(combined[1], combined[2], token)
+        }
         nameParts = []
         continue
       }
 
+      if (nameParts.length && canResolve(nameParts.join(' '))) flushDefaultRequest()
       nameParts.push(token)
     }
 
-    if (nameParts.length) {
-      throw new Error(`缺少数量：${nameParts.join(' ')}，格式示例 石头64 或 石头 64`)
-    }
+    flushDefaultRequest()
     return requests
   }
 
@@ -2405,7 +2478,7 @@ class CloudStoreService {
       if (itemText) {
         try {
           return {
-            requests: this.parseWithdraw(itemText, playerUuid),
+            requests: this.parseWithdraw(itemText, playerUuid, owner),
             targetUsername: candidateTarget
           }
         } catch {
@@ -2415,7 +2488,7 @@ class CloudStoreService {
     }
 
     return {
-      requests: this.parseWithdraw(raw, playerUuid),
+      requests: this.parseWithdraw(raw, playerUuid, owner),
       targetUsername: fallbackTarget
     }
   }
