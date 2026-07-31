@@ -468,8 +468,15 @@ class CloudStoreService {
       return
     }
     console.error(error)
-    if (this.active?.type === 'withdraw' && this.active.targetUsername && this.active.targetUsername !== username) {
-      this.msg(this.active.targetUsername, `${username} 给你的取货失败：${error.message}`)
+    const context = this.active || error?.commandContext
+    if (context?.type === 'withdraw' && context.targetUsername && context.targetUsername !== username) {
+      const repair = context.deliveryMode === 'repair'
+      this.msg(context.targetUsername, repair
+        ? `${username} 给你修装备失败：${error.message}`
+        : `${username} 给你的取货失败：${error.message}`)
+      this.msg(username, repair
+        ? `给 ${context.targetUsername} 修装备失败：${error.message}`
+        : `给 ${context.targetUsername} 的取货失败：${error.message}`)
     } else {
       this.msg(username, `操作失败：${error.message}`)
     }
@@ -593,6 +600,11 @@ class CloudStoreService {
     this.active = active
     try {
       await this.db.runWithCommandContext(active.commandLogId, () => this.withBotContext(fn))
+    } catch (error) {
+      if (error && typeof error === 'object' && !error.commandContext) {
+        error.commandContext = { ...active }
+      }
+      throw error
     } finally {
       if (active.reservationId) this.db.releaseInventoryReservation(active.reservationId)
       if (this.active === active) this.active = null
@@ -912,13 +924,14 @@ class CloudStoreService {
       throw new Error('存取/取存只能由本人接收物品，不能指定其他目标玩家。')
     }
     const msgActor = message => {
-      if (!deliveryToOther) this.msg(username, message)
+      this.msg(username, message)
     }
     const msgTarget = message => this.msg(deliveryTarget, message)
     if (this.active) {
       this.active.player = player
       this.active.owner = storageOwner
       this.active.targetUsername = deliveryTarget
+      this.active.deliveryMode = deliveryMode
       this.active.phase = 'prepare_withdraw'
     }
     const requests = parsedWithdraw.requests
@@ -938,7 +951,14 @@ class CloudStoreService {
     }
 
     if (!plan.allocations.length) {
-      if (deliveryToOther) msgTarget(`${username} 想给你取物品，但仓库没有可取出的物品。`)
+      if (deliveryToOther) {
+        msgTarget(deliveryMode === 'repair'
+          ? `${username} 想给你修装备，但仓库没有可用的经验瓶。`
+          : `${username} 想给你取物品，但仓库没有可取出的物品。`)
+        msgActor(deliveryMode === 'repair'
+          ? `给 ${deliveryTarget} 修装备失败：仓库没有可用的经验瓶。`
+          : `给 ${deliveryTarget} 的取货失败：仓库没有可取出的物品。`)
+      }
       else this.msg(username, '没有可取出的物品。')
       return
     }
@@ -992,10 +1012,16 @@ class CloudStoreService {
         }
         const partial = this.mergeItems(allDeducted)
         if (partial.length) {
-          const summary = deliveryToOther
-            ? `${username} 给你的部分物品已送达：${this.formatWithdrawSummary(partial)}。剩余取货因未接受传送请求已取消。`
-            : `${this.ownerActionPrefix(storageOwner)}已分批取出部分物品：${this.formatWithdrawSummary(partial)}。剩余取货因未接受传送请求已取消。`
-          deliveryToOther ? msgTarget(summary) : this.msg(username, summary)
+          if (deliveryToOther) {
+            msgTarget(`${username} 给你的部分物品已送达：${this.formatWithdrawSummary(partial)}。剩余取货因未接受传送请求已取消。`)
+            msgActor(`给 ${deliveryTarget} 的部分物品已送达：${this.formatWithdrawSummary(partial)}。剩余取货因对方未接受传送请求已取消。`)
+          } else {
+            this.msg(username, `${this.ownerActionPrefix(storageOwner)}已分批取出部分物品：${this.formatWithdrawSummary(partial)}。剩余取货因未接受传送请求已取消。`)
+          }
+        } else if (deliveryToOther) {
+          msgActor(deliveryMode === 'repair'
+            ? `给 ${deliveryTarget} 修装备已取消：对方未接受传送请求。`
+            : `给 ${deliveryTarget} 的取货已取消：对方未接受传送请求。`)
         }
         this.db.clearRecoveryTask(this.botId)
         return
@@ -1056,6 +1082,7 @@ class CloudStoreService {
         this.msg(username, `${this.ownerActionPrefix(storageOwner)}修装备未开始或未成功使用经验瓶，已把经验瓶回收入库，本次不会扣除库存。`)
       } else if (deliveryToOther) {
         msgTarget(`${username} 给你的取货失败：仓库实物取出失败，请稍后再试。`)
+        msgActor(`给 ${deliveryTarget} 的取货失败：仓库实物取出失败，请稍后再试。`)
       } else {
         this.msg(username, `账本有库存，但按本地木桶记录没有成功取出：${this.formatItemList(plan.allocations)}。请管理员执行 !同步 后再试。`)
       }
@@ -1073,6 +1100,9 @@ class CloudStoreService {
       msgTarget(deliveryMode === 'repair'
         ? `${username} 给你修装备已完成：共用了 ${this.totalAmount(deliveredTotal)} 个${this.buildRepairBottleRequest().displayName}${suffix}`
         : `${username} 给你的取货已送达：${this.formatWithdrawSummary(deliveredTotal)}${suffix}`)
+      msgActor(deliveryMode === 'repair'
+        ? `给 ${deliveryTarget} 修装备已完成：共用了 ${this.totalAmount(deliveredTotal)} 个${this.buildRepairBottleRequest().displayName}${suffix}`
+        : `给 ${deliveryTarget} 的取货已送达：${this.formatWithdrawSummary(deliveredTotal)}${suffix}`)
     } else {
       this.msg(username, deliveryMode === 'repair'
         ? `${this.ownerActionPrefix(storageOwner)}修装备完成：共用了 ${this.totalAmount(deliveredTotal)} 个${this.buildRepairBottleRequest().displayName}。`

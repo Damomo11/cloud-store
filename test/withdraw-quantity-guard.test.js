@@ -20,6 +20,7 @@ function createFixture (withdrawAmounts) {
   let inventory = []
   let withdrawCalls = 0
   let teleportCalls = 0
+  let teleportResult = true
   const depositCalls = []
   const dropRequests = []
   const balanceChanges = []
@@ -35,7 +36,11 @@ function createFixture (withdrawAmounts) {
     upsertPlayer: () => {},
     currentCommandLogId: () => 1,
     addCommandReply: () => {},
+    runWithCommandContext: (commandLogId, fn) => fn(),
+    runWithBotContext: (botContext, fn) => fn(),
+    getRecoveryTask: () => null,
     reserveInventory: () => {},
+    releaseInventoryReservation: () => {},
     saveRecoveryTask: () => {},
     clearRecoveryTask: () => {},
     transaction: fn => fn(),
@@ -76,6 +81,11 @@ function createFixture (withdrawAmounts) {
         .filter(entry => entry.count > 0)
       return dropped
     },
+    repairPlayerWithExperienceBottles: async () => {
+      const used = catalog.aggregatePrismarineItems(inventory)
+      inventory = []
+      return used
+    },
     dropInventoryToPlayer: async () => {
       throw new Error('full inventory delivery must not be used')
     }
@@ -90,7 +100,7 @@ function createFixture (withdrawAmounts) {
   service.buildWithdrawPlanForRequest = () => ({ notices: [], allocations: [allocation] })
   service.teleportToPlayer = async () => {
     teleportCalls++
-    return true
+    return teleportResult
   }
 
   return {
@@ -99,6 +109,10 @@ function createFixture (withdrawAmounts) {
     depositCalls,
     dropRequests,
     balanceChanges,
+    sent,
+    setTeleportResult: result => {
+      teleportResult = result
+    },
     getWithdrawCalls: () => withdrawCalls,
     getTeleportCalls: () => teleportCalls
   }
@@ -124,6 +138,92 @@ test('over-withdrawn loose stack is returned and only the requested amount is de
     itemKey: fixture.allocation.itemKey,
     amount: -10
   }])
+})
+
+test('delivery result is sent to both recipient and actor when withdrawing for another player', async () => {
+  const fixture = createFixture([10])
+  const owner = { uuid: 'vault-1', username: 'Vault', scope: 'custom', vaultName: '测试仓库' }
+
+  await fixture.service.handleWithdraw('Alice', '', owner, [{
+    itemId: 'minecraft:stone',
+    displayName: '石头',
+    amount: 10
+  }], 'Bob')
+
+  assert.ok(fixture.sent.includes('/msg Bob Alice 给你的取货已送达：1种物品，共10个。'))
+  assert.ok(fixture.sent.includes('/msg Alice 给 Bob 的取货已送达：1种物品，共10个。'))
+})
+
+test('self-withdraw sends only one final result', async () => {
+  const fixture = createFixture([10])
+  const owner = { uuid: 'vault-1', username: 'Vault', scope: 'custom', vaultName: '测试仓库' }
+
+  await fixture.service.handleWithdraw('Alice', '', owner, [{
+    itemId: 'minecraft:stone',
+    displayName: '石头',
+    amount: 10
+  }])
+
+  assert.equal(fixture.sent.filter(message => message.includes('取货完成')).length, 1)
+  assert.equal(fixture.sent.filter(message => message.includes('取货已送达')).length, 0)
+})
+
+test('actor is told when recipient does not accept the teleport request', async () => {
+  const fixture = createFixture([10])
+  const owner = { uuid: 'vault-1', username: 'Vault', scope: 'custom', vaultName: '测试仓库' }
+  fixture.setTeleportResult(false)
+
+  await fixture.service.handleWithdraw('Alice', '', owner, [{
+    itemId: 'minecraft:stone',
+    displayName: '石头',
+    amount: 10
+  }], 'Bob')
+
+  assert.ok(fixture.sent.includes('/msg Alice 给 Bob 的取货已取消：对方未接受传送请求。'))
+})
+
+test('actor and recipient are both told when requested inventory is unavailable', async () => {
+  const fixture = createFixture([0])
+  const owner = { uuid: 'vault-1', username: 'Vault', scope: 'custom', vaultName: '测试仓库' }
+  fixture.service.buildWithdrawPlanForRequest = () => ({ notices: [], allocations: [] })
+
+  await fixture.service.handleWithdraw('Alice', '', owner, [{
+    itemId: 'minecraft:stone',
+    displayName: '石头',
+    amount: 10
+  }], 'Bob')
+
+  assert.ok(fixture.sent.includes('/msg Bob Alice 想给你取物品，但仓库没有可取出的物品。'))
+  assert.ok(fixture.sent.includes('/msg Alice 给 Bob 的取货失败：仓库没有可取出的物品。'))
+})
+
+test('repair result is sent to both recipient and actor', async () => {
+  const fixture = createFixture([10])
+  const owner = { uuid: 'vault-1', username: 'Vault', scope: 'custom', vaultName: '测试仓库' }
+
+  await fixture.service.handleWithdraw('Alice', '', owner, [{
+    itemId: 'minecraft:experience_bottle',
+    displayName: '附魔之瓶',
+    amount: 10
+  }], 'Bob', { deliveryMode: 'repair' })
+
+  assert.ok(fixture.sent.some(message => message.startsWith('/msg Bob Alice 给你修装备已完成：共用了 10 个')))
+  assert.ok(fixture.sent.some(message => message.startsWith('/msg Alice 给 Bob 修装备已完成：共用了 10 个')))
+})
+
+test('generic delegated-withdraw error is sent to both recipient and actor', async () => {
+  const fixture = createFixture([10])
+  const error = new Error('测试异常')
+  error.commandContext = {
+    type: 'withdraw',
+    targetUsername: 'Bob',
+    deliveryMode: 'drop'
+  }
+
+  fixture.service.handleCommandError('Alice', error)
+
+  assert.ok(fixture.sent.includes('/msg Bob Alice 给你的取货失败：测试异常'))
+  assert.ok(fixture.sent.includes('/msg Alice 给 Bob 的取货失败：测试异常'))
 })
 
 test('repeated over-withdraw aborts before teleporting or delivering items', async () => {
