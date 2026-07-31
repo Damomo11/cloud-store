@@ -120,6 +120,30 @@ test('global aliases keep an explicit display category', () => {
   }
 })
 
+test('web inventory exposes the localized base item name for variant searches', () => {
+  const fixture = createDb()
+  const books = [
+    { itemKey: 'book-unbreaking-1', itemId: 'minecraft:enchanted_book', displayName: '耐久一', nbtJson: '', metaJson: '{}', amount: 2 },
+    { itemKey: 'book-efficiency-5', itemId: 'minecraft:enchanted_book', displayName: '效率五', nbtJson: '', metaJson: '{}', amount: 3 }
+  ]
+
+  try {
+    fixture.db.catalog = {
+      getDisplayName: itemId => itemId === 'minecraft:enchanted_book' ? '附魔书' : itemId,
+      extractShulkerContents: () => []
+    }
+    fixture.db.addBalanceItems('player-1', books)
+
+    const inventory = fixture.db.getWebInventory('player-1', 'player-1')
+    const enchantedBooks = inventory.items.filter(item => item.itemId === 'minecraft:enchanted_book')
+
+    assert.equal(enchantedBooks.length, 2)
+    assert.ok(enchantedBooks.every(item => item.baseDisplayName === '附魔书'))
+  } finally {
+    fixture.close()
+  }
+})
+
 test('concurrent transaction records keep the executing bot', async () => {
   const fixture = createDb()
   try {
