@@ -1895,10 +1895,12 @@ class CloudStoreWebServer {
 
   adminItem (row) {
     const itemKey = row.itemKey || row.item_key || ''
+    const itemId = row.itemId || row.item_id || ''
     return {
       itemKey,
-      itemId: row.itemId || row.item_id || '',
-      displayName: row.displayName || row.display_name || row.itemId || row.item_id || '',
+      itemId,
+      displayName: row.displayName || row.display_name || itemId,
+      baseDisplayName: row.baseDisplayName || row.base_display_name || this.db.catalog?.getDisplayName(itemId) || '',
       nbtJson: row.nbtJson || row.nbt_json || '',
       metaJson: row.metaJson || row.meta_json || '',
       shortCode: this.db.shortCodeForItemKey(itemKey)
@@ -1906,7 +1908,7 @@ class CloudStoreWebServer {
   }
 
   adminItemMatches (item, query) {
-    return [item.displayName, item.itemId, item.itemKey, item.shortCode, item.nbtJson, item.metaJson, ...(item.globalAliases || [])].some(value => this.textMatches(value, query))
+    return [item.displayName, item.baseDisplayName, item.itemId, item.itemKey, item.shortCode, item.nbtJson, item.metaJson, ...(item.globalAliases || [])].some(value => this.textMatches(value, query))
   }
 
   adminTransactionItemMatches (item, query) {
@@ -3972,7 +3974,7 @@ const HTML = `<!doctype html>
     }
 
     function itemText(item) {
-      return [item.displayName, item.adminDisplayName, ...(item.personalAliases || []), ...(item.globalAliases || []), item.itemId, item.itemKey, item.shortCode, item.nbtJson, item.metaJson, ...(item.shulkerContents || []).map(x => x.displayName + ' ' + x.adminDisplayName + ' ' + (x.personalAliases || []).join(' ') + ' ' + (x.globalAliases || []).join(' ') + ' ' + x.itemId + ' ' + x.shortCode)].join(' ').toLowerCase();
+      return [item.displayName, item.adminDisplayName, item.baseDisplayName, ...(item.personalAliases || []), ...(item.globalAliases || []), item.itemId, item.itemKey, item.shortCode, item.nbtJson, item.metaJson, ...(item.shulkerContents || []).map(x => x.displayName + ' ' + x.adminDisplayName + ' ' + x.baseDisplayName + ' ' + (x.personalAliases || []).join(' ') + ' ' + (x.globalAliases || []).join(' ') + ' ' + x.itemId + ' ' + x.shortCode)].join(' ').toLowerCase();
     }
 
     function shortCount(value) {

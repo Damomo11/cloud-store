@@ -97,4 +97,23 @@ test('rendered browser script is valid JavaScript', async () => {
   assert.match(script, /const queue = rows\.filter\(row => visibleKeys\.has\(row\.itemKey\)\);/)
   assert.doesNotMatch(script, /visibleKeys\.has\(row\.itemKey\)\)\.slice\(0, 180\)/)
   assert.match(script, /document\.querySelector\('main'\)\.addEventListener\('scroll', handleInventoryScroll/)
+  assert.match(script, /item\.baseDisplayName/)
+  assert.match(script, /x\.baseDisplayName/)
+})
+
+test('admin inventory search matches localized base item names', () => {
+  const server = new CloudStoreWebServer({
+    catalog: {
+      getDisplayName: itemId => itemId === 'minecraft:enchanted_book' ? '附魔书' : itemId
+    },
+    shortCodeForItemKey: () => 'abc123'
+  }, { web: {} }, () => null)
+  const item = server.adminItem({
+    itemKey: 'book-unbreaking-3',
+    itemId: 'minecraft:enchanted_book',
+    displayName: '耐久三'
+  })
+
+  assert.equal(item.baseDisplayName, '附魔书')
+  assert.equal(server.adminItemMatches(item, '附魔书'), true)
 })

@@ -2228,6 +2228,7 @@ class StoreDb {
         })
         return {
           ...this.rowToItem(row),
+          baseDisplayName: this.catalog?.getDisplayName(row.itemId) || '',
           adminDisplayName: row.displayName,
           globalAliases: globalAliases.get(row.itemKey) || [],
           personalAliases,
@@ -2263,6 +2264,7 @@ class StoreDb {
       for (const row of rows) {
         const item = {
           ...this.rowToItem(row),
+          baseDisplayName: this.catalog?.getDisplayName(row.itemId) || '',
           amount: row.amount,
           slotCount: row.slotCount,
           shortCode: this.shortCodeForItemKey(row.itemKey)
