@@ -719,8 +719,8 @@ class StoreDb {
     const grouped = new Map()
     for (const item of items || []) {
       const ownerUuid = String(item.ownerUuid || '')
-      const itemKey = String(item.itemKey || '')
-      const amount = Number(item.amount || 0)
+      const itemKey = String(item.reservationItemKey || item.itemKey || '')
+      const amount = Number(item.reservationAmount || item.amount || 0)
       if (!ownerUuid || !itemKey || amount <= 0) continue
       const key = `${ownerUuid}\u0000${itemKey}`
       const current = grouped.get(key) || { ownerUuid, itemKey, amount: 0 }
@@ -2050,6 +2050,28 @@ class StoreDb {
     })
   }
 
+  applyShulkerExtraction (ownerUuid, oldBoxItemKey, newBoxItem, extractedItems, username = '', message = '') {
+    const extracted = (extractedItems || []).filter(item => Number(item.amount || 0) > 0)
+    if (!ownerUuid || !oldBoxItemKey || !newBoxItem?.itemKey || !extracted.length) {
+      throw new Error('invalid shulker extraction balance update')
+    }
+    if (oldBoxItemKey === newBoxItem.itemKey) {
+      throw new Error(`shulker contents changed without a new item fingerprint: ${oldBoxItemKey}`)
+    }
+
+    this.transaction(() => {
+      this.upsertItem(newBoxItem)
+      this.adjustBalance(ownerUuid, oldBoxItemKey, -1)
+      this.adjustBalance(ownerUuid, newBoxItem.itemKey, 1)
+      for (const item of extracted) {
+        this.upsertItem(item)
+        this.adjustBalance(ownerUuid, item.itemKey, Number(item.amount || 0))
+      }
+      this.addTransaction('shulker_repack', 'ok', ownerUuid, username || this.ownerLabel(ownerUuid), extracted,
+        message || `old_box=${oldBoxItemKey}, new_box=${newBoxItem.itemKey}`)
+    })
+  }
+
   removeBalanceItems (ownerUuid, items) {
     this.transaction(() => {
       for (const item of items) {
@@ -2366,6 +2388,8 @@ class StoreDb {
              b.amount - COALESCE((SELECT SUM(r.amount) FROM inventory_reservations r
                WHERE r.owner_uuid = b.owner_uuid AND r.item_key = b.item_key), 0) AS shulkerAmount,
              sc.contained_item_id AS containedItemId,
+             sc.contained_item_key AS containedItemKey,
+             contained.display_name AS containedDisplayName,
              GROUP_CONCAT(DISTINCT contained.display_name) AS containedDisplayNames,
              SUM(sc.amount) AS containedAmount,
              SUM(sc.slot_count) AS slotCount,
@@ -2386,7 +2410,7 @@ class StoreDb {
           WHERE r.owner_uuid = b.owner_uuid AND r.item_key = b.item_key), 0) > 0
         AND sc.contained_item_id = ?
         AND sc.amount > 0
-      GROUP BY b.owner_uuid, sc.shulker_item_key
+      GROUP BY b.owner_uuid, sc.shulker_item_key, sc.contained_item_key
       ORDER BY totalContainedAmount DESC, box.display_name COLLATE NOCASE ASC
     `).all(ownerUuid, itemId)
   }
@@ -2402,6 +2426,8 @@ class StoreDb {
              b.amount - COALESCE((SELECT SUM(r.amount) FROM inventory_reservations r
                WHERE r.owner_uuid = b.owner_uuid AND r.item_key = b.item_key), 0) AS shulkerAmount,
              sc.contained_item_id AS containedItemId,
+             sc.contained_item_key AS containedItemKey,
+             contained.display_name AS containedDisplayName,
              contained.display_name AS containedDisplayNames,
              sc.amount AS containedAmount,
              sc.slot_count AS slotCount,

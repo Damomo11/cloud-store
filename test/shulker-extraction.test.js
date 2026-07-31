@@ -1,0 +1,242 @@
+const test = require('node:test')
+const assert = require('node:assert/strict')
+const { EventEmitter } = require('node:events')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
+const CloudStoreService = require('../src/service')
+const StoreDb = require('../src/db')
+const Warehouse = require('../src/warehouse')
+const { DEFAULT_CONFIG } = require('../src/config')
+
+function createPlanningService ({ loose = 0, boxes = 1, perBox = 64, singleItem = true } = {}) {
+  const target = {
+    itemKey: 'target-key',
+    itemId: 'minecraft:diamond',
+    displayName: '钻石',
+    nbtJson: '',
+    metaJson: ''
+  }
+  const shulker = {
+    shulkerItemKey: 'box-key',
+    shulkerItemId: 'minecraft:purple_shulker_box',
+    shulkerDisplayName: '紫色潜影盒',
+    shulkerNbtJson: '',
+    shulkerMetaJson: '{}',
+    shulkerAmount: boxes,
+    containedItemId: target.itemId,
+    containedItemKey: target.itemKey,
+    containedDisplayName: target.displayName,
+    containedAmount: perBox,
+    slotCount: singleItem ? 27 : 1,
+    totalSlotCount: 27,
+    boxContainedAmount: singleItem ? perBox : perBox + 1
+  }
+  const db = {
+    getOwnerItemsByItemKey: () => loose > 0 ? [{ ...target, amount: loose }] : [],
+    getOwnerItemsByItemId: () => loose > 0 ? [{ ...target, amount: loose }] : [],
+    getOwnerShulkersContainingItemKey: () => boxes > 0 ? [shulker] : [],
+    getOwnerShulkersContainingItemId: () => boxes > 0 ? [shulker] : []
+  }
+  const catalog = {
+    getDisplayName: () => target.displayName,
+    getStackSize: () => 64
+  }
+  const config = structuredClone(DEFAULT_CONFIG)
+  return {
+    service: new CloudStoreService({ username: 'bot' }, db, catalog, {}, config),
+    target,
+    shulker
+  }
+}
+
+test('withdraw below 1728 uses loose items first and extracts only the shortfall from a shulker', () => {
+  const { service, target } = createPlanningService({ loose: 10, boxes: 2, perBox: 64 })
+  const plan = service.buildWithdrawPlan('owner', [{ ...target, amount: 70, requestIndex: 0 }])
+
+  assert.equal(plan.allocations.length, 2)
+  assert.equal(plan.allocations[0].withdrawMode, undefined)
+  assert.equal(plan.allocations[0].amount, 10)
+  assert.equal(plan.allocations[1].withdrawMode, 'shulker_extract')
+  assert.equal(plan.allocations[1].amount, 60)
+  assert.equal(plan.allocations[1].sourceBoxCount, 1)
+  assert.equal(plan.allocations[1].reservationItemKey, 'box-key')
+  assert.equal(plan.allocations[1].reservationAmount, 1)
+})
+
+test('shulker extraction plans as much as physically available when inventory is short', () => {
+  const { service, target } = createPlanningService({ loose: 10, boxes: 2, perBox: 64 })
+  const plan = service.buildWithdrawPlan('owner', [{ ...target, amount: 200, requestIndex: 0 }])
+
+  assert.match(plan.notices[0], /只有 138 个钻石，将尽量取出/)
+  assert.equal(plan.allocations.reduce((sum, item) => sum + item.amount, 0), 138)
+  const extraction = plan.allocations.find(item => item.withdrawMode === 'shulker_extract')
+  assert.equal(extraction.amount, 128)
+  assert.equal(extraction.sourceBoxCount, 2)
+})
+
+test('withdraw at 1728 keeps whole-shulker delivery behavior', () => {
+  const { service, target } = createPlanningService({ loose: 0, boxes: 1, perBox: 1728 })
+  const plan = service.buildWithdrawPlan('owner', [{ ...target, amount: 1728, requestIndex: 0 }])
+
+  assert.equal(plan.allocations.length, 1)
+  assert.equal(plan.allocations[0].withdrawMode, undefined)
+  assert.equal(plan.allocations[0].itemKey, 'box-key')
+  assert.equal(plan.allocations[0].amount, 1)
+  assert.equal(plan.allocations[0].coverageAmount, 1728)
+})
+
+test('shulker extraction batches reserve one inventory workspace slot', () => {
+  const { service, target } = createPlanningService()
+  const batches = service.splitAllocationsIntoInventoryBatches([{
+    withdrawMode: 'shulker_extract',
+    itemKey: target.itemKey,
+    itemId: target.itemId,
+    amount: 36 * 64
+  }], 36)
+
+  assert.equal(batches.length, 2)
+  assert.equal(batches[0][0].amount, 35 * 64)
+  assert.equal(batches[1][0].amount, 64)
+})
+
+function createDb () {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'cloud-store-shulker-test-'))
+  const db = new StoreDb(path.join(directory, 'store.sqlite'), structuredClone(DEFAULT_CONFIG))
+  return {
+    db,
+    close: () => {
+      db.close()
+      fs.rmSync(directory, { recursive: true, force: true })
+    }
+  }
+}
+
+test('shulker reservation reserves the source box instead of nonexistent loose contents', () => {
+  const fixture = createDb()
+  const oldBox = { itemKey: 'old-box', itemId: 'minecraft:shulker_box', displayName: '潜影盒', nbtJson: '', metaJson: '{}', amount: 1 }
+  try {
+    fixture.db.addBalanceItems('owner', [oldBox])
+    fixture.db.reserveInventory('task', [{
+      ownerUuid: 'owner',
+      itemKey: 'target-key',
+      amount: 20,
+      reservationItemKey: oldBox.itemKey,
+      reservationAmount: 1
+    }])
+
+    const row = fixture.db.db.prepare('SELECT item_key AS itemKey, amount FROM inventory_reservations WHERE reservation_id = ?').get('task')
+    assert.deepEqual(row, { itemKey: oldBox.itemKey, amount: 1 })
+  } finally {
+    fixture.close()
+  }
+})
+
+test('shulker extraction atomically replaces the box balance and credits extracted loose items', () => {
+  const fixture = createDb()
+  const oldBox = { itemKey: 'old-box', itemId: 'minecraft:shulker_box', displayName: '潜影盒', nbtJson: '', metaJson: '{"contents":64}', amount: 1 }
+  const newBox = { itemKey: 'new-box', itemId: 'minecraft:shulker_box', displayName: '潜影盒', nbtJson: '', metaJson: '{"contents":59}', amount: 1 }
+  const target = { itemKey: 'target-key', itemId: 'minecraft:diamond', displayName: '钻石', nbtJson: '', metaJson: '', amount: 5 }
+  try {
+    fixture.db.addBalanceItems('owner', [oldBox])
+    fixture.db.applyShulkerExtraction('owner', oldBox.itemKey, newBox, [target], 'Player')
+
+    assert.equal(fixture.db.getBalance('owner', oldBox.itemKey), 0)
+    assert.equal(fixture.db.getBalance('owner', newBox.itemKey), 1)
+    assert.equal(fixture.db.getBalance('owner', target.itemKey), 5)
+    const transaction = fixture.db.db.prepare('SELECT type, status FROM transactions ORDER BY id DESC LIMIT 1').get()
+    assert.deepEqual(transaction, { type: 'shulker_repack', status: 'ok' })
+  } finally {
+    fixture.close()
+  }
+})
+
+test('quick shulker opening aims at air and sends activateItem without block interaction', async () => {
+  const bot = new EventEmitter()
+  let activateCalls = 0
+  let blockOpenCalls = 0
+  bot.entity = { yaw: 0, pitch: 0 }
+  bot.currentWindow = null
+  bot.look = async () => {}
+  bot.blockAtCursor = () => null
+  bot.activateItem = offHand => {
+    assert.equal(offHand, false)
+    activateCalls++
+    setImmediate(() => bot.emit('windowOpen', {
+      type: 'minecraft:shulker_box',
+      inventoryStart: 27,
+      slots: new Array(63),
+      close: () => {}
+    }))
+  }
+  bot.openContainer = () => { blockOpenCalls++ }
+  const config = structuredClone(DEFAULT_CONFIG)
+  config.debug = false
+  config.timing.openContainerTimeoutMs = 200
+  const warehouse = new Warehouse(bot, {}, {}, config)
+
+  const window = await warehouse.openQuickShulkerWindow()
+
+  assert.equal(window.inventoryStart, 27)
+  assert.equal(activateCalls, 1)
+  assert.equal(blockOpenCalls, 0)
+})
+
+test('shulker extraction returns the changed box to its source chest before updating balances', async () => {
+  const target = { itemKey: 'target-key', itemId: 'minecraft:diamond', displayName: '钻石', amount: 2 }
+  const oldBoxInfo = { itemKey: 'old-box', itemId: 'minecraft:purple_shulker_box', displayName: '潜影盒' }
+  const oldBox = { slot: 36, count: 1, normalized: oldBoxInfo }
+  const newBoxInfo = { itemKey: 'new-box', itemId: oldBoxInfo.itemId, displayName: '潜影盒' }
+  const newBox = { slot: 36, count: 1, normalized: newBoxInfo }
+  let inventory = [oldBox]
+  let returnedTo = null
+  let balanceUpdate = null
+  const db = {
+    getItemByKey: key => key === target.itemKey ? target : (key === oldBoxInfo.itemKey ? oldBoxInfo : null),
+    listSlotsForItemKey: () => [{ chestId: '1,2,3', x: 1, y: 2, z: 3, blockName: 'barrel', slot: 4, amount: 1 }],
+    applyShulkerExtraction: (...args) => { balanceUpdate = args }
+  }
+  const catalog = {
+    fromPrismarineItem: item => ({ ...item.normalized, amount: item.count }),
+    isShulkerBox: itemId => /_shulker_box$/.test(itemId),
+    extractShulkerContents: box => box.itemKey === newBoxInfo.itemKey
+      ? [{ item: target, amount: 3 }]
+      : [{ item: target, amount: 5 }]
+  }
+  const bot = { inventory: { items: () => inventory } }
+  const config = structuredClone(DEFAULT_CONFIG)
+  config.debug = false
+  config.timing.containerSettleMs = 0
+  const warehouse = new Warehouse(bot, db, catalog, config)
+  warehouse.takeOneShulkerFromChest = async chest => {
+    assert.equal(chest.chestId, '1,2,3')
+    return oldBox
+  }
+  warehouse.equipItemInHand = async item => assert.equal(item, oldBox)
+  warehouse.openQuickShulkerWindow = async () => ({ close: () => { inventory = [newBox] } })
+  warehouse.countContainerItem = () => 5
+  warehouse.tryWithdrawExactFrom = async () => 2
+  warehouse.returnShulkerToChest = async (chest, item) => {
+    returnedTo = { chest, item }
+    inventory = []
+  }
+
+  const result = await warehouse.withdrawFromShulkerBoxes({
+    withdrawMode: 'shulker_extract',
+    ownerUuid: 'owner',
+    ownerUsername: 'Player',
+    itemKey: target.itemKey,
+    amount: 2,
+    sourceShulkerItemKey: oldBoxInfo.itemKey,
+    sourceBoxCount: 1
+  })
+
+  assert.equal(result.withdrawn[0].amount, 2)
+  assert.equal(result.missing.length, 0)
+  assert.equal(returnedTo.chest.chestId, '1,2,3')
+  assert.equal(returnedTo.item, newBox)
+  assert.equal(balanceUpdate[0], 'owner')
+  assert.equal(balanceUpdate[1], oldBoxInfo.itemKey)
+  assert.equal(balanceUpdate[2].itemKey, newBoxInfo.itemKey)
+  assert.equal(balanceUpdate[3][0].amount, 2)
+})

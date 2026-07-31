@@ -378,6 +378,13 @@ class Warehouse {
     const missing = []
 
     for (const allocation of allocations) {
+      if (allocation.withdrawMode === 'shulker_extract') {
+        const result = await this.withdrawFromShulkerBoxes(allocation)
+        withdrawn.push(...result.withdrawn)
+        missing.push(...result.missing)
+        continue
+      }
+
       let remaining = allocation.amount
       const itemInfo = this.db.getItemByKey(allocation.itemKey)
       if (!itemInfo) {
@@ -422,6 +429,231 @@ class Warehouse {
       withdrawn: this.mergeItems(withdrawn),
       missing: this.mergeItems(missing)
     }
+  }
+
+  async withdrawFromShulkerBoxes (allocation) {
+    const targetItem = this.db.getItemByKey(allocation.itemKey)
+    if (!targetItem) return { withdrawn: [], missing: [{ ...allocation }] }
+    if (!allocation.ownerUuid) throw new Error('拆潜影盒取货缺少库存所有者。')
+
+    const sourceKey = String(allocation.sourceShulkerItemKey || '')
+    const sourceItem = this.db.getItemByKey(sourceKey)
+    if (!sourceKey || !sourceItem) {
+      return { withdrawn: [], missing: [{ ...targetItem, amount: Number(allocation.amount || 0) }] }
+    }
+
+    let remaining = Number(allocation.amount || 0)
+    let boxesRemaining = Math.max(0, Number(allocation.sourceBoxCount || 0))
+    const withdrawn = []
+    const slots = this.db.listSlotsForItemKey(sourceKey)
+    const chestGroups = this.groupSlotsForWithdrawal(slots)
+
+    this.debug(`shulker extract ${targetItem.displayName || allocation.itemKey} need=${remaining} boxes=${boxesRemaining} source=${sourceItem.displayName || sourceKey}`)
+
+    for (const group of chestGroups) {
+      if (remaining <= 0 || boxesRemaining <= 0) break
+      const slot = group.slots[0]
+      const chest = { chestId: group.chestId, x: slot.x, y: slot.y, z: slot.z, blockName: slot.blockName }
+
+      while (remaining > 0 && boxesRemaining > 0) {
+        const sourceBox = await this.takeOneShulkerFromChest(chest, sourceKey, group.slots.map(row => row.slot))
+        if (!sourceBox) break
+        boxesRemaining--
+
+        let quickWindow = null
+        let boxToReturn = sourceBox
+        let returned = false
+        try {
+          await this.equipItemInHand(sourceBox)
+          quickWindow = await this.openQuickShulkerWindow()
+          const available = this.countContainerItem(quickWindow, allocation.itemKey)
+          const toTake = Math.min(remaining, available)
+          const moved = await this.tryWithdrawExactFrom(quickWindow, allocation.itemKey, toTake)
+          this.debug(`shulker extract open source=${sourceKey} available=${available} moved=${moved} remaining=${remaining}`)
+
+          quickWindow.close()
+          quickWindow = null
+          await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
+
+          if (moved <= 0) {
+            boxToReturn = this.findInventoryItemByKey(sourceKey) || sourceBox
+            await this.returnShulkerToChest(chest, boxToReturn)
+            returned = true
+            continue
+          }
+
+          boxToReturn = await this.waitForChangedShulkerItem(sourceKey, sourceItem.itemId)
+          const newBox = this.catalog.fromPrismarineItem(boxToReturn)
+          this.verifyShulkerExtraction(newBox, allocation.itemKey, available, moved)
+
+          await this.returnShulkerToChest(chest, boxToReturn)
+          returned = true
+          this.db.applyShulkerExtraction(
+            allocation.ownerUuid,
+            sourceKey,
+            { ...newBox, amount: 1 },
+            [{ ...targetItem, amount: moved }],
+            allocation.ownerUsername || '',
+            `source_chest=${chest.chestId}, old_box=${sourceKey}, new_box=${newBox.itemKey}`
+          )
+
+          withdrawn.push({ ...targetItem, amount: moved })
+          remaining -= moved
+        } catch (error) {
+          if (quickWindow) {
+            try { quickWindow.close() } catch {}
+          }
+          if (!returned) {
+            const recoverableBox = this.findInventoryShulker(sourceItem.itemId, sourceKey) || boxToReturn
+            try {
+              await this.returnShulkerToChest(chest, recoverableBox)
+            } catch (returnError) {
+              error.message += `；潜影盒放回失败：${returnError.message}`
+            }
+          }
+          throw error
+        }
+      }
+    }
+
+    return {
+      withdrawn: this.mergeItems(withdrawn),
+      missing: remaining > 0 ? [{ ...targetItem, amount: remaining }] : []
+    }
+  }
+
+  async takeOneShulkerFromChest (chest, itemKey, preferredSlots = []) {
+    const container = await this.openContainerAt(chest)
+    try {
+      const available = this.countContainerItem(container, itemKey)
+      if (available <= 0) {
+        this.refreshChestSnapshot(chest, container)
+        return null
+      }
+      const moved = await this.tryWithdrawExactFrom(container, itemKey, 1, preferredSlots)
+      await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
+      this.refreshChestSnapshot(chest, container)
+      if (moved !== 1) throw new Error(`从 ${this.describeChest(chest)} 取潜影盒失败，实际取出 ${moved} 个。`)
+      return this.findInventoryItemByKey(itemKey)
+    } finally {
+      container.close()
+      await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
+    }
+  }
+
+  async returnShulkerToChest (chest, item) {
+    if (!item) throw new Error('机器人背包中找不到待放回的潜影盒。')
+    const normalized = this.catalog.fromPrismarineItem(item)
+    if (!this.catalog.isShulkerBox(normalized.itemId)) throw new Error(`待放回物品不是潜影盒：${normalized.displayName}`)
+
+    const container = await this.openContainerAt(chest)
+    try {
+      const moved = await this.tryDepositInto(container, item)
+      await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
+      this.refreshChestSnapshot(chest, container)
+      if (moved !== 1) throw new Error(`放回 ${this.describeChest(chest)} 失败，实际放入 ${moved} 个潜影盒。`)
+      return normalized
+    } finally {
+      container.close()
+      await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
+    }
+  }
+
+  findInventoryItemByKey (itemKey) {
+    return this.bot.inventory.items().find(item => this.catalog.fromPrismarineItem(item).itemKey === itemKey) || null
+  }
+
+  findInventoryShulker (itemId, preferredItemKey = '') {
+    const candidates = this.bot.inventory.items().filter(item => {
+      const normalized = this.catalog.fromPrismarineItem(item)
+      return normalized.itemId === itemId && this.catalog.isShulkerBox(normalized.itemId)
+    })
+    return candidates.find(item => this.catalog.fromPrismarineItem(item).itemKey !== preferredItemKey) ||
+      candidates.find(item => this.catalog.fromPrismarineItem(item).itemKey === preferredItemKey) || null
+  }
+
+  async waitForChangedShulkerItem (oldItemKey, itemId) {
+    const timeoutMs = Math.max(500, Number(this.config.timing?.inventoryUpdateTimeoutMs || 2000))
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      const item = this.findInventoryShulker(itemId, oldItemKey)
+      if (item && this.catalog.fromPrismarineItem(item).itemKey !== oldItemKey) return item
+      await sleep(50)
+    }
+    throw new Error('快捷潜影盒内容已取出，但客户端没有收到盒子内容更新。')
+  }
+
+  verifyShulkerExtraction (newBox, targetItemKey, before, moved) {
+    if (!newBox?.itemKey) throw new Error('无法读取变化后的潜影盒指纹。')
+    const after = this.catalog.extractShulkerContents(newBox)
+      .filter(entry => entry.item.itemKey === targetItemKey)
+      .reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
+    const expected = Math.max(0, Number(before || 0) - Number(moved || 0))
+    if (after !== expected) {
+      throw new Error(`潜影盒内容校验失败：目标物品应剩 ${expected} 个，实际索引为 ${after} 个。`)
+    }
+  }
+
+  async aimAtAir (maxDistance = 6) {
+    const startYaw = Number(this.bot.entity?.yaw || 0)
+    const candidates = [
+      { yaw: startYaw, pitch: Math.PI / 2 },
+      { yaw: startYaw + Math.PI / 2, pitch: Math.PI / 3 },
+      { yaw: startYaw + Math.PI, pitch: Math.PI / 3 },
+      { yaw: startYaw - Math.PI / 2, pitch: Math.PI / 3 }
+    ]
+
+    for (const candidate of candidates) {
+      await this.bot.look(candidate.yaw, candidate.pitch, true)
+      await sleep(100)
+      if (!this.bot.blockAtCursor(maxDistance)) return
+    }
+    throw new Error(`无法找到前方 ${maxDistance} 格内没有方块的方向，已取消快捷打开潜影盒。`)
+  }
+
+  async openQuickShulkerWindow () {
+    if (this.bot.currentWindow) {
+      this.bot.closeWindow(this.bot.currentWindow)
+      await sleep(150)
+    }
+    await this.aimAtAir(6)
+
+    const timeoutMs = Math.max(500, Number(this.config.timing?.openContainerTimeoutMs || 8000))
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const windowPromise = this.waitForWindowOpen(timeoutMs)
+      this.bot.activateItem(false)
+      const window = await windowPromise
+      if (window) {
+        if (!this.isQuickShulkerWindow(window)) {
+          try { window.close() } catch {}
+          throw new Error(`快捷开盒返回了非潜影盒窗口：type=${window.type || 'unknown'} slots=${window.inventoryStart}`)
+        }
+        return window
+      }
+      if (attempt < 2) await sleep(250)
+    }
+    throw new Error('拿着潜影盒对空气右键后，没有收到潜影盒窗口。')
+  }
+
+  waitForWindowOpen (timeoutMs) {
+    if (this.bot.currentWindow) return Promise.resolve(this.bot.currentWindow)
+    return new Promise(resolve => {
+      let timer
+      const onOpen = window => {
+        clearTimeout(timer)
+        resolve(window)
+      }
+      this.bot.once('windowOpen', onOpen)
+      timer = setTimeout(() => {
+        this.bot.removeListener('windowOpen', onOpen)
+        resolve(null)
+      }, timeoutMs)
+    })
+  }
+
+  isQuickShulkerWindow (window) {
+    const type = String(window?.type || '')
+    return Number(window?.inventoryStart) === 27 && /(?:^|:)shulker_box$/.test(type)
   }
 
   groupSlotsForWithdrawal (slots) {

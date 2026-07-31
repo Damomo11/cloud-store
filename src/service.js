@@ -3,6 +3,7 @@ const { clampInt, sleep, sumBy } = require('./utils')
 const REPAIR_BOTTLE_ITEM_ID = 'minecraft:experience_bottle'
 const REPAIR_BOTTLE_AMOUNT = 64
 const REPAIR_MAX_DISTANCE = 4
+const WHOLE_SHULKER_WITHDRAW_THRESHOLD = 1728
 
 class CloudStoreService {
   constructor (bot, db, catalog, warehouse, config, taskPool = null, subscriptions = null) {
@@ -1784,9 +1785,9 @@ class CloudStoreService {
       }
 
       let remainingRequest = Math.min(request.amount, available)
-      let preferredShulkerCovered = 0
+      const deliverWholeShulkers = request.amount >= WHOLE_SHULKER_WITHDRAW_THRESHOLD
 
-      for (const row of shulkerRows) {
+      for (const row of deliverWholeShulkers ? shulkerRows : []) {
         if (remainingRequest <= 0) break
         const perBox = Number(row.containedAmount || 0)
         const ownedBoxes = Number(row.shulkerAmount || 0)
@@ -1801,7 +1802,6 @@ class CloudStoreService {
         const allocation = this.shulkerRowToAllocation(row, boxes, displayName, request, coveredAmount)
         allocations.push(allocation)
         reservedShulkerBoxes.set(row.shulkerItemKey, reserved + boxes)
-        preferredShulkerCovered += coveredAmount
         remainingRequest -= coveredAmount
       }
 
@@ -1823,7 +1823,7 @@ class CloudStoreService {
         remaining -= amount
       }
 
-      let remainingInside = request.amount - preferredShulkerCovered - loosePlanned
+      let remainingInside = Math.max(0, remainingRequest - loosePlanned)
       for (const row of shulkerRows) {
         if (remainingInside <= 0) break
         const perBox = Number(row.containedAmount || 0)
@@ -1836,7 +1836,9 @@ class CloudStoreService {
         if (boxes <= 0) continue
 
         const coveredAmount = Math.min(remainingInside, boxes * perBox)
-        const allocation = this.shulkerRowToAllocation(row, boxes, displayName, request, coveredAmount)
+        const allocation = deliverWholeShulkers
+          ? this.shulkerRowToAllocation(row, boxes, displayName, request, coveredAmount)
+          : this.shulkerRowToExtractionAllocation(row, boxes, displayName, request, coveredAmount)
         allocations.push(allocation)
         reservedShulkerBoxes.set(row.shulkerItemKey, reserved + boxes)
         remainingInside -= coveredAmount
@@ -2000,10 +2002,14 @@ class CloudStoreService {
     const byKey = new Map()
     for (const item of allocations) {
       const requestIndex = Number.isInteger(item.requestIndex) ? item.requestIndex : ''
-      const key = `${item.itemKey}|${this.withdrawCoverageKey(item)}|${requestIndex}`
+      const key = `${item.withdrawMode || 'item'}|${item.sourceShulkerItemKey || ''}|${item.itemKey}|${this.withdrawCoverageKey(item)}|${requestIndex}`
       const existing = byKey.get(key)
       if (existing) {
         existing.amount += item.amount
+        if (item.withdrawMode === 'shulker_extract') {
+          existing.sourceBoxCount = Number(existing.sourceBoxCount || 0) + Number(item.sourceBoxCount || 0)
+          existing.reservationAmount = Number(existing.reservationAmount || 0) + Number(item.reservationAmount || 0)
+        }
         if (Number(item.coverageAmount || 0) > 0 || Number(existing.coverageAmount || 0) > 0) {
           existing.coverageAmount = Number(existing.coverageAmount || 0) + Number(item.coverageAmount || 0)
         }
@@ -2018,6 +2024,7 @@ class CloudStoreService {
     const batches = []
     let current = []
     let usedSlots = 0
+    let workspaceSlots = 0
     const limit = Math.max(1, Number.parseInt(maxSlots, 10) || 36)
 
     const pushCurrent = () => {
@@ -2025,6 +2032,7 @@ class CloudStoreService {
       batches.push(current)
       current = []
       usedSlots = 0
+      workspaceSlots = 0
     }
 
     for (const item of allocations || []) {
@@ -2033,14 +2041,17 @@ class CloudStoreService {
       const stackSize = Math.max(1, this.catalog.getStackSize(item.itemId))
 
       while (remaining > 0) {
-        if (usedSlots >= limit) pushCurrent()
-        const freeSlots = Math.max(1, limit - usedSlots)
+        const itemWorkspaceSlots = item.withdrawMode === 'shulker_extract' ? 1 : 0
+        const requiredWorkspaceSlots = Math.max(workspaceSlots, itemWorkspaceSlots)
+        if (usedSlots >= limit - requiredWorkspaceSlots) pushCurrent()
+        workspaceSlots = Math.max(workspaceSlots, itemWorkspaceSlots)
+        const freeSlots = Math.max(1, limit - workspaceSlots - usedSlots)
         const amount = Math.min(remaining, freeSlots * stackSize)
         const slots = Math.ceil(amount / stackSize)
         current.push({ ...item, amount })
         usedSlots += slots
         remaining -= amount
-        if (usedSlots >= limit) pushCurrent()
+        if (usedSlots >= limit - workspaceSlots) pushCurrent()
       }
     }
 
@@ -2288,6 +2299,32 @@ class CloudStoreService {
       requestItemId: request?.itemId || '',
       requestDisplayName: requestedDisplayName,
       coverageAmount: Number(coveredAmount || 0)
+    }
+  }
+
+  shulkerRowToExtractionAllocation (row, sourceBoxCount, requestedDisplayName = '', request = null, amount = 0) {
+    const itemKey = request?.itemKey || row.containedItemKey || ''
+    if (!itemKey) throw new Error(`潜影盒内容缺少物品指纹：${requestedDisplayName || row.containedItemId || 'unknown'}`)
+    return {
+      withdrawMode: 'shulker_extract',
+      itemKey,
+      itemId: row.containedItemId || request?.itemId || '',
+      displayName: row.containedDisplayName || requestedDisplayName,
+      amount: Number(amount || 0),
+      sourceShulkerItemKey: row.shulkerItemKey,
+      sourceShulkerItemId: row.shulkerItemId,
+      sourceShulkerDisplayName: row.shulkerDisplayName,
+      sourceShulkerNbtJson: row.shulkerNbtJson || '',
+      sourceShulkerMetaJson: row.shulkerMetaJson || '',
+      sourceBoxCount: Number(sourceBoxCount || 0),
+      sourceContainedAmountPerBox: Number(row.containedAmount || 0),
+      reservationItemKey: row.shulkerItemKey,
+      reservationAmount: Number(sourceBoxCount || 0),
+      shulkerForItem: requestedDisplayName,
+      requestIndex: Number.isInteger(request?.requestIndex) ? request.requestIndex : undefined,
+      requestItemKey: request?.itemKey || '',
+      requestItemId: request?.itemId || '',
+      requestDisplayName: requestedDisplayName
     }
   }
 
