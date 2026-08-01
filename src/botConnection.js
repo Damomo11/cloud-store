@@ -4,6 +4,11 @@ function terminateBotTransport (bot, reason) {
   try { bot._client?.socket?.destroy?.() } catch {}
 }
 
+function isFatalProtocolReadError (error) {
+  const message = String(error?.message || error || '')
+  return /SlotComponent|array size is abnormally large|Read error.*(?:intArray|longArray|byteArray)|play\.toClient/i.test(message)
+}
+
 function releaseBotConnection (state, bot, service, taskPool, reason, options = {}) {
   if (!state || state.bot !== bot) return false
   taskPool?.unregister?.(service)
@@ -14,4 +19,4 @@ function releaseBotConnection (state, bot, service, taskPool, reason, options = 
   return true
 }
 
-module.exports = { releaseBotConnection, terminateBotTransport }
+module.exports = { isFatalProtocolReadError, releaseBotConnection, terminateBotTransport }
