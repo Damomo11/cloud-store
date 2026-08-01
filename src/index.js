@@ -18,7 +18,7 @@ const {
   isMicrosoftAuthRateLimitError,
   microsoftAuthRetryDelayMs
 } = require('./authCache')
-const { releaseBotConnection, terminateBotTransport } = require('./botConnection')
+const { isFatalProtocolReadError, releaseBotConnection, terminateBotTransport } = require('./botConnection')
 
 function createBot (config, onMsaCode) {
   const options = {
@@ -63,11 +63,6 @@ function buildProtocolVersionList (config) {
     .map(version => String(version || '').trim())
     .filter(Boolean)
   return [...new Set(versions)]
-}
-
-function shouldFallbackProtocol (error) {
-  const message = String(error?.message || error || '')
-  return /SlotComponent|array size is abnormally large|Read error.*intArray|play\.toClient/i.test(message)
 }
 
 function advanceProtocolFallback (state, reason) {
@@ -416,6 +411,24 @@ function launchBot (state) {
   bot.on('error', error => {
     if (state.bot !== bot) return
     state.lastError = String(error?.message || error)
+    if (isFatalProtocolReadError(error)) {
+      const contextualError = warehouse.abortForProtocolReadError(error)
+      state.lastError = contextualError.message
+      const advanced = advanceProtocolFallback(state, contextualError.message)
+      const nextVersion = protocolVersions[state.protocolVersionIndex]
+      console.error(
+        `[protocol:${state.account.botName}] ${contextualError.message} ` +
+        (advanced
+          ? `连接已终止，将用 ${nextVersion} 重连。`
+          : `连接已终止；没有更多协议版本可尝试，将继续用 ${nextVersion} 重连。`)
+      )
+      clearInterval(loginWatchdog)
+      if (releaseBotConnection(state, bot, service, taskPool, 'fatal Slot/NBT protocol read error')) {
+        state.status = state.desiredEnabled ? 'offline' : 'disabled'
+        if (state.desiredEnabled) scheduleReconnect(state, 1000)
+      }
+      return
+    }
     if (!spawned && isMicrosoftAuthRateLimitError(error)) {
       const retryDelay = microsoftAuthRetryDelayMs(state.reconnectAttempt, config.timing?.reconnectDelayMs)
       console.warn(`[auth:${state.account.botName}] Microsoft/Xbox login was rate limited; released the failed bot instance and will retry in ${retryDelay}ms`)
@@ -446,18 +459,6 @@ function launchBot (state) {
     if (isSocketDisconnectError(error)) {
       console.warn(`[network] ${error.code}: socket 已断开，等待重连。${lastDisconnectReason ? `lastReason=${lastDisconnectReason}` : '通常是服务器/代理主动断开或网络抖动。'}`)
       return
-    }
-    if (!spawned && shouldFallbackProtocol(error)) {
-      const advanced = advanceProtocolFallback(state, error.message)
-      if (advanced) {
-        console.error(`[protocol:${state.account.botName}] Slot/NBT 解析失败，准备用 ${protocolVersions[state.protocolVersionIndex]} 重连：${error.message}`)
-        clearInterval(loginWatchdog)
-        if (releaseBotConnection(state, bot, service, taskPool, 'protocol fallback')) {
-          state.status = state.desiredEnabled ? 'offline' : 'disabled'
-          if (state.desiredEnabled) scheduleReconnect(state, 1000)
-        }
-        return
-      }
     }
     console.error(`[login:${state.account.botName}] Bot error:`, error)
   })

@@ -2,6 +2,7 @@ const { GoalBlock, GoalNear } = require('mineflayer-pathfinder').goals
 const { Movements } = require('mineflayer-pathfinder')
 const Vec3 = require('vec3')
 const { sleep, sumBy } = require('./utils')
+const { isFatalProtocolReadError } = require('./botConnection')
 
 class Warehouse {
   constructor (bot, db, catalog, config, warehouseMutex = null) {
@@ -12,6 +13,8 @@ class Warehouse {
     this.warehouseMutex = warehouseMutex
     this.chestNames = new Set(config.warehouse.chestBlockNames || ['barrel'])
     this.homePosition = null
+    this.openingChest = null
+    this.connectionAbortController = new AbortController()
   }
 
   withWarehouseLock (fn) {
@@ -566,6 +569,7 @@ class Warehouse {
     const snapshots = []
     const failures = []
     for (let index = 0; index < blocks.length; index++) {
+      this.assertConnectionHealthy()
       const block = blocks[index]
       const chest = this.blockToChest(block)
       this.debug(`sync open ${index + 1}/${blocks.length} ${this.describeChest(chest)}`)
@@ -581,6 +585,7 @@ class Warehouse {
         actualItems.push(...slots)
         this.debug(`sync read ${this.describeChest(chest)} slots=${slots.length} items=${slots.reduce((sum, item) => sum + item.amount, 0)}`)
       } catch (error) {
+        if (error?.code === 'FATAL_PROTOCOL_READ' || this.connectionAbortController.signal.aborted) throw error
         const failure = `${this.describeChest(chest)} ${error.message}`
         failures.push(failure)
         console.error(`[warehouse] sync failed: ${failure}`)
@@ -667,15 +672,47 @@ class Warehouse {
   }
 
   async openContainerAt (chest) {
+    this.assertConnectionHealthy()
     this.debug(`goto ${this.describeChest(chest)} from ${this.describePosition(this.bot.entity.position)}`)
     await this.gotoForContainer(chest)
     const block = this.bot.blockAt(new Vec3(chest.x, chest.y, chest.z))
     if (!block || !this.chestNames.has(block.name)) {
       throw new Error(`找不到箱子：${chest.x},${chest.y},${chest.z}`)
     }
-    const container = await this.openContainerBlock(block)
-    this.warnUnexpectedContainerWindow(container, chest)
-    return container
+    this.openingChest = chest
+    try {
+      const container = await this.openContainerBlock(block)
+      this.warnUnexpectedContainerWindow(container, chest)
+      return container
+    } finally {
+      this.openingChest = null
+    }
+  }
+
+  abortForProtocolReadError (error) {
+    if (!isFatalProtocolReadError(error)) return error
+    if (this.connectionAbortController.signal.aborted) return this.connectionAbortController.signal.reason
+
+    const target = this.openingChest ? this.describeChest(this.openingChest) : '未知容器'
+    const wrapped = new Error(
+      `读取 ${target} 时发生 Slot/NBT 协议解析错误。` +
+      `该木桶内可能有当前协议无法解析的嵌套物品；请先不要移动物品，程序将尝试协议 fallback。原始错误：${error.message}`,
+      { cause: error }
+    )
+    wrapped.code = 'FATAL_PROTOCOL_READ'
+    wrapped.chest = this.openingChest ? { ...this.openingChest } : null
+    this.connectionAbortController.abort(wrapped)
+    console.error(`[warehouse] fatal protocol read error: ${wrapped.message}`)
+    return wrapped
+  }
+
+  assertConnectionHealthy () {
+    if (this.connectionAbortController.signal.aborted) throw this.connectionAbortController.signal.reason
+    if (this.isClientClosed()) {
+      const error = new Error('Minecraft 连接已断开，当前仓库操作已终止。')
+      error.code = 'CONNECTION_CLOSED'
+      throw error
+    }
   }
 
   async gotoForContainer (chest) {
@@ -843,6 +880,7 @@ class Warehouse {
           `打开箱子超时 ${this.describeBlock(candidate)} face=${this.describeVector(direction)}`
         )
       } catch (error) {
+        if (error?.code === 'FATAL_PROTOCOL_READ' || this.connectionAbortController.signal.aborted) throw error
         errors.push(`${this.describeBlock(candidate)} face=${this.describeVector(direction)} ${error.message}`)
         this.debug(`open attempt failed: ${errors.at(-1)}`)
       }
@@ -1031,16 +1069,24 @@ class Warehouse {
   }
 
   async withTimeout (promise, ms, message) {
+    this.assertConnectionHealthy()
+    const signal = this.connectionAbortController.signal
     let timer
+    let onAbort
     try {
       return await Promise.race([
         promise,
         new Promise((resolve, reject) => {
           timer = setTimeout(() => reject(new Error(message)), ms)
+        }),
+        new Promise((resolve, reject) => {
+          onAbort = () => reject(signal.reason || new Error('Minecraft 连接已断开。'))
+          signal.addEventListener('abort', onAbort, { once: true })
         })
       ])
     } finally {
       clearTimeout(timer)
+      if (onAbort) signal.removeEventListener('abort', onAbort)
     }
   }
 
