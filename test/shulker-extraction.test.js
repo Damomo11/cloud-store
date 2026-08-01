@@ -182,6 +182,65 @@ test('quick shulker opening aims at air and sends activateItem without block int
   assert.equal(blockOpenCalls, 0)
 })
 
+test('air aiming finds a horizontal cardinal opening inside a 1x2 barrel tunnel', async () => {
+  const looks = []
+  const bot = {
+    entity: { yaw: 0.37, pitch: 0 },
+    look: async (yaw, pitch) => {
+      bot.entity.yaw = yaw
+      bot.entity.pitch = pitch
+      looks.push({ yaw, pitch })
+    },
+    blockAtCursor: () => {
+      const eastOrWest = Math.abs(Math.abs(bot.entity.yaw) - (Math.PI / 2)) < 0.001
+      return bot.entity.pitch === 0 && eastOrWest
+        ? null
+        : { name: bot.entity.pitch === 0 ? 'barrel' : 'quartz_block', position: { x: 0, y: 0, z: 0 } }
+    }
+  }
+  const config = structuredClone(DEFAULT_CONFIG)
+  config.debug = false
+  const warehouse = new Warehouse(bot, {}, {}, config)
+
+  await warehouse.aimAtAir(6)
+
+  assert.equal(looks.at(-1).pitch, 0)
+  assert.ok(Math.abs(Math.abs(looks.at(-1).yaw) - (Math.PI / 2)) < 0.001)
+  assert.ok(looks.every(look => look.pitch === 0), 'horizontal opening should be found before vertical fallback')
+})
+
+test('shulker return accepts a delayed inventory update without clicking twice', async () => {
+  const boxInfo = { itemKey: 'box-key', itemId: 'minecraft:purple_shulker_box', displayName: '紫色潜影盒' }
+  const box = { name: 'purple_shulker_box', slot: 36, count: 1, normalized: boxInfo }
+  let inventory = [box]
+  let depositCalls = 0
+  let refreshed = false
+  const container = { close: () => {} }
+  const bot = { inventory: { items: () => inventory } }
+  const catalog = {
+    fromPrismarineItem: item => ({ ...item.normalized, amount: item.count }),
+    isShulkerBox: itemId => /_shulker_box$/.test(itemId)
+  }
+  const config = structuredClone(DEFAULT_CONFIG)
+  config.debug = false
+  config.timing.containerSettleMs = 0
+  config.timing.inventoryUpdateTimeoutMs = 200
+  const warehouse = new Warehouse(bot, {}, catalog, config)
+  warehouse.openContainerAt = async () => container
+  warehouse.tryDepositInto = async () => {
+    depositCalls++
+    setTimeout(() => { inventory = [] }, 25)
+    return 0
+  }
+  warehouse.refreshChestSnapshot = () => { refreshed = true }
+
+  const returned = await warehouse.returnShulkerToChest({ chestId: '1,2,3', x: 1, y: 2, z: 3, blockName: 'barrel' }, box)
+
+  assert.equal(returned.itemKey, boxInfo.itemKey)
+  assert.equal(depositCalls, 1)
+  assert.equal(refreshed, true)
+})
+
 test('shulker extraction returns the changed box to its source chest before updating balances', async () => {
   const target = { itemKey: 'target-key', itemId: 'minecraft:diamond', displayName: '钻石', amount: 2 }
   const oldBoxInfo = { itemKey: 'old-box', itemId: 'minecraft:purple_shulker_box', displayName: '潜影盒' }

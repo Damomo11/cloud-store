@@ -548,7 +548,14 @@ class Warehouse {
 
     const container = await this.openContainerAt(chest)
     try {
-      const moved = await this.tryDepositInto(container, item)
+      const before = this.inventoryCountByItemKey(normalized.itemKey)
+      let moved = await this.tryDepositInto(container, item)
+      if (moved <= 0 && before > 0) {
+        moved = await this.waitForInventoryDecrease(normalized.itemKey, before, {
+          intervalMs: 50,
+          timeoutMs: Math.max(500, Number(this.config.timing?.inventoryUpdateTimeoutMs || 2000))
+        })
+      }
       await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
       this.refreshChestSnapshot(chest, container)
       if (moved !== 1) throw new Error(`放回 ${this.describeChest(chest)} 失败，实际放入 ${moved} 个潜影盒。`)
@@ -596,17 +603,32 @@ class Warehouse {
 
   async aimAtAir (maxDistance = 6) {
     const startYaw = Number(this.bot.entity?.yaw || 0)
-    const candidates = [
-      { yaw: startYaw, pitch: Math.PI / 2 },
-      { yaw: startYaw + Math.PI / 2, pitch: Math.PI / 3 },
-      { yaw: startYaw + Math.PI, pitch: Math.PI / 3 },
-      { yaw: startYaw - Math.PI / 2, pitch: Math.PI / 3 }
-    ]
+    const candidates = []
+    const seen = new Set()
+    const addCandidate = (yaw, pitch) => {
+      const normalizedYaw = Math.atan2(Math.sin(yaw), Math.cos(yaw))
+      const key = `${normalizedYaw.toFixed(6)},${pitch.toFixed(6)}`
+      if (seen.has(key)) return
+      seen.add(key)
+      candidates.push({ yaw: normalizedYaw, pitch })
+    }
+
+    // A 1x2 warehouse tunnel has floor and ceiling blocks close to the bot, so
+    // horizontal cardinal directions must be checked before looking up or down.
+    for (const yaw of [0, Math.PI / 2, Math.PI, -Math.PI / 2]) addCandidate(yaw, 0)
+    for (const offset of [0, Math.PI / 2, Math.PI, -Math.PI / 2]) addCandidate(startYaw + offset, 0)
+    addCandidate(startYaw, Math.PI / 2)
+    for (const offset of [Math.PI / 2, Math.PI, -Math.PI / 2]) addCandidate(startYaw + offset, Math.PI / 3)
 
     for (const candidate of candidates) {
       await this.bot.look(candidate.yaw, candidate.pitch, true)
       await sleep(100)
-      if (!this.bot.blockAtCursor(maxDistance)) return
+      const block = this.bot.blockAtCursor(maxDistance)
+      if (!block) {
+        this.debug(`air target confirmed yaw=${candidate.yaw.toFixed(3)} pitch=${candidate.pitch.toFixed(3)} distance=${maxDistance}`)
+        return
+      }
+      this.debug(`air target blocked yaw=${candidate.yaw.toFixed(3)} pitch=${candidate.pitch.toFixed(3)} by ${this.describeBlock(block)}`)
     }
     throw new Error(`无法找到前方 ${maxDistance} 格内没有方块的方向，已取消快捷打开潜影盒。`)
   }
@@ -1524,7 +1546,7 @@ class Warehouse {
   }
 
   async waitForInventoryDecrease (itemKey, before, options = {}) {
-    const timeoutMs = Number(this.config.timing.dropConfirmTimeoutMs || 5000)
+    const timeoutMs = Number(options.timeoutMs ?? this.config.timing.dropConfirmTimeoutMs ?? 5000)
     const intervalMs = Math.max(10, Number(options.intervalMs ?? this.inventoryConfirmPollMs()))
     const startedAt = Date.now()
     while (Date.now() - startedAt < timeoutMs) {
