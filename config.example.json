@@ -30,14 +30,8 @@
     // Legacy single-account auth cache folder for Microsoft OAuth2 tokens.
     "profilesFolder": "auth-cache",
 
-    // Main Minecraft protocol version. The server may still negotiate a nearby protocol.
+    // Minecraft protocol version. Cloud store always uses this exact version.
     "version": "1.21.11",
-
-    // Fallback protocol versions used when the newest protocol crashes on unusual item data.
-    "protocolFallbackVersions": [
-      "1.21.9",
-      "1.21.8"
-    ],
 
     // Client language sent to the server.
     "locale": "zh_CN"

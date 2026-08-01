@@ -317,12 +317,31 @@ class Warehouse {
     const before = this.inventoryCountByItemKey(normalized.itemKey)
     const windowSlot = this.windowSlotFromBotInventorySlot(container, item.slot)
     if (windowSlot === null) return 0
+    const sourceWindowItem = container.slots?.[windowSlot] || null
+    const sourceCount = Math.max(0, Number(sourceWindowItem?.count || item.count || 0))
+    const canConfirmByWindowSlot = Boolean(sourceWindowItem)
 
     try {
       await this.bot.clickWindow(windowSlot, 0, 1)
-      await sleep(this.config.timing.containerSettleMs)
-      const after = this.inventoryCountByItemKey(normalized.itemKey)
-      return Math.max(0, before - after)
+      const timeoutMs = Math.max(
+        Number(this.config.timing?.containerSettleMs || 0),
+        Number(this.config.timing?.inventoryUpdateTimeoutMs || 2000),
+        500
+      )
+      const deadline = Date.now() + timeoutMs
+      while (Date.now() < deadline) {
+        if (canConfirmByWindowSlot) {
+          const currentSlotItem = container.slots?.[windowSlot] || null
+          if (!currentSlotItem) return Math.min(sourceCount, free)
+          const currentCount = Math.max(0, Number(currentSlotItem.count || 0))
+          if (currentCount < sourceCount) return Math.min(sourceCount - currentCount, free)
+        } else {
+          const byKey = Math.max(0, before - this.inventoryCountByItemKey(normalized.itemKey))
+          if (byKey > 0) return byKey
+        }
+        await sleep(50)
+      }
+      return 0
     } catch (error) {
       this.debug(`deposit exact slot ${item.name}@${item.slot} failed: ${error.message}`)
       return 0
@@ -468,8 +487,8 @@ class Warehouse {
         let returned = false
         try {
           await this.equipItemInHand(sourceBox)
-          quickWindow = await this.openQuickShulkerWindow()
-          const available = this.countContainerItem(quickWindow, allocation.itemKey)
+          quickWindow = await this.openQuickShulkerWindow(sourceKey)
+          const available = await this.waitForContainerItemCount(quickWindow, allocation.itemKey)
           const toTake = Math.min(remaining, available)
           const moved = await this.tryWithdrawExactFrom(quickWindow, allocation.itemKey, toTake)
           this.debug(`shulker extract open source=${sourceKey} available=${available} moved=${moved} remaining=${remaining}`)
@@ -527,21 +546,25 @@ class Warehouse {
 
   async takeOneShulkerFromChest (chest, itemKey, preferredSlots = []) {
     const container = await this.openContainerAt(chest)
+    let moved = 0
     try {
       const available = this.countContainerItem(container, itemKey)
       if (available <= 0) {
         this.refreshChestSnapshot(chest, container)
         return null
       }
-      const moved = await this.tryWithdrawExactFrom(container, itemKey, 1, preferredSlots)
+      moved = await this.tryWithdrawExactFrom(container, itemKey, 1, preferredSlots)
       await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
       this.refreshChestSnapshot(chest, container)
-      if (moved !== 1) throw new Error(`从 ${this.describeChest(chest)} 取潜影盒失败，实际取出 ${moved} 个。`)
-      return this.findInventoryItemByKey(itemKey)
     } finally {
       container.close()
       await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
     }
+
+    if (moved !== 1) throw new Error(`从 ${this.describeChest(chest)} 取潜影盒失败，实际取出 ${moved} 个。`)
+    const item = await this.waitForInventoryItemByKey(itemKey)
+    if (!item) throw new Error(`已从 ${this.describeChest(chest)} 取出潜影盒，但客户端背包没有收到该物品。`)
+    return item
   }
 
   async returnShulkerToChest (chest, item) {
@@ -551,10 +574,9 @@ class Warehouse {
 
     const container = await this.openContainerAt(chest)
     try {
-      const before = this.inventoryCountByItemKey(normalized.itemKey)
       let moved = await this.tryDepositInto(container, item)
-      if (moved <= 0 && before > 0) {
-        moved = await this.waitForInventoryDecrease(normalized.itemKey, before, {
+      if (moved <= 0) {
+        moved = await this.waitForInventorySlotDecrease(item.slot, normalized.itemId, item.count, {
           intervalMs: 50,
           timeoutMs: Math.max(500, Number(this.config.timing?.inventoryUpdateTimeoutMs || 2000))
         })
@@ -571,6 +593,35 @@ class Warehouse {
 
   findInventoryItemByKey (itemKey) {
     return this.bot.inventory.items().find(item => this.catalog.fromPrismarineItem(item).itemKey === itemKey) || null
+  }
+
+  async waitForInventoryItemByKey (itemKey, timeoutMs = null) {
+    const timeout = Math.max(500, Number(timeoutMs ?? this.config.timing?.inventoryUpdateTimeoutMs ?? 2000))
+    const deadline = Date.now() + timeout
+    while (Date.now() < deadline) {
+      const item = this.findInventoryItemByKey(itemKey)
+      if (item) return item
+      await sleep(50)
+    }
+    return this.findInventoryItemByKey(itemKey)
+  }
+
+  async waitForInventorySlotDecrease (slot, itemId, before, options = {}) {
+    if (!Number.isInteger(slot)) return 0
+    const timeoutMs = Math.max(0, Number(options.timeoutMs ?? this.config.timing?.inventoryUpdateTimeoutMs ?? 2000))
+    const intervalMs = Math.max(10, Number(options.intervalMs ?? 50))
+    const startingCount = Math.max(0, Number(before || 0))
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      const current = this.bot.inventory.items().find(entry => entry.slot === slot) || null
+      if (!current) return startingCount
+      const normalized = this.catalog.fromPrismarineItem(current)
+      if (normalized.itemId !== itemId) return startingCount
+      const moved = Math.max(0, startingCount - Number(current.count || 0))
+      if (moved > 0) return moved
+      await sleep(intervalMs)
+    }
+    return 0
   }
 
   findInventoryShulker (itemId, preferredItemKey = '') {
@@ -636,11 +687,12 @@ class Warehouse {
     throw new Error(`无法找到前方 ${maxDistance} 格内没有方块的方向，已取消快捷打开潜影盒。`)
   }
 
-  async openQuickShulkerWindow () {
+  async openQuickShulkerWindow (expectedItemKey = '') {
     if (this.bot.currentWindow) {
       this.bot.closeWindow(this.bot.currentWindow)
       await sleep(150)
     }
+    this.assertHeldShulker(expectedItemKey)
     await this.aimAtAir(6)
 
     const timeoutMs = Math.max(500, Number(this.config.timing?.openContainerTimeoutMs || 8000))
@@ -658,6 +710,20 @@ class Warehouse {
       if (attempt < 2) await sleep(250)
     }
     throw new Error('拿着潜影盒对空气右键后，没有收到潜影盒窗口。')
+  }
+
+  assertHeldShulker (expectedItemKey = '') {
+    const held = this.bot.heldItem
+    if (!held) throw new Error('快捷打开潜影盒前主手为空。')
+    const normalized = this.catalog.fromPrismarineItem(held)
+    if (!this.catalog.isShulkerBox(normalized.itemId)) {
+      throw new Error(`快捷打开潜影盒前主手物品不是潜影盒：${normalized.displayName || normalized.itemId}`)
+    }
+    if (expectedItemKey && normalized.itemKey !== expectedItemKey) {
+      throw new Error(`快捷打开潜影盒前主手拿错物品：期望 ${expectedItemKey.slice(-6)}，实际 ${normalized.itemKey.slice(-6)}`)
+    }
+    this.debug(`quick shulker held ${normalized.displayName || normalized.itemId} key=${normalized.itemKey.slice(-6)} slot=${held.slot}`)
+    return held
   }
 
   waitForWindowOpen (timeoutMs) {
@@ -679,6 +745,28 @@ class Warehouse {
   isQuickShulkerWindow (window) {
     const type = String(window?.type || '')
     return Number(window?.inventoryStart) === 27 && /(?:^|:)shulker_box$/.test(type)
+  }
+
+  async waitForContainerItemCount (container, itemKey, timeoutMs = null) {
+    const timeout = Math.max(500, Number(timeoutMs ?? this.config.timing?.inventoryUpdateTimeoutMs ?? 2000))
+    const deadline = Date.now() + timeout
+    while (Date.now() < deadline) {
+      const count = this.countContainerItem(container, itemKey)
+      if (count > 0) return count
+      await sleep(50)
+    }
+    const count = this.countContainerItem(container, itemKey)
+    if (count <= 0) this.debug(`quick shulker target missing key=${itemKey.slice(-6)} contents=${this.containerContentsForDebug(container)}`)
+    return count
+  }
+
+  containerContentsForDebug (container) {
+    const contents = this.containerContentItems(container)
+    if (!contents.length) return 'empty'
+    return contents.map(item => {
+      const normalized = this.catalog.fromPrismarineItem(item)
+      return `${normalized.displayName || normalized.itemId} x${item.count} key=${normalized.itemKey.slice(-6)} slot=${item.slot}`
+    }).join(', ')
   }
 
   groupSlotsForWithdrawal (slots) {
@@ -948,9 +1036,10 @@ class Warehouse {
     if (this.connectionAbortController.signal.aborted) return this.connectionAbortController.signal.reason
 
     const target = this.openingChest ? this.describeChest(this.openingChest) : '未知容器'
+    const version = this.config.server?.version || '配置版本'
     const wrapped = new Error(
       `读取 ${target} 时发生 Slot/NBT 协议解析错误。` +
-      `该木桶内可能有当前协议无法解析的嵌套物品；请先不要移动物品，程序将尝试协议 fallback。原始错误：${error.message}`,
+      `该木桶内可能有当前协议无法解析的嵌套物品；请先不要移动物品，程序会保存失败包并仅用 ${version} 重连。原始错误：${error.message}`,
       { cause: error }
     )
     wrapped.code = 'FATAL_PROTOCOL_READ'
@@ -1616,19 +1705,31 @@ class Warehouse {
 
   async equipItemInHand (item) {
     if (!item) return
-    if (this.bot.heldItem?.slot === item.slot) return
+    const expected = this.catalog.fromPrismarineItem(item)
+    const heldMatches = () => {
+      if (!this.bot.heldItem) return false
+      return this.catalog.fromPrismarineItem(this.bot.heldItem).itemKey === expected.itemKey
+    }
+    if (heldMatches()) return
     if (typeof this.bot.equip === 'function') {
       await this.bot.equip(item, 'hand')
-      await sleep(50)
-      return
-    }
-    const quickBarStart = this.bot.QUICK_BAR_START || 36
-    if (typeof this.bot.setQuickBarSlot === 'function' && item.slot >= quickBarStart && item.slot < quickBarStart + 9) {
+    } else {
+      const quickBarStart = this.bot.QUICK_BAR_START || 36
+      if (typeof this.bot.setQuickBarSlot !== 'function' || item.slot < quickBarStart || item.slot >= quickBarStart + 9) {
+        throw new Error(`cannot equip item in hand: ${item.name || item.itemId || 'item'}`)
+      }
       this.bot.setQuickBarSlot(item.slot - quickBarStart)
-      await sleep(50)
-      return
     }
-    throw new Error(`cannot equip item in hand: ${item.name || item.itemId || 'item'}`)
+
+    const deadline = Date.now() + Math.max(500, Number(this.config.timing?.inventoryUpdateTimeoutMs || 2000))
+    while (Date.now() < deadline) {
+      if (heldMatches()) {
+        this.debug(`equipped ${expected.displayName || expected.itemId} key=${expected.itemKey.slice(-6)} in main hand`)
+        return
+      }
+      await sleep(50)
+    }
+    throw new Error(`装备潜影盒到主手失败：${expected.displayName || expected.itemId}`)
   }
 
   async useHeldItemOnce () {

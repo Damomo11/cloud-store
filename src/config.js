@@ -12,7 +12,6 @@ const DEFAULT_CONFIG = {
     password: '',
     profilesFolder: 'auth-cache',
     version: '1.21.11',
-    protocolFallbackVersions: ['1.21.9', '1.21.8'],
     locale: 'zh_CN'
   },
   admins: [],

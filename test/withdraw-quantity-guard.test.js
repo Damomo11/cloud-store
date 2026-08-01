@@ -24,6 +24,7 @@ function createFixture (withdrawAmounts) {
   const depositCalls = []
   const dropRequests = []
   const balanceChanges = []
+  const upsertedItems = []
   const sent = []
 
   const bot = {
@@ -44,7 +45,14 @@ function createFixture (withdrawAmounts) {
     saveRecoveryTask: () => {},
     clearRecoveryTask: () => {},
     transaction: fn => fn(),
-    upsertItem: () => {},
+    getItemByKey: itemKey => itemKey === item.itemKey
+      ? { ...item, nbtJson: 'null', metaJson: '{"components":null,"metadata":null}' }
+      : null,
+    upsertItem: entry => {
+      assert.notEqual(entry.nbtJson, undefined)
+      assert.notEqual(entry.metaJson, undefined)
+      upsertedItems.push(entry)
+    },
     adjustBalance: (ownerUuid, itemKey, amount) => balanceChanges.push({ ownerUuid, itemKey, amount }),
     addTransaction: () => {}
   }
@@ -109,6 +117,7 @@ function createFixture (withdrawAmounts) {
     depositCalls,
     dropRequests,
     balanceChanges,
+    upsertedItems,
     sent,
     setTeleportResult: result => {
       teleportResult = result
@@ -138,6 +147,8 @@ test('over-withdrawn loose stack is returned and only the requested amount is de
     itemKey: fixture.allocation.itemKey,
     amount: -10
   }])
+  assert.equal(fixture.upsertedItems[0].nbtJson, 'null')
+  assert.equal(fixture.upsertedItems[0].metaJson, '{"components":null,"metadata":null}')
 })
 
 test('delivery result is sent to both recipient and actor when withdrawing for another player', async () => {

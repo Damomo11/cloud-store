@@ -70,7 +70,8 @@ class ItemCatalog {
     const itemId = `minecraft:${item.name}`
     const rawMeta = {
       metadata: item.metadata ?? null,
-      components: item.components || null
+      components: item.components || null,
+      removeComponents: item.removedComponents || null
     }
     const safeNbt = this.sanitizeNbtForStorage(itemId, item.nbt || null)
     const safeMeta = this.sanitizeMetaForStorage(itemId, rawMeta)
@@ -109,8 +110,8 @@ class ItemCatalog {
 
   canonicalizeStoredItem (row) {
     if (!row?.itemId) return row
-    const meta = this.parseStoredJson(row.metaJson, {})
-    const nbt = this.parseStoredJson(row.nbtJson, null)
+    const meta = this.sanitizeMetaForStorage(row.itemId, this.parseStoredJson(row.metaJson, {}))
+    const nbt = this.sanitizeNbtForStorage(row.itemId, this.parseStoredJson(row.nbtJson, null))
     const canonicalMeta = this.normalizeMetaForFingerprint(row.itemId, meta)
     const canonicalNbt = this.normalizeNbtForFingerprint(row.itemId, nbt)
     const fingerprint = sha1(stableStringify({
@@ -121,9 +122,9 @@ class ItemCatalog {
     return {
       itemKey: `${row.itemId}|${fingerprint}`,
       itemId: row.itemId,
-      displayName: row.displayName || this.describeStoredItem(row.itemId, row.metaJson, row.nbtJson),
-      nbtJson: row.nbtJson || 'null',
-      metaJson: row.metaJson || '',
+      displayName: row.displayName || this.describeStoredItem(row.itemId, stableStringify(meta), stableStringify(nbt)),
+      nbtJson: stableStringify(nbt),
+      metaJson: stableStringify(meta),
       amount: row.amount || 0
     }
   }
@@ -135,10 +136,11 @@ class ItemCatalog {
 
     const itemId = `minecraft:${item.name}`
     const components = Array.isArray(entry.components) && entry.components.length ? entry.components : null
-    const meta = this.sanitizeMetaForStorage(itemId, { metadata: null, components })
-    if (Array.isArray(entry.removeComponents) && entry.removeComponents.length) {
-      meta.removeComponents = entry.removeComponents
-    }
+    const meta = this.sanitizeMetaForStorage(itemId, {
+      metadata: null,
+      components,
+      removeComponents: entry.removeComponents || null
+    })
 
     const nbtJson = stableStringify(null)
     const metaJson = stableStringify(meta)
@@ -231,8 +233,15 @@ class ItemCatalog {
   }
 
   normalizeMetaForFingerprint (itemId, meta) {
-    const base = this.isShulkerBox(itemId) ? this.normalizeShulkerMetaForFingerprint(meta) : meta
+    const canonicalMeta = meta && typeof meta === 'object'
+      ? { ...meta, metadata: this.normalizeItemMetadata(meta.metadata) }
+      : meta
+    const base = this.isShulkerBox(itemId) ? this.normalizeShulkerMetaForFingerprint(canonicalMeta) : canonicalMeta
     return this.sortMetaComponentsForFingerprint(this.stripVolatileMetaForFingerprint(itemId, base))
+  }
+
+  normalizeItemMetadata (metadata) {
+    return this.mcData.supportFeature?.('itemsWithComponents') ? null : (metadata ?? null)
   }
 
   normalizeNbtForFingerprint (itemId, nbt) {
@@ -369,11 +378,12 @@ class ItemCatalog {
   }
 
   sanitizeMetaForStorage (itemId, meta = {}) {
+    const components = Array.isArray(meta?.components)
+      ? meta.components.map(component => this.sanitizeComponentForStorage(itemId, component)).filter(Boolean)
+      : meta?.components
     const result = {
-      metadata: meta?.metadata ?? null,
-      components: Array.isArray(meta?.components)
-        ? meta.components.map(component => this.sanitizeComponentForStorage(itemId, component)).filter(Boolean)
-        : (meta?.components || null)
+      metadata: this.normalizeItemMetadata(meta?.metadata),
+      components: Array.isArray(components) && components.length === 0 ? null : (components || null)
     }
     if (Array.isArray(meta?.removeComponents) && meta.removeComponents.length) {
       result.removeComponents = [...meta.removeComponents]
@@ -385,6 +395,15 @@ class ItemCatalog {
     if (!component || typeof component !== 'object') return component
 
     const type = component.type
+    if (this.isShulkerBox(itemId) && type === 'custom_data') {
+      const data = this.omitObjectKeyDeep(component.data, 'AxShulkers-UUID')
+      if (this.isEmptyValue(data)) return null
+      return {
+        ...component,
+        data: this.compactLargeValue(data, `component:${type}`)
+      }
+    }
+
     if (this.isBeeContainer(itemId) && ['bees', 'block_entity_data', 'custom_data'].includes(type)) {
       return {
         ...component,

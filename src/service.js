@@ -1990,7 +1990,19 @@ class CloudStoreService {
       for (const group of groups.values()) {
         const merged = this.mergeItems(group.items)
         for (const item of merged) {
-          this.db.upsertItem(item)
+          const stored = this.db.getItemByKey(item.itemKey)
+          const complete = {
+            ...stored,
+            ...item,
+            itemId: item.itemId || stored?.itemId,
+            displayName: item.displayName || stored?.displayName,
+            nbtJson: item.nbtJson ?? stored?.nbtJson,
+            metaJson: item.metaJson ?? stored?.metaJson
+          }
+          if (!complete.itemId || !complete.displayName || complete.nbtJson === undefined || complete.metaJson === undefined) {
+            throw new Error(`扣账物品记录不完整：${item.itemKey}`)
+          }
+          this.db.upsertItem(complete)
           this.db.adjustBalance(group.owner.uuid, item.itemKey, -item.amount)
         }
         this.db.addTransaction('withdraw', 'ok', group.owner.uuid, group.owner.username, merged, message)

@@ -7,6 +7,7 @@ const path = require('node:path')
 const CloudStoreService = require('../src/service')
 const StoreDb = require('../src/db')
 const Warehouse = require('../src/warehouse')
+const ItemCatalog = require('../src/itemCatalog')
 const { DEFAULT_CONFIG } = require('../src/config')
 
 function createPlanningService ({ loose = 0, boxes = 1, perBox = 64, singleItem = true } = {}) {
@@ -157,6 +158,7 @@ test('quick shulker opening aims at air and sends activateItem without block int
   let blockOpenCalls = 0
   bot.entity = { yaw: 0, pitch: 0 }
   bot.currentWindow = null
+  bot.heldItem = { name: 'purple_shulker_box', slot: 36, count: 1 }
   bot.look = async () => {}
   bot.blockAtCursor = () => null
   bot.activateItem = offHand => {
@@ -173,13 +175,171 @@ test('quick shulker opening aims at air and sends activateItem without block int
   const config = structuredClone(DEFAULT_CONFIG)
   config.debug = false
   config.timing.openContainerTimeoutMs = 200
-  const warehouse = new Warehouse(bot, {}, {}, config)
+  const catalog = {
+    fromPrismarineItem: () => ({ itemKey: 'box-key', itemId: 'minecraft:purple_shulker_box', displayName: '紫色潜影盒' }),
+    isShulkerBox: itemId => /_shulker_box$/.test(itemId)
+  }
+  const warehouse = new Warehouse(bot, {}, catalog, config)
 
-  const window = await warehouse.openQuickShulkerWindow()
+  const window = await warehouse.openQuickShulkerWindow('box-key')
 
   assert.equal(window.inventoryStart, 27)
   assert.equal(activateCalls, 1)
   assert.equal(blockOpenCalls, 0)
+})
+
+test('taking a shulker waits for the delayed inventory update after the barrel closes', async () => {
+  const boxInfo = { itemKey: 'box-key', itemId: 'minecraft:purple_shulker_box', displayName: '紫色潜影盒' }
+  const box = { name: 'purple_shulker_box', slot: 36, count: 1, normalized: boxInfo }
+  let inventory = []
+  const container = {
+    close: () => setTimeout(() => { inventory = [box] }, 25)
+  }
+  const bot = { inventory: { items: () => inventory } }
+  const catalog = { fromPrismarineItem: item => ({ ...item.normalized, amount: item.count }) }
+  const config = structuredClone(DEFAULT_CONFIG)
+  config.debug = false
+  config.timing.containerSettleMs = 0
+  config.timing.inventoryUpdateTimeoutMs = 200
+  const warehouse = new Warehouse(bot, {}, catalog, config)
+  warehouse.openContainerAt = async () => container
+  warehouse.countContainerItem = () => 1
+  warehouse.tryWithdrawExactFrom = async () => 1
+  warehouse.refreshChestSnapshot = () => {}
+
+  const taken = await warehouse.takeOneShulkerFromChest(
+    { chestId: '1,2,3', x: 1, y: 2, z: 3, blockName: 'barrel' },
+    boxInfo.itemKey,
+    [4]
+  )
+
+  assert.equal(taken, box)
+})
+
+test('quick shulker opening refuses to activate an empty main hand', async () => {
+  const bot = new EventEmitter()
+  bot.currentWindow = null
+  bot.heldItem = null
+  const config = structuredClone(DEFAULT_CONFIG)
+  config.debug = false
+  const warehouse = new Warehouse(bot, {}, {}, config)
+
+  await assert.rejects(warehouse.openQuickShulkerWindow(), /主手为空/)
+})
+
+test('quick shulker extraction waits for delayed window contents', async () => {
+  const target = { slot: 0, count: 3, normalized: { itemKey: 'target-key', itemId: 'minecraft:diamond', displayName: '钻石' } }
+  let contents = []
+  const window = { items: () => contents }
+  const catalog = { fromPrismarineItem: item => ({ ...item.normalized, amount: item.count }) }
+  const config = structuredClone(DEFAULT_CONFIG)
+  config.debug = false
+  config.timing.inventoryUpdateTimeoutMs = 200
+  const warehouse = new Warehouse({}, {}, catalog, config)
+  setTimeout(() => { contents = [target] }, 25)
+
+  const available = await warehouse.waitForContainerItemCount(window, 'target-key')
+
+  assert.equal(available, 3)
+})
+
+test('shulker metadata drops AxShulkers UUID while preserving other custom data', () => {
+  const catalog = new ItemCatalog('1.21.11')
+  const container = {
+    type: 'container',
+    data: { contents: [{ itemId: 995, itemCount: 16, components: [], removeComponents: [] }] }
+  }
+  const customData = value => ({
+    type: 'custom_data',
+    data: { type: 'compound', value }
+  })
+  const common = {
+    name: 'purple_shulker_box',
+    count: 1,
+    type: 1193,
+    metadata: 0
+  }
+  const withPluginUuid = catalog.fromPrismarineItem({
+    ...common,
+    components: [
+      customData({
+        'AxShulkers-UUID': { type: 'string', value: 'ea78f26f-e5f3-4f55-9866-09f863e6832f' },
+        KeepMe: { type: 'string', value: 'custom-value' }
+      }),
+      container
+    ]
+  })
+  const withoutPluginUuid = catalog.fromPrismarineItem({
+    ...common,
+    components: [customData({ KeepMe: { type: 'string', value: 'custom-value' } }), container]
+  })
+  const onlyPluginUuid = catalog.fromPrismarineItem({
+    ...common,
+    components: [customData({ 'AxShulkers-UUID': { type: 'string', value: 'temporary' } }), container]
+  })
+
+  assert.equal(withPluginUuid.itemKey, withoutPluginUuid.itemKey)
+  assert.equal(withPluginUuid.metaJson.includes('AxShulkers-UUID'), false)
+  assert.equal(withPluginUuid.metaJson.includes('KeepMe'), true)
+  assert.equal(onlyPluginUuid.metaJson.includes('custom_data'), false)
+
+  const canonical = catalog.canonicalizeStoredItem({
+    itemKey: 'old-key',
+    itemId: 'minecraft:purple_shulker_box',
+    displayName: '潜影盒',
+    nbtJson: 'null',
+    metaJson: JSON.stringify({
+      metadata: 0,
+      components: [customData({ 'AxShulkers-UUID': { type: 'string', value: 'stored-value' } }), container]
+    }),
+    amount: 1
+  })
+  assert.equal(canonical.metaJson.includes('AxShulkers-UUID'), false)
+})
+
+test('component items use the same fingerprint inside a shulker and in an open window', () => {
+  const catalog = new ItemCatalog('1.21.11')
+  const itemData = catalog.mcData.itemsByName.amethyst_block
+  const components = [
+    { type: 'custom_name', data: '{"text":"紫水晶母岩"}' },
+    { type: 'custom_data', data: { type: 'compound', value: { CustomId: { type: 'string', value: 'amethyst_bedrock' } } } }
+  ]
+  const removeComponents = ['minecraft:rarity']
+  const nested = catalog.fromContainerEntry({
+    itemId: itemData.id,
+    itemCount: 2,
+    components,
+    removeComponents
+  })
+  const opened = catalog.fromPrismarineItem({
+    name: itemData.name,
+    type: itemData.id,
+    count: 2,
+    metadata: 0,
+    components,
+    removedComponents: removeComponents
+  })
+
+  assert.equal(opened.itemKey, nested.itemKey)
+  assert.equal(JSON.parse(opened.metaJson).metadata, null)
+  assert.deepEqual(JSON.parse(opened.metaJson).removeComponents, removeComponents)
+
+  const nestedWithoutComponents = catalog.fromContainerEntry({
+    itemId: itemData.id,
+    itemCount: 2,
+    components: [],
+    removeComponents: []
+  })
+  const openedWithoutComponents = catalog.fromPrismarineItem({
+    name: itemData.name,
+    type: itemData.id,
+    count: 2,
+    metadata: 0,
+    components: [],
+    removedComponents: []
+  })
+  assert.equal(openedWithoutComponents.itemKey, nestedWithoutComponents.itemKey)
+  assert.equal(JSON.parse(openedWithoutComponents.metaJson).components, null)
 })
 
 test('air aiming finds a horizontal cardinal opening inside a 1x2 barrel tunnel', async () => {
@@ -239,6 +399,43 @@ test('shulker return accepts a delayed inventory update without clicking twice',
   assert.equal(returned.itemKey, boxInfo.itemKey)
   assert.equal(depositCalls, 1)
   assert.equal(refreshed, true)
+})
+
+test('deposit confirms a shulker from the clicked window slot when inventory metadata stays stale', async () => {
+  const oldBoxInfo = { itemKey: 'old-box-key', itemId: 'minecraft:purple_shulker_box', displayName: '紫色潜影盒' }
+  const mutatedBoxInfo = { ...oldBoxInfo, itemKey: 'plugin-mutated-key' }
+  const box = { name: 'purple_shulker_box', slot: 36, count: 1, stackSize: 1, normalized: oldBoxInfo }
+  const mutatedBox = { ...box, normalized: mutatedBoxInfo }
+  let inventory = [box]
+  let clickCalls = 0
+  const slots = new Array(63).fill(null)
+  slots[54] = box
+  const container = { inventoryStart: 27, inventoryEnd: 63, slots }
+  const bot = {
+    inventory: { inventoryStart: 9, items: () => inventory },
+    clickWindow: async slot => {
+      assert.equal(slot, 54)
+      clickCalls++
+      setTimeout(() => { inventory = [mutatedBox] }, 10)
+      setTimeout(() => { slots[54] = null }, 90)
+    }
+  }
+  const catalog = {
+    fromPrismarineItem: item => ({ ...item.normalized, amount: item.count }),
+    getStackSize: () => 1
+  }
+  const config = structuredClone(DEFAULT_CONFIG)
+  config.debug = false
+  config.timing.containerSettleMs = 0
+  config.timing.inventoryUpdateTimeoutMs = 200
+  const warehouse = new Warehouse(bot, {}, catalog, config)
+
+  const startedAt = Date.now()
+  const moved = await warehouse.tryDepositInto(container, box)
+
+  assert.equal(moved, 1)
+  assert.equal(clickCalls, 1)
+  assert.ok(Date.now() - startedAt >= 75, 'metadata-only changes must not confirm the deposit')
 })
 
 test('shulker extraction returns the changed box to its source chest before updating balances', async () => {

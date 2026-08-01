@@ -18,7 +18,7 @@ const {
   isMicrosoftAuthRateLimitError,
   microsoftAuthRetryDelayMs
 } = require('./authCache')
-const { isFatalProtocolReadError, releaseBotConnection, terminateBotTransport } = require('./botConnection')
+const { installFatalProtocolPacketCapture, isFatalProtocolReadError, releaseBotConnection, terminateBotTransport } = require('./botConnection')
 
 function createBot (config, onMsaCode) {
   const options = {
@@ -54,25 +54,6 @@ function attachCatalog (nextCatalog) {
   }
 }
 
-function buildProtocolVersionList (config) {
-  const configured = config.server.version
-  const fallbacks = Array.isArray(config.server.protocolFallbackVersions)
-    ? config.server.protocolFallbackVersions
-    : (configured === '1.21.11' ? ['1.21.9', '1.21.8'] : [])
-  const versions = [configured, ...fallbacks]
-    .map(version => String(version || '').trim())
-    .filter(Boolean)
-  return [...new Set(versions)]
-}
-
-function advanceProtocolFallback (state, reason) {
-  if (state.protocolVersionIndex >= protocolVersions.length - 1) return false
-  const previous = protocolVersions[state.protocolVersionIndex]
-  state.protocolVersionIndex += 1
-  console.error(`[protocol:${state.account.botName}] ${previous} 启动失败，切换到 ${protocolVersions[state.protocolVersionIndex]}。原因：${reason}`)
-  return true
-}
-
 function formatKickReason (reason) {
   if (typeof reason === 'string') return reason
   try {
@@ -100,8 +81,7 @@ function isSocketDisconnectError (error) {
 const config = loadConfig(path.resolve(process.cwd(), 'config.json'), { autoUpdate: true })
 const db = new StoreDb(path.resolve(process.cwd(), 'data', 'cloud-store.sqlite'), config)
 const subscriptions = new SubscriptionManager(db, config)
-const protocolVersions = buildProtocolVersionList(config)
-let catalog = createCatalogForVersion(protocolVersions[0] || config.server.version)
+const catalog = createCatalogForVersion(config.server.version)
 attachCatalog(catalog)
 
 const configuredAccounts = (Array.isArray(config.bots) && config.bots.length ? config.bots : [config.server])
@@ -125,9 +105,6 @@ const accounts = db.listBotAccounts()
 if (!accounts.length) throw new Error('没有配置微软机器人账号，请在 config.json 的 server.username 或 bots[] 中填写账号。')
 console.log(`Configured ${accounts.length} Microsoft OAuth2 bot account(s)`)
 console.log(`Minecraft version: ${config.server.version}, auth: microsoft`)
-if (protocolVersions.length > 1) {
-  console.log(`Protocol fallback versions: ${protocolVersions.join(' -> ')}`)
-}
 
 let shuttingDown = false
 const taskPool = new BotTaskPool(config)
@@ -155,7 +132,6 @@ function createBotState (account) {
     drainTimer: null,
     reconnectAttempt: 0,
     lastProfileAuthRecoveryAt: 0,
-    protocolVersionIndex: 0,
     desiredEnabled: Boolean(account.enabled),
     status: account.enabled ? 'starting' : 'disabled',
     lastError: '',
@@ -266,14 +242,7 @@ function launchBot (state) {
     console.log(`[reconnect:${state.account.botName}] attempt ${state.reconnectAttempt}`)
   }
 
-  const activeVersion = protocolVersions[state.protocolVersionIndex] || config.server.version
-  if (activeVersion !== config.server.version) {
-    console.log(`[protocol:${state.account.botName}] launching with fallback Minecraft version ${activeVersion}`)
-  }
-  if (catalog.version !== activeVersion) {
-    catalog = createCatalogForVersion(activeVersion)
-    attachCatalog(catalog)
-  }
+  const activeVersion = config.server.version
 
   const launchConfig = {
     ...config,
@@ -298,6 +267,9 @@ function launchBot (state) {
     console.log(`[oauth:${state.account.botName}] open ${state.deviceCode.verificationUri} and enter ${state.deviceCode.userCode}`)
   })
   state.bot = bot
+  const protocolPacketCapture = installFatalProtocolPacketCapture(bot, {
+    directory: path.resolve(process.cwd(), 'logs')
+  })
   let loggedIn = false
   let spawned = false
   let lastDisconnectReason = ''
@@ -403,25 +375,21 @@ function launchBot (state) {
     const kickReason = formatKickReason(reason)
     lastDisconnectReason = kickReason
     state.lastError = kickReason
-    if (!spawned && /outdated|version|protocol|版本|协议/i.test(kickReason)) {
-      advanceProtocolFallback(state, `kick before spawn: ${kickReason}`)
-    }
   })
 
   bot.on('error', error => {
     if (state.bot !== bot) return
     state.lastError = String(error?.message || error)
     if (isFatalProtocolReadError(error)) {
+      const packetPath = protocolPacketCapture.dump(error, {
+        botName: state.account.botName,
+        version: activeVersion,
+        openingChest: warehouse.openingChest || null
+      })
+      if (packetPath) console.error(`[protocol:${state.account.botName}] saved failing packet to ${packetPath}`)
       const contextualError = warehouse.abortForProtocolReadError(error)
       state.lastError = contextualError.message
-      const advanced = advanceProtocolFallback(state, contextualError.message)
-      const nextVersion = protocolVersions[state.protocolVersionIndex]
-      console.error(
-        `[protocol:${state.account.botName}] ${contextualError.message} ` +
-        (advanced
-          ? `连接已终止，将用 ${nextVersion} 重连。`
-          : `连接已终止；没有更多协议版本可尝试，将继续用 ${nextVersion} 重连。`)
-      )
+      console.error(`[protocol:${state.account.botName}] ${contextualError.message} 连接已终止，将继续用 ${activeVersion} 重连。`)
       clearInterval(loginWatchdog)
       if (releaseBotConnection(state, bot, service, taskPool, 'fatal Slot/NBT protocol read error')) {
         state.status = state.desiredEnabled ? 'offline' : 'disabled'
