@@ -87,6 +87,28 @@ test('withdraw at 1728 keeps whole-shulker delivery behavior', () => {
   assert.equal(plan.allocations[0].coverageAmount, 1728)
 })
 
+test('large withdrawals extract partial or non-full shulkers instead of delivering whole boxes', () => {
+  const partial = createPlanningService({ loose: 42, boxes: 2, perBox: 875 })
+  const partialPlan = partial.service.buildWithdrawPlan('owner', [{ ...partial.target, amount: 1792, requestIndex: 0 }])
+
+  assert.equal(partialPlan.allocations.length, 2)
+  assert.equal(partialPlan.allocations[0].withdrawMode, undefined)
+  assert.equal(partialPlan.allocations[0].amount, 42)
+  assert.equal(partialPlan.allocations[1].withdrawMode, 'shulker_extract')
+  assert.equal(partialPlan.allocations[1].amount, 1750)
+  assert.equal(partialPlan.allocations[1].sourceBoxCount, 2)
+
+  const remainder = createPlanningService({ loose: 0, boxes: 2, perBox: 1728 })
+  const remainderPlan = remainder.service.buildWithdrawPlan('owner', [{ ...remainder.target, amount: 2000, requestIndex: 0 }])
+
+  assert.equal(remainderPlan.allocations.length, 2)
+  assert.equal(remainderPlan.allocations[0].withdrawMode, undefined)
+  assert.equal(remainderPlan.allocations[0].amount, 1)
+  assert.equal(remainderPlan.allocations[1].withdrawMode, 'shulker_extract')
+  assert.equal(remainderPlan.allocations[1].amount, 272)
+  assert.equal(remainderPlan.allocations[1].sourceBoxCount, 1)
+})
+
 test('shulker extraction batches reserve one inventory workspace slot', () => {
   const { service, target } = createPlanningService()
   const batches = service.splitAllocationsIntoInventoryBatches([{
@@ -342,6 +364,72 @@ test('component items use the same fingerprint inside a shulker and in an open w
   assert.equal(JSON.parse(openedWithoutComponents.metaJson).components, null)
 })
 
+test('bee containers use a fixed fingerprint inside shulkers and open windows', () => {
+  const catalog = new ItemCatalog('1.21.11')
+  const beeNest = catalog.mcData.itemsByName.bee_nest
+  const nested = catalog.fromContainerEntry({
+    itemId: beeNest.id,
+    itemCount: 1,
+    components: [{
+      type: 'bees',
+      data: { bees: [{ ticksInHive: 20, entityData: { UUID: [1, 2, 3, 4] } }] }
+    }],
+    removeComponents: ['minecraft:custom_data']
+  })
+  const opened = catalog.fromPrismarineItem({
+    name: beeNest.name,
+    type: beeNest.id,
+    count: 1,
+    metadata: 0,
+    components: [{
+      type: 'custom_data',
+      data: { type: 'compound', value: { 'VV|original_hashes': { type: 'intArray', value: [1, 2] } } }
+    }],
+    removedComponents: []
+  })
+
+  assert.equal(opened.itemKey, nested.itemKey)
+  assert.equal(opened.metaJson, JSON.stringify({ components: null, metadata: null }))
+  assert.equal(opened.nbtJson, 'null')
+})
+
+test('shulker storage strips nested bee container components', () => {
+  const catalog = new ItemCatalog('1.21.11')
+  const shulker = catalog.mcData.itemsByName.shulker_box
+  const beeNest = catalog.mcData.itemsByName.bee_nest
+  const corruptedNumericItem = catalog.mcData.itemsByName.copper_nugget
+  const normalized = catalog.fromPrismarineItem({
+    name: shulker.name,
+    type: shulker.id,
+    count: 1,
+    metadata: 0,
+    components: [{
+      type: 'container',
+      data: {
+        contents: [{
+          itemId: corruptedNumericItem.id,
+          itemCount: 1,
+          addedComponentCount: 1,
+          components: [{
+            type: 'custom_data',
+            data: { type: 'compound', value: { 'VV|original_hashes': { type: 'intArray', value: [1, 2] } } }
+          }],
+          removeComponents: ['minecraft:bees'],
+          removedComponentCount: 1
+        }]
+      }
+    }]
+  })
+
+  const storedEntry = JSON.parse(normalized.metaJson).components[0].data.contents[0]
+  assert.equal(storedEntry.itemId, beeNest.id)
+  assert.deepEqual(storedEntry.components, [])
+  assert.deepEqual(storedEntry.removeComponents, [])
+  assert.equal(storedEntry.addedComponentCount, 0)
+  assert.equal(storedEntry.removedComponentCount, 0)
+  assert.equal(normalized.metaJson.includes('VV|original_hashes'), false)
+})
+
 test('air aiming finds a horizontal cardinal opening inside a 1x2 barrel tunnel', async () => {
   const looks = []
   const bot = {
@@ -436,6 +524,49 @@ test('deposit confirms a shulker from the clicked window slot when inventory met
   assert.equal(moved, 1)
   assert.equal(clickCalls, 1)
   assert.ok(Date.now() - startedAt >= 75, 'metadata-only changes must not confirm the deposit')
+})
+
+test('deposit skips stale inventory entries after the open window slot is empty', async () => {
+  const itemInfo = { itemKey: 'moss-key', itemId: 'minecraft:moss_block', displayName: '苔藓块' }
+  const item = { name: 'moss_block', slot: 36, count: 64, stackSize: 64, normalized: itemInfo }
+  let inventory = [item]
+  let clickCalls = 0
+  const slots = new Array(63).fill(null)
+  slots[54] = item
+  const container = {
+    inventoryStart: 27,
+    inventoryEnd: 63,
+    slots,
+    close: () => { inventory = [] }
+  }
+  const bot = {
+    inventory: { inventoryStart: 9, items: () => inventory },
+    clickWindow: async slot => {
+      assert.equal(slot, 54)
+      clickCalls++
+      slots[54] = null
+    }
+  }
+  const db = {
+    listChests: () => [{ chestId: '1,2,3' }],
+    listChestSlots: () => [{ chestId: '1,2,3', x: 1, y: 2, z: 3, blockName: 'barrel', slot: null }]
+  }
+  const catalog = {
+    fromPrismarineItem: entry => ({ ...entry.normalized, amount: entry.count }),
+    getStackSize: () => 64
+  }
+  const config = structuredClone(DEFAULT_CONFIG)
+  config.debug = false
+  config.timing.containerSettleMs = 0
+  config.timing.inventoryUpdateTimeoutMs = 200
+  const warehouse = new Warehouse(bot, db, catalog, config)
+  warehouse.openContainerAt = async () => container
+  warehouse.refreshChestSnapshot = () => {}
+
+  await warehouse.depositAllPossible()
+
+  assert.equal(clickCalls, 1)
+  assert.deepEqual(inventory, [])
 })
 
 test('shulker extraction returns the changed box to its source chest before updating balances', async () => {

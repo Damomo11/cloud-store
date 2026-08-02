@@ -15,6 +15,8 @@ data/*.sqlite3
 data/*.sqlite3-*
 data/bot-platform-sso.key
 *.log
+logs/fatal-protocol-*.bin
+logs/fatal-protocol-*.json
 __pycache__/
 *.pyc
 tmp-crash-*/

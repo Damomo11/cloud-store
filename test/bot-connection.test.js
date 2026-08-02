@@ -77,3 +77,53 @@ test('fatal protocol capture saves the latest decompressed packet inside the con
     fs.rmSync(directory, { recursive: true, force: true })
   }
 })
+
+test('fatal protocol capture prefers the exact buffer that made the deserializer throw', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'cloud-store-protocol-capture-'))
+  try {
+    const splitter = new EventEmitter()
+    const client = new EventEmitter()
+    client.splitter = splitter
+    client.version = '1.21.11'
+    client.deserializer = {
+      parsePacketBuffer: () => { throw new Error('SlotComponent read error') }
+    }
+    const capture = installFatalProtocolPacketCapture({ username: 'BotA', _client: client }, { directory })
+    const failingPacket = Buffer.from('120102030405', 'hex')
+    let parseError
+    try {
+      client.deserializer.parsePacketBuffer(failingPacket)
+    } catch (error) {
+      parseError = error
+    }
+    splitter.emit('data', Buffer.from('00', 'hex'))
+
+    const packetPath = capture.dump(parseError, { botName: 'BotA' })
+
+    assert.deepEqual(fs.readFileSync(packetPath), failingPacket)
+    const metadata = JSON.parse(fs.readFileSync(packetPath.replace(/\.bin$/, '.json'), 'utf8'))
+    assert.equal(metadata.source, 'deserializer')
+    assert.equal(metadata.packetId, 0x12)
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('1.21.11 window items repairs the extra bee NBT int-array prefix before decoding', () => {
+  const splitter = new EventEmitter()
+  const client = new EventEmitter()
+  client.splitter = splitter
+  let decodedBuffer = null
+  client.deserializer = {
+    parsePacketBuffer: buffer => {
+      decodedBuffer = Buffer.from(buffer)
+      return { data: { name: 'window_items', params: {} }, metadata: {} }
+    }
+  }
+  installFatalProtocolPacketCapture({ username: 'BotA', _client: client })
+
+  const malformed = Buffer.from('12000b0a08001150617065722e537061776e526561736f6e00', 'hex')
+  client.deserializer.parsePacketBuffer(malformed)
+
+  assert.deepEqual(decodedBuffer, Buffer.from('12000a08001150617065722e537061776e526561736f6e00', 'hex'))
+})

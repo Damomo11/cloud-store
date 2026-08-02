@@ -131,7 +131,8 @@ class ItemCatalog {
 
   fromContainerEntry (entry) {
     if (!entry || !Number.isInteger(entry.itemId)) return null
-    const item = this.mcData.items[entry.itemId]
+    const entryItemId = this.isBeeContainerEntry(entry) ? this.canonicalBeeContainerItemId(entry) : entry.itemId
+    const item = this.mcData.items[entryItemId]
     if (!item) return null
 
     const itemId = `minecraft:${item.name}`
@@ -233,6 +234,7 @@ class ItemCatalog {
   }
 
   normalizeMetaForFingerprint (itemId, meta) {
+    if (this.isBeeContainer(itemId)) return this.fixedBeeContainerMeta()
     const canonicalMeta = meta && typeof meta === 'object'
       ? { ...meta, metadata: this.normalizeItemMetadata(meta.metadata) }
       : meta
@@ -298,18 +300,19 @@ class ItemCatalog {
     const count = Number.parseInt(entry.itemCount ?? entry.count ?? 0, 10)
     if (!Number.isFinite(count) || count <= 0) return null
 
-    const components = Array.isArray(entry.components)
+    const fixedBeeContainer = this.isBeeContainerEntry(entry)
+    const components = !fixedBeeContainer && Array.isArray(entry.components)
       ? entry.components
         .filter(component => this.shouldKeepComponentForFingerprint(component))
         .map(component => this.normalizeComponentForFingerprint(component))
       : []
     components.sort((a, b) => this.compareFingerprintValues(a, b))
-    const removeComponents = Array.isArray(entry.removeComponents) && entry.removeComponents.length
+    const removeComponents = !fixedBeeContainer && Array.isArray(entry.removeComponents) && entry.removeComponents.length
       ? [...entry.removeComponents].sort()
       : []
 
     return {
-      itemId: entry.itemId,
+      itemId: fixedBeeContainer ? this.canonicalBeeContainerItemId(entry) : entry.itemId,
       itemCount: count,
       components,
       removeComponents
@@ -378,6 +381,7 @@ class ItemCatalog {
   }
 
   sanitizeMetaForStorage (itemId, meta = {}) {
+    if (this.isBeeContainer(itemId)) return this.fixedBeeContainerMeta()
     const components = Array.isArray(meta?.components)
       ? meta.components.map(component => this.sanitizeComponentForStorage(itemId, component)).filter(Boolean)
       : meta?.components
@@ -391,10 +395,30 @@ class ItemCatalog {
     return result
   }
 
+  fixedBeeContainerMeta () {
+    return {
+      metadata: null,
+      components: null
+    }
+  }
+
   sanitizeComponentForStorage (itemId, component) {
     if (!component || typeof component !== 'object') return component
 
     const type = component.type
+    if (this.isShulkerBox(itemId) && type === 'container') {
+      const contents = Array.isArray(component.data?.contents)
+        ? component.data.contents.map(entry => this.sanitizeShulkerContainerEntry(entry))
+        : []
+      return {
+        ...component,
+        data: {
+          ...component.data,
+          contents
+        }
+      }
+    }
+
     if (this.isShulkerBox(itemId) && type === 'custom_data') {
       const data = this.omitObjectKeyDeep(component.data, 'AxShulkers-UUID')
       if (this.isEmptyValue(data)) return null
@@ -415,6 +439,47 @@ class ItemCatalog {
       ...component,
       data: this.compactLargeValue(component.data, `component:${type}`)
     }
+  }
+
+  sanitizeShulkerContainerEntry (entry) {
+    if (!entry || !Number.isInteger(entry.itemId)) return entry
+    if (!this.isBeeContainerEntry(entry)) return entry
+    return {
+      ...entry,
+      itemId: this.canonicalBeeContainerItemId(entry),
+      addedComponentCount: 0,
+      components: [],
+      removeComponents: [],
+      removedComponentCount: 0
+    }
+  }
+
+  isBeeContainerEntry (entry) {
+    if (!entry || !Number.isInteger(entry.itemId)) return false
+    const nestedItem = this.mcData.items[entry.itemId]
+    const nestedItemId = nestedItem ? `minecraft:${nestedItem.name}` : null
+    if (this.isBeeContainer(nestedItemId)) return true
+
+    if (Array.isArray(entry.removeComponents) && entry.removeComponents.some(component => {
+      return component === 'bees' || component === 'minecraft:bees'
+    })) return true
+
+    let found = false
+    this.walkValue(entry.components, value => {
+      if (found) return
+      if (typeof value === 'string' && /^(?:minecraft:)?(?:bees|bee_nest|beehive)$/.test(value)) found = true
+      if (!value || typeof value !== 'object') return
+      if (Object.prototype.hasOwnProperty.call(value, 'Bees') || Object.prototype.hasOwnProperty.call(value, 'bees')) found = true
+      if (value.type === 'bees') found = true
+    })
+    return found
+  }
+
+  canonicalBeeContainerItemId (entry) {
+    const nestedItem = this.mcData.items[entry?.itemId]
+    const nestedItemId = nestedItem ? `minecraft:${nestedItem.name}` : null
+    if (this.isBeeContainer(nestedItemId)) return entry.itemId
+    return this.mcData.itemsByName.bee_nest?.id ?? entry.itemId
   }
 
   summarizeBeeComponent (type, data) {

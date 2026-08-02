@@ -1793,7 +1793,7 @@ class CloudStoreService {
         const ownedBoxes = Number(row.shulkerAmount || 0)
         const reserved = reservedShulkerBoxes.get(row.shulkerItemKey) || 0
         const availableBoxes = Math.max(0, ownedBoxes - reserved)
-        if (perBox <= 0 || availableBoxes <= 0 || !this.isSingleItemShulkerRow(row)) continue
+        if (perBox <= 0 || availableBoxes <= 0 || !this.isFullSingleItemShulkerRow(row)) continue
 
         const boxes = Math.min(availableBoxes, Math.floor(remainingRequest / perBox))
         if (boxes <= 0) continue
@@ -1836,7 +1836,10 @@ class CloudStoreService {
         if (boxes <= 0) continue
 
         const coveredAmount = Math.min(remainingInside, boxes * perBox)
-        const allocation = deliverWholeShulkers
+        const deliverWholeBox = deliverWholeShulkers &&
+          remainingInside >= perBox &&
+          this.isFullSingleItemShulkerRow(row)
+        const allocation = deliverWholeBox
           ? this.shulkerRowToAllocation(row, boxes, displayName, request, coveredAmount)
           : this.shulkerRowToExtractionAllocation(row, boxes, displayName, request, coveredAmount)
         allocations.push(allocation)
@@ -1858,6 +1861,14 @@ class CloudStoreService {
       containedAmount > 0 &&
       totalSlotCount === slotCount &&
       totalContainedAmount === containedAmount
+  }
+
+  isFullSingleItemShulkerRow (row) {
+    if (!this.isSingleItemShulkerRow(row)) return false
+    const stackSize = Math.max(1, Number(this.catalog.getStackSize(row.containedItemId) || 64))
+    const fullAmount = 27 * stackSize
+    return Number(row.containedAmount || 0) === fullAmount &&
+      Number(row.slotCount || 0) === 27
   }
 
   buildWithdrawPlanForRequest (player, storageOwner, requests) {

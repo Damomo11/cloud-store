@@ -314,12 +314,14 @@ class Warehouse {
       return 0
     }
 
-    const before = this.inventoryCountByItemKey(normalized.itemKey)
     const windowSlot = this.windowSlotFromBotInventorySlot(container, item.slot)
     if (windowSlot === null) return 0
     const sourceWindowItem = container.slots?.[windowSlot] || null
-    const sourceCount = Math.max(0, Number(sourceWindowItem?.count || item.count || 0))
-    const canConfirmByWindowSlot = Boolean(sourceWindowItem)
+    if (!sourceWindowItem) {
+      this.debug(`deposit skip stale inventory slot ${item.name}@${item.slot}: window slot ${windowSlot} is empty`)
+      return 0
+    }
+    const sourceCount = Math.max(0, Number(sourceWindowItem.count || item.count || 0))
 
     try {
       await this.bot.clickWindow(windowSlot, 0, 1)
@@ -330,15 +332,10 @@ class Warehouse {
       )
       const deadline = Date.now() + timeoutMs
       while (Date.now() < deadline) {
-        if (canConfirmByWindowSlot) {
-          const currentSlotItem = container.slots?.[windowSlot] || null
-          if (!currentSlotItem) return Math.min(sourceCount, free)
-          const currentCount = Math.max(0, Number(currentSlotItem.count || 0))
-          if (currentCount < sourceCount) return Math.min(sourceCount - currentCount, free)
-        } else {
-          const byKey = Math.max(0, before - this.inventoryCountByItemKey(normalized.itemKey))
-          if (byKey > 0) return byKey
-        }
+        const currentSlotItem = container.slots?.[windowSlot] || null
+        if (!currentSlotItem) return Math.min(sourceCount, free)
+        const currentCount = Math.max(0, Number(currentSlotItem.count || 0))
+        if (currentCount < sourceCount) return Math.min(sourceCount - currentCount, free)
         await sleep(50)
       }
       return 0
