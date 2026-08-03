@@ -28,6 +28,7 @@ function createBot (config, onMsaCode) {
     auth: 'microsoft',
     version: config.server.version,
     locale: config.server.locale || 'zh_CN',
+    disableChatSigning: true,
     logErrors: false,
     onMsaCode
   }
