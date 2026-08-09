@@ -11,6 +11,7 @@ class Warehouse {
     this.catalog = catalog
     this.config = config
     this.warehouseMutex = warehouseMutex
+    this.botId = String(config.server?.botName || config.server?.username || bot.username || 'bot').toLowerCase()
     this.chestNames = new Set(config.warehouse.chestBlockNames || ['barrel'])
     this.homePosition = null
     this.openingChest = null
@@ -482,11 +483,25 @@ class Warehouse {
         let quickWindow = null
         let boxToReturn = sourceBox
         let returned = false
+        let repackState = ''
         try {
           await this.equipItemInHand(sourceBox)
           quickWindow = await this.openQuickShulkerWindow(sourceKey)
           const available = await this.waitForContainerItemCount(quickWindow, allocation.itemKey)
           const toTake = Math.min(remaining, available)
+          if (toTake > 0) {
+            this.db.beginShulkerRepackRecovery(this.botId, {
+              ownerUuid: allocation.ownerUuid,
+              ownerUsername: allocation.ownerUsername || '',
+              oldBoxItemKey: sourceKey,
+              sourceChestId: chest.chestId,
+              targetItem,
+              beforeAmount: available,
+              requestedAmount: toTake,
+              message: `source_chest=${chest.chestId}, old_box=${sourceKey}`
+            })
+            repackState = 'prepared'
+          }
           const moved = await this.tryWithdrawExactFrom(quickWindow, allocation.itemKey, toTake)
           this.debug(`shulker extract open source=${sourceKey} available=${available} moved=${moved} remaining=${remaining}`)
 
@@ -495,6 +510,8 @@ class Warehouse {
           await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
 
           if (moved <= 0) {
+            if (repackState) this.db.clearShulkerRepackRecovery(this.botId)
+            repackState = ''
             boxToReturn = this.findInventoryItemByKey(sourceKey) || sourceBox
             await this.returnShulkerToChest(chest, boxToReturn)
             returned = true
@@ -505,22 +522,36 @@ class Warehouse {
           const newBox = this.catalog.fromPrismarineItem(boxToReturn)
           this.verifyShulkerExtraction(newBox, allocation.itemKey, available, moved)
 
-          await this.returnShulkerToChest(chest, boxToReturn)
-          returned = true
-          this.db.applyShulkerExtraction(
-            allocation.ownerUuid,
-            sourceKey,
+          this.db.markShulkerRepackPhysicalChange(
+            this.botId,
             { ...newBox, amount: 1 },
             [{ ...targetItem, amount: moved }],
-            allocation.ownerUsername || '',
             `source_chest=${chest.chestId}, old_box=${sourceKey}, new_box=${newBox.itemKey}`
           )
+          repackState = 'physical_changed'
+
+          await this.returnShulkerToChest(chest, boxToReturn)
+          returned = true
+          this.db.commitShulkerRepackRecovery(this.botId)
+          repackState = ''
 
           withdrawn.push({ ...targetItem, amount: moved })
           remaining -= moved
         } catch (error) {
           if (quickWindow) {
             try { quickWindow.close() } catch {}
+          }
+          if (repackState === 'prepared') {
+            const changedBox = this.findInventoryShulker(sourceItem.itemId, sourceKey) || boxToReturn
+            try {
+              const recovery = this.db.getShulkerRepackRecovery(this.botId)
+              if (recovery) {
+                this.resolvePreparedShulkerRepackFromItem(recovery, changedBox)
+                repackState = this.db.getShulkerRepackRecovery(this.botId)?.state || ''
+              }
+            } catch (recoveryError) {
+              error.message += `；潜影盒重打包状态记录失败：${recoveryError.message}`
+            }
           }
           if (!returned) {
             const recoverableBox = this.findInventoryShulker(sourceItem.itemId, sourceKey) || boxToReturn
@@ -707,6 +738,98 @@ class Warehouse {
       if (attempt < 2) await sleep(250)
     }
     throw new Error('拿着潜影盒对空气右键后，没有收到潜影盒窗口。')
+  }
+
+  resolvePreparedShulkerRepackFromItem (recovery, item) {
+    if (!recovery || recovery.state !== 'prepared') return recovery || null
+    if (!item) throw new Error('找不到待恢复的潜影盒。')
+    const normalized = this.catalog.fromPrismarineItem(item)
+    if (!this.catalog.isShulkerBox(normalized.itemId)) throw new Error('待恢复物品不是潜影盒。')
+    if (normalized.itemKey === recovery.oldBoxItemKey) {
+      this.db.clearShulkerRepackRecovery(this.botId)
+      return null
+    }
+    const targetItem = recovery.targetItem
+    if (!targetItem?.itemKey) throw new Error('重打包恢复记录缺少目标物品。')
+    const oldBox = this.db.getItemByKey(recovery.oldBoxItemKey)
+    if (!oldBox) throw new Error(`找不到重打包恢复记录中的原潜影盒：${recovery.oldBoxItemKey}`)
+    const moved = this.inferPreparedShulkerRepackAmount(recovery, oldBox, normalized)
+    return this.db.markShulkerRepackPhysicalChange(
+      this.botId,
+      { ...normalized, amount: 1 },
+      [{ ...targetItem, amount: moved }],
+      `${recovery.message || ''}, recovery=inferred, new_box=${normalized.itemKey}`
+    )
+  }
+
+  inferPreparedShulkerRepackAmount (recovery, oldBox, candidateBox) {
+    const targetKey = recovery.targetItem?.itemKey
+    const before = Number(recovery.beforeAmount || 0)
+    const requested = Number(recovery.requestedAmount || 0)
+    if (!targetKey || before <= 0 || requested <= 0) throw new Error('重打包恢复记录不完整。')
+
+    const contentAmounts = box => new Map(this.catalog.extractShulkerContents(box)
+      .map(entry => [entry.item.itemKey, Number(entry.amount || 0)]))
+    const oldContents = contentAmounts(oldBox)
+    const candidateContents = contentAmounts(candidateBox)
+    const recordedBefore = Number(oldContents.get(targetKey) || 0)
+    if (recordedBefore !== before) {
+      throw new Error(`原潜影盒内容与恢复记录不一致：记录 ${before}，物品档案 ${recordedBefore}。`)
+    }
+
+    const after = Number(candidateContents.get(targetKey) || 0)
+    const moved = before - after
+    if (moved <= 0 || moved > requested) {
+      throw new Error(`无法从盒内数量推断已取出物品：变化前 ${before}，当前 ${after}，计划最多 ${requested}。`)
+    }
+
+    const keys = new Set([...oldContents.keys(), ...candidateContents.keys()])
+    keys.delete(targetKey)
+    for (const key of keys) {
+      if (Number(oldContents.get(key) || 0) !== Number(candidateContents.get(key) || 0)) {
+        throw new Error('候选潜影盒除目标物品外还有其他内容变化。')
+      }
+    }
+    return moved
+  }
+
+  resolvePreparedShulkerRepackFromInventory () {
+    const recovery = this.db.getShulkerRepackRecovery(this.botId)
+    if (!recovery || recovery.state !== 'prepared') return recovery || null
+    const oldBox = this.db.getItemByKey(recovery.oldBoxItemKey)
+    if (!oldBox) throw new Error(`找不到重打包恢复记录中的原潜影盒：${recovery.oldBoxItemKey}`)
+    const candidates = this.bot.inventory.items().filter(item => {
+      const normalized = this.catalog.fromPrismarineItem(item)
+      return normalized.itemId === oldBox.itemId && this.catalog.isShulkerBox(normalized.itemId)
+    })
+    const unchanged = []
+    const validChangedByKey = new Map()
+    const rejected = []
+    for (const candidate of candidates) {
+      const normalized = this.catalog.fromPrismarineItem(candidate)
+      if (normalized.itemKey === recovery.oldBoxItemKey) {
+        unchanged.push(candidate)
+        continue
+      }
+      try {
+        this.inferPreparedShulkerRepackAmount(recovery, oldBox, normalized)
+        if (!validChangedByKey.has(normalized.itemKey)) validChangedByKey.set(normalized.itemKey, candidate)
+      } catch (error) {
+        rejected.push(error.message)
+      }
+    }
+
+    if (validChangedByKey.size === 1) {
+      return this.resolvePreparedShulkerRepackFromItem(recovery, [...validChangedByKey.values()][0])
+    }
+    if (validChangedByKey.size > 1) {
+      throw new Error('机器人背包中有多个可能的重打包潜影盒，无法安全判断；已保留恢复记录并停止后续任务。')
+    }
+    if (rejected.length) {
+      throw new Error(`机器人背包中的同色潜影盒均不符合重打包记录；已保留恢复记录并停止后续任务。${rejected[0]}`)
+    }
+    if (unchanged.length) return this.resolvePreparedShulkerRepackFromItem(recovery, unchanged[0])
+    throw new Error('机器人背包中找不到待恢复的潜影盒，已保留恢复记录并停止后续任务。')
   }
 
   assertHeldShulker (expectedItemKey = '') {
@@ -933,8 +1056,12 @@ class Warehouse {
       }
     }
 
-    if (blocks.length > 0 && snapshots.length === 0) {
-      throw new Error(`同步失败：找到 ${blocks.length} 个木桶，但没有成功读取任何木桶；已保留旧本地记录。请检查 home 点、权限或服务器插件 GUI。`)
+    if (!blocks.length) {
+      throw new Error('同步失败：没有找到可读取的仓库容器；已保留旧本地记录，不会生成库存异常。请检查同步半径、home 点和仓库布局。')
+    }
+    if (failures.length) {
+      const examples = failures.slice(0, 3).join('；')
+      throw new Error(`同步失败：${blocks.length} 个容器中有 ${failures.length} 个读取失败；已保留全部旧记录，不会生成库存异常。${examples ? `失败示例：${examples}` : ''}`)
     }
 
     this.db.clearChests()
