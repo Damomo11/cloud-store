@@ -69,6 +69,9 @@ const DEFAULT_CONFIG = {
     autoAccept: true
   },
   warehouse: {
+    // Whether withdrawals may extract loose items from quick/openable shulker boxes.
+    // Individual warehouses can override this setting in the admin panel.
+    quickShulkerExtractionEnabled: true,
     layoutMode: 'normal',
     defaultSyncRadius: 16,
     pickupRadius: 2,

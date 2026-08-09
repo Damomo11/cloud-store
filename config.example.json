@@ -158,6 +158,10 @@
 
   // Physical warehouse layout and container scanning.
   "warehouse": {
+    // Platform default for extracting loose items from quick/openable shulker boxes.
+    // Individual warehouses can override this in the admin panel.
+    "quickShulkerExtractionEnabled": true,
+
     // "normal" works for ordinary layouts. "cylinder" enables special stand-position logic.
     "layoutMode": "normal",
 

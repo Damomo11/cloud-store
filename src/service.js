@@ -1784,6 +1784,20 @@ class CloudStoreService {
         notices.push(`${ownerLabel}散装和潜影盒内合计只有 ${available} 个${displayName}，将尽量取出。`)
       }
 
+      if (this.db.isQuickShulkerExtractionEnabled && !this.db.isQuickShulkerExtractionEnabled(ownerUuid)) {
+        this.planLegacyWholeShulkerWithdrawals({
+          shulkerRows,
+          availableRows,
+          request,
+          displayName,
+          remainingRequest: Math.min(request.amount, available),
+          reservedLooseItems,
+          reservedShulkerBoxes,
+          allocations
+        })
+        continue
+      }
+
       let remainingRequest = Math.min(request.amount, available)
       const deliverWholeShulkers = request.amount >= WHOLE_SHULKER_WITHDRAW_THRESHOLD
 
@@ -1850,6 +1864,51 @@ class CloudStoreService {
     }
 
     return { notices, allocations: this.mergeAllocations(allocations) }
+  }
+
+  planLegacyWholeShulkerWithdrawals ({ shulkerRows, availableRows, request, displayName, remainingRequest, reservedLooseItems, reservedShulkerBoxes, allocations }) {
+    let preferredShulkerCovered = 0
+    for (const row of shulkerRows) {
+      if (remainingRequest <= 0) break
+      const perBox = Number(row.containedAmount || 0)
+      const ownedBoxes = Number(row.shulkerAmount || 0)
+      const reserved = Number(reservedShulkerBoxes.get(row.shulkerItemKey) || 0)
+      const availableBoxes = Math.max(0, ownedBoxes - reserved)
+      if (perBox <= 0 || availableBoxes <= 0) continue
+      if (!this.isSingleItemShulkerRow(row)) continue
+      const boxes = Math.min(availableBoxes, Math.floor(remainingRequest / perBox))
+      if (boxes <= 0) continue
+      const coveredAmount = boxes * perBox
+      allocations.push(this.shulkerRowToAllocation(row, boxes, displayName, request, coveredAmount))
+      reservedShulkerBoxes.set(row.shulkerItemKey, reserved + boxes)
+      preferredShulkerCovered += coveredAmount
+      remainingRequest -= coveredAmount
+    }
+    const loosePlanned = Math.min(remainingRequest, availableRows.reduce((sum, row) => sum + row.availableAmount, 0))
+    let looseRemaining = loosePlanned
+    for (const row of availableRows) {
+      if (looseRemaining <= 0) break
+      const amount = Math.min(row.availableAmount, looseRemaining)
+      const { availableAmount, ...item } = row
+      allocations.push({ ...item, amount, requestIndex: Number.isInteger(request?.requestIndex) ? request.requestIndex : undefined, requestItemKey: request?.itemKey || '', requestItemId: request?.itemId || '', requestDisplayName: displayName })
+      reservedLooseItems.set(row.itemKey, Number(reservedLooseItems.get(row.itemKey) || 0) + amount)
+      looseRemaining -= amount
+    }
+    let remainingInside = request.amount - preferredShulkerCovered - loosePlanned
+    for (const row of shulkerRows) {
+      if (remainingInside <= 0) break
+      const perBox = Number(row.containedAmount || 0)
+      const ownedBoxes = Number(row.shulkerAmount || 0)
+      const reserved = Number(reservedShulkerBoxes.get(row.shulkerItemKey) || 0)
+      const availableBoxes = Math.max(0, ownedBoxes - reserved)
+      if (perBox <= 0 || availableBoxes <= 0) continue
+      const boxes = Math.min(availableBoxes, Math.ceil(remainingInside / perBox))
+      if (boxes <= 0) continue
+      const coveredAmount = Math.min(remainingInside, boxes * perBox)
+      allocations.push(this.shulkerRowToAllocation(row, boxes, displayName, request, coveredAmount))
+      reservedShulkerBoxes.set(row.shulkerItemKey, reserved + boxes)
+      remainingInside -= coveredAmount
+    }
   }
 
   isSingleItemShulkerRow (row) {

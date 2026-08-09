@@ -4,6 +4,8 @@
 
 已登录的普通玩家和管理员都可以从导航栏进入独立的“Bot 自托管平台”。云仓库只在点击时检查目标服务并签发 60 秒登录凭证；目标未启动时返回 HTTP 404，不影响云仓库其他功能。两个项目分别启动和停止，互不依赖。
 
+Mod、桌面程序或其他第三方客户端请参阅 [云仓库第三方客户端接入文档](INTEGRATION.md)。
+
 ## 环境
 
 - Node.js 22 或更高版本
@@ -57,6 +59,7 @@ copy config.example.json config.json
 - `timing.containerClickIntervalMs`: 散装拆堆时连续容器点击的间隔；服务器延迟较高时可适当调大
 - `warehouse.defaultSyncRadius`: `!同步仓库` 的默认半径
 - `warehouse.homeSkipRadius`: bot 已在已同步木桶附近时跳过 `/home` 的判定半径，默认 8
+- `warehouse.quickShulkerExtractionEnabled`: 平台默认是否允许从快捷潜影盒取散装物品，默认开启；管理员可在 Web 的仓库管理中按个人或组织仓库单独关闭
 - `warehouse.layoutMode`: 仓库开箱站位模式，默认 `normal`；圆柱形仓库可设为 `cylinder`
 - `warehouse.cylinder.axis`: 圆柱通道延伸方向，`x` 表示按木桶所在 X 面移动，`z` 表示按木桶所在 Z 面移动
 - `warehouse.cylinder.tunnelCenter`: 圆柱通道中心坐标；留空时使用 bot `/home` 后所在位置，`axis=x` 时每次会自动替换为目标木桶的 X，`axis=z` 时自动替换为目标木桶的 Z

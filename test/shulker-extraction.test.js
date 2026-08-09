@@ -51,6 +51,16 @@ function createPlanningService ({ loose = 0, boxes = 1, perBox = 64, singleItem 
   }
 }
 
+test('disabled quick shulker extraction falls back to whole-box allocations', () => {
+  const { service, target } = createPlanningService({ loose: 10, boxes: 2, perBox: 64 })
+  service.db.isQuickShulkerExtractionEnabled = () => false
+  const plan = service.buildWithdrawPlan('owner', [{ ...target, amount: 70, requestIndex: 0 }])
+
+  assert.equal(plan.allocations.some(item => item.withdrawMode === 'shulker_extract'), false)
+  assert.equal(plan.allocations.filter(item => item.itemKey === 'box-key').reduce((sum, item) => sum + item.amount, 0), 1)
+  assert.equal(plan.allocations.filter(item => item.itemKey === 'target-key').reduce((sum, item) => sum + item.amount, 0), 6)
+})
+
 test('withdraw below 1728 uses loose items first and extracts only the shortfall from a shulker', () => {
   const { service, target } = createPlanningService({ loose: 10, boxes: 2, perBox: 64 })
   const plan = service.buildWithdrawPlan('owner', [{ ...target, amount: 70, requestIndex: 0 }])
@@ -134,6 +144,18 @@ function createDb () {
     }
   }
 }
+
+test('quick shulker extraction defaults to enabled and persists warehouse overrides', () => {
+  const fixture = createDb()
+  try {
+    assert.equal(fixture.db.isQuickShulkerExtractionEnabled('owner'), true)
+    fixture.db.setQuickShulkerExtractionEnabled('owner', false)
+    assert.equal(fixture.db.isQuickShulkerExtractionEnabled('owner'), false)
+    assert.equal(fixture.db.getWarehouseFeatureSettings('owner').quickShulkerExtractionEnabled, 0)
+  } finally {
+    fixture.close()
+  }
+})
 
 test('shulker reservation reserves the source box instead of nonexistent loose contents', () => {
   const fixture = createDb()

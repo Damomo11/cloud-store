@@ -154,6 +154,10 @@ class CloudStoreWebServer {
         const body = await this.readBody(req)
         return this.sendJson(res, this.apiWarehouseAdminMemberRole(session, body))
       }
+      if (req.method === 'POST' && url.pathname === '/api/warehouse-admin/quick-shulker-extraction') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiWarehouseAdminQuickShulkerExtractionSave(session, body))
+      }
       if (req.method === 'POST' && url.pathname === '/api/warehouse-admin/rename') {
         const body = await this.readBody(req)
         return this.sendJson(res, this.apiWarehouseAdminRename(session, body))
@@ -213,6 +217,10 @@ class CloudStoreWebServer {
       if (req.method === 'POST' && url.pathname === '/api/admin/quota/save') {
         const body = await this.readBody(req)
         return this.sendJson(res, this.apiAdminQuotaSave(session, body))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/admin/warehouse/quick-shulker-extraction') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiAdminQuickShulkerExtractionSave(session, body))
       }
       if (req.method === 'POST' && url.pathname === '/api/admin/quota/restore') {
         const body = await this.readBody(req)
@@ -468,6 +476,7 @@ class CloudStoreWebServer {
       return {
         ...warehouse,
         ownerUuid,
+        quickShulkerExtractionEnabled: this.db.isQuickShulkerExtractionEnabled(ownerUuid),
         isAdmin: warehouse.role === 'admin',
         usedSlots,
         ...entitlement,
@@ -495,6 +504,7 @@ class CloudStoreWebServer {
       return {
         ...warehouse,
         ownerUuid,
+        quickShulkerExtractionEnabled: this.db.isQuickShulkerExtractionEnabled(ownerUuid),
         usedSlots,
         ...entitlement,
         quotaSlots,
@@ -1205,7 +1215,7 @@ class CloudStoreWebServer {
     this.requireAdmin(session)
     return {
       ok: true,
-      personal: this.db.listPersonalWarehouses().map(row => ({ ...row, usedSlots: this.adminOwnerUsedSlots(row.ownerUuid), totalAmount: this.db.ownerTotalAmount(row.ownerUuid) })),
+      personal: this.db.listPersonalWarehouses().map(row => ({ ...row, quickShulkerExtractionEnabled: this.db.isQuickShulkerExtractionEnabled(row.ownerUuid), usedSlots: this.adminOwnerUsedSlots(row.ownerUuid), totalAmount: this.db.ownerTotalAmount(row.ownerUuid) })),
       organizations: this.db.db.prepare(`
         SELECT name_lower AS nameLower, name, creator_uuid AS creatorUuid,
                creator_username AS creatorUsername, created_at AS createdAt,
@@ -1213,7 +1223,7 @@ class CloudStoreWebServer {
         FROM custom_warehouses w ORDER BY name COLLATE NOCASE ASC
       `).all().map(row => {
         const ownerUuid = `vault:${row.nameLower}`
-        return { ...row, ownerUuid, usedSlots: this.adminOwnerUsedSlots(ownerUuid), totalAmount: this.db.ownerTotalAmount(ownerUuid) }
+        return { ...row, ownerUuid, quickShulkerExtractionEnabled: this.db.isQuickShulkerExtractionEnabled(ownerUuid), usedSlots: this.adminOwnerUsedSlots(ownerUuid), totalAmount: this.db.ownerTotalAmount(ownerUuid) }
       })
     }
   }
@@ -1231,6 +1241,7 @@ class CloudStoreWebServer {
       warehouse: {
         ...warehouse,
         ownerUuid,
+        quickShulkerExtractionEnabled: this.db.isQuickShulkerExtractionEnabled(ownerUuid),
         ...entitlement,
         totalAmount: this.db.ownerTotalAmount(ownerUuid),
         usedSlots,
@@ -1881,6 +1892,29 @@ class CloudStoreWebServer {
     return { ok: true, entitlement, message: `已恢复 ${this.db.ownerLabel(ownerUuid)} 的套餐额度。` }
   }
 
+  apiAdminQuickShulkerExtractionSave (session, body) {
+    const user = this.requireAdmin(session)
+    const ownerUuid = this.resolveAdminOwnerArgument(body.ownerUuid || body.ownerText || '')
+    if (!ownerUuid || ownerUuid === this.config.momoOwner) throw new Error('请选择有效的个人或组织仓库。')
+    if (typeof body.enabled !== 'boolean' && body.enabled !== 0 && body.enabled !== 1 && body.enabled !== '0' && body.enabled !== '1') {
+      throw new Error('快捷潜影盒取货开关值无效。')
+    }
+    const enabled = body.enabled === true || body.enabled === 1 || body.enabled === '1'
+    this.db.setQuickShulkerExtractionEnabled(ownerUuid, enabled)
+    this.db.addTransaction('web_admin_quick_shulker_extraction_save', 'ok', ownerUuid, this.db.ownerLabel(ownerUuid), [], `admin=${user.username}; enabled=${enabled}`)
+    return { ok: true, enabled, message: `${this.db.ownerLabel(ownerUuid)} 已${enabled ? '启用' : '关闭'}快捷潜影盒散装取货。` }
+  }
+
+  apiWarehouseAdminQuickShulkerExtractionSave (session, body) {
+    const warehouse = this.requireWarehouseAdmin(session, body.warehouse)
+    const raw = body.enabled
+    if (typeof raw !== 'boolean' && raw !== 0 && raw !== 1 && raw !== '0' && raw !== '1') throw new Error('快捷潜影盒取货开关值无效。')
+    const enabled = raw === true || raw === 1 || raw === '1'
+    const ownerUuid = `vault:${warehouse.nameLower}`
+    this.db.setQuickShulkerExtractionEnabled(ownerUuid, enabled)
+    return { ok: true, enabled, message: `${warehouse.name} 已${enabled ? '启用' : '关闭'}快捷潜影盒散装取货。` }
+  }
+
   adminOwnerUsedSlots (ownerUuid) {
     const rows = this.db.db.prepare(`
       SELECT b.amount, i.item_id AS itemId
@@ -2058,7 +2092,8 @@ class CloudStoreWebServer {
       web_admin_organization_member_role: '管理员设置组织身份',
       web_admin_alias_save: '保存物品别名',
       web_admin_alias_delete: '删除物品别名',
-      web_admin_quota_save: '设置仓库额度'
+      web_admin_quota_save: '设置仓库额度',
+      web_admin_quick_shulker_extraction_save: '设置快捷潜影盒取货'
     }
     return labels[type] || String(type || '')
   }
@@ -4667,11 +4702,11 @@ const HTML = `<!doctype html>
 
     async function loadAdminWarehouseProvisioning() {
       const data = await api('/api/admin/warehouse-provisioning');
-      renderTable('adminPersonalWarehouseList', ['玩家', '库存', '已用格数', '创建时间', '操作'], (data.personal || []).map(row =>
-        '<tr><td>' + esc(row.username) + '<div class="muted">' + esc(row.ownerUuid) + '</div></td><td>' + num(row.totalAmount) + ' 件</td><td>' + num(row.usedSlots) + ' 格</td><td>' + esc(row.createdAt || '') + '</td><td><button class="danger" data-admin-personal-delete="' + esc(row.ownerUuid) + '" data-owner-name="' + esc(row.username) + '">删除</button></td></tr>'
+      renderTable('adminPersonalWarehouseList', ['玩家', '库存', '已用格数', '快捷潜影盒取货', '创建时间', '操作'], (data.personal || []).map(row =>
+        '<tr><td>' + esc(row.username) + '<div class="muted">' + esc(row.ownerUuid) + '</div></td><td>' + num(row.totalAmount) + ' 件</td><td>' + num(row.usedSlots) + ' 格</td><td><button data-admin-quick-shulker="' + esc(row.ownerUuid) + '" data-enabled="' + (row.quickShulkerExtractionEnabled ? '1' : '0') + '">' + (row.quickShulkerExtractionEnabled ? '已启用' : '已关闭') + '</button></td><td>' + esc(row.createdAt || '') + '</td><td><button class="danger" data-admin-personal-delete="' + esc(row.ownerUuid) + '" data-owner-name="' + esc(row.username) + '">删除</button></td></tr>'
       ), '还没有创建个人仓库。');
-      renderTable('adminOrganizationWarehouseList', ['仓库', '首位管理员', '成员', '库存', '已用格数', '创建时间', '操作'], (data.organizations || []).map(row =>
-        '<tr><td>' + esc(row.name) + '</td><td>' + esc(row.creatorUsername) + '</td><td>' + num(row.memberCount) + ' 人</td><td>' + num(row.totalAmount) + ' 件</td><td>' + num(row.usedSlots) + ' 格</td><td>' + esc(row.createdAt || '') + '</td><td><button data-admin-org-view="' + esc(row.name) + '">查看</button></td></tr>'
+      renderTable('adminOrganizationWarehouseList', ['仓库', '首位管理员', '成员', '库存', '已用格数', '快捷潜影盒取货', '创建时间', '操作'], (data.organizations || []).map(row =>
+        '<tr><td>' + esc(row.name) + '</td><td>' + esc(row.creatorUsername) + '</td><td>' + num(row.memberCount) + ' 人</td><td>' + num(row.totalAmount) + ' 件</td><td>' + num(row.usedSlots) + ' 格</td><td><button data-admin-quick-shulker="' + esc(row.ownerUuid) + '" data-enabled="' + (row.quickShulkerExtractionEnabled ? '1' : '0') + '">' + (row.quickShulkerExtractionEnabled ? '已启用' : '已关闭') + '</button></td><td>' + esc(row.createdAt || '') + '</td><td><button data-admin-org-view="' + esc(row.name) + '">查看</button></td></tr>'
       ), '还没有组织仓库。');
       const names = new Set((data.organizations || []).map(row => row.name));
       if (state.adminOrganizationName && names.has(state.adminOrganizationName)) await loadAdminOrganizationDetail(state.adminOrganizationName);
@@ -4710,7 +4745,7 @@ const HTML = `<!doctype html>
       const data = await api('/api/warehouse-admin/organizations');
       const rows = data.rows || [];
       $('warehouseAdminOrganizationList').innerHTML = rows.length ? rows.map(warehouse => {
-        const actions = '<div class="organization-actions"><input data-org-new-name value="' + esc(warehouse.name) + '" placeholder="新仓库名"><button data-org-rename>修改仓库名</button><input data-org-add-name placeholder="玩家 ID"><button data-org-member-add>添加成员</button></div>';
+        const actions = '<div class="organization-actions"><input data-org-new-name value="' + esc(warehouse.name) + '" placeholder="新仓库名"><button data-org-rename>修改仓库名</button><input data-org-add-name placeholder="玩家 ID"><button data-org-member-add>添加成员</button><button data-org-quick-shulker="' + esc(warehouse.name) + '" data-enabled="' + (warehouse.quickShulkerExtractionEnabled ? '1' : '0') + '">' + (warehouse.quickShulkerExtractionEnabled ? '已启用快捷潜影盒取货' : '已关闭快捷潜影盒取货') + '</button></div>';
         const members = (warehouse.members || []).map(member =>
           '<div class="member-row" data-member="' + esc(member.playerUuid) + '"><div><strong>' + esc(member.username) + '</strong>' + (member.playerUuid === warehouse.creatorUuid ? '<div class="muted">创建者</div>' : '') + '</div><select data-member-role' + (member.playerUuid === warehouse.creatorUuid ? ' disabled' : '') + '><option value="member"' + (member.role === 'member' ? ' selected' : '') + '>普通成员</option><option value="admin"' + (member.role === 'admin' ? ' selected' : '') + '>仓库管理员</option></select>' + (member.playerUuid !== warehouse.creatorUuid ? '<button data-org-member-remove>删除成员</button>' : '<span></span>') + '</div>'
         ).join('');
@@ -5172,6 +5207,7 @@ const HTML = `<!doctype html>
       const aliasDelete = event.target.closest('[data-admin-alias-delete]');
       const adminAliasCard = event.target.closest('[data-admin-alias-card]');
       const quotaSave = event.target.closest('[data-quota-save]');
+      const adminQuickShulker = event.target.closest('[data-admin-quick-shulker]');
       const personalAliasDelete = event.target.closest('[data-personal-alias-delete]');
       const myAliasAdd = event.target.closest('[data-my-alias-add]');
       const myPersonalAliasCard = event.target.closest('[data-my-personal-alias-card]');
@@ -5180,6 +5216,7 @@ const HTML = `<!doctype html>
       const orgRename = event.target.closest('[data-org-rename]');
       const orgMemberAdd = event.target.closest('[data-org-member-add]');
       const orgMemberRemove = event.target.closest('[data-org-member-remove]');
+      const orgQuickShulker = event.target.closest('[data-org-quick-shulker]');
       const adminOrgView = event.target.closest('[data-admin-org-view]');
       const adminOrgMemberAdd = event.target.closest('[data-admin-org-member-add]');
       const adminOrgMemberRemove = event.target.closest('[data-admin-org-member-remove]');
@@ -5213,6 +5250,11 @@ const HTML = `<!doctype html>
           toast(data.message);
           if (state.adminTab === 'players' && state.adminSubscriptionUserUuid) await loadAdminSubscriptionUser(state.adminSubscriptionUserUuid);
           if (state.adminTab === 'warehouses') await loadAdminWarehouses();
+        } else if (adminQuickShulker) {
+          const enabled = adminQuickShulker.dataset.enabled !== '1';
+          const data = await post('/api/admin/warehouse/quick-shulker-extraction', { ownerUuid: adminQuickShulker.dataset.adminQuickShulker, enabled });
+          toast(data.message);
+          await loadAdminWarehouses();
         } else if (adminPlanSave) {
           await saveAdminSubscriptionPlan(adminPlanSave.closest('[data-plan-editor]'));
         } else if (adminPickRemove) {
@@ -5289,6 +5331,11 @@ const HTML = `<!doctype html>
           toast(data.message); state.adminOrganizationName = ''; state.adminOwners = []; state.owners = []; state.inventoryCache.clear();
           const me = await api('/api/me'); state.owners = me.owners || []; state.defaultOwnerUuid = me.defaultOwnerUuid; renderOwners();
           await loadAdminWarehouses();
+        } else if (orgQuickShulker) {
+          const enabled = orgQuickShulker.dataset.enabled !== '1';
+          const card = orgQuickShulker.closest('[data-warehouse]');
+          const data = await post('/api/warehouse-admin/quick-shulker-extraction', { warehouse: card.dataset.warehouse, enabled });
+          toast(data.message); await loadWarehouseAdminOrganizations();
         } else if (orgRename) {
           const card = orgRename.closest('[data-warehouse]');
           const data = await post('/api/warehouse-admin/rename', { warehouse: card.dataset.warehouse, newName: card.querySelector('[data-org-new-name]').value });

@@ -114,6 +114,12 @@ class StoreDb {
         FOREIGN KEY (warehouse_name_lower) REFERENCES custom_warehouses(name_lower) ON DELETE CASCADE
       );
 
+      CREATE TABLE IF NOT EXISTS warehouse_feature_settings (
+        owner_uuid TEXT PRIMARY KEY,
+        quick_shulker_extraction_enabled INTEGER NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+
       CREATE TABLE IF NOT EXISTS item_name_overrides (
         short_code TEXT PRIMARY KEY,
         item_key TEXT,
@@ -1692,6 +1698,36 @@ class StoreDb {
     `).get(this.normalizeWarehouseName(name)) || null
   }
 
+  getWarehouseFeatureSettings (ownerUuid) {
+    return this.db.prepare(`
+      SELECT owner_uuid AS ownerUuid,
+             quick_shulker_extraction_enabled AS quickShulkerExtractionEnabled,
+             updated_at AS updatedAt
+      FROM warehouse_feature_settings
+      WHERE owner_uuid = ?
+      LIMIT 1
+    `).get(String(ownerUuid || '').trim()) || null
+  }
+
+  isQuickShulkerExtractionEnabled (ownerUuid) {
+    const row = this.getWarehouseFeatureSettings(ownerUuid)
+    if (row) return Boolean(row.quickShulkerExtractionEnabled)
+    return this.config?.warehouse?.quickShulkerExtractionEnabled !== false
+  }
+
+  setQuickShulkerExtractionEnabled (ownerUuid, enabled) {
+    const uuid = String(ownerUuid || '').trim()
+    if (!uuid) throw new Error('缺少仓库归属。')
+    this.db.prepare(`
+      INSERT INTO warehouse_feature_settings (owner_uuid, quick_shulker_extraction_enabled, updated_at)
+      VALUES (?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(owner_uuid) DO UPDATE SET
+        quick_shulker_extraction_enabled = excluded.quick_shulker_extraction_enabled,
+        updated_at = CURRENT_TIMESTAMP
+    `).run(uuid, enabled ? 1 : 0)
+    return this.getWarehouseFeatureSettings(uuid)
+  }
+
   listCustomWarehousesForPlayer (playerUuid) {
     return this.db.prepare(`
       SELECT w.name_lower AS nameLower, w.name, w.creator_uuid AS creatorUuid,
@@ -1793,6 +1829,7 @@ class StoreDb {
       this.addTransaction('warehouse_delete_transfer_out', 'ok', ownerUuid, ownerUsername, items, `${message}; to=${this.momoOwner}`)
       this.addTransaction('warehouse_delete_transfer_in', 'ok', this.momoOwner, 'momo', items, `${message}; from=${ownerUuid}`)
       this.db.prepare('DELETE FROM player_quotas WHERE owner_uuid = ?').run(ownerUuid)
+      this.db.prepare('DELETE FROM warehouse_feature_settings WHERE owner_uuid = ?').run(ownerUuid)
       this.db.prepare('DELETE FROM warehouse_subscriptions WHERE owner_uuid = ?').run(ownerUuid)
       this.db.prepare("UPDATE players SET default_owner_uuid = '' WHERE default_owner_uuid = ?").run(ownerUuid)
       this.db.prepare(`
@@ -1834,6 +1871,7 @@ class StoreDb {
       this.db.prepare('UPDATE custom_warehouse_members SET warehouse_name_lower = ? WHERE warehouse_name_lower = ?').run(nextLower, warehouse.nameLower)
       this.db.prepare('UPDATE balances SET owner_uuid = ? WHERE owner_uuid = ?').run(newOwner, oldOwner)
       this.db.prepare('UPDATE player_quotas SET owner_uuid = ? WHERE owner_uuid = ?').run(newOwner, oldOwner)
+      this.db.prepare('UPDATE warehouse_feature_settings SET owner_uuid = ? WHERE owner_uuid = ?').run(newOwner, oldOwner)
       this.db.prepare('UPDATE warehouse_subscriptions SET owner_uuid = ? WHERE owner_uuid = ?').run(newOwner, oldOwner)
       this.db.prepare('UPDATE subscription_orders SET owner_uuid = ? WHERE owner_uuid = ?').run(newOwner, oldOwner)
       this.db.prepare('UPDATE subscription_cancellations SET owner_uuid = ? WHERE owner_uuid = ?').run(newOwner, oldOwner)
