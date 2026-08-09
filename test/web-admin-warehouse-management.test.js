@@ -99,6 +99,11 @@ test('rendered browser script is valid JavaScript', async () => {
   assert.match(script, /document\.querySelector\('main'\)\.addEventListener\('scroll', handleInventoryScroll/)
   assert.match(script, /item\.baseDisplayName/)
   assert.match(script, /x\.baseDisplayName/)
+  assert.match(script, /state\.adminMismatchRows = new Map\(rows\.map/)
+  assert.match(script, /#adminMismatches \[data-admin-card\]/)
+  assert.match(script, /bindAdminMismatchTooltips\(\);/)
+  assert.match(script, /data-admin-mm-components=/)
+  assert.match(script, /openNbtModal\(row\);/)
 })
 
 test('admin inventory search matches localized base item names', () => {

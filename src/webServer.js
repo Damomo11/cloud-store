@@ -1419,11 +1419,21 @@ class CloudStoreWebServer {
     const result = []
     let extraAmount = 0
     let missingAmount = 0
+    const shulkerContents = this.db.getShulkerContentsByBox(rows
+      .filter(row => String(row.itemId || '').endsWith('shulker_box'))
+      .map(row => row.itemKey))
     for (const row of rows) {
       const ownerLabel = row.ownerUuid ? this.db.ownerLabel(row.ownerUuid) : (row.username || '未知归属')
-      const item = this.adminItem(row)
+      const item = {
+        ...this.adminItem(row),
+        shulkerContents: (shulkerContents.get(row.itemKey) || []).map(content => ({
+          ...this.adminItem(content),
+          amount: Number(content.amount || 0),
+          slotCount: Number(content.slotCount || 0)
+        }))
+      }
       if (ownerQ && !this.textMatches(ownerLabel, ownerQ) && !this.textMatches(row.username, ownerQ) && !this.textMatches(row.ownerUuid, ownerQ)) continue
-      if (itemQ && !this.adminItemMatches(item, itemQ)) continue
+      if (itemQ && !this.adminItemMatches(item, itemQ) && !item.shulkerContents.some(content => this.adminItemMatches(content, itemQ))) continue
       const amount = Number(row.amount || 0)
       if (row.kind === 'extra') extraAmount += amount
       if (row.kind === 'missing') missingAmount += amount
@@ -1746,9 +1756,18 @@ class CloudStoreWebServer {
     const amount = Number(row.amount || 0)
     if (amount <= 0) throw new Error('异常数量无效。')
     const item = this.db.getItemByKey(row.itemKey) || this.db.rowToItem(row)
+    const sourceOwnerUuid = row.ownerUuid || this.db.momoOwner || this.config.momoOwner
     this.db.transaction(() => {
       this.db.upsertItem(item)
-      this.db.adjustBalance(targetOwnerUuid, row.itemKey, amount)
+      if (sourceOwnerUuid !== targetOwnerUuid) {
+        const sourceBalance = this.db.getBalance(sourceOwnerUuid, row.itemKey)
+        if (sourceBalance < amount) {
+          throw new Error(`${this.db.ownerLabel(sourceOwnerUuid)} 的 ${row.displayName || row.itemId} 仅剩 x${sourceBalance}，不足以转入 x${amount}。请重新同步库存异常。`)
+        }
+        this.db.adjustBalance(sourceOwnerUuid, row.itemKey, -amount)
+        this.db.adjustBalance(targetOwnerUuid, row.itemKey, amount)
+        this.db.addTransaction('web_admin_mismatch_transfer_out', 'ok', sourceOwnerUuid, this.db.ownerLabel(sourceOwnerUuid), [{ ...item, amount }], `mismatch #${row.id}; admin=${user.username}; to=${targetOwnerUuid}`)
+      }
       this.db.addTransaction('web_admin_mismatch_transfer', 'ok', targetOwnerUuid, this.db.ownerLabel(targetOwnerUuid), [{ ...item, amount }], `mismatch #${row.id}; admin=${user.username}; source=physical_extra`)
       this.db.db.prepare(`
         UPDATE inventory_mismatches
@@ -2084,6 +2103,7 @@ class CloudStoreWebServer {
       web_admin_transfer_out: '管理员转出',
       web_admin_transfer_in: '管理员转入',
       web_admin_mismatch_deduct: '异常扣除',
+      web_admin_mismatch_transfer_out: '多余物品从 momo 转出',
       web_admin_mismatch_transfer: '多余物品转入库存',
       warehouse_delete_transfer_out: '删除仓库转出',
       warehouse_delete_transfer_in: '删除仓库转入 momo',
@@ -3447,7 +3467,7 @@ const HTML = `<!doctype html>
   <div id="tooltip" class="tooltip"></div>
 
   <script>
-    const state = { view: 'inventory', myTab: 'organizations', myPersonalAliasItemKey: '', myGlobalAliasItemKey: '', user: null, owners: [], owner: '', items: [], tx: [], txPage: 1, txTotalPages: 1, selected: new Map(), aliasMode: false, aliasItem: null, adminTab: 'inventory', adminAliasMode: false, adminGlobalAliasItem: null, adminOrganizationName: '', adminInventoryLoadId: 0, adminOwners: [], adminInventoryRows: new Map(), adminSelected: new Map(), adminAliasItem: null, adminTxPage: 1, adminTxTotalPages: 1, adminPaymentPage: 1, adminPaymentTotalPages: 1, actionCooldownUntil: 0, actionCooldownTimer: null, iconRenderId: 0, activePoll: null, iconCache: new Map(), inventoryCache: new Map(), inventoryLoadId: 0, iconScrollTimer: null, tipLocked: false, onlinePlayersTimer: null, loginChallengeTimer: null, loginChallengeExpiresAt: 0, loginChallengeCommand: '', subscriptionData: null, subscriptionOrganizationOwner: '', adminSubscriptionUserUuid: '' };
+    const state = { view: 'inventory', myTab: 'organizations', myPersonalAliasItemKey: '', myGlobalAliasItemKey: '', user: null, owners: [], owner: '', items: [], tx: [], txPage: 1, txTotalPages: 1, selected: new Map(), aliasMode: false, aliasItem: null, adminTab: 'inventory', adminAliasMode: false, adminGlobalAliasItem: null, adminOrganizationName: '', adminInventoryLoadId: 0, adminOwners: [], adminInventoryRows: new Map(), adminMismatchRows: new Map(), adminSelected: new Map(), adminAliasItem: null, adminTxPage: 1, adminTxTotalPages: 1, adminPaymentPage: 1, adminPaymentTotalPages: 1, actionCooldownUntil: 0, actionCooldownTimer: null, iconRenderId: 0, activePoll: null, iconCache: new Map(), inventoryCache: new Map(), inventoryLoadId: 0, iconScrollTimer: null, tipLocked: false, onlinePlayersTimer: null, loginChallengeTimer: null, loginChallengeExpiresAt: 0, loginChallengeCommand: '', subscriptionData: null, subscriptionOrganizationOwner: '', adminSubscriptionUserUuid: '' };
     const $ = id => document.getElementById(id);
     const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
     const num = value => Number(value || 0).toLocaleString('zh-CN');
@@ -4638,6 +4658,17 @@ const HTML = `<!doctype html>
       }
     }
 
+    function bindAdminMismatchTooltips() {
+      if (!canHoverTooltip()) return;
+      for (const card of document.querySelectorAll('#adminMismatches [data-admin-card]')) {
+        const item = state.adminMismatchRows.get(card.dataset.adminCard);
+        if (!item) continue;
+        card.addEventListener('mouseenter', event => showTip(event, item));
+        card.addEventListener('mousemove', moveTip);
+        card.addEventListener('mouseleave', hideTip);
+      }
+    }
+
     async function loadAdminInventory(options = {}) {
       const loadId = ++state.adminInventoryLoadId;
       const startedAt = performance.now();
@@ -4688,16 +4719,21 @@ const HTML = `<!doctype html>
       });
       await loadAdminOwners();
       const rows = data.rows || [];
-      const mismatchHtml = row => adminCardHtml(row, 'mm-' + row.id, {
-        className: 'mismatch-card',
-        actions: row.status !== 'open' ? '<div class="admin-item-meta">已处理 ' + esc(row.resolvedAt || '') + '</div>' : row.kind === 'extra'
-          ? '<div class="mismatch-actions"><select data-mm-target><option value="">目标仓库</option>' + ownerOptions() + '</select><button data-admin-mm-resolve="' + esc(row.id) + '">转入</button></div>'
-          : '<div class="mismatch-actions"><button data-admin-mm-deduct="' + esc(row.id) + '">清除库存</button></div>'
-      });
+      state.adminMismatchRows = new Map(rows.map(row => ['mm-' + row.id, row]));
+      const mismatchHtml = row => {
+        const detailButton = '<button class="ghost" data-admin-mm-components="' + esc(row.id) + '">查看组件</button>';
+        const actions = row.status !== 'open'
+          ? '<div class="mismatch-actions">' + detailButton + '<span class="admin-item-meta">已处理 ' + esc(row.resolvedAt || '') + '</span></div>'
+          : row.kind === 'extra'
+            ? '<div class="mismatch-actions"><select data-mm-target><option value="">目标仓库</option>' + ownerOptions() + '</select><button data-admin-mm-resolve="' + esc(row.id) + '">转入</button>' + detailButton + '</div>'
+            : '<div class="mismatch-actions"><button data-admin-mm-deduct="' + esc(row.id) + '">清除库存</button>' + detailButton + '</div>';
+        return adminCardHtml(row, 'mm-' + row.id, { className: 'mismatch-card', actions });
+      };
       const extra = rows.filter(row => row.kind === 'extra');
       const missing = rows.filter(row => row.kind === 'missing');
       $('adminMmExtra').innerHTML = extra.length ? '<div class="admin-item-grid">' + extra.map(mismatchHtml).join('') + '</div>' : '<p class="muted">没有多余物品。</p>';
       $('adminMmMissing').innerHTML = missing.length ? '<div class="admin-item-grid">' + missing.map(mismatchHtml).join('') + '</div>' : '<p class="muted">没有缺失物品。</p>';
+      bindAdminMismatchTooltips();
     }
 
     async function loadAdminWarehouseProvisioning() {
@@ -5202,6 +5238,7 @@ const HTML = `<!doctype html>
       const adminPickClear = event.target.closest('[data-admin-pick-clear]');
       const mmDeduct = event.target.closest('[data-admin-mm-deduct]');
       const mmResolve = event.target.closest('[data-admin-mm-resolve]');
+      const mmComponents = event.target.closest('[data-admin-mm-components]');
       const aliasSave = event.target.closest('[data-admin-alias-save]');
       const aliasDetailSave = event.target.closest('[data-admin-alias-detail-save]');
       const aliasDelete = event.target.closest('[data-admin-alias-delete]');
@@ -5354,6 +5391,10 @@ const HTML = `<!doctype html>
           if (!confirm('确认删除这个仓库成员吗？')) return;
           const data = await post('/api/warehouse-admin/member/remove', { warehouse: card.dataset.warehouse, playerUuid: member.dataset.member });
           toast(data.message); await loadWarehouseAdminOrganizations();
+        } else if (mmComponents) {
+          const row = state.adminMismatchRows.get('mm-' + mmComponents.dataset.adminMmComponents);
+          if (!row) throw new Error('找不到这条异常记录。');
+          openNbtModal(row);
         } else if (mmDeduct) {
           const ok = confirm('确认清除这条缺失物品对应的账本库存吗？');
           if (!ok) return;
