@@ -261,6 +261,23 @@ class StoreDb {
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
 
+      CREATE TABLE IF NOT EXISTS shulker_repack_recovery (
+        bot_id TEXT PRIMARY KEY,
+        state TEXT NOT NULL DEFAULT 'prepared',
+        owner_uuid TEXT NOT NULL,
+        owner_username TEXT NOT NULL DEFAULT '',
+        old_box_item_key TEXT NOT NULL,
+        source_chest_id TEXT NOT NULL DEFAULT '',
+        target_item_json TEXT NOT NULL,
+        before_amount INTEGER NOT NULL,
+        requested_amount INTEGER NOT NULL,
+        new_box_item_json TEXT NOT NULL DEFAULT '',
+        extracted_items_json TEXT NOT NULL DEFAULT '[]',
+        message TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+
       CREATE TABLE IF NOT EXISTS inventory_reservations (
         reservation_id TEXT NOT NULL,
         owner_uuid TEXT NOT NULL,
@@ -513,6 +530,7 @@ class StoreDb {
       const oldBalances = this.db.prepare('SELECT owner_uuid AS ownerUuid, amount FROM balances WHERE item_key = ?')
       const deleteOldBalances = this.db.prepare('DELETE FROM balances WHERE item_key = ?')
       const updateSlots = this.db.prepare('UPDATE chest_slots SET item_key = ? WHERE item_key = ?')
+      const updatePendingRepack = this.db.prepare('UPDATE shulker_repack_recovery SET old_box_item_key = ? WHERE old_box_item_key = ?')
       const oldPlayerOverrides = this.db.prepare(`
         SELECT player_uuid AS playerUuid, display_name AS displayName
         FROM player_item_name_overrides
@@ -558,6 +576,7 @@ class StoreDb {
         }
         deleteOldBalances.run(move.old.itemKey)
         updateSlots.run(move.canonical.itemKey, move.old.itemKey)
+        updatePendingRepack.run(move.canonical.itemKey, move.old.itemKey)
         for (const override of oldPlayerOverrides.all(move.old.itemKey)) {
           insertPlayerOverride.run(override.playerUuid, move.canonical.itemKey, move.canonical.itemId, override.displayName)
         }
@@ -648,6 +667,118 @@ class StoreDb {
 
   clearRecoveryTask (botId = 'legacy') {
     this.db.prepare('DELETE FROM bot_recovery_tasks WHERE bot_id = ?').run(String(botId || 'legacy'))
+  }
+
+  beginShulkerRepackRecovery (botId, details) {
+    const id = String(botId || 'legacy')
+    const targetItem = this.rowToItem(details.targetItem || {})
+    const beforeAmount = Number(details.beforeAmount || 0)
+    const requestedAmount = Number(details.requestedAmount || 0)
+    if (!details.ownerUuid || !details.oldBoxItemKey || !targetItem.itemKey || beforeAmount <= 0 || requestedAmount <= 0) {
+      throw new Error('invalid prepared shulker repack recovery')
+    }
+    try {
+      this.db.prepare(`
+        INSERT INTO shulker_repack_recovery (
+          bot_id, state, owner_uuid, owner_username, old_box_item_key,
+          source_chest_id, target_item_json, before_amount, requested_amount,
+          message, updated_at
+        ) VALUES (?, 'prepared', ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+      `).run(
+        id,
+        String(details.ownerUuid),
+        String(details.ownerUsername || ''),
+        String(details.oldBoxItemKey),
+        String(details.sourceChestId || ''),
+        JSON.stringify(targetItem),
+        beforeAmount,
+        requestedAmount,
+        String(details.message || '')
+      )
+    } catch (error) {
+      if (String(error?.code || '').startsWith('SQLITE_CONSTRAINT')) {
+        throw new Error(`bot ${id} already has a pending shulker repack recovery`)
+      }
+      throw error
+    }
+    return this.getShulkerRepackRecovery(id)
+  }
+
+  markShulkerRepackPhysicalChange (botId, newBoxItem, extractedItems, message = '') {
+    const id = String(botId || 'legacy')
+    const box = this.rowToItem(newBoxItem || {})
+    const extracted = (extractedItems || [])
+      .map(item => ({ ...this.rowToItem(item), amount: Number(item.amount || 0) }))
+      .filter(item => item.itemKey && item.amount > 0)
+    if (!box.itemKey || !extracted.length) throw new Error('invalid physical shulker repack recovery update')
+    const changed = this.db.prepare(`
+      UPDATE shulker_repack_recovery
+      SET state = 'physical_changed',
+          new_box_item_json = ?,
+          extracted_items_json = ?,
+          message = CASE WHEN ? = '' THEN message ELSE ? END,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE bot_id = ? AND state = 'prepared'
+    `).run(JSON.stringify(box), JSON.stringify(extracted), String(message || ''), String(message || ''), id).changes
+    if (!changed) throw new Error(`no prepared shulker repack recovery for bot ${id}`)
+    return this.getShulkerRepackRecovery(id)
+  }
+
+  getShulkerRepackRecovery (botId = 'legacy') {
+    const row = this.db.prepare(`
+      SELECT bot_id AS botId, state, owner_uuid AS ownerUuid, owner_username AS ownerUsername,
+             old_box_item_key AS oldBoxItemKey, source_chest_id AS sourceChestId,
+             target_item_json AS targetItemJson, before_amount AS beforeAmount,
+             requested_amount AS requestedAmount, new_box_item_json AS newBoxItemJson,
+             extracted_items_json AS extractedItemsJson, message,
+             created_at AS createdAt, updated_at AS updatedAt
+      FROM shulker_repack_recovery WHERE bot_id = ? LIMIT 1
+    `).get(String(botId || 'legacy'))
+    if (!row) return null
+    const parseItem = raw => {
+      if (!raw) return null
+      try {
+        const item = JSON.parse(raw)
+        return this.catalog?.canonicalizeStoredItem(item) || item
+      } catch {
+        return null
+      }
+    }
+    row.targetItem = parseItem(row.targetItemJson)
+    row.newBoxItem = parseItem(row.newBoxItemJson)
+    try {
+      row.extractedItems = JSON.parse(row.extractedItemsJson || '[]')
+        .map(item => ({ ...(this.catalog?.canonicalizeStoredItem(item) || item), amount: Number(item.amount || 0) }))
+        .filter(item => item.itemKey && item.amount > 0)
+    } catch {
+      row.extractedItems = []
+    }
+    return row
+  }
+
+  clearShulkerRepackRecovery (botId = 'legacy') {
+    return this.db.prepare('DELETE FROM shulker_repack_recovery WHERE bot_id = ?').run(String(botId || 'legacy')).changes
+  }
+
+  commitShulkerRepackRecovery (botId = 'legacy') {
+    const id = String(botId || 'legacy')
+    return this.transaction(() => {
+      const recovery = this.getShulkerRepackRecovery(id)
+      if (!recovery) return null
+      if (recovery.state !== 'physical_changed' || !recovery.newBoxItem?.itemKey || !recovery.extractedItems.length) {
+        throw new Error(`shulker repack recovery for bot ${id} is not ready to commit`)
+      }
+      this.applyShulkerExtractionBalance(
+        recovery.ownerUuid,
+        recovery.oldBoxItemKey,
+        recovery.newBoxItem,
+        recovery.extractedItems,
+        recovery.ownerUsername,
+        recovery.message
+      )
+      this.clearShulkerRepackRecovery(id)
+      return recovery
+    })
   }
 
   listRecoveryTasks () {
@@ -2089,6 +2220,10 @@ class StoreDb {
   }
 
   applyShulkerExtraction (ownerUuid, oldBoxItemKey, newBoxItem, extractedItems, username = '', message = '') {
+    return this.transaction(() => this.applyShulkerExtractionBalance(ownerUuid, oldBoxItemKey, newBoxItem, extractedItems, username, message))
+  }
+
+  applyShulkerExtractionBalance (ownerUuid, oldBoxItemKey, newBoxItem, extractedItems, username = '', message = '') {
     const extracted = (extractedItems || []).filter(item => Number(item.amount || 0) > 0)
     if (!ownerUuid || !oldBoxItemKey || !newBoxItem?.itemKey || !extracted.length) {
       throw new Error('invalid shulker extraction balance update')
@@ -2097,17 +2232,16 @@ class StoreDb {
       throw new Error(`shulker contents changed without a new item fingerprint: ${oldBoxItemKey}`)
     }
 
-    this.transaction(() => {
-      this.upsertItem(newBoxItem)
-      this.adjustBalance(ownerUuid, oldBoxItemKey, -1)
-      this.adjustBalance(ownerUuid, newBoxItem.itemKey, 1)
-      for (const item of extracted) {
-        this.upsertItem(item)
-        this.adjustBalance(ownerUuid, item.itemKey, Number(item.amount || 0))
-      }
-      this.addTransaction('shulker_repack', 'ok', ownerUuid, username || this.ownerLabel(ownerUuid), extracted,
-        message || `old_box=${oldBoxItemKey}, new_box=${newBoxItem.itemKey}`)
-    })
+    this.upsertItem(newBoxItem)
+    this.adjustBalance(ownerUuid, oldBoxItemKey, -1)
+    this.adjustBalance(ownerUuid, newBoxItem.itemKey, 1)
+    for (const item of extracted) {
+      this.upsertItem(item)
+      this.adjustBalance(ownerUuid, item.itemKey, Number(item.amount || 0))
+    }
+    this.addTransaction('shulker_repack', 'ok', ownerUuid, username || this.ownerLabel(ownerUuid), extracted,
+      message || `old_box=${oldBoxItemKey}, new_box=${newBoxItem.itemKey}`)
+    return { ownerUuid, oldBoxItemKey, newBoxItem, extractedItems: extracted }
   }
 
   removeBalanceItems (ownerUuid, items) {

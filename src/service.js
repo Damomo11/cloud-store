@@ -109,7 +109,13 @@ class CloudStoreService {
           this.msg(context.username, `仓库空间不足，剩余${this.formatDepositSummary(result.leftover)}已转记为 momo，避免影响下一个玩家。`)
         }
       } else if (context.type === 'withdraw') {
+        const held = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
+        const pendingRepack = this.resolvePreparedShulkerRepackRecovery()
+        if (pendingRepack && !held.length) {
+          throw new Error('存在潜影盒重打包恢复记录，但死亡后机器人背包为空；已保留记录并停止自动补账。')
+        }
         const result = await this.warehouse.depositInventoryWithoutBalance('withdraw_death_recovery', `player=${context.username}, phase=${context.phase || ''}`)
+        if (pendingRepack) this.commitRecoveredShulkerRepack(result, 'death')
         if (context.username) {
           this.msg(context.username, '机器人取物品过程中死亡，本次取物品已终止；身上剩余物品已回收入库，不会扣除未交付数量。')
         }
@@ -159,13 +165,42 @@ class CloudStoreService {
     }
   }
 
+  resolvePreparedShulkerRepackRecovery () {
+    const recovery = this.db.getShulkerRepackRecovery?.(this.botId) || null
+    if (!recovery || recovery.state !== 'prepared') return recovery || null
+    return this.warehouse.resolvePreparedShulkerRepackFromInventory()
+  }
+
+  commitRecoveredShulkerRepack (depositResult, recoveryType) {
+    const recovery = this.db.getShulkerRepackRecovery?.(this.botId) || null
+    if (!recovery) return null
+    if (depositResult?.leftover?.length) {
+      throw new Error(`潜影盒重打包恢复仍有物品未能回库，暂不补记账本：${this.formatItemList(depositResult.leftover)}`)
+    }
+    const committed = this.db.commitShulkerRepackRecovery(this.botId)
+    if (committed) {
+      console.warn(`[shulker-repack-recovery] committed bot=${this.botId} type=${recoveryType} old=${committed.oldBoxItemKey} new=${committed.newBoxItem.itemKey}`)
+    }
+    return committed
+  }
+
   async recoverPersistedTaskOnSpawn () {
     const task = this.db.getRecoveryTask(this.botId)
-    if (!task) return
-
     const held = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
+    const pendingRepack = this.resolvePreparedShulkerRepackRecovery()
+    if (!task && !pendingRepack) return
+    if (pendingRepack && !held.length) {
+      throw new Error('存在潜影盒重打包恢复记录，但机器人背包为空；已停止服务并保留记录。')
+    }
+    if (!task && pendingRepack) {
+      await this.warehouse.goHome({ requireWarehouse: true })
+      const result = await this.warehouse.depositInventoryWithoutBalance('disconnect_recovery_shulker_repack', `bot=${this.botId}`)
+      this.commitRecoveredShulkerRepack(result, 'disconnect_without_task')
+      return
+    }
+
     const owner = this.recoveryOwnerFromTask(task)
-    if (!held.length && !(task.type === 'withdraw' && this.isWithdrawDeliveryPhase(task.phase) && task.items?.length)) {
+    if (!held.length && !pendingRepack && !(task.type === 'withdraw' && this.isWithdrawDeliveryPhase(task.phase) && task.items?.length)) {
       console.warn(`[disconnect-recovery] clearing stale recovery task without held items: ${task.type}:${task.actorUsername}:${task.phase}`)
       this.db.clearRecoveryTask(this.botId)
       return
@@ -196,6 +231,7 @@ class CloudStoreService {
           }
         }
       }
+      if (pendingRepack) this.commitRecoveredShulkerRepack(result, 'disconnect')
       if (task.actorUsername && result.deposited.length) {
         this.msg(task.actorUsername, `机器人重连后已把未交付的取货物品回收入库；这部分不会扣除库存。`)
       }
@@ -2614,9 +2650,15 @@ class CloudStoreService {
 
   async flushResidual () {
     const held = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
-    if (!held.length) return
+    if (!held.length) {
+      if (this.db.getShulkerRepackRecovery?.(this.botId)) {
+        throw new Error('存在未完成的潜影盒重打包记录，但机器人背包为空；请先检查仓库实物并重新同步。')
+      }
+      return
+    }
 
     const task = this.db.getRecoveryTask(this.botId)
+    const pendingRepack = this.resolvePreparedShulkerRepackRecovery()
     if (task?.type === 'deposit') {
       const owner = this.recoveryOwnerFromTask(task)
       console.warn(`[residual-recovery] continuing pending deposit before task: actor=${task.actorUsername}, owner=${owner.uuid}, held=${this.formatItemList(held)}`)
@@ -2642,7 +2684,15 @@ class CloudStoreService {
       if (delivered.length) {
         this.recordWithdrawDeduction(owner, delivered, `actor=${task.actorUsername}, target=${task.targetUsername}, phase=${task.phase}, recovery=residual`)
       }
+      if (pendingRepack) this.commitRecoveredShulkerRepack(result, 'residual')
       this.db.clearRecoveryTask(this.botId)
+      return
+    }
+
+    if (pendingRepack) {
+      console.warn(`[shulker-repack-recovery] returning pending repack without generic task bot=${this.botId}`)
+      const result = await this.warehouse.depositInventoryWithoutBalance('shulker_repack_residual_recovery', `bot=${this.botId}`)
+      this.commitRecoveredShulkerRepack(result, 'residual_without_task')
       return
     }
 
