@@ -1343,19 +1343,37 @@ class CloudStoreWebServer {
 
   apiAdminInventory (session, url) {
     this.requireAdmin(session)
-    const ownerQ = String(url.searchParams.get('owner') || '').trim().toLowerCase()
+    const ownerRaw = String(url.searchParams.get('owner') || '').trim()
+    const ownerQ = ownerRaw.toLowerCase()
     const itemQ = String(url.searchParams.get('item') || '').trim().toLowerCase()
     const limit = this.clampLimit(url.searchParams.get('limit'), 500, 2000)
+    const where = ['b.amount > 0']
+    const params = []
+    if (ownerQ) {
+      const matchingOwners = this.db.db.prepare(`
+        SELECT owner_uuid AS ownerUuid
+        FROM balances
+        WHERE amount > 0
+        GROUP BY owner_uuid
+        ORDER BY owner_uuid COLLATE NOCASE ASC
+      `).all().filter(row => {
+        const ownerLabel = this.db.ownerLabel(row.ownerUuid)
+        return this.textMatches(ownerLabel, ownerQ) || this.textMatches(row.ownerUuid, ownerQ)
+      }).map(row => row.ownerUuid)
+      if (!matchingOwners.length) return { ok: true, stats: { owners: 0, itemTypes: 0, totalAmount: 0 }, rows: [] }
+      where.push(`b.owner_uuid IN (${matchingOwners.map(() => '?').join(', ')})`)
+      params.push(...matchingOwners)
+    }
     const rows = this.db.db.prepare(`
       SELECT b.owner_uuid AS ownerUuid, i.item_key AS itemKey, i.item_id AS itemId,
              i.display_name AS displayName, i.nbt_json AS nbtJson,
              i.meta_json AS metaJson, b.amount
       FROM balances b
       JOIN items i ON i.item_key = b.item_key
-      WHERE b.amount > 0
+      WHERE ${where.join(' AND ')}
       ORDER BY b.owner_uuid COLLATE NOCASE ASC, i.display_name COLLATE NOCASE ASC
       LIMIT ?
-    `).all(limit * 3)
+    `).all(...params, limit * 3)
 
     const result = []
     const owners = new Set()
@@ -1367,7 +1385,6 @@ class CloudStoreWebServer {
     for (const row of rows) {
       const ownerLabel = this.db.ownerLabel(row.ownerUuid)
       const item = this.adminItem(row)
-      if (ownerQ && !this.textMatches(ownerLabel, ownerQ) && !this.textMatches(row.ownerUuid, ownerQ)) continue
       const decorated = {
         ...item,
         ownerUuid: row.ownerUuid,

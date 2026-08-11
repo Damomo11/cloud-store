@@ -122,3 +122,52 @@ test('admin inventory search matches localized base item names', () => {
   assert.equal(item.baseDisplayName, '附魔书')
   assert.equal(server.adminItemMatches(item, '附魔书'), true)
 })
+
+test('admin inventory applies owner filter before limiting rows', () => {
+  let inventorySql = ''
+  let inventoryParams = []
+  const server = new CloudStoreWebServer({
+    db: {
+      prepare: sql => {
+        if (sql.includes('GROUP BY owner_uuid')) {
+          return {
+            all: () => [
+              { ownerUuid: 'vault:xmc' },
+              { ownerUuid: 'vault:锈色' }
+            ]
+          }
+        }
+        if (sql.includes('FROM balances b') && sql.includes('JOIN items i') && sql.includes('LIMIT ?')) {
+          return {
+            all: (...params) => {
+              inventorySql = sql
+              inventoryParams = params
+              return [{
+                ownerUuid: 'vault:锈色',
+                itemKey: 'minecraft:iron_ingot',
+                itemId: 'minecraft:iron_ingot',
+                displayName: '铁锭',
+                amount: 24978
+              }]
+            }
+          }
+        }
+        throw new Error(`Unexpected query: ${sql}`)
+      }
+    },
+    ownerLabel: ownerUuid => ownerUuid === 'vault:锈色' ? '仓库:锈色' : ownerUuid,
+    shortCodeForItemKey: () => 'abc123',
+    getGlobalAliasesForItems: () => new Map(),
+    getShulkerContentsByBox: () => new Map()
+  }, { web: {} }, () => null)
+  server.requireAdmin = () => ({ username: 'admin' })
+
+  const result = server.apiAdminInventory({}, new URL('http://localhost/api/admin/inventory?owner=vault%3A%E9%94%88%E8%89%B2'))
+
+  assert.match(inventorySql, /b\.owner_uuid IN \(\?\)/)
+  assert.deepEqual(inventoryParams, ['vault:锈色', 1500])
+  assert.equal(result.rows.length, 1)
+  assert.equal(result.stats.owners, 1)
+  assert.equal(result.stats.itemTypes, 1)
+  assert.equal(result.stats.totalAmount, 24978)
+})
