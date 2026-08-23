@@ -112,10 +112,10 @@ class CloudStoreService {
         const held = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
         const pendingRepack = this.resolvePreparedShulkerRepackRecovery()
         if (pendingRepack && !held.length) {
-          throw new Error('存在潜影盒重打包恢复记录，但死亡后机器人背包为空；已保留记录并停止自动补账。')
+          console.warn(`[death-recovery] pending shulker repack has no held items; keeping the recovery record without committing: bot=${this.botId}`)
         }
         const result = await this.warehouse.depositInventoryWithoutBalance('withdraw_death_recovery', `player=${context.username}, phase=${context.phase || ''}`)
-        if (pendingRepack) this.commitRecoveredShulkerRepack(result, 'death')
+        if (pendingRepack && held.length) this.commitRecoveredShulkerRepack(result, 'death')
         if (context.username) {
           this.msg(context.username, '机器人取物品过程中死亡，本次取物品已终止；身上剩余物品已回收入库，不会扣除未交付数量。')
         }
@@ -190,7 +190,8 @@ class CloudStoreService {
     const pendingRepack = this.resolvePreparedShulkerRepackRecovery()
     if (!task && !pendingRepack) return
     if (pendingRepack && !held.length) {
-      throw new Error('存在潜影盒重打包恢复记录，但机器人背包为空；已停止服务并保留记录。')
+      console.warn(`[disconnect-recovery] pending shulker repack has no held items; keeping the recovery record and continuing service: bot=${this.botId}`)
+      if (!task) return
     }
     if (!task && pendingRepack) {
       await this.warehouse.goHome({ requireWarehouse: true })
@@ -231,7 +232,7 @@ class CloudStoreService {
           }
         }
       }
-      if (pendingRepack) this.commitRecoveredShulkerRepack(result, 'disconnect')
+      if (pendingRepack && held.length) this.commitRecoveredShulkerRepack(result, 'disconnect')
       if (task.actorUsername && result.deposited.length) {
         this.msg(task.actorUsername, `机器人重连后已把未交付的取货物品回收入库；这部分不会扣除库存。`)
       }
@@ -2651,8 +2652,9 @@ class CloudStoreService {
   async flushResidual () {
     const held = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
     if (!held.length) {
-      if (this.db.getShulkerRepackRecovery?.(this.botId)) {
-        throw new Error('存在未完成的潜影盒重打包记录，但机器人背包为空；请先检查仓库实物并重新同步。')
+      const pendingRepack = this.db.getShulkerRepackRecovery?.(this.botId)
+      if (pendingRepack) {
+        console.warn(`[shulker-repack-recovery] no held items while recovery remains pending; keeping the record and continuing task: bot=${this.botId} state=${pendingRepack.state}`)
       }
       return
     }

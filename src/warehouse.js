@@ -829,7 +829,8 @@ class Warehouse {
       throw new Error(`机器人背包中的同色潜影盒均不符合重打包记录；已保留恢复记录并停止后续任务。${rejected[0]}`)
     }
     if (unchanged.length) return this.resolvePreparedShulkerRepackFromItem(recovery, unchanged[0])
-    throw new Error('机器人背包中找不到待恢复的潜影盒，已保留恢复记录并停止后续任务。')
+    console.warn(`[shulker-repack-recovery] prepared record is still pending; matching box is not currently in inventory, keeping the record and continuing bot tasks: bot=${this.botId} old=${recovery.oldBoxItemKey}`)
+    return null
   }
 
   assertHeldShulker (expectedItemKey = '') {

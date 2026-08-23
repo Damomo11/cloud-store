@@ -272,6 +272,67 @@ test('prepared shulker recovery infers the physical change from the held box', (
   }
 })
 
+test('prepared shulker recovery stays pending when the box is temporarily absent', () => {
+  const fixture = createDb()
+  const oldBox = { itemKey: 'missing-old-box', itemId: 'minecraft:purple_shulker_box', displayName: '紫色潜影盒', nbtJson: '', metaJson: '{}' }
+  const target = { itemKey: 'missing-target', itemId: 'minecraft:diamond', displayName: '钻石', nbtJson: '', metaJson: '' }
+  try {
+    fixture.db.addBalanceItems('owner', [{ ...oldBox, amount: 1 }])
+    fixture.db.beginShulkerRepackRecovery('bot-a', {
+      ownerUuid: 'owner',
+      ownerUsername: 'Player',
+      oldBoxItemKey: oldBox.itemKey,
+      targetItem: target,
+      beforeAmount: 64,
+      requestedAmount: 5
+    })
+
+    const warehouse = new Warehouse(
+      { username: 'BotA', inventory: { items: () => [] } },
+      fixture.db,
+      {
+        fromPrismarineItem: item => item.normalized,
+        isShulkerBox: itemId => /_shulker_box$/.test(itemId)
+      },
+      { ...structuredClone(DEFAULT_CONFIG), server: { ...DEFAULT_CONFIG.server, botName: 'BotA' } }
+    )
+
+    assert.equal(warehouse.resolvePreparedShulkerRepackFromInventory(), null)
+    assert.equal(fixture.db.getShulkerRepackRecovery('bot-a').state, 'prepared')
+  } finally {
+    fixture.close()
+  }
+})
+
+test('flushResidual continues normal cleanup when a prepared shulker is absent', async () => {
+  const events = []
+  const loose = { itemKey: 'residual-loose', itemId: 'minecraft:diamond', displayName: '钻石', amount: 1 }
+  const recovery = { state: 'prepared', oldBoxItemKey: 'residual-old-box' }
+  const db = {
+    getShulkerRepackRecovery: () => recovery,
+    getRecoveryTask: () => null,
+    addBalanceItems: (...args) => events.push(['balance', ...args]),
+    addTransaction: (...args) => events.push(['transaction', ...args])
+  }
+  const bot = { username: 'BotA', inventory: { items: () => [{ normalized: loose }] } }
+  const catalog = { aggregatePrismarineItems: () => [loose] }
+  const warehouse = {
+    resolvePreparedShulkerRepackFromInventory: () => null,
+    depositInventoryWithoutBalance: async () => {
+      events.push(['deposit'])
+      return { deposited: [loose], leftover: [] }
+    }
+  }
+  const config = structuredClone(DEFAULT_CONFIG)
+  config.server.botName = 'BotA'
+  const service = new CloudStoreService(bot, db, catalog, warehouse, config)
+
+  await service.flushResidual()
+
+  assert.deepEqual(events.map(event => event[0]), ['balance', 'transaction', 'deposit'])
+  assert.equal(db.getShulkerRepackRecovery(), recovery)
+})
+
 test('disconnect recovery stores held items before committing the pending shulker repack', async () => {
   const events = []
   const loose = { itemKey: 'recovery-target', itemId: 'minecraft:diamond', displayName: '钻石', amount: 5 }
