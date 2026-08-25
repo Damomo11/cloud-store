@@ -897,3 +897,104 @@ test('shulker extraction keeps the physical-change journal when the balance comm
   assert.equal(recovery.oldBoxItemKey, oldBoxInfo.itemKey)
   assert.equal(recovery.newBoxItem.itemKey, newBoxInfo.itemKey)
 })
+
+test('shulker extraction skips an unresolved recovery conflict without stopping the bot', async () => {
+  const target = { itemKey: 'conflict-target', itemId: 'minecraft:diamond', displayName: '钻石', amount: 2 }
+  const oldBoxInfo = { itemKey: 'conflict-old-box', itemId: 'minecraft:purple_shulker_box', displayName: '潜影盒' }
+  const oldBox = { slot: 36, count: 1, normalized: oldBoxInfo }
+  let inventory = [oldBox]
+  let returned = false
+  const recovery = {
+    state: 'physical_changed',
+    oldBoxItemKey: oldBoxInfo.itemKey,
+    newBoxItem: { itemKey: 'conflict-new-box', itemId: oldBoxInfo.itemId },
+    extractedItems: [{ ...target, amount: 1 }]
+  }
+  const db = {
+    getItemByKey: key => key === target.itemKey ? target : (key === oldBoxInfo.itemKey ? oldBoxInfo : null),
+    listSlotsForItemKey: () => [{ chestId: '1,2,3', x: 1, y: 2, z: 3, blockName: 'barrel', slot: 4, amount: 1 }],
+    getShulkerRepackRecovery: () => recovery,
+    clearShulkerRepackRecovery: () => { throw new Error('must not clear unresolved recovery') },
+    beginShulkerRepackRecovery: () => { throw new Error('must not begin while recovery is unresolved') }
+  }
+  const catalog = {
+    fromPrismarineItem: item => ({ ...item.normalized, amount: item.count }),
+    isShulkerBox: itemId => /_shulker_box$/.test(itemId)
+  }
+  const bot = { username: 'BotA', inventory: { items: () => inventory } }
+  const config = structuredClone(DEFAULT_CONFIG)
+  config.server.botName = 'BotA'
+  config.debug = false
+  config.timing.containerSettleMs = 0
+  const warehouse = new Warehouse(bot, db, catalog, config)
+  warehouse.takeOneShulkerFromChest = async () => oldBox
+  warehouse.equipItemInHand = async () => {}
+  warehouse.openQuickShulkerWindow = async () => ({ close: () => { inventory = [oldBox] } })
+  warehouse.countContainerItem = () => 5
+  warehouse.tryWithdrawExactFrom = async () => 2
+  warehouse.returnShulkerToChest = async (chest, item) => {
+    assert.equal(item, oldBox)
+    returned = true
+    inventory = []
+  }
+
+  const result = await warehouse.withdrawFromShulkerBoxes({
+    ownerUuid: 'owner',
+    ownerUsername: 'Player',
+    itemKey: target.itemKey,
+    amount: 2,
+    sourceShulkerItemKey: oldBoxInfo.itemKey,
+    sourceBoxCount: 1
+  })
+
+  assert.deepEqual(result.withdrawn, [])
+  assert.equal(result.missing[0].amount, 2)
+  assert.equal(returned, true)
+})
+
+test('shulker extraction clears an unchanged prepared recovery before retrying', async () => {
+  const target = { itemKey: 'retry-target', itemId: 'minecraft:diamond', displayName: '钻石', amount: 2 }
+  const oldBoxInfo = { itemKey: 'retry-old-box', itemId: 'minecraft:purple_shulker_box', displayName: '潜影盒' }
+  const oldBox = { slot: 36, count: 1, normalized: oldBoxInfo }
+  let recovery = { state: 'prepared', oldBoxItemKey: oldBoxInfo.itemKey }
+  const operations = []
+  let inventory = [oldBox]
+  const db = {
+    getItemByKey: key => key === target.itemKey ? target : (key === oldBoxInfo.itemKey ? oldBoxInfo : null),
+    listSlotsForItemKey: () => [{ chestId: '1,2,3', x: 1, y: 2, z: 3, blockName: 'barrel', slot: 4, amount: 1 }],
+    getShulkerRepackRecovery: () => recovery,
+    clearShulkerRepackRecovery: () => { operations.push('cleared'); recovery = null },
+    beginShulkerRepackRecovery: () => { operations.push('prepared') },
+    markShulkerRepackPhysicalChange: () => { operations.push('physical_changed') },
+    commitShulkerRepackRecovery: () => { operations.push('committed') }
+  }
+  const catalog = {
+    fromPrismarineItem: item => ({ ...item.normalized, amount: item.count }),
+    isShulkerBox: itemId => /_shulker_box$/.test(itemId),
+    extractShulkerContents: () => [{ item: target, amount: 3 }]
+  }
+  const bot = { username: 'BotA', inventory: { items: () => inventory } }
+  const config = structuredClone(DEFAULT_CONFIG)
+  config.server.botName = 'BotA'
+  config.debug = false
+  config.timing.containerSettleMs = 0
+  const warehouse = new Warehouse(bot, db, catalog, config)
+  warehouse.takeOneShulkerFromChest = async () => oldBox
+  warehouse.equipItemInHand = async () => {}
+  warehouse.openQuickShulkerWindow = async () => ({ close: () => { inventory = [oldBox] } })
+  warehouse.countContainerItem = () => 5
+  warehouse.tryWithdrawExactFrom = async () => 0
+  warehouse.returnShulkerToChest = async () => { inventory = [] }
+
+  const result = await warehouse.withdrawFromShulkerBoxes({
+    ownerUuid: 'owner',
+    ownerUsername: 'Player',
+    itemKey: target.itemKey,
+    amount: 2,
+    sourceShulkerItemKey: oldBoxInfo.itemKey,
+    sourceBoxCount: 1
+  })
+
+  assert.equal(result.missing[0].amount, 2)
+  assert.deepEqual(operations, ['cleared', 'prepared', 'cleared'])
+})
