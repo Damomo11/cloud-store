@@ -2,6 +2,7 @@ const { GoalBlock, GoalNear } = require('mineflayer-pathfinder').goals
 const { Movements } = require('mineflayer-pathfinder')
 const Vec3 = require('vec3')
 const { sleep, sumBy } = require('./utils')
+const { logLocalError } = require('./localErrorLog')
 const { isFatalProtocolReadError } = require('./botConnection')
 
 class Warehouse {
@@ -490,6 +491,30 @@ class Warehouse {
           const available = await this.waitForContainerItemCount(quickWindow, allocation.itemKey)
           const toTake = Math.min(remaining, available)
           if (toTake > 0) {
+            const pending = this.db.getShulkerRepackRecovery?.(this.botId)
+            if (pending) {
+              if (pending.state === 'prepared' && pending.oldBoxItemKey === sourceKey) {
+                this.db.clearShulkerRepackRecovery(this.botId)
+                console.warn(`[shulker-repack-recovery] cleared unchanged stale prepared record before retry: bot=${this.botId} old=${sourceKey}`)
+              } else {
+                const conflict = new Error(`bot ${this.botId} has an unresolved shulker repack recovery`)
+                logLocalError('shulker-repack-conflict', conflict, {
+                  botId: this.botId,
+                  sourceChestId: chest.chestId,
+                  sourceKey,
+                  pendingState: pending.state,
+                  pendingOldBoxItemKey: pending.oldBoxItemKey,
+                  ownerUuid: allocation.ownerUuid
+                }, { directory: this.config.localLogDirectory })
+                console.error(`[shulker-repack-recovery] unresolved record blocks extraction; returning box and continuing: bot=${this.botId} state=${pending.state} old=${pending.oldBoxItemKey}`)
+                quickWindow.close()
+                quickWindow = null
+                boxToReturn = this.findInventoryItemByKey(sourceKey) || sourceBox
+                await this.returnShulkerToChest(chest, boxToReturn)
+                returned = true
+                continue
+              }
+            }
             this.db.beginShulkerRepackRecovery(this.botId, {
               ownerUuid: allocation.ownerUuid,
               ownerUsername: allocation.ownerUsername || '',
@@ -538,8 +563,28 @@ class Warehouse {
           withdrawn.push({ ...targetItem, amount: moved })
           remaining -= moved
         } catch (error) {
+          if (repackState || /shulker repack recovery/i.test(String(error?.message || ''))) {
+            logLocalError('shulker-repack-error', error, {
+              botId: this.botId,
+              sourceChestId: chest.chestId,
+              sourceKey,
+              targetKey: allocation.itemKey,
+              recoveryState: repackState
+            }, { directory: this.config.localLogDirectory })
+          }
           if (quickWindow) {
             try { quickWindow.close() } catch {}
+            quickWindow = null
+          }
+          if (/already has a pending shulker repack recovery|unresolved shulker repack recovery/i.test(String(error?.message || ''))) {
+            const recoverableBox = this.findInventoryShulker(sourceItem.itemId, sourceKey) || boxToReturn
+            try {
+              await this.returnShulkerToChest(chest, recoverableBox)
+              returned = true
+              continue
+            } catch (returnError) {
+              error.message += `；潜影盒冲突后放回失败：${returnError.message}`
+            }
           }
           if (repackState === 'prepared') {
             const changedBox = this.findInventoryShulker(sourceItem.itemId, sourceKey) || boxToReturn
