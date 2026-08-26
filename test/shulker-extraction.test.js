@@ -75,6 +75,16 @@ test('withdraw below 1728 uses loose items first and extracts only the shortfall
   assert.equal(plan.allocations[1].reservationAmount, 1)
 })
 
+test('withdraw uses sufficient loose stock without opening a mixed shulker', () => {
+  const { service, target } = createPlanningService({ loose: 64, boxes: 1, perBox: 64, singleItem: false })
+  const plan = service.buildWithdrawPlan('owner', [{ ...target, amount: 64, requestIndex: 0 }])
+
+  assert.equal(plan.allocations.length, 1)
+  assert.equal(plan.allocations[0].itemKey, target.itemKey)
+  assert.equal(plan.allocations[0].amount, 64)
+  assert.equal(plan.allocations[0].withdrawMode, undefined)
+})
+
 test('shulker extraction plans as much as physically available when inventory is short', () => {
   const { service, target } = createPlanningService({ loose: 10, boxes: 2, perBox: 64 })
   const plan = service.buildWithdrawPlan('owner', [{ ...target, amount: 200, requestIndex: 0 }])
@@ -331,6 +341,46 @@ test('flushResidual continues normal cleanup when a prepared shulker is absent',
 
   assert.deepEqual(events.map(event => event[0]), ['balance', 'transaction', 'deposit'])
   assert.equal(db.getShulkerRepackRecovery(), recovery)
+})
+
+test('flushResidual clears an orphaned prepared shulker recovery without held items', async () => {
+  const recovery = { state: 'prepared', oldBoxItemKey: 'orphan-old-box' }
+  let cleared = 0
+  const db = {
+    getShulkerRepackRecovery: () => recovery,
+    getRecoveryTask: () => null,
+    clearShulkerRepackRecovery: () => { cleared++ }
+  }
+  const bot = { username: 'BotA', inventory: { items: () => [] } }
+  const catalog = { aggregatePrismarineItems: () => [] }
+  const service = new CloudStoreService(bot, db, catalog, {}, {
+    ...structuredClone(DEFAULT_CONFIG),
+    server: { ...DEFAULT_CONFIG.server, botName: 'BotA' }
+  })
+
+  await service.flushResidual()
+
+  assert.equal(cleared, 1)
+})
+
+test('flushResidual keeps a physical-change shulker recovery without held items', async () => {
+  const recovery = { state: 'physical_changed', oldBoxItemKey: 'changed-old-box' }
+  let cleared = 0
+  const db = {
+    getShulkerRepackRecovery: () => recovery,
+    getRecoveryTask: () => null,
+    clearShulkerRepackRecovery: () => { cleared++ }
+  }
+  const bot = { username: 'BotA', inventory: { items: () => [] } }
+  const catalog = { aggregatePrismarineItems: () => [] }
+  const service = new CloudStoreService(bot, db, catalog, {}, {
+    ...structuredClone(DEFAULT_CONFIG),
+    server: { ...DEFAULT_CONFIG.server, botName: 'BotA' }
+  })
+
+  await service.flushResidual()
+
+  assert.equal(cleared, 0)
 })
 
 test('disconnect recovery stores held items before committing the pending shulker repack', async () => {

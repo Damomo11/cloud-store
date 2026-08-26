@@ -171,6 +171,13 @@ class CloudStoreService {
     return this.warehouse.resolvePreparedShulkerRepackFromInventory()
   }
 
+  clearOrphanedPreparedShulkerRepack (recovery, task, held) {
+    if (recovery?.state !== 'prepared' || task || held?.length) return false
+    this.db.clearShulkerRepackRecovery(this.botId)
+    console.warn(`[shulker-repack-recovery] cleared orphaned prepared record with no held items or recovery task: bot=${this.botId} old=${recovery.oldBoxItemKey}`)
+    return true
+  }
+
   commitRecoveredShulkerRepack (depositResult, recoveryType) {
     const recovery = this.db.getShulkerRepackRecovery?.(this.botId) || null
     if (!recovery) return null
@@ -187,8 +194,12 @@ class CloudStoreService {
   async recoverPersistedTaskOnSpawn () {
     const task = this.db.getRecoveryTask(this.botId)
     const held = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
+    const pendingRecord = this.db.getShulkerRepackRecovery?.(this.botId) || null
     const pendingRepack = this.resolvePreparedShulkerRepackRecovery()
-    if (!task && !pendingRepack) return
+    if (!task && !pendingRepack) {
+      if (this.clearOrphanedPreparedShulkerRepack(pendingRecord, task, held)) return
+      return
+    }
     if (pendingRepack && !held.length) {
       console.warn(`[disconnect-recovery] pending shulker repack has no held items; keeping the recovery record and continuing service: bot=${this.botId}`)
       if (!task) return
@@ -2651,15 +2662,15 @@ class CloudStoreService {
 
   async flushResidual () {
     const held = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
+    const task = this.db.getRecoveryTask(this.botId)
     if (!held.length) {
       const pendingRepack = this.db.getShulkerRepackRecovery?.(this.botId)
-      if (pendingRepack) {
+      if (pendingRepack && !this.clearOrphanedPreparedShulkerRepack(pendingRepack, task, held)) {
         console.warn(`[shulker-repack-recovery] no held items while recovery remains pending; keeping the record and continuing task: bot=${this.botId} state=${pendingRepack.state}`)
       }
       return
     }
 
-    const task = this.db.getRecoveryTask(this.botId)
     const pendingRepack = this.resolvePreparedShulkerRepackRecovery()
     if (task?.type === 'deposit') {
       const owner = this.recoveryOwnerFromTask(task)
