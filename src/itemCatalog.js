@@ -251,12 +251,35 @@ class ItemCatalog {
   }
 
   stripVolatileMetaForFingerprint (itemId, meta) {
-    if (!this.shouldIgnoreCraftEngineNetworkData(itemId)) return meta
-    const stripped = this.omitObjectKeyDeep(meta, 'craftengine:network_data')
-    if (Array.isArray(stripped?.components)) {
-      return {
-        ...stripped,
-        components: stripped.components.filter(component => !this.isEmptyCustomDataComponent(component))
+    const isShitHat = this.isShitHatMeta(meta)
+    const isBreweryX = this.isBreweryXMeta(meta)
+    if (!this.shouldIgnoreCraftEngineNetworkData(itemId) && !isShitHat && !isBreweryX) return meta
+
+    let stripped = meta
+    if (this.shouldIgnoreCraftEngineNetworkData(itemId) || isShitHat) {
+      stripped = this.omitObjectKeyDeep(stripped, 'craftengine:network_data')
+      if (Array.isArray(stripped?.components)) {
+        stripped = {
+          ...stripped,
+          components: stripped.components.filter(component => !this.isEmptyCustomDataComponent(component))
+        }
+      }
+    }
+    if (isBreweryX) {
+      stripped = this.omitObjectKeyDeep(stripped, 'breweryx:brewdata')
+      if (Array.isArray(stripped?.components)) {
+        stripped = {
+          ...stripped,
+          components: stripped.components
+            .map(component => {
+              if (component?.type !== 'tooltip_display') return component
+              return {
+                ...component,
+                data: this.omitObjectKeyDeep(component.data, 'hiddenComponents')
+              }
+            })
+            .filter(component => !this.isEmptyCustomDataComponent(component))
+        }
       }
     }
     return stripped
@@ -267,6 +290,36 @@ class ItemCatalog {
     return normalized === 'minecraft:string' ||
       normalized === 'minecraft:tripwire_hook' ||
       normalized === 'minecraft:note_block'
+  }
+
+  isShitHatMeta (meta) {
+    return this.hasObjectKeyWithValueDeep(meta, 'craftengine:id', 'tsl:shit_hat')
+  }
+
+  isBreweryXMeta (meta) {
+    return this.hasObjectKeyDeep(meta, 'breweryx:brewdata')
+  }
+
+  hasObjectKeyDeep (value, targetKey) {
+    if (Array.isArray(value)) return value.some(item => this.hasObjectKeyDeep(item, targetKey))
+    if (!value || typeof value !== 'object') return false
+    return Object.entries(value).some(([key, child]) => key === targetKey || this.hasObjectKeyDeep(child, targetKey))
+  }
+
+  hasObjectKeyWithValueDeep (value, targetKey, expected) {
+    if (Array.isArray(value)) return value.some(item => this.hasObjectKeyWithValueDeep(item, targetKey, expected))
+    if (!value || typeof value !== 'object') return false
+    return Object.entries(value).some(([key, child]) => {
+      if (key === targetKey) return this.unwrapTypedValue(child) === expected
+      return this.hasObjectKeyWithValueDeep(child, targetKey, expected)
+    })
+  }
+
+  unwrapTypedValue (value) {
+    if (value && typeof value === 'object' && !Array.isArray(value) && Object.prototype.hasOwnProperty.call(value, 'value')) {
+      return this.unwrapTypedValue(value.value)
+    }
+    return value
   }
 
   omitObjectKeyDeep (value, keyToOmit) {
@@ -301,10 +354,11 @@ class ItemCatalog {
     if (!Number.isFinite(count) || count <= 0) return null
 
     const fixedBeeContainer = this.isBeeContainerEntry(entry)
+    const isBreweryX = this.isBreweryXMeta({ components: entry.components })
     const components = !fixedBeeContainer && Array.isArray(entry.components)
       ? entry.components
         .filter(component => this.shouldKeepComponentForFingerprint(component))
-        .map(component => this.normalizeComponentForFingerprint(component))
+        .map(component => this.normalizeContainerComponentForFingerprint(component, isBreweryX))
       : []
     components.sort((a, b) => this.compareFingerprintValues(a, b))
     const removeComponents = !fixedBeeContainer && Array.isArray(entry.removeComponents) && entry.removeComponents.length
@@ -329,6 +383,15 @@ class ItemCatalog {
     return {
       type: component.type,
       data: this.sortNestedItemComponentsForFingerprint(component.data ?? null)
+    }
+  }
+
+  normalizeContainerComponentForFingerprint (component, isBreweryX) {
+    const normalized = this.normalizeComponentForFingerprint(component)
+    if (!isBreweryX || component?.type !== 'tooltip_display') return normalized
+    return {
+      ...normalized,
+      data: this.omitObjectKeyDeep(normalized.data, 'hiddenComponents')
     }
   }
 
