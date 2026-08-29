@@ -17,6 +17,8 @@ class Warehouse {
     this.homePosition = null
     this.openingChest = null
     this.connectionAbortController = new AbortController()
+    this.mutationSeq = 0
+    this.chestMutationSeqs = new Map()
   }
 
   withWarehouseLock (fn) {
@@ -504,8 +506,22 @@ class Warehouse {
         let repackState = ''
         try {
           await this.equipItemInHand(sourceBox)
-          quickWindow = await this.openQuickShulkerWindow(sourceKey)
-          const available = await this.waitForContainerItemCount(quickWindow, allocation.itemKey)
+          // 服务器偶尔会在快捷开盒后返回空窗口（数量 0），与盒内应有物品对不上；
+          // 关窗重开最多 quickShulkerOpenAttempts 次，仍为 0 才跳过该盒。
+          let available = 0
+          const maxOpenAttempts = Math.max(1, Number(this.config.timing?.quickShulkerOpenAttempts ?? 3))
+          for (let openAttempt = 1; openAttempt <= maxOpenAttempts; openAttempt++) {
+            quickWindow = await this.openQuickShulkerWindow(sourceKey)
+            available = await this.waitForContainerItemCount(quickWindow, allocation.itemKey)
+            if (available > 0) break
+            this.debug(`quick shulker window empty (attempt ${openAttempt}/${maxOpenAttempts}) source=${sourceKey} target=${allocation.itemKey}`)
+            quickWindow.close()
+            quickWindow = null
+            if (openAttempt < maxOpenAttempts) await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
+          }
+          if (available <= 0) {
+            console.warn(`[shulker-extract] 快捷开盒连续 ${maxOpenAttempts} 次读取数量为 0：source=${sourceKey}，本次跳过该盒。`)
+          }
           const toTake = Math.min(remaining, available)
           if (toTake > 0) {
             const pending = this.db.getShulkerRepackRecovery?.(this.botId)
@@ -974,47 +990,72 @@ class Warehouse {
   }
 
   async tryWithdrawExactFrom (container, itemKey, amount, preferredSlots = []) {
+    let movedTotal = 0
     let remaining = amount
-    let moved = 0
     const preferredOrder = new Map(preferredSlots.map((slot, index) => [slot, index]))
+    const maxPasses = Math.max(1, Number(this.config.timing?.withdrawConfirmPasses ?? 2))
 
-    while (remaining > 0) {
-      const item = this.containerContentItems(container)
-        .filter(entry => {
-          const normalized = this.catalog.fromPrismarineItem(entry)
-          return normalized.itemKey === itemKey
-        })
-        .sort((a, b) => {
-          const ao = preferredOrder.has(a.slot) ? preferredOrder.get(a.slot) : Number.MAX_SAFE_INTEGER
-          const bo = preferredOrder.has(b.slot) ? preferredOrder.get(b.slot) : Number.MAX_SAFE_INTEGER
-          return ao - bo || b.count - a.count || a.slot - b.slot
-        })[0]
-      if (!item) break
+    // 整批点击、末端一次确认：点击期间不等服务器逐条确认，
+    // 少拿的数量在下一轮补取，避免逐次等待拖慢整批取货。
+    for (let pass = 0; pass < maxPasses && remaining > 0; pass++) {
+      const containerBefore = this.countContainerItem(container, itemKey)
+      const expectedTake = Math.min(remaining, containerBefore)
+      if (expectedTake <= 0) break
 
-      const before = this.windowInventoryCountByItemKey(container, itemKey)
-      try {
-        if (item.count <= remaining) {
-          await this.moveContainerSlotToInventory(container, item.slot)
-        } else {
-          await this.movePartialContainerSlotToInventory(container, item.slot, remaining)
+      let planned = 0
+      while (planned < expectedTake) {
+        const item = this.containerContentItems(container)
+          .filter(entry => {
+            const normalized = this.catalog.fromPrismarineItem(entry)
+            return normalized.itemKey === itemKey
+          })
+          .sort((a, b) => {
+            const ao = preferredOrder.has(a.slot) ? preferredOrder.get(a.slot) : Number.MAX_SAFE_INTEGER
+            const bo = preferredOrder.has(b.slot) ? preferredOrder.get(b.slot) : Number.MAX_SAFE_INTEGER
+            return ao - bo || b.count - a.count || a.slot - b.slot
+          })[0]
+        if (!item) break
+
+        const take = Math.min(item.count, expectedTake - planned)
+        try {
+          if (take >= item.count) {
+            await this.moveContainerSlotToInventory(container, item.slot)
+          } else {
+            await this.movePartialContainerSlotToInventory(container, item.slot, take)
+          }
+        } catch (error) {
+          this.debug(`withdraw exact slot ${item.slot} failed: ${error.message}`)
+          await this.ensureWindowCursorCleared(container)
+          break
         }
-        await this.waitForWindowInventoryIncrease(container, itemKey, before)
-      } catch (error) {
-        this.debug(`withdraw exact slot ${item.slot} failed: ${error.message}`)
-        break
+        if (!(await this.ensureWindowCursorCleared(container))) break
+        planned += take
       }
 
-      const after = this.windowInventoryCountByItemKey(container, itemKey)
-      const delta = Math.max(0, after - before)
-      if (delta <= 0) {
-        this.debug(`withdraw no movement slot=${item.slot} count=${item.count} before=${before} after=${after} mode=${item.count <= remaining ? 'move' : 'partial'}`)
+      await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
+      const moved = Math.max(0, containerBefore - this.countContainerItem(container, itemKey))
+      if (moved <= 0) {
+        this.debug(`withdraw batch pass ${pass + 1} moved nothing for ${itemKey}`)
         break
       }
-      moved += delta
-      remaining -= delta
+      movedTotal += moved
+      remaining -= moved
     }
 
-    return moved
+    return movedTotal
+  }
+
+  async ensureWindowCursorCleared (container) {
+    if (!container.selectedItem) return true
+    const destSlot = this.firstEmptyWindowInventorySlot(container)
+    if (destSlot === null) return false
+    try {
+      await this.bot.clickWindow(destSlot, 0, 0)
+    } catch {
+      return false
+    }
+    await sleep(Math.max(0, Number(this.config.timing?.containerClickIntervalMs ?? 50)))
+    return !container.selectedItem
   }
 
   windowInventoryCountByItemKey (window, itemKey) {
@@ -1041,23 +1082,23 @@ class Warehouse {
     if (destSlot === null) throw new Error('机器人背包没有空槽，无法取物')
 
     await this.bot.clickWindow(sourceSlot, 0, 0)
-    await sleep(this.config.timing.containerSettleMs)
+    await sleep(Math.max(0, Number(this.config.timing?.containerClickIntervalMs ?? 50)))
     await this.bot.clickWindow(destSlot, 0, 0)
   }
 
   async movePartialContainerSlotToInventory (container, sourceSlot, count) {
     const destSlot = this.firstEmptyWindowInventorySlot(container)
     if (destSlot === null) throw new Error('机器人背包没有空槽，无法拆分取物')
+    const intervalMs = Math.max(0, Number(this.config.timing?.containerClickIntervalMs ?? 50))
 
     await this.bot.clickWindow(sourceSlot, 0, 0)
-    await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
+    await sleep(intervalMs)
     for (let i = 0; i < count; i++) {
       await this.bot.clickWindow(destSlot, 1, 0)
-      const intervalMs = Math.max(0, Number(this.config.timing?.containerClickIntervalMs ?? 50))
       if (intervalMs > 0) await sleep(intervalMs)
     }
     await this.bot.clickWindow(sourceSlot, 0, 0)
-    await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
+    await sleep(intervalMs)
     if (container.selectedItem) {
       throw new Error(`拆分取物后鼠标仍持有 ${container.selectedItem.name || '物品'} x${container.selectedItem.count || 0}`)
     }
@@ -1072,7 +1113,13 @@ class Warehouse {
     return total
   }
 
+  noteChestMutation (chestId) {
+    if (!chestId) return
+    this.chestMutationSeqs.set(String(chestId), ++this.mutationSeq)
+  }
+
   refreshChestSnapshot (chest, container) {
+    this.noteChestMutation(chest.chestId)
     this.db.upsertChest(chest)
     const slots = this.containerContentItems(container).map(item => ({
       ...this.catalog.fromPrismarineItem(item),
@@ -1083,10 +1130,13 @@ class Warehouse {
   }
 
   async syncWarehouse (radius) {
-    return this.withWarehouseLock(() => this.syncWarehouseLocked(radius))
+    // 阶段一：不持仓库锁扫描，业务存取照常进行；
+    // 阶段二：短暂持锁，重读扫描期间被业务改动过的木桶后换入新库存并对账。
+    const scan = await this.scanWarehouseContainers(radius)
+    return this.withWarehouseLock(() => this.applyWarehouseScan(scan, radius))
   }
 
-  async syncWarehouseLocked (radius) {
+  async scanWarehouseContainers (radius) {
     this.debug(`sync start radius=${radius}`)
     await this.goHome({ requireWarehouse: this.db.listChests().length > 0 })
     const blocks = this.findContainerBlocks(radius)
@@ -1100,6 +1150,7 @@ class Warehouse {
       const block = blocks[index]
       const chest = this.blockToChest(block)
       this.debug(`sync open ${index + 1}/${blocks.length} ${this.describeChest(chest)}`)
+      const preReadSeq = ++this.mutationSeq
       let container
       try {
         container = await this.openContainerAt(chest)
@@ -1108,7 +1159,7 @@ class Warehouse {
           slot: item.slot,
           amount: item.count
         }))
-        snapshots.push({ chest, slots })
+        snapshots.push({ chest, slots, preReadSeq })
         actualItems.push(...slots)
         this.debug(`sync read ${this.describeChest(chest)} slots=${slots.length} items=${slots.reduce((sum, item) => sum + item.amount, 0)}`)
       } catch (error) {
@@ -1129,6 +1180,32 @@ class Warehouse {
       throw new Error(`同步失败：${blocks.length} 个容器中有 ${failures.length} 个读取失败；已保留全部旧记录，不会生成库存异常。${examples ? `失败示例：${examples}` : ''}`)
     }
 
+    return { radius, blocks, snapshots, actualItems }
+  }
+
+  async applyWarehouseScan (scan, radius) {
+    const { blocks, snapshots } = scan
+
+    // 重读同步扫描期间被业务存取改动过的木桶，避免用过期快照覆盖业务变更。
+    // 任一重读失败都直接抛错：此时还没有写入任何新记录，旧库存原样保留。
+    let rescanCount = 0
+    for (const snapshot of snapshots) {
+      if ((this.chestMutationSeqs.get(snapshot.chest.chestId) || 0) <= snapshot.preReadSeq) continue
+      this.debug(`sync rescan mutated chest ${this.describeChest(snapshot.chest)}`)
+      const container = await this.openContainerAt(snapshot.chest)
+      try {
+        snapshot.slots = this.containerContentItems(container).map(item => ({
+          ...this.catalog.fromPrismarineItem(item),
+          slot: item.slot,
+          amount: item.count
+        }))
+        rescanCount++
+      } finally {
+        if (container) container.close()
+      }
+    }
+
+    const actualItems = snapshots.flatMap(snapshot => snapshot.slots)
     this.db.clearChests()
     for (const snapshot of snapshots) {
       this.db.upsertChest(snapshot.chest)
@@ -1142,7 +1219,8 @@ class Warehouse {
     return {
       chestCount: blocks.length,
       openedChestCount: snapshots.length,
-      failures,
+      rescanCount,
+      failures: [],
       totals,
       ...reconcile
     }
@@ -1752,42 +1830,78 @@ class Warehouse {
 
   async dropItemsToPlayer (username, requestedItems) {
     const requested = this.mergeItems(requestedItems || [])
-    const dropped = []
     if (this.bot.currentWindow) {
       this.debug(`closing open window before dropping selected items: ${this.bot.currentWindow.type || this.bot.currentWindow.id}`)
       this.bot.closeWindow(this.bot.currentWindow)
       await sleep(150)
     }
 
-    for (const request of requested) {
-      let remaining = Number(request.amount || 0)
-      while (remaining > 0) {
-        const item = this.bot.inventory.items().find(entry => {
-          const normalized = this.catalog.fromPrismarineItem(entry)
-          return normalized.itemKey === request.itemKey
-        })
-        if (!item) break
+    const beforeByKey = new Map(requested.map(request => [request.itemKey, this.inventoryCountByItemKey(request.itemKey)]))
+    const maxRounds = Math.max(1, Number(this.config.timing?.dropConfirmRounds ?? 3))
 
-        const normalized = this.catalog.fromPrismarineItem(item)
-        const amount = Math.min(remaining, item.count)
-        const before = this.inventoryCountByItemKey(normalized.itemKey)
-        const startedAt = Date.now()
-        this.debug(`drop selected ${normalized.displayName} x${amount} slot=${item.slot} to ${username}`)
-        await this.lookAtPlayer(username)
-        await this.dropSlotAmountFast(item, amount)
-        const moved = await this.waitForInventoryDecrease(normalized.itemKey, before)
-        if (moved <= 0) {
-          throw new Error(`丢出 ${normalized.displayName} 超时，背包数量没有减少。`)
+    // 整批丢出、末端一次确认：全部丢完后统一对账背包减少量，
+    // 没有离开背包的部分在下一轮补丢，而不是逐组等待确认。
+    for (let round = 0; round < maxRounds; round++) {
+      const pending = requested
+        .map(request => ({
+          request,
+          amount: Number(request.amount || 0) - (beforeByKey.get(request.itemKey) - this.inventoryCountByItemKey(request.itemKey))
+        }))
+        .filter(entry => entry.amount > 0)
+      if (!pending.length) break
+
+      await this.lookAtPlayer(username)
+      let plannedThisRound = 0
+      for (const entry of pending) {
+        let remaining = entry.amount
+        while (remaining > 0) {
+          const item = this.bot.inventory.items().find(slot => {
+            const normalized = this.catalog.fromPrismarineItem(slot)
+            return normalized.itemKey === entry.request.itemKey
+          })
+          if (!item) break
+          const normalized = this.catalog.fromPrismarineItem(item)
+          const amount = Math.min(remaining, item.count)
+          const startedAt = Date.now()
+          this.debug(`drop batch ${normalized.displayName} x${amount} slot=${item.slot} round=${round + 1}/${maxRounds}`)
+          await this.dropSlotAmountFast(item, amount)
+          remaining -= amount
+          plannedThisRound += amount
+          await this.waitDropCooldown(startedAt)
         }
-        const credited = Math.min(remaining, moved)
-        dropped.push({ ...normalized, amount: credited })
-        remaining -= credited
-        this.debug(`drop selected done ${normalized.displayName} x${credited} confirm=${Date.now() - startedAt}ms cooldown=${this.dropIntervalMs()}ms`)
-        await this.waitDropCooldown(startedAt)
       }
+      if (!plannedThisRound) break
+      await this.waitForInventoryIdle(beforeByKey.keys())
     }
 
+    const dropped = []
+    for (const request of requested) {
+      const before = beforeByKey.get(request.itemKey) || 0
+      const moved = Math.min(Number(request.amount || 0), Math.max(0, before - this.inventoryCountByItemKey(request.itemKey)))
+      if (moved > 0) dropped.push({ ...request, amount: moved })
+    }
     return this.mergeItems(dropped)
+  }
+
+  async waitForInventoryIdle (itemKeys) {
+    const keys = [...itemKeys]
+    if (!keys.length) return
+    const pollMs = this.inventoryConfirmPollMs()
+    const timeoutMs = Number(this.config.timing.dropConfirmTimeoutMs || 5000)
+    const idleMs = Math.max(2 * pollMs, 150)
+    const startedAt = Date.now()
+    let last = keys.map(key => this.inventoryCountByItemKey(key))
+    let idleSince = Date.now()
+    while (Date.now() - startedAt < timeoutMs) {
+      await sleep(pollMs)
+      const current = keys.map(key => this.inventoryCountByItemKey(key))
+      if (current.some((count, index) => count !== last[index])) {
+        last = current
+        idleSince = Date.now()
+        continue
+      }
+      if (Date.now() - idleSince >= idleMs) return
+    }
   }
 
   async repairPlayerWithExperienceBottles (username, options = {}) {

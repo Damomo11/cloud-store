@@ -1785,7 +1785,7 @@ class CloudStoreService {
       const addedAmount = this.totalAmount(result.addedToMomo)
       const unresolvedAmount = this.totalAmount(result.unresolved)
       const failureText = result.failures.length ? `，失败${result.failures.length}` : ''
-      this.msg(username, `同步完成：木桶${result.chestCount}，打开${result.openedChestCount}${failureText}，多余${addedAmount}/${this.itemTypeCount(result.addedToMomo)}种，缺失${unresolvedAmount}/${this.itemTypeCount(result.unresolved)}种。详情见Web管理页。`)
+      this.msg(username, `同步完成：木桶${result.chestCount}，打开${result.openedChestCount}，重读${result.rescanCount || 0}${failureText}，多余${addedAmount}/${this.itemTypeCount(result.addedToMomo)}种，缺失${unresolvedAmount}/${this.itemTypeCount(result.unresolved)}种。详情见Web管理页。`)
     }, { exclusive: true })
   }
 

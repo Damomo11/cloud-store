@@ -1291,3 +1291,62 @@ test('death recovery resolves a stuck physical_changed record when the bot holds
   assert.ok(events.includes('resolve:bota:death recovery with empty inventory:held=0'))
   assert.ok(events.includes('clear-task'))
 })
+
+test('quick shulker extraction retries opening when the server returns an empty window', async () => {
+  const target = { itemKey: 'target-key', itemId: 'minecraft:diamond', displayName: '钻石', amount: 2 }
+  const oldBoxInfo = { itemKey: 'old-box', itemId: 'minecraft:purple_shulker_box', displayName: '潜影盒' }
+  const oldBox = { slot: 36, count: 1, normalized: oldBoxInfo }
+  const newBoxInfo = { itemKey: 'new-box', itemId: oldBoxInfo.itemId, displayName: '潜影盒' }
+  const newBox = { slot: 36, count: 1, normalized: newBoxInfo }
+  let inventory = [oldBox]
+  const operations = []
+  const db = {
+    getItemByKey: key => key === target.itemKey ? target : (key === oldBoxInfo.itemKey ? oldBoxInfo : null),
+    listSlotsForItemKey: () => [{ chestId: '1,2,3', x: 1, y: 2, z: 3, blockName: 'barrel', slot: 4, amount: 1 }],
+    beginShulkerRepackRecovery: () => { operations.push('prepared') },
+    markShulkerRepackPhysicalChange: () => { operations.push('physical_changed') },
+    commitShulkerRepackRecovery: () => { operations.push('committed') },
+    clearShulkerRepackRecovery: () => {},
+    getShulkerRepackRecovery: () => null
+  }
+  const catalog = {
+    fromPrismarineItem: item => ({ ...item.normalized, amount: item.count }),
+    isShulkerBox: itemId => /_shulker_box$/.test(itemId),
+    extractShulkerContents: box => box.itemKey === newBoxInfo.itemKey
+      ? [{ item: target, amount: 3 }]
+      : [{ item: target, amount: 5 }]
+  }
+  const bot = { inventory: { items: () => inventory } }
+  const config = structuredClone(DEFAULT_CONFIG)
+  config.debug = false
+  config.timing.containerSettleMs = 0
+  config.timing.inventoryUpdateTimeoutMs = 200
+  const warehouse = new Warehouse(bot, db, catalog, config)
+  warehouse.takeOneShulkerFromChest = async () => oldBox
+  warehouse.equipItemInHand = async () => {}
+  let opens = 0
+  warehouse.openQuickShulkerWindow = async () => {
+    opens++
+    const items = opens >= 3
+      ? [{ normalized: { itemKey: target.itemKey, itemId: target.itemId, displayName: '钻石' }, slot: 0, count: 5 }]
+      : []
+    return { items: () => items, close: () => { inventory = [newBox] } }
+  }
+  warehouse.tryWithdrawExactFrom = async () => 2
+  warehouse.returnShulkerToChest = async () => { inventory = [] }
+
+  const result = await warehouse.withdrawFromShulkerBoxes({
+    withdrawMode: 'shulker_extract',
+    ownerUuid: 'owner',
+    ownerUsername: 'Player',
+    itemKey: target.itemKey,
+    amount: 2,
+    sourceShulkerItemKey: oldBoxInfo.itemKey,
+    sourceBoxCount: 1
+  })
+
+  assert.equal(opens, 3)
+  assert.equal(result.withdrawn[0].amount, 2)
+  assert.equal(result.missing.length, 0)
+  assert.deepEqual(operations, ['prepared', 'physical_changed', 'committed'])
+})

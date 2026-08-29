@@ -127,6 +127,18 @@
     // Maximum wait for inventory count to decrease after dropping an item stack.
     "dropConfirmTimeoutMs": 5000,
 
+    // Items are dropped as one batch and confirmed once at the end;
+    // this is how many extra rounds are used to re-drop whatever did not leave the inventory.
+    "dropConfirmRounds": 3,
+
+    // Container withdrawals click in batches and confirm once per pass;
+    // this is how many extra passes are used to re-take whatever did not move.
+    "withdrawConfirmPasses": 2,
+
+    // The server may occasionally answer a quick shulker open with an empty window;
+    // close and reopen up to this many times before skipping the box.
+    "quickShulkerOpenAttempts": 3,
+
     "pickupSettleMs": 3500,
     "pickupStableMs": 700,
     "containerSettleMs": 250,
