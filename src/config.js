@@ -92,12 +92,7 @@ const DEFAULT_CONFIG = {
   language: {
     file: 'data/zh_cn.json'
   },
-  aliases: {
-    石头: 'minecraft:stone',
-    圆石: 'minecraft:cobblestone',
-    石英块: 'minecraft:quartz_block',
-    红石块: 'minecraft:redstone_block'
-  }
+  aliases: {}
 }
 
 function stripJsonComments (text) {

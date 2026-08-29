@@ -112,7 +112,14 @@ class CloudStoreService {
         const held = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
         const pendingRepack = this.resolvePreparedShulkerRepackRecovery()
         if (pendingRepack && !held.length) {
-          console.warn(`[death-recovery] pending shulker repack has no held items; keeping the recovery record without committing: bot=${this.botId}`)
+          if (pendingRepack.state === 'physical_changed') {
+            const resolved = this.db.resolveStuckShulkerRepack?.(this.botId, [], 'death recovery with empty inventory')
+            if (resolved) {
+              console.warn(`[death-recovery] resolved stuck shulker repack record with empty inventory: bot=${this.botId} committed=${resolved.committed}${resolved.committed ? '' : `, cleared with mismatch (${resolved.error})`}`)
+            }
+          } else {
+            console.warn(`[death-recovery] pending shulker repack has no held items; keeping the recovery record without committing: bot=${this.botId}`)
+          }
         }
         const result = await this.warehouse.depositInventoryWithoutBalance('withdraw_death_recovery', `player=${context.username}, phase=${context.phase || ''}`)
         if (pendingRepack && held.length) this.commitRecoveredShulkerRepack(result, 'death')
@@ -201,7 +208,14 @@ class CloudStoreService {
       return
     }
     if (pendingRepack && !held.length) {
-      console.warn(`[disconnect-recovery] pending shulker repack has no held items; keeping the recovery record and continuing service: bot=${this.botId}`)
+      if (pendingRecord?.state === 'physical_changed') {
+        const resolved = this.db.resolveStuckShulkerRepack?.(this.botId, [], 'disconnect recovery with empty inventory')
+        if (resolved) {
+          console.warn(`[disconnect-recovery] resolved stuck shulker repack record with empty inventory: bot=${this.botId} committed=${resolved.committed}${resolved.committed ? '' : `, cleared with mismatch (${resolved.error})`}`)
+        }
+      } else {
+        console.warn(`[disconnect-recovery] pending shulker repack has no held items; keeping the recovery record and continuing service: bot=${this.botId}`)
+      }
       if (!task) return
     }
     if (!task && pendingRepack) {
@@ -2263,14 +2277,21 @@ class CloudStoreService {
     return result
   }
 
-  resolveStoredItem (name, playerUuid = '') {
+  resolveByAliasChain (name, playerUuid) {
     const shortCodeItem = this.resolveStoredItemByShortCode(name)
-    if (shortCodeItem) return shortCodeItem
+    if (shortCodeItem) return { layer: 'shortCode', item: shortCodeItem }
     const personalAliasItem = this.db.findItemByPlayerAlias(playerUuid, name)
-    if (personalAliasItem) return personalAliasItem
+    if (personalAliasItem) return { layer: 'personal', item: personalAliasItem }
     const globalAliasItem = this.db.findItemByGlobalAlias(name, playerUuid)
-    if (globalAliasItem) return globalAliasItem
-    if (this.db.isGlobalItemAliasDisabled(playerUuid, name)) throw new Error(`你已禁用全局别名：${name}`)
+    if (globalAliasItem) return { layer: 'global', item: globalAliasItem }
+    if (this.db.isGlobalItemAliasDisabled(playerUuid, name)) return { layer: 'disabled', item: null }
+    return { layer: 'none', item: null }
+  }
+
+  resolveStoredItem (name, playerUuid = '') {
+    const alias = this.resolveByAliasChain(name, playerUuid)
+    if (alias.item) return alias.item
+    if (alias.layer === 'disabled') throw new Error(`你已禁用全局别名：${name}`)
 
     try {
       return this.catalog.resolveName(name)
@@ -2352,24 +2373,12 @@ class CloudStoreService {
   }
 
   resolveStoredItemsForOwnerQuery (ownerUuid, name, playerUuid = '') {
-    const shortCodeItem = this.resolveStoredItemByShortCode(name)
-    if (shortCodeItem) {
-      const amount = this.db.getOwnerTotalByItemKey(ownerUuid, shortCodeItem.itemKey)
-      return amount > 0 ? [{ ...shortCodeItem, amount }] : []
+    const alias = this.resolveByAliasChain(name, playerUuid)
+    if (alias.item) {
+      const amount = this.db.getOwnerTotalByItemKey(ownerUuid, alias.item.itemKey)
+      return amount > 0 ? [{ ...alias.item, amount }] : []
     }
-
-    const personalAliasItem = this.db.findItemByPlayerAlias(playerUuid, name)
-    if (personalAliasItem) {
-      const amount = this.db.getOwnerTotalByItemKey(ownerUuid, personalAliasItem.itemKey)
-      return amount > 0 ? [{ ...personalAliasItem, amount }] : []
-    }
-
-    const globalAliasItem = this.db.findItemByGlobalAlias(name, playerUuid)
-    if (globalAliasItem) {
-      const amount = this.db.getOwnerTotalByItemKey(ownerUuid, globalAliasItem.itemKey)
-      return amount > 0 ? [{ ...globalAliasItem, amount }] : []
-    }
-    if (this.db.isGlobalItemAliasDisabled(playerUuid, name)) return []
+    if (alias.layer === 'disabled') return []
 
     const raw = String(name || '').trim()
     try {
@@ -2393,17 +2402,11 @@ class CloudStoreService {
   }
 
   resolveShulkerContentsForOwnerQuery (ownerUuid, name, playerUuid = '') {
-    const shortCodeItem = this.resolveStoredItemByShortCode(name)
-    if (shortCodeItem) {
-      return this.db.getOwnerShulkersContainingItemKey(ownerUuid, shortCodeItem.itemKey)
+    const alias = this.resolveByAliasChain(name, playerUuid)
+    if (alias.item) {
+      return this.db.getOwnerShulkersContainingItemKey(ownerUuid, alias.item.itemKey)
     }
-
-    const personalAliasItem = this.db.findItemByPlayerAlias(playerUuid, name)
-    if (personalAliasItem) return this.db.getOwnerShulkersContainingItemKey(ownerUuid, personalAliasItem.itemKey)
-
-    const globalAliasItem = this.db.findItemByGlobalAlias(name, playerUuid)
-    if (globalAliasItem) return this.db.getOwnerShulkersContainingItemKey(ownerUuid, globalAliasItem.itemKey)
-    if (this.db.isGlobalItemAliasDisabled(playerUuid, name)) return []
+    if (alias.layer === 'disabled') return []
 
     const raw = String(name || '').trim()
     try {

@@ -645,7 +645,13 @@ class ItemCatalog {
     const filePath = path.resolve(process.cwd(), languageConfig.file)
     if (!fs.existsSync(filePath)) return 0
 
-    const lang = JSON.parse(fs.readFileSync(filePath, 'utf8'))
+    let lang
+    try {
+      lang = JSON.parse(fs.readFileSync(filePath, 'utf8'))
+    } catch (error) {
+      console.warn(`Failed to load localized item alias file: ${filePath} (${error.message})`)
+      return 0
+    }
     this.language = lang
     let loaded = 0
     for (const item of Object.values(this.mcData.itemsByName)) {

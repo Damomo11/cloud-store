@@ -452,6 +452,23 @@ class Warehouse {
     }
   }
 
+  resolveStuckShulkerRepackSelfHeal (pending, sourceKey) {
+    if (pending?.state !== 'physical_changed' || typeof this.db.resolveStuckShulkerRepack !== 'function') return false
+    try {
+      const held = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
+      const resolved = this.db.resolveStuckShulkerRepack(this.botId, held, `extraction self-heal, old_box=${sourceKey}`)
+      if (!resolved) return false
+      console.warn(`[shulker-repack-recovery] auto-resolved stuck physical_changed record before extraction: bot=${this.botId} old=${pending.oldBoxItemKey} committed=${resolved.committed}${resolved.committed ? '' : `, cleared with mismatch (${resolved.error})`}`)
+      return true
+    } catch (error) {
+      logLocalError('shulker-repack-self-heal', error, {
+        botId: this.botId,
+        oldBoxItemKey: pending.oldBoxItemKey
+      }, { directory: this.config.localLogDirectory })
+      return false
+    }
+  }
+
   async withdrawFromShulkerBoxes (allocation) {
     const targetItem = this.db.getItemByKey(allocation.itemKey)
     if (!targetItem) return { withdrawn: [], missing: [{ ...allocation }] }
@@ -496,6 +513,8 @@ class Warehouse {
               if (pending.state === 'prepared' && pending.oldBoxItemKey === sourceKey) {
                 this.db.clearShulkerRepackRecovery(this.botId)
                 console.warn(`[shulker-repack-recovery] cleared unchanged stale prepared record before retry: bot=${this.botId} old=${sourceKey}`)
+              } else if (this.resolveStuckShulkerRepackSelfHeal(pending, sourceKey)) {
+                // 上次换盒已实际完成，这里补账后继续本次拆盒
               } else {
                 const conflict = new Error(`bot ${this.botId} has an unresolved shulker repack recovery`)
                 logLocalError('shulker-repack-conflict', conflict, {

@@ -211,11 +211,8 @@
     "file": "data/zh_cn.json"
   },
 
-  // Manual item name aliases. Left side is what players type, right side is minecraft:item_id.
+  // Manual item name aliases for items not covered by the built-in registry or
+  // the localized language file (vanilla/mod names, e.g. "石头": "modid:custom_stone").
   "aliases": {
-    "石头": "minecraft:stone",
-    "圆石": "minecraft:cobblestone",
-    "石英块": "minecraft:quartz_block",
-    "红石块": "minecraft:redstone_block"
   }
 }

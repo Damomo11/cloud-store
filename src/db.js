@@ -781,6 +781,68 @@ class StoreDb {
     })
   }
 
+  resolveStuckShulkerRepack (botId = 'legacy', held = [], reason = '') {
+    const id = String(botId || 'legacy')
+    const recovery = this.getShulkerRepackRecovery(id)
+    if (!recovery || recovery.state !== 'physical_changed') return null
+
+    const heldByKey = new Map((Array.isArray(held) ? held : []).map(item => [item.itemKey, Number(item.amount || 0)]))
+    const newBoxHeld = Boolean(recovery.newBoxItem?.itemKey) && (heldByKey.get(recovery.newBoxItem.itemKey) || 0) >= 1
+    const groundedExtracted = (recovery.extractedItems || []).map(item => {
+      const amount = Math.min(Number(item.amount || 0), heldByKey.get(item.itemKey) || 0)
+      return amount > 0 ? { ...item, amount } : null
+    }).filter(Boolean)
+
+    // 按机器人背包实际持有的物品补账；背包里没有对应实物时绝不按记录盲补
+    if (!newBoxHeld || !groundedExtracted.length) {
+      this.transaction(() => {
+        const current = this.getShulkerRepackRecovery(id)
+        if (!current || current.state !== 'physical_changed') return
+        this.addInventoryMismatch(
+          'missing',
+          current.ownerUuid,
+          current.ownerUsername || '',
+          { itemKey: current.oldBoxItemKey, itemId: current.newBoxItem?.itemId || '', displayName: current.newBoxItem?.displayName || current.oldBoxItemKey },
+          1,
+          `潜影盒重打包后机器人背包中没有对应实物，未按记录补账，已清除阻塞记录${reason ? `；来源：${reason}` : ''}。`
+        )
+        this.clearShulkerRepackRecovery(id)
+      })
+      return { recovery, committed: false, error: 'no matching held items' }
+    }
+
+    try {
+      const exact = groundedExtracted.length === recovery.extractedItems.length &&
+        groundedExtracted.every((item, index) => Number(item.amount) === Number(recovery.extractedItems[index].amount))
+      let committed
+      if (exact) {
+        committed = this.commitShulkerRepackRecovery(id)
+      } else {
+        committed = this.transaction(() => {
+          this.applyShulkerExtractionBalance(recovery.ownerUuid, recovery.oldBoxItemKey, recovery.newBoxItem, groundedExtracted, recovery.ownerUsername, recovery.message)
+          this.clearShulkerRepackRecovery(id)
+          return recovery
+        })
+      }
+      return committed ? { recovery: committed, committed: true } : null
+    } catch (error) {
+      this.transaction(() => {
+        const current = this.getShulkerRepackRecovery(id)
+        if (!current || current.state !== 'physical_changed') return
+        this.addInventoryMismatch(
+          'missing',
+          current.ownerUuid,
+          current.ownerUsername || '',
+          { itemKey: current.oldBoxItemKey, itemId: recovery.newBoxItem?.itemId || '', displayName: recovery.newBoxItem?.displayName || current.oldBoxItemKey },
+          1,
+          `潜影盒重打包恢复记录无法补记账本（${error.message}），已清除阻塞记录${reason ? `；来源：${reason}` : ''}。`
+        )
+        this.clearShulkerRepackRecovery(id)
+      })
+      return { recovery, committed: false, error: error.message }
+    }
+  }
+
   listRecoveryTasks () {
     return this.db.prepare(`
       SELECT bot_id AS botId, type, actor_username AS actorUsername,
@@ -2791,7 +2853,9 @@ class StoreDb {
       transactions: this.db.prepare('SELECT COUNT(*) AS count FROM transactions').get().count,
       shulkerContents: this.db.prepare('SELECT COUNT(*) AS count FROM shulker_contents').get().count,
       inventoryMismatches: this.db.prepare('SELECT COUNT(*) AS count FROM inventory_mismatches').get().count,
-      items: this.db.prepare('SELECT COUNT(*) AS count FROM items').get().count
+      items: this.db.prepare('SELECT COUNT(*) AS count FROM items').get().count,
+      botRecoveryTasks: this.db.prepare('SELECT COUNT(*) AS count FROM bot_recovery_tasks').get().count,
+      shulkerRepackRecoveries: this.db.prepare('SELECT COUNT(*) AS count FROM shulker_repack_recovery').get().count
     }
 
     this.transaction(() => {
@@ -2805,6 +2869,8 @@ class StoreDb {
       this.db.prepare('DELETE FROM player_item_aliases').run()
       this.db.prepare('DELETE FROM player_item_display_names').run()
       this.db.prepare('DELETE FROM player_disabled_global_aliases').run()
+      this.db.prepare('DELETE FROM bot_recovery_tasks').run()
+      this.db.prepare('DELETE FROM shulker_repack_recovery').run()
       this.db.prepare('DELETE FROM items').run()
     })
 

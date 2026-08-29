@@ -1048,3 +1048,246 @@ test('shulker extraction clears an unchanged prepared recovery before retrying',
   assert.equal(result.missing[0].amount, 2)
   assert.deepEqual(operations, ['cleared', 'prepared', 'cleared'])
 })
+
+test('resolveStuckShulkerRepack commits a stuck physical_changed record and clears its journal', () => {
+  const fixture = createDb()
+  const oldBox = { itemKey: 'stuck-old-box', itemId: 'minecraft:shulker_box', displayName: '潜影盒', nbtJson: '', metaJson: '{"contents":64}' }
+  const newBox = { itemKey: 'stuck-new-box', itemId: 'minecraft:shulker_box', displayName: '潜影盒', nbtJson: '', metaJson: '{"contents":59}' }
+  const target = { itemKey: 'stuck-target', itemId: 'minecraft:diamond', displayName: '钻石', nbtJson: '', metaJson: '' }
+  try {
+    fixture.db.addBalanceItems('owner', [{ ...oldBox, amount: 1 }])
+    fixture.db.beginShulkerRepackRecovery('bot-a', {
+      ownerUuid: 'owner',
+      ownerUsername: 'Player',
+      oldBoxItemKey: oldBox.itemKey,
+      sourceChestId: 'chest-1',
+      targetItem: target,
+      beforeAmount: 64,
+      requestedAmount: 5
+    })
+    fixture.db.markShulkerRepackPhysicalChange('bot-a', newBox, [{ ...target, amount: 5 }], 'source_chest=chest-1')
+
+    const resolved = fixture.db.resolveStuckShulkerRepack('bot-a', [
+      { itemKey: newBox.itemKey, amount: 1 },
+      { itemKey: target.itemKey, amount: 5 }
+    ], 'test')
+
+    assert.equal(resolved.committed, true)
+    assert.equal(fixture.db.getShulkerRepackRecovery('bot-a'), null)
+    assert.equal(fixture.db.getBalance('owner', oldBox.itemKey), 0)
+    assert.equal(fixture.db.getBalance('owner', newBox.itemKey), 1)
+    assert.equal(fixture.db.getBalance('owner', target.itemKey), 5)
+    assert.equal(fixture.db.resolveStuckShulkerRepack('bot-a', [], 'again'), null)
+    assert.equal(fixture.db.db.prepare("SELECT COUNT(*) AS count FROM inventory_mismatches WHERE status = 'open'").get().count, 0)
+  } finally {
+    fixture.close()
+  }
+})
+
+test('resolveStuckShulkerRepack credits only the extracted items actually held by the bot', () => {
+  const fixture = createDb()
+  const oldBox = { itemKey: 'partial-old-box', itemId: 'minecraft:shulker_box', displayName: '潜影盒', nbtJson: '', metaJson: '{"contents":64}' }
+  const newBox = { itemKey: 'partial-new-box', itemId: 'minecraft:shulker_box', displayName: '潜影盒', nbtJson: '', metaJson: '{"contents":62}' }
+  const target = { itemKey: 'partial-target', itemId: 'minecraft:diamond', displayName: '钻石', nbtJson: '', metaJson: '' }
+  try {
+    fixture.db.addBalanceItems('owner', [{ ...oldBox, amount: 1 }])
+    fixture.db.beginShulkerRepackRecovery('bot-a', {
+      ownerUuid: 'owner',
+      ownerUsername: 'Player',
+      oldBoxItemKey: oldBox.itemKey,
+      sourceChestId: 'chest-1',
+      targetItem: target,
+      beforeAmount: 64,
+      requestedAmount: 5
+    })
+    fixture.db.markShulkerRepackPhysicalChange('bot-a', newBox, [{ ...target, amount: 5 }], 'source_chest=chest-1')
+
+    const resolved = fixture.db.resolveStuckShulkerRepack('bot-a', [
+      { itemKey: newBox.itemKey, amount: 1 },
+      { itemKey: target.itemKey, amount: 2 }
+    ], 'test')
+
+    assert.equal(resolved.committed, true)
+    assert.equal(fixture.db.getShulkerRepackRecovery('bot-a'), null)
+    assert.equal(fixture.db.getBalance('owner', oldBox.itemKey), 0)
+    assert.equal(fixture.db.getBalance('owner', newBox.itemKey), 1)
+    assert.equal(fixture.db.getBalance('owner', target.itemKey), 2)
+  } finally {
+    fixture.close()
+  }
+})
+
+test('resolveStuckShulkerRepack credits nothing when the bot backpack has no matching items', () => {
+  const fixture = createDb()
+  const oldBox = { itemKey: 'empty-held-old-box', itemId: 'minecraft:shulker_box', displayName: '潜影盒', nbtJson: '', metaJson: '{"contents":64}' }
+  const newBox = { itemKey: 'empty-held-new-box', itemId: 'minecraft:shulker_box', displayName: '潜影盒', nbtJson: '', metaJson: '{"contents":59}' }
+  const target = { itemKey: 'empty-held-target', itemId: 'minecraft:diamond', displayName: '钻石', nbtJson: '', metaJson: '' }
+  try {
+    fixture.db.addBalanceItems('owner', [{ ...oldBox, amount: 1 }])
+    fixture.db.beginShulkerRepackRecovery('bot-a', {
+      ownerUuid: 'owner',
+      ownerUsername: 'Player',
+      oldBoxItemKey: oldBox.itemKey,
+      sourceChestId: 'chest-1',
+      targetItem: target,
+      beforeAmount: 64,
+      requestedAmount: 5
+    })
+    fixture.db.markShulkerRepackPhysicalChange('bot-a', newBox, [{ ...target, amount: 5 }], 'source_chest=chest-1')
+
+    const resolved = fixture.db.resolveStuckShulkerRepack('bot-a', [], 'test')
+
+    assert.equal(resolved.committed, false)
+    assert.equal(resolved.error, 'no matching held items')
+    assert.equal(fixture.db.getShulkerRepackRecovery('bot-a'), null)
+    assert.equal(fixture.db.getBalance('owner', oldBox.itemKey), 1)
+    assert.equal(fixture.db.getBalance('owner', newBox.itemKey), 0)
+    assert.equal(fixture.db.getBalance('owner', target.itemKey), 0)
+    const mismatch = fixture.db.db.prepare("SELECT kind, item_key, amount FROM inventory_mismatches WHERE status = 'open'").get()
+    assert.equal(mismatch.kind, 'missing')
+    assert.equal(mismatch.item_key, oldBox.itemKey)
+    assert.equal(mismatch.amount, 1)
+  } finally {
+    fixture.close()
+  }
+})
+
+test('resolveStuckShulkerRepack clears an uncommittable record and records a mismatch', () => {
+  const fixture = createDb()
+  const oldBox = { itemKey: 'orphan-old-box', itemId: 'minecraft:shulker_box', displayName: '潜影盒', nbtJson: '', metaJson: '{"contents":64}' }
+  const newBox = { itemKey: 'orphan-new-box', itemId: 'minecraft:shulker_box', displayName: '潜影盒', nbtJson: '', metaJson: '{"contents":59}' }
+  const target = { itemKey: 'orphan-target', itemId: 'minecraft:diamond', displayName: '钻石', nbtJson: '', metaJson: '' }
+  try {
+    fixture.db.beginShulkerRepackRecovery('bot-a', {
+      ownerUuid: 'owner',
+      ownerUsername: 'Player',
+      oldBoxItemKey: oldBox.itemKey,
+      sourceChestId: 'chest-1',
+      targetItem: target,
+      beforeAmount: 64,
+      requestedAmount: 5
+    })
+    fixture.db.markShulkerRepackPhysicalChange('bot-a', newBox, [{ ...target, amount: 5 }], 'source_chest=chest-1')
+
+    const resolved = fixture.db.resolveStuckShulkerRepack('bot-a', [
+      { itemKey: newBox.itemKey, amount: 1 },
+      { itemKey: target.itemKey, amount: 5 }
+    ], 'test')
+
+    assert.equal(resolved.committed, false)
+    assert.ok(resolved.error)
+    assert.equal(fixture.db.getShulkerRepackRecovery('bot-a'), null)
+    const mismatch = fixture.db.db.prepare("SELECT kind, item_key, amount FROM inventory_mismatches WHERE status = 'open'").get()
+    assert.equal(mismatch.kind, 'missing')
+    assert.equal(mismatch.item_key, oldBox.itemKey)
+    assert.equal(mismatch.amount, 1)
+  } finally {
+    fixture.close()
+  }
+})
+
+test('clearInventoryData also clears bot recovery tasks and shulker repack journals', () => {
+  const fixture = createDb()
+  const target = { itemKey: 'wipe-target', itemId: 'minecraft:diamond', displayName: '钻石', nbtJson: '', metaJson: '' }
+  try {
+    fixture.db.beginShulkerRepackRecovery('bot-a', {
+      ownerUuid: 'owner',
+      ownerUsername: 'Player',
+      oldBoxItemKey: 'old-box',
+      sourceChestId: 'chest-1',
+      targetItem: target,
+      beforeAmount: 64,
+      requestedAmount: 5
+    })
+    fixture.db.saveRecoveryTask({
+      type: 'withdraw',
+      actorUsername: 'Player',
+      ownerUuid: 'owner',
+      ownerUsername: 'Player',
+      ownerScope: 'personal',
+      targetUsername: 'Player',
+      phase: 'withdraw_dropping',
+      items: []
+    }, 'bot-a')
+
+    const counts = fixture.db.clearInventoryData()
+
+    assert.equal(counts.shulkerRepackRecoveries, 1)
+    assert.equal(counts.botRecoveryTasks, 1)
+    assert.equal(fixture.db.getShulkerRepackRecovery('bot-a'), null)
+    assert.equal(fixture.db.db.prepare('SELECT COUNT(*) AS count FROM bot_recovery_tasks').get().count, 0)
+  } finally {
+    fixture.close()
+  }
+})
+
+test('spawn recovery resolves a stuck physical_changed record when the bot holds nothing', async () => {
+  const events = []
+  const pending = {
+    state: 'physical_changed',
+    ownerUuid: 'owner',
+    ownerUsername: 'Player',
+    oldBoxItemKey: 'old-box',
+    newBoxItem: { itemKey: 'new-box' },
+    extractedItems: []
+  }
+  const db = {
+    getRecoveryTask: () => null,
+    getShulkerRepackRecovery: () => pending,
+    resolveStuckShulkerRepack: (botId, held, reason) => {
+      events.push(`resolve:${botId}:${reason}:held=${held.length}`)
+      return { recovery: pending, committed: true }
+    },
+    addCommandReply: () => {},
+    clearRecoveryTask: () => {},
+    ownerLabel: () => 'Player'
+  }
+  const bot = { username: 'BotA', inventory: { items: () => [] }, chat: () => {} }
+  const catalog = { aggregatePrismarineItems: () => [] }
+  const config = structuredClone(DEFAULT_CONFIG)
+  config.server.botName = 'BotA'
+  const service = new CloudStoreService(bot, db, catalog, {}, config)
+
+  await service.recoverPersistedTaskOnSpawn()
+
+  assert.equal(events.length, 1)
+  assert.match(events[0], /^resolve:bota:disconnect recovery with empty inventory:held=0$/)
+})
+
+test('death recovery resolves a stuck physical_changed record when the bot holds nothing', async () => {
+  const events = []
+  const pending = {
+    state: 'physical_changed',
+    ownerUuid: 'owner',
+    ownerUsername: 'Player',
+    oldBoxItemKey: 'old-box',
+    newBoxItem: { itemKey: 'new-box' },
+    extractedItems: []
+  }
+  const db = {
+    getRecoveryTask: () => null,
+    getShulkerRepackRecovery: () => pending,
+    resolveStuckShulkerRepack: (botId, held, reason) => {
+      events.push(`resolve:${botId}:${reason}:held=${held.length}`)
+      return { recovery: pending, committed: true }
+    },
+    addCommandReply: () => {},
+    clearRecoveryTask: () => { events.push('clear-task') },
+    ownerLabel: () => 'Player'
+  }
+  const bot = { username: 'BotA', inventory: { items: () => [] }, chat: () => {} }
+  const catalog = { aggregatePrismarineItems: () => [] }
+  const warehouse = {
+    goHome: async () => { events.push('home') },
+    depositInventoryWithoutBalance: async () => ({ deposited: [], leftover: [] })
+  }
+  const config = structuredClone(DEFAULT_CONFIG)
+  config.server.botName = 'BotA'
+  const service = new CloudStoreService(bot, db, catalog, warehouse, config)
+  service.deathContext = { type: 'withdraw', username: 'Player', phase: 'withdraw_dropping' }
+
+  await service.handleRespawn()
+
+  assert.ok(events.includes('resolve:bota:death recovery with empty inventory:held=0'))
+  assert.ok(events.includes('clear-task'))
+})
