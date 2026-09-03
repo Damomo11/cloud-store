@@ -2587,6 +2587,9 @@ const HTML = `<!doctype html>
     .toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 18px; flex-wrap: wrap; }
     .toolbar input { min-width: 260px; }
     .toolbar select { min-width: 210px; }
+    .toolbar-check { display: inline-flex; gap: 6px; align-items: center; color: #d8d4ca; font-size: 13px; cursor: pointer; user-select: none; white-space: nowrap; }
+    .toolbar-check input { min-width: 0; width: 15px; height: 15px; accent-color: var(--gold); cursor: pointer; }
+    .boxed-badge { position: absolute; left: 3px; bottom: 2px; color: var(--gold); font-size: 10px; line-height: 1; text-shadow: 1px 1px 0 #000, -1px -1px 0 #000; pointer-events: none; }
     .title { font-size: 22px; margin-right: auto; }
     .muted { color: var(--muted); }
     .panel {
@@ -3064,6 +3067,7 @@ const HTML = `<!doctype html>
           <div class="title">远程存储 <span id="loaded" class="muted">0/0 种已加载</span></div>
           <select id="owner"></select>
           <button id="setDefaultOwner" class="primary">设为默认</button>
+          <label class="toolbar-check" title="勾选：显示潜影盒；不勾选：潜影盒内容与散装物品合并显示"><input id="shulkerBoxView" type="checkbox">显示潜影盒</label>
           <input id="search" placeholder="搜索物品、ID、6位码...">
           <button id="aliasMode" class="primary">物品别名</button>
           <button id="deposit" class="primary">远程存储</button>
@@ -3484,7 +3488,7 @@ const HTML = `<!doctype html>
   <div id="tooltip" class="tooltip"></div>
 
   <script>
-    const state = { view: 'inventory', myTab: 'organizations', myPersonalAliasItemKey: '', myGlobalAliasItemKey: '', user: null, owners: [], owner: '', items: [], tx: [], txPage: 1, txTotalPages: 1, selected: new Map(), aliasMode: false, aliasItem: null, adminTab: 'inventory', adminAliasMode: false, adminGlobalAliasItem: null, adminOrganizationName: '', adminInventoryLoadId: 0, adminOwners: [], adminInventoryRows: new Map(), adminMismatchRows: new Map(), adminSelected: new Map(), adminAliasItem: null, adminTxPage: 1, adminTxTotalPages: 1, adminPaymentPage: 1, adminPaymentTotalPages: 1, actionCooldownUntil: 0, actionCooldownTimer: null, iconRenderId: 0, activePoll: null, iconCache: new Map(), inventoryCache: new Map(), inventoryLoadId: 0, iconScrollTimer: null, tipLocked: false, onlinePlayersTimer: null, loginChallengeTimer: null, loginChallengeExpiresAt: 0, loginChallengeCommand: '', subscriptionData: null, subscriptionOrganizationOwner: '', adminSubscriptionUserUuid: '' };
+    const state = { view: 'inventory', myTab: 'organizations', myPersonalAliasItemKey: '', myGlobalAliasItemKey: '', user: null, owners: [], owner: '', items: [], tx: [], txPage: 1, txTotalPages: 1, selected: new Map(), aliasMode: false, aliasItem: null, adminTab: 'inventory', adminAliasMode: false, adminGlobalAliasItem: null, adminOrganizationName: '', adminInventoryLoadId: 0, adminOwners: [], adminInventoryRows: new Map(), adminMismatchRows: new Map(), adminSelected: new Map(), adminAliasItem: null, adminTxPage: 1, adminTxTotalPages: 1, adminPaymentPage: 1, adminPaymentTotalPages: 1, actionCooldownUntil: 0, actionCooldownTimer: null, iconRenderId: 0, activePoll: null, iconCache: new Map(), inventoryCache: new Map(), inventoryLoadId: 0, shulkerBoxView: false, bulkItems: [], lastInventoryStats: null, iconScrollTimer: null, tipLocked: false, onlinePlayersTimer: null, loginChallengeTimer: null, loginChallengeExpiresAt: 0, loginChallengeCommand: '', subscriptionData: null, subscriptionOrganizationOwner: '', adminSubscriptionUserUuid: '' };
     const $ = id => document.getElementById(id);
     const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
     const num = value => Number(value || 0).toLocaleString('zh-CN');
@@ -3962,20 +3966,32 @@ const HTML = `<!doctype html>
 
     function applyInventoryData(data) {
       state.items = data.items || [];
+      state.lastInventoryStats = data.stats || null;
+      state.bulkItems = flattenBulkItems(state.items);
       updateActiveStatus(data.active);
       state.selected.clear();
       renderLitematicPlan(null);
-      $('heroTypes').textContent = num(data.stats?.itemTypes || 0);
-      $('heroAmount').textContent = num(data.stats?.totalAmount || 0);
+      updateInventoryHeroStats();
       $('inventoryQuota').textContent = '仓库额度 ' + num(data.quota?.usedSlots || 0) + '/' + num(data.quota?.quotaSlots || 0) + '格';
       renderSelected();
       renderInventory();
+    }
+
+    function updateInventoryHeroStats() {
+      if (state.shulkerBoxView) {
+        $('heroTypes').textContent = num(state.lastInventoryStats?.itemTypes || 0);
+        $('heroAmount').textContent = num(state.lastInventoryStats?.totalAmount || 0);
+        return;
+      }
+      $('heroTypes').textContent = num(state.bulkItems.length);
+      $('heroAmount').textContent = num(state.bulkItems.reduce((sum, row) => sum + Number(row.amount || 0), 0));
     }
 
     async function loadInventory(options = {}) {
       state.owner = $('owner').value || state.owner;
       if (!state.owner) {
         state.items = [];
+        state.bulkItems = [];
         state.selected.clear();
         $('heroTypes').textContent = '0';
         $('heroAmount').textContent = '0';
@@ -4064,7 +4080,7 @@ const HTML = `<!doctype html>
         item.globalAliases?.length ? '<div class="tip-line">全局别名：' + esc(item.globalAliases.join('、')) + '</div>' : '',
         item.adminDisplayName && item.adminDisplayName !== item.displayName ? '<div class="tip-line">默认名：' + esc(item.adminDisplayName) + '</div>' : '',
         item.ownerLabel ? '<div class="tip-line">归属：' + esc(item.ownerLabel) + '</div>' : '',
-        '<div class="tip-line">数量：' + num(item.amount) + '</div>',
+        '<div class="tip-line">数量：' + num(item.amount) + bulkAmountSuffix(item) + '</div>',
         '<div class="tip-line">ID：' + esc(item.itemId) + '</div>'
       ].filter(Boolean);
       if (shulker.length) {
@@ -4078,6 +4094,13 @@ const HTML = `<!doctype html>
         ).join('') + emptySlots + '</div><div class="tip-slot-detail" data-tip-slot-detail aria-live="polite"></div>');
       }
       return lines.join('');
+    }
+
+    function bulkAmountSuffix(item) {
+      const boxed = Number(item.boxedAmount || 0);
+      if (boxed <= 0) return '';
+      const loose = Number(item.looseAmount || 0);
+      return loose > 0 ? '（散装 ' + num(loose) + ' + 盒内 ' + num(boxed) + '）' : '（盒内）';
     }
 
     function bindTipSlotNames(tip) {
@@ -4208,6 +4231,20 @@ const HTML = `<!doctype html>
       renderInventory();
     }
 
+    function pruneSelection() {
+      const available = new Map(displayRows().map(row => [row.itemKey, row]));
+      for (const [key, row] of [...state.selected]) {
+        const item = available.get(key);
+        if (!item) {
+          state.selected.delete(key);
+          continue;
+        }
+        row.displayName = item.displayName || row.displayName;
+        row.max = Number(item.amount || 0);
+        row.amount = Math.max(1, Math.min(Number(row.amount || 1), row.max || row.amount));
+      }
+    }
+
     function setAliasMode(enabled) {
       state.aliasMode = Boolean(enabled);
       $('aliasMode').classList.toggle('solid', state.aliasMode);
@@ -4334,14 +4371,51 @@ const HTML = `<!doctype html>
       }
     }
 
+    function isShulkerItem(item) {
+      return String(item.itemId || '').endsWith('shulker_box');
+    }
+
+    function displayRows() {
+      return state.shulkerBoxView ? state.items : state.bulkItems;
+    }
+
+    function mergeBulkItem(merged, source, loose, boxed) {
+      const key = source.itemKey || source.itemId;
+      let target = merged.get(key);
+      if (!target) {
+        target = { ...source, shulkerContents: [], looseAmount: 0, boxedAmount: 0 };
+        merged.set(key, target);
+      }
+      target.looseAmount += loose;
+      target.boxedAmount += boxed;
+      target.amount = target.looseAmount + target.boxedAmount;
+    }
+
+    // 散装视图：潜影盒本身不展示，盒内物品按 itemKey 与散装物品合并计数。
+    function flattenBulkItems(items) {
+      const merged = new Map();
+      for (const item of items || []) {
+        if (isShulkerItem(item)) {
+          const boxCount = Math.max(0, Number(item.amount || 0));
+          for (const content of item.shulkerContents || []) {
+            mergeBulkItem(merged, content, 0, Math.max(0, Number(content.amount || 0)) * boxCount);
+          }
+        } else {
+          mergeBulkItem(merged, item, Math.max(0, Number(item.amount || 0)), 0);
+        }
+      }
+      return [...merged.values()].sort((a, b) => String(a.displayName || '').localeCompare(String(b.displayName || ''), undefined, { sensitivity: 'base' }));
+    }
+
     function currentInventoryRows() {
       const q = $('search').value.trim().toLowerCase();
-      return q ? state.items.filter(item => itemText(item).includes(q)) : state.items;
+      const rows = displayRows();
+      return q ? rows.filter(item => itemText(item).includes(q)) : rows;
     }
 
     function renderInventory() {
       const rows = currentInventoryRows();
-      $('loaded').textContent = rows.length + '/' + state.items.length + ' 种已加载';
+      $('loaded').textContent = rows.length + '/' + displayRows().length + ' 种已加载';
       if (!rows.length) {
         $('inventory').innerHTML = '<p class="muted" style="text-align:center;margin:46px 0">账户为空，暂无物品存储。</p>';
         return;
@@ -4349,8 +4423,9 @@ const HTML = `<!doctype html>
       $('inventory').innerHTML = '<div class="grid">' + rows.map(item => {
         const selected = state.selected.has(item.itemKey) ? ' selected' : '';
         const aliasTitle = item.personalAliases?.length ? '个人别名：' + item.personalAliases.join('、') : (item.adminDisplayName && item.adminDisplayName !== item.displayName ? '默认名：' + item.adminDisplayName : '');
+        const boxedBadge = !state.shulkerBoxView && Number(item.boxedAmount || 0) > 0 ? '<span class="boxed-badge">盒</span>' : '';
         return '<div class="item' + selected + '" data-key="' + esc(item.itemKey) + '">' +
-          '<div class="icon"><img data-key="' + esc(item.itemKey) + '" alt="" loading="lazy" decoding="async"><span class="fallback">' + esc((item.displayName || item.itemId).slice(0, 4)) + '</span><span class="count">' + esc(shortCount(item.amount)) + '</span></div>' +
+          '<div class="icon"><img data-key="' + esc(item.itemKey) + '" alt="" loading="lazy" decoding="async"><span class="fallback">' + esc((item.displayName || item.itemId).slice(0, 4)) + '</span><span class="count">' + esc(shortCount(item.amount)) + '</span>' + boxedBadge + '</div>' +
           '<div class="name" title="' + esc(aliasTitle) + '">' + esc(item.displayName || item.itemId) + '</div>' +
           '</div>';
       }).join('') + '</div>';
@@ -4530,6 +4605,7 @@ const HTML = `<!doctype html>
       }
       const picked = state.selected.get(itemKey);
       if (picked) picked.displayName = personalDisplayName || picked.displayName;
+      state.bulkItems = flattenBulkItems(state.items);
       state.inventoryCache.delete(state.owner);
       renderSelected();
       renderInventory();
@@ -5102,6 +5178,17 @@ const HTML = `<!doctype html>
     });
     $('setDefaultOwner').addEventListener('click', () => setDefaultOwner().catch(error => toast(error.message)));
     $('search').addEventListener('input', renderInventory);
+    try { state.shulkerBoxView = localStorage.getItem('shulkerBoxView') === '1'; } catch { }
+    $('shulkerBoxView').checked = state.shulkerBoxView;
+    $('shulkerBoxView').addEventListener('change', () => {
+      state.shulkerBoxView = $('shulkerBoxView').checked;
+      try { localStorage.setItem('shulkerBoxView', state.shulkerBoxView ? '1' : '0'); } catch { }
+      hideTip();
+      pruneSelection();
+      updateInventoryHeroStats();
+      renderSelected();
+      renderInventory();
+    });
     $('targetPlayer').addEventListener('input', scheduleOnlinePlayersLoad);
     $('targetPlayer').addEventListener('focus', scheduleOnlinePlayersLoad);
     $('targetPlayer').addEventListener('keydown', event => {
