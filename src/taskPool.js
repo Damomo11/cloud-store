@@ -64,12 +64,26 @@ class BotTaskPool {
     })
   }
 
+  eligibleWorkerForTask (task) {
+    // 私聊进来的业务任务绑定接收私信的机器人；该机器人掉线后退回任意空闲机器人，避免任务卡死。
+    if (task.stickyWorker && this.workers.has(task.stickyWorker)) {
+      const sticky = task.stickyWorker
+      return sticky.ready && !sticky.active && !sticky.recoveringFromDeath ? sticky : null
+    }
+    return [...this.workers].find(candidate => candidate.ready && !candidate.active && !candidate.recoveringFromDeath) || null
+  }
+
   snapshot () {
     const active = [...this.workers]
       .filter(worker => worker.active)
       .map(worker => ({ ...worker.active, botName: worker.bot.username }))
     return {
-      queued: this.queue.map(task => ({ id: task.id, type: task.type, username: task.username })),
+      queued: this.queue.map(task => ({
+        id: task.id,
+        type: task.type,
+        username: task.username,
+        stickyBotName: this.workers.has(task.stickyWorker) ? task.stickyWorker.bot.username : ''
+      })),
       active,
       onlineBots: this.workers.size
     }
@@ -79,16 +93,18 @@ class BotTaskPool {
     if ([...this.workers].some(worker => worker.active?.exclusive)) return
     if (this.queue[0]?.exclusive) {
       if ([...this.workers].some(worker => worker.active)) return
-      const worker = [...this.workers].find(candidate => candidate.ready && !candidate.recoveringFromDeath)
+      const worker = this.eligibleWorkerForTask(this.queue[0])
       if (!worker) return
       this.run(worker, this.queue.shift())
       return
     }
-    for (const worker of this.workers) {
-      if (!this.queue.length) break
-      if (this.queue[0].exclusive) break
-      if (!worker.ready || worker.active || worker.recoveringFromDeath) continue
-      const task = this.queue.shift()
+    for (let index = 0; index < this.queue.length; index++) {
+      const task = this.queue[index]
+      if (task.exclusive) break
+      const worker = this.eligibleWorkerForTask(task)
+      if (!worker) continue
+      this.queue.splice(index, 1)
+      index--
       this.run(worker, task)
     }
   }

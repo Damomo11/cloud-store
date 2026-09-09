@@ -552,6 +552,8 @@ class CloudStoreService {
     if (!text.startsWith('!')) return
     if (this.config.debugChat) console.log(`[command] ${username} -> ${this.redactSensitiveText(text)}`)
     this.touchPlayer(username)
+    // 私聊进来的业务任务由收到私信的机器人执行；公屏保持原逻辑（任意空闲机器人接单）。
+    const taskOptions = { stickyWorker: this.isPrivateSource(context.source) ? this : null }
 
     if (this.isBotGameCommand(text)) {
       await this.handleBotGameCommand(username, text, context)
@@ -585,13 +587,13 @@ class CloudStoreService {
 
     const personalCommand = this.parsePersonalWarehouseCommand(text)
     if (personalCommand) {
-      await this.handlePersonalWarehouseCommand(username, personalCommand)
+      await this.handlePersonalWarehouseCommand(username, personalCommand, taskOptions)
       return
     }
 
     const customCommand = this.parseCustomWarehouseCommand(text)
     if (customCommand) {
-      await this.handleCustomWarehouseCommand(username, customCommand)
+      await this.handleCustomWarehouseCommand(username, customCommand, taskOptions)
       return
     }
 
@@ -631,7 +633,7 @@ class CloudStoreService {
     }
 
     if (/^!修装备(?:\s|$)?/.test(text)) {
-      await this.handleRepairCommand(username, text)
+      await this.handleRepairCommand(username, text, taskOptions)
       return
     }
 
@@ -639,7 +641,7 @@ class CloudStoreService {
       const player = this.getPlayer(username)
       if (!this.db.hasPersonalWarehouse(player.uuid) && this.subscriptions) this.subscriptions.maybeAutoRegister(player, 'deposit')
       const owner = this.defaultStorageOwnerForPlayer(player)
-      await this.enqueueTask(username, 'deposit', worker => worker.handleDeposit(username, owner))
+      await this.enqueueTask(username, 'deposit', worker => worker.handleDeposit(username, owner), taskOptions)
       return
     }
 
@@ -648,13 +650,13 @@ class CloudStoreService {
       if (!this.db.hasPersonalWarehouse(player.uuid) && this.subscriptions) this.subscriptions.maybeAutoRegister(player, 'deposit')
       const owner = this.defaultStorageOwnerForPlayer(player)
       const withdrawText = text.replace(/^!(存取|取存)/, '!取')
-      await this.enqueueTask(username, 'withdraw', worker => worker.handleWithdraw(username, withdrawText, owner, null, username, { continueWithDeposit: true }))
+      await this.enqueueTask(username, 'withdraw', worker => worker.handleWithdraw(username, withdrawText, owner, null, username, { continueWithDeposit: true }), taskOptions)
       return
     }
 
     if (text.startsWith('!取物品') || text.startsWith('!取')) {
       const owner = this.defaultStorageOwnerForPlayer(this.getPlayer(username))
-      await this.enqueueTask(username, 'withdraw', worker => worker.handleWithdraw(username, text, owner))
+      await this.enqueueTask(username, 'withdraw', worker => worker.handleWithdraw(username, text, owner), taskOptions)
     }
   }
 
@@ -683,15 +685,20 @@ class CloudStoreService {
 
   enqueueTask (username, type, run, options = {}) {
     if (!this.taskPool) return this.runExclusive(username, type, () => run(this))
+    const stickyWorker = options.stickyWorker && this.taskPool.workers.has(options.stickyWorker) ? options.stickyWorker : null
     return this.taskPool.enqueue({
       username,
       type,
       run,
       commandLogId: this.db.currentCommandLogId(),
       exclusive: Boolean(options.exclusive),
+      stickyWorker,
       onQueued: position => {
-        if (position > 1 || ![...this.taskPool.workers].some(worker => worker.ready && !worker.active)) {
-          this.msg(username, `任务已加入队列，前面还有 ${Math.max(0, position - 1)} 个任务。`)
+        const stickyBusy = stickyWorker && (stickyWorker.active || stickyWorker.recoveringFromDeath)
+        if (position > 1 || stickyBusy || ![...this.taskPool.workers].some(worker => worker.ready && !worker.active)) {
+          this.msg(username, stickyWorker
+            ? `任务已加入队列，将等待 ${this.bot.username} 处理，前面还有 ${Math.max(0, position - 1)} 个任务。`
+            : `任务已加入队列，前面还有 ${Math.max(0, position - 1)} 个任务。`)
         }
       }
     })
@@ -943,7 +950,7 @@ class CloudStoreService {
     this.db.addTransaction('deposit_session', status, owner.uuid, owner.username, items, message)
   }
 
-  async handleRepairCommand (username, text) {
+  async handleRepairCommand (username, text, taskOptions = {}) {
     const actor = this.getPlayer(username)
     const storageOwner = this.defaultStorageOwnerForPlayer(actor)
     const targetUsername = this.parseRepairTarget(text, username)
@@ -955,7 +962,7 @@ class CloudStoreService {
       [request],
       targetUsername,
       { deliveryMode: 'repair' }
-    ))
+    ), taskOptions)
   }
 
   parseRepairTarget (text, fallbackUsername) {
@@ -1368,7 +1375,7 @@ class CloudStoreService {
     return { action: match[1], rest: String(match[2] || '').trim() }
   }
 
-  async handlePersonalWarehouseCommand (username, command) {
+  async handlePersonalWarehouseCommand (username, command, taskOptions = {}) {
     const player = this.getPlayer(username)
     if (!this.db.hasPersonalWarehouse(player.uuid) && command.action === '存' && this.subscriptions) {
       this.subscriptions.maybeAutoRegister(player, 'deposit')
@@ -1393,7 +1400,7 @@ class CloudStoreService {
         this.msg(username, '格式：个人 存')
         return
       }
-      await this.enqueueTask(username, 'deposit', worker => worker.handleDeposit(username, owner))
+      await this.enqueueTask(username, 'deposit', worker => worker.handleDeposit(username, owner), taskOptions)
       return
     }
 
@@ -1402,7 +1409,7 @@ class CloudStoreService {
         this.msg(username, '格式：个人 取 石头64')
         return
       }
-      await this.enqueueTask(username, 'withdraw', worker => worker.handleWithdraw(username, `!个人 取 ${command.rest}`, owner))
+      await this.enqueueTask(username, 'withdraw', worker => worker.handleWithdraw(username, `!个人 取 ${command.rest}`, owner), taskOptions)
     }
   }
 
@@ -1424,7 +1431,7 @@ class CloudStoreService {
     return aliases[type]?.includes(action) || false
   }
 
-  async handleCustomWarehouseCommand (username, command) {
+  async handleCustomWarehouseCommand (username, command, taskOptions = {}) {
     const actor = this.getPlayer(username)
     const warehouse = this.db.getCustomWarehouse(command.warehouseName)
     if (!warehouse) {
@@ -1524,7 +1531,7 @@ class CloudStoreService {
         this.msg(username, `格式：!${warehouse.name} 存`)
         return
       }
-      await this.enqueueTask(username, 'deposit', worker => worker.handleDeposit(username, owner))
+      await this.enqueueTask(username, 'deposit', worker => worker.handleDeposit(username, owner), taskOptions)
       return
     }
 
@@ -1533,7 +1540,7 @@ class CloudStoreService {
         this.msg(username, `格式：!${warehouse.name} 取 石头64`)
         return
       }
-      await this.enqueueTask(username, 'withdraw', worker => worker.handleWithdraw(username, `!${warehouse.name} 取 ${command.rest}`, owner))
+      await this.enqueueTask(username, 'withdraw', worker => worker.handleWithdraw(username, `!${warehouse.name} 取 ${command.rest}`, owner), taskOptions)
     }
   }
 
