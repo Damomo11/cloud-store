@@ -57,6 +57,8 @@ const DEFAULT_CONFIG = {
     containerSettleMs: 250,
     containerClickIntervalMs: 50,
     openContainerTimeoutMs: 8000,
+    openContainerAttempts: 3,
+    openContainerTimeoutsMs: [2000, 4000, 8000],
     inventoryUpdateTimeoutMs: 2000,
     pathTimeoutMs: 15000,
     pathNoProgressMs: 4000,

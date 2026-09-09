@@ -1290,9 +1290,20 @@ class Warehouse {
     }
     this.openingChest = chest
     try {
-      const container = await this.openContainerBlock(block)
-      this.warnUnexpectedContainerWindow(container, chest)
-      return container
+      // 服务器偶尔会弄丢开箱请求，等满超时也没有窗口；总共最多 openContainerAttempts 次，
+      // 每次超时按 openContainerTimeoutsMs 递增（默认 2s/4s/8s）。
+      const maxAttempts = Math.max(1, Number(this.config.timing?.openContainerAttempts ?? 3))
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const container = await this.openContainerBlock(block, this.timeoutForOpenAttempt(attempt))
+          this.warnUnexpectedContainerWindow(container, chest)
+          return container
+        } catch (error) {
+          if (!error?.allOpenTimeouts || attempt + 1 >= maxAttempts) throw error
+          this.debug(`open ${this.describeChest(chest)} timed out (attempt ${attempt + 1}/${maxAttempts}), retrying with timeout ${this.timeoutForOpenAttempt(attempt + 1)}ms`)
+          await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
+        }
+      }
     } finally {
       this.openingChest = null
     }
@@ -1473,7 +1484,25 @@ class Warehouse {
     return firstNonFlint
   }
 
-  async openContainerBlock (block) {
+  closeLingeringWindow () {
+    const window = this.bot.currentWindow
+    if (!window) return
+    // 超时后服务器仍可能迟到下发窗口；不清掉会在下一次开箱时干扰交互。
+    this.debug('closing lingering window before opening container')
+    try { this.bot.closeWindow(window) } catch {}
+  }
+
+  timeoutForOpenAttempt (attempt) {
+    const raw = this.config.timing?.openContainerTimeoutsMs
+    const schedule = Array.isArray(raw)
+      ? raw.map(value => Number(value)).filter(value => Number.isFinite(value) && value > 0)
+      : []
+    if (!schedule.length) return Number(this.config.timing?.openContainerTimeoutMs) || 8000
+    // 次数超出配置表时沿用最后一档超时。
+    return schedule[Math.min(attempt, schedule.length - 1)]
+  }
+
+  async openContainerBlock (block, timeoutMs = this.timeoutForOpenAttempt(0)) {
     const candidates = this.getContainerOpenCandidates(block)
     const errors = []
 
@@ -1482,11 +1511,12 @@ class Warehouse {
       const direction = this.getInteractionDirection(candidate)
       this.debug(`opening ${this.describeBlock(candidate)} distance=${distance.toFixed(2)} face=${this.describeVector(direction)}`)
       try {
+        this.closeLingeringWindow()
         await this.lookAtBlock(candidate)
         this.ensureSafeHandForContainerOpen()
         return await this.withTimeout(
           this.bot.openContainer(candidate, direction, new Vec3(0.5, 0.5, 0.5)),
-          this.config.timing.openContainerTimeoutMs || 8000,
+          timeoutMs,
           `打开箱子超时 ${this.describeBlock(candidate)} face=${this.describeVector(direction)}`
         )
       } catch (error) {
@@ -1496,7 +1526,10 @@ class Warehouse {
       }
     }
 
-    throw new Error(errors.join(' ; '))
+    const failure = new Error(errors.join(' ; '))
+    // 全部候选方块都只是超时（而非协议错误等）时，允许上层关窗后重试。
+    failure.allOpenTimeouts = errors.every(message => message.includes('打开箱子超时'))
+    throw failure
   }
 
   getContainerOpenCandidates (block) {

@@ -143,7 +143,15 @@
     "pickupStableMs": 700,
     "containerSettleMs": 250,
     "containerClickIntervalMs": 50,
+    // Milliseconds to wait for the quick shulker window after right-click
+    // activation (also the fallback timeout for container opens).
     "openContainerTimeoutMs": 8000,
+
+    // The server may occasionally drop an open-container request, waiting out the
+    // timeout with no window. Retry up to this many attempts in total (first one
+    // included); each attempt uses the timeout below, doubling as it goes.
+    "openContainerAttempts": 3,
+    "openContainerTimeoutsMs": [2000, 4000, 8000],
     "inventoryUpdateTimeoutMs": 2000,
     "pathTimeoutMs": 15000,
     "pathNoProgressMs": 4000,
