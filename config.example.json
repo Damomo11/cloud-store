@@ -200,6 +200,12 @@
     // Stop deposit after trying this many empty candidate barrels.
     "maxEmptyDepositAttempts": 3,
 
+    // Held item ids (without the minecraft: prefix) the bot must not hold when
+    // opening a container, e.g. "flint" — it switches hotbar first. Any *_spawn_egg
+    // id is always treated as unsafe regardless of this list (right-click spawns
+    // a mob instead of opening the container).
+    "containerOpenUnsafeHeldItems": ["flint"],
+
     // Extra settings for cylinder warehouse layouts.
     "cylinder": {
       // Main tunnel axis: "x" or "z".

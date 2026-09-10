@@ -1463,8 +1463,10 @@ class Warehouse {
 
   isUnsafeContainerOpenHeldItem (item) {
     if (!item) return false
-    const unsafeNames = this.config.warehouse?.containerOpenUnsafeHeldItems || ['flint']
     const itemName = String(item.name || '').replace(/^minecraft:/, '').toLowerCase()
+    // 刷怪蛋右键会生成生物而不是开箱；服务器特殊物品也常用刷怪蛋 id 做皮肤，一律视为不安全。
+    if (itemName.endsWith('_spawn_egg')) return true
+    const unsafeNames = this.config.warehouse?.containerOpenUnsafeHeldItems || ['flint']
     return unsafeNames.some(name => String(name || '').replace(/^minecraft:/, '').toLowerCase() === itemName)
   }
 
