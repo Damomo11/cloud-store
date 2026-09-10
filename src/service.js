@@ -1601,10 +1601,14 @@ class CloudStoreService {
   }
 
   isBotGameCommand (text) {
-    return /^!指令(?:\s|$)/.test(String(text || ''))
+    return /^!(指令|切换)(?:\s|$)/.test(String(text || ''))
   }
 
   async handleBotGameCommand (username, text, context = {}) {
+    if (/^!切换(?:\s|$)/.test(String(text || ''))) {
+      await this.handleSwitchHotbarCommand(username, text, context)
+      return
+    }
     const command = String(text || '').replace(/^!指令(?:\s+)?/, '').trim()
     const privateSource = this.isPrivateSource(context.source)
     if (!this.isAdmin(username)) {
@@ -1622,6 +1626,34 @@ class CloudStoreService {
     if (this.config.debugChat) console.log(`[bot-command:${this.bot.username}] ${username} -> ${this.redactSensitiveText(command)}`)
     this.bot.chat(command)
     if (privateSource) this.msg(username, `已执行：${command}`)
+  }
+
+  // 手动把主手切到快捷栏第 n 格：排查手持物品干扰开箱（右键触发了物品效果而非开箱）等问题用。
+  async handleSwitchHotbarCommand (username, text, context = {}) {
+    const privateSource = this.isPrivateSource(context.source)
+    if (!this.isAdmin(username)) {
+      if (privateSource) this.msg(username, '你没有权限切换机器人快捷栏。')
+      return
+    }
+    const slot = Number(String(text || '').replace(/^!切换(?:\s+)?/, '').trim())
+    if (!Number.isInteger(slot) || slot < 1 || slot > 9) {
+      if (privateSource) this.msg(username, '格式：切换 1~9，把机器人主手切到快捷栏第 n 格。')
+      return
+    }
+    if (this.active?.type === 'deposit' || this.active?.type === 'withdraw') {
+      if (privateSource) this.msg(username, `机器人正在为 ${this.active.username} 执行${this.active.type === 'deposit' ? '存货' : '取货'}任务，暂时不允许切换快捷栏。`)
+      return
+    }
+    const before = this.describeHeldItemForSwitch()
+    this.bot.setQuickBarSlot(slot - 1)
+    if (privateSource) this.msg(username, `已切换到快捷栏第 ${slot} 格：${before} -> ${this.describeHeldItemForSwitch()}。`)
+  }
+
+  describeHeldItemForSwitch () {
+    const held = this.bot.heldItem
+    if (!held) return '空手'
+    const display = this.catalog?.getDisplayName?.(held.name) || held.name
+    return `${display} x${held.count}`
   }
 
   isWebLoginTokenCommand (text) {
@@ -3035,6 +3067,7 @@ class CloudStoreService {
       '加管理员',
       '加管理',
       '指令',
+      '切换',
       '设置密钥',
       '设置密码',
       '登录',
