@@ -24,3 +24,4 @@ tmp-crash-*/
 cloud-store-mod/.gradle/
 cloud-store-mod/build/
 cloud-store-mod/run/
+logs/errors.jsonl

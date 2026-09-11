@@ -5,6 +5,7 @@ const fs = require('node:fs')
 const path = require('node:path')
 const { parseLitematicData } = require('../scripts/litematic-materials')
 const { signCloudStoreToken } = require('./botPlatformSso')
+const { logLocalError } = require('./localErrorLog')
 
 class CloudStoreWebServer {
   constructor (db, config, serviceProvider, botManagerProvider = null, subscriptions = null) {
@@ -56,9 +57,15 @@ class CloudStoreWebServer {
   }
 
   async handle (req, res) {
-    const url = new URL(req.url, 'http://localhost')
-    const session = this.getSession(req, res)
+    let url
     try {
+      url = new URL(req.url, 'http://localhost')
+    } catch (error) {
+      this.logRejectedRequest(req, error)
+      return this.sendText(res, 400, 'Bad request')
+    }
+    try {
+      const session = this.getSession(req, res)
       if (req.method === 'GET' && url.pathname === '/bot-platform') return await this.openBotPlatform(res, session)
       if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/admin')) return this.sendHtml(res, HTML)
       if (req.method === 'GET' && url.pathname === '/api/me') return this.sendJson(res, this.apiMe(session))
@@ -2422,6 +2429,12 @@ class CloudStoreWebServer {
     for (const [sid, session] of this.sessions) {
       if (this.isWebSessionExpired(session)) this.sessions.delete(sid)
     }
+  }
+
+  logRejectedRequest (req, error) {
+    const clientIp = this.clientIp(req)
+    console.warn(`[web] rejected malformed request ${req.method} ${JSON.stringify(String(req.url))} from ${clientIp}: ${error.message}`)
+    logLocalError('web-malformed-request-url', error, { method: req.method, url: String(req.url), clientIp })
   }
 
   clientIp (req) {

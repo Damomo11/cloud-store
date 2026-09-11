@@ -19,6 +19,7 @@ const {
   microsoftAuthRetryDelayMs
 } = require('./authCache')
 const { installFatalProtocolPacketCapture, isFatalProtocolReadError, releaseBotConnection, terminateBotTransport } = require('./botConnection')
+const { logLocalError } = require('./localErrorLog')
 
 function createBot (config, onMsaCode) {
   const options = {
@@ -578,6 +579,16 @@ function acceptResourcePackDirect (bot, uuid) {
   }
   return ok
 }
+
+process.on('uncaughtException', (error) => {
+  console.error('[process] uncaught exception:', error)
+  logLocalError('uncaught-exception', error)
+})
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[process] unhandled rejection:', reason)
+  logLocalError('unhandled-rejection', reason)
+})
 
 process.on('SIGINT', () => {
   shuttingDown = true
