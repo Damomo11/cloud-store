@@ -139,6 +139,17 @@
     // close and reopen up to this many times before skipping the box.
     "quickShulkerOpenAttempts": 3,
 
+    // A barrel that reads as completely empty is usually a lagged empty window,
+    // not real missing stock; close and reopen up to this many times before
+    // skipping that barrel while keeping its old record.
+    "barrelEmptyRereadAttempts": 3,
+
+    // When a barrel holds less of an item than recorded, its record is refreshed
+    // in place and the bot moves on to the next recorded barrel; this caps how
+    // many short-stocked barrels are chased per item before reporting the rest
+    // as missing.
+    "withdrawMaxMissingBarrels": 5,
+
     "pickupSettleMs": 3500,
     "pickupStableMs": 700,
     "containerSettleMs": 250,

@@ -419,15 +419,46 @@ class Warehouse {
       const chestGroups = this.groupSlotsForWithdrawal(slots)
       this.debug(`withdraw plan ${itemInfo.displayName || allocation.itemKey} need=${allocation.amount} chests=${chestGroups.map(group => `${group.chestId}:${group.recordedAmount}`).join(' | ') || 'none'}`)
 
+      // 记录说这个桶有货、实际却没取到（含整桶读空疑似卡顿）时，就地同步这一个桶的记录，
+      // 然后换下一个有记录的桶接着找；这样的“缺货换桶”最多 maxMissingBarrels 次（可配置），
+      // 账实相符的桶不计数。
+      let missingBarrelHops = 0
+      const maxMissingBarrels = Math.max(1, Number(this.config.timing?.withdrawMaxMissingBarrels ?? 5))
       for (const group of chestGroups) {
         if (remaining <= 0) break
+        if (missingBarrelHops >= maxMissingBarrels) {
+          this.debug(`withdraw ${itemInfo.displayName || allocation.itemKey} 缺货换桶已达上限 ${missingBarrelHops}/${maxMissingBarrels}，停止继续找桶，剩余计入缺失`)
+          break
+        }
         const slot = group.slots[0]
         const chestId = group.chestId
         const chest = { chestId, x: slot.x, y: slot.y, z: slot.z, blockName: slot.blockName }
-        const container = await this.openContainerAt(chest)
+        const maxReadAttempts = Math.max(1, Number(this.config.timing?.barrelEmptyRereadAttempts ?? 3))
+        let container = await this.openContainerAt(chest)
         try {
+          // 木桶整个读出来一个物品都没有，多半是服务器卡顿返回了空窗口，而不是真实缺货：
+          // 关窗重开重读确认；重读仍为空就保留原记录并跳过该木桶，与真实缺货区分开。
+          let available = 0
+          let trustedRead = false
+          for (let readAttempt = 1; readAttempt <= maxReadAttempts; readAttempt++) {
+            available = this.countContainerItem(container, allocation.itemKey)
+            const totalInChest = this.containerContentItems(container).reduce((sum, item) => sum + Number(item.count || 0), 0)
+            if (totalInChest > 0) {
+              trustedRead = true
+              break
+            }
+            this.debug(`withdraw empty window read attempt=${readAttempt}/${maxReadAttempts} ${this.describeChest(chest)} recorded=${group.recordedAmount} item=${allocation.itemKey}`)
+            if (readAttempt === maxReadAttempts) break
+            container.close()
+            await sleep(Math.max(0, Number(this.config.timing.containerSettleMs ?? 250)))
+            container = await this.openContainerAt(chest)
+          }
+          if (!trustedRead) {
+            console.warn(`[withdraw] ${this.describeChest(chest)} 连续 ${maxReadAttempts} 次读到空木桶，疑似服务器卡顿；跳过该木桶并保留原记录 item=${allocation.itemKey} recorded=${group.recordedAmount}`)
+            missingBarrelHops++
+            continue
+          }
           this.debug(`window slots container=0..${container.inventoryStart - 1} inventory=${container.inventoryStart}..${container.inventoryEnd - 1}`)
-          const available = this.countContainerItem(container, allocation.itemKey)
           const toTake = Math.min(remaining, available)
           this.debug(`withdraw open ${this.describeChest(chest)} recorded=${group.recordedAmount} actual=${available} need=${remaining}`)
           const moved = await this.tryWithdrawExactFrom(container, allocation.itemKey, toTake, group.slots.map(row => row.slot))
@@ -437,7 +468,12 @@ class Warehouse {
             await sleep(this.config.timing.containerSettleMs)
             this.debug(`withdraw moved ${moved} ${itemInfo.displayName || allocation.itemKey} from ${this.describeChest(chest)} remaining=${remaining}`)
           }
+          // 实物比记录少（含物品被换成别的东西）时，当场把这一个木桶的记录刷新成实际内容
           this.refreshChestSnapshot(chest, container)
+          if (available < group.recordedAmount) {
+            missingBarrelHops++
+            this.debug(`withdraw ${this.describeChest(chest)} 实际少于记录 recorded=${group.recordedAmount} actual=${available} 缺货换桶 ${missingBarrelHops}/${maxMissingBarrels}`)
+          }
         } finally {
           container.close()
         }
@@ -565,14 +601,21 @@ class Warehouse {
           const moved = await this.tryWithdrawExactFrom(quickWindow, allocation.itemKey, toTake)
           this.debug(`shulker extract open source=${sourceKey} available=${available} moved=${moved} remaining=${remaining}`)
 
-          quickWindow.close()
-          quickWindow = null
+          // 连续开盒读到 0 时 quickWindow 已在上面重开循环里关掉置空，这里不能再重复关
+          if (quickWindow) {
+            quickWindow.close()
+            quickWindow = null
+          }
           await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
 
           if (moved <= 0) {
             if (repackState) this.db.clearShulkerRepackRecovery(this.botId)
             repackState = ''
             boxToReturn = this.findInventoryItemByKey(sourceKey) || sourceBox
+            // 盒里实际取不到目标物品：用手上盒子的真实 NBT 重建这个盒的内容记录，
+            // 让记录与实物对齐，后续任务不再按旧记录扑空；
+            // 若只是卡顿误读（盒里其实有），NBT 同样能还原正确记录，不会误清。
+            this.syncShulkerBoxContents(boxToReturn)
             await this.returnShulkerToChest(chest, boxToReturn)
             returned = true
             continue
@@ -649,6 +692,16 @@ class Warehouse {
     return {
       withdrawn: this.mergeItems(withdrawn),
       missing: remaining > 0 ? [{ ...targetItem, amount: remaining }] : []
+    }
+  }
+
+  syncShulkerBoxContents (item) {
+    try {
+      const normalized = this.catalog.fromPrismarineItem(item)
+      if (!this.catalog.isShulkerBox(normalized.itemId)) return
+      this.db.upsertItem(normalized)
+    } catch (error) {
+      this.debug(`sync shulker contents failed: ${error?.message || error}`)
     }
   }
 

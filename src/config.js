@@ -52,6 +52,8 @@ const DEFAULT_CONFIG = {
     dropConfirmRounds: 3,
     withdrawConfirmPasses: 2,
     quickShulkerOpenAttempts: 3,
+    barrelEmptyRereadAttempts: 3,
+    withdrawMaxMissingBarrels: 5,
     pickupSettleMs: 3500,
     pickupStableMs: 700,
     containerSettleMs: 250,

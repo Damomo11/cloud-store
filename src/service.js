@@ -1047,9 +1047,86 @@ class CloudStoreService {
     if (deliveryToOther) msgTarget(teleportNotice)
     else msgActor(teleportNotice)
 
+    const runBatches = () => this.runWithdrawBatches({
+      username,
+      storageOwner,
+      deliveryTarget,
+      deliveryToOther,
+      deliveryMode,
+      batches,
+      continueWithDeposit,
+      msgActor,
+      msgTarget
+    })
+
+    let attempt = await runBatches()
+    if (attempt.cancelled || attempt.aborted) return
+
+    let deliveredTotal = this.mergeItems(attempt.allDeducted)
+    if (!deliveredTotal.length) {
+      // 取货时已就地核对每个木桶：实物少了当场刷新该木桶记录，读到整桶为空按服务器卡顿处理并保留原记录。
+      // 这里先把残余放回清点，再按最新木桶记录立即重试一次，不做耗时的全仓同步。
+      await this.warehouse.goHome({ requireWarehouse: true })
+      const returned = await this.warehouse.depositInventoryWithoutBalance('withdraw_failed_return', `owner=${storageOwner.uuid}, actor=${username}`)
+      if (!returned.leftover.length) {
+        msgActor('账本有库存但没有取出任何物品，已逐个木桶核对实际库存，正在按最新记录重试……')
+        attempt = await runBatches()
+        if (attempt.cancelled || attempt.aborted) return
+        deliveredTotal = this.mergeItems(attempt.allDeducted)
+      }
+    }
+
+    if (!deliveredTotal.length) {
+      await this.warehouse.goHome({ requireWarehouse: true })
+      const returned = await this.warehouse.depositInventoryWithoutBalance('withdraw_failed_return', `owner=${storageOwner.uuid}, actor=${username}`)
+      if (returned.leftover.length) {
+        msgActor(`机器人身上仍有未能放回仓库的物品：${this.formatItemList(returned.leftover)}`)
+      }
+      if (deliveryMode === 'repair') {
+        if (deliveryToOther) msgTarget(`${username} 想给你修装备，但你离开太远或未能成功使用经验瓶，本次已取消。`)
+        this.msg(username, `${this.ownerActionPrefix(storageOwner)}修装备未开始或未成功使用经验瓶，已把经验瓶回收入库，本次不会扣除库存。`)
+      } else if (deliveryToOther) {
+        msgTarget(`${username} 给你的取货失败：仓库实物取出失败，请稍后再试。`)
+        msgActor(`给 ${deliveryTarget} 的取货失败：仓库实物取出失败，请稍后再试。`)
+      } else {
+        this.msg(username, `账本有库存，但按本地木桶记录没有取出：${this.formatItemList(plan.allocations)}。已就地核对各木桶并重试仍未取到，请稍后再试；若持续出现，请管理员在Web管理页检查库存异常。`)
+      }
+      this.db.clearRecoveryTask(this.botId)
+      return
+    }
+
+    const missingByItem = this.groupMissingByDisplay(plan.allocations, attempt.allWithdrawn)
+    if (!deliveryToOther) {
+      for (const notice of missingByItem) this.msg(username, notice)
+    }
+
+    if (deliveryToOther) {
+      const suffix = missingByItem.length ? '，部分物品仓库实物不足，未取到。' : '。'
+      msgTarget(deliveryMode === 'repair'
+        ? `${username} 给你修装备已完成：共用了 ${this.totalAmount(deliveredTotal)} 个${this.buildRepairBottleRequest().displayName}${suffix}`
+        : `${username} 给你的取货已送达：${this.formatWithdrawSummary(deliveredTotal)}${suffix}`)
+      msgActor(deliveryMode === 'repair'
+        ? `给 ${deliveryTarget} 修装备已完成：共用了 ${this.totalAmount(deliveredTotal)} 个${this.buildRepairBottleRequest().displayName}${suffix}`
+        : `给 ${deliveryTarget} 的取货已送达：${this.formatWithdrawSummary(deliveredTotal)}${suffix}`)
+    } else {
+      this.msg(username, deliveryMode === 'repair'
+        ? `${this.ownerActionPrefix(storageOwner)}修装备完成：共用了 ${this.totalAmount(deliveredTotal)} 个${this.buildRepairBottleRequest().displayName}。`
+        : `${this.ownerActionPrefix(storageOwner)}取货完成：${this.formatWithdrawSummary(deliveredTotal)}。`)
+    }
+
+    if (continueWithDeposit) {
+      await this.handleDeposit(username, storageOwner, { alreadyAtPlayer: attempt.stayedWithPlayerForDeposit })
+      return
+    }
+    this.db.clearRecoveryTask(this.botId)
+  }
+
+  async runWithdrawBatches ({ username, storageOwner, deliveryTarget, deliveryToOther, deliveryMode, batches, continueWithDeposit, msgActor, msgTarget }) {
     const allWithdrawn = []
     const allDeducted = []
     let stayedWithPlayerForDeposit = false
+    let cancelled = false
+    let aborted = false
     for (let index = 0; index < batches.length; index++) {
       const batch = batches[index]
       this.setWithdrawBatchProgress(index + 1, batches.length, 'withdraw_from_chests')
@@ -1061,7 +1138,10 @@ class CloudStoreService {
         batchIndex: index + 1,
         totalBatches: batches.length
       })
-      if (this.isActiveCancelled()) return
+      if (this.isActiveCancelled()) {
+        cancelled = true
+        break
+      }
 
       const delivered = this.allocateWithdrawnToPlanned(batch, physical.withdrawn)
 
@@ -1094,10 +1174,14 @@ class CloudStoreService {
             : `给 ${deliveryTarget} 的取货已取消：对方未接受传送请求。`)
         }
         this.db.clearRecoveryTask(this.botId)
-        return
+        aborted = true
+        break
       }
 
-      if (this.isActiveCancelled()) return
+      if (this.isActiveCancelled()) {
+        cancelled = true
+        break
+      }
       const deliveryPhase = deliveryMode === 'repair' ? 'withdraw_repairing' : 'withdraw_dropping'
       this.setWithdrawBatchProgress(index + 1, batches.length, deliveryPhase)
       this.saveRecoveryTask('withdraw', username, storageOwner, deliveryTarget, deliveryPhase, delivered)
@@ -1107,7 +1191,10 @@ class CloudStoreService {
             maxDistance: REPAIR_MAX_DISTANCE
           })
         : await this.dropWithdrawItemsToPlayer(deliveryTarget, delivered)
-      if (this.isActiveCancelled()) return
+      if (this.isActiveCancelled()) {
+        cancelled = true
+        break
+      }
 
       const deduct = this.allocateWithdrawnToPlanned(delivered, dropped)
 
@@ -1127,7 +1214,10 @@ class CloudStoreService {
 
       this.setWithdrawBatchProgress(index + 1, batches.length, 'withdraw_return_home')
       await this.warehouse.goHome({ requireWarehouse: true })
-      if (this.isActiveCancelled()) return
+      if (this.isActiveCancelled()) {
+        cancelled = true
+        break
+      }
       const residual = continueWithDeposit
         ? await this.warehouse.depositInventoryForOwner(storageOwner.uuid, storageOwner.username)
         : await this.warehouse.depositInventoryWithoutBalance('withdraw_residual_return', `owner=${storageOwner.uuid}, actor=${username}, target=${deliveryTarget}, batch=${index + 1}/${batches.length}`)
@@ -1140,50 +1230,7 @@ class CloudStoreService {
       }
     }
 
-    const deliveredTotal = this.mergeItems(allDeducted)
-    if (!deliveredTotal.length) {
-      await this.warehouse.goHome({ requireWarehouse: true })
-      const returned = await this.warehouse.depositInventoryWithoutBalance('withdraw_failed_return', `owner=${storageOwner.uuid}, actor=${username}`)
-      if (returned.leftover.length) {
-        msgActor(`机器人身上仍有未能放回仓库的物品：${this.formatItemList(returned.leftover)}`)
-      }
-      if (deliveryMode === 'repair') {
-        if (deliveryToOther) msgTarget(`${username} 想给你修装备，但你离开太远或未能成功使用经验瓶，本次已取消。`)
-        this.msg(username, `${this.ownerActionPrefix(storageOwner)}修装备未开始或未成功使用经验瓶，已把经验瓶回收入库，本次不会扣除库存。`)
-      } else if (deliveryToOther) {
-        msgTarget(`${username} 给你的取货失败：仓库实物取出失败，请稍后再试。`)
-        msgActor(`给 ${deliveryTarget} 的取货失败：仓库实物取出失败，请稍后再试。`)
-      } else {
-        this.msg(username, `账本有库存，但按本地木桶记录没有成功取出：${this.formatItemList(plan.allocations)}。请管理员执行 !同步 后再试。`)
-      }
-      this.db.clearRecoveryTask(this.botId)
-      return
-    }
-
-    const missingByItem = this.groupMissingByDisplay(plan.allocations, allWithdrawn)
-    if (!deliveryToOther) {
-      for (const notice of missingByItem) this.msg(username, notice)
-    }
-
-    if (deliveryToOther) {
-      const suffix = missingByItem.length ? '，部分物品仓库实物不足，未取到。' : '。'
-      msgTarget(deliveryMode === 'repair'
-        ? `${username} 给你修装备已完成：共用了 ${this.totalAmount(deliveredTotal)} 个${this.buildRepairBottleRequest().displayName}${suffix}`
-        : `${username} 给你的取货已送达：${this.formatWithdrawSummary(deliveredTotal)}${suffix}`)
-      msgActor(deliveryMode === 'repair'
-        ? `给 ${deliveryTarget} 修装备已完成：共用了 ${this.totalAmount(deliveredTotal)} 个${this.buildRepairBottleRequest().displayName}${suffix}`
-        : `给 ${deliveryTarget} 的取货已送达：${this.formatWithdrawSummary(deliveredTotal)}${suffix}`)
-    } else {
-      this.msg(username, deliveryMode === 'repair'
-        ? `${this.ownerActionPrefix(storageOwner)}修装备完成：共用了 ${this.totalAmount(deliveredTotal)} 个${this.buildRepairBottleRequest().displayName}。`
-        : `${this.ownerActionPrefix(storageOwner)}取货完成：${this.formatWithdrawSummary(deliveredTotal)}。`)
-    }
-
-    if (continueWithDeposit) {
-      await this.handleDeposit(username, storageOwner, { alreadyAtPlayer: stayedWithPlayerForDeposit })
-      return
-    }
-    this.db.clearRecoveryTask(this.botId)
+    return { allWithdrawn, allDeducted, stayedWithPlayerForDeposit, cancelled, aborted }
   }
 
   async dropWithdrawItemsToPlayer (username, requestedItems) {
