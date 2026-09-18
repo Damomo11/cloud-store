@@ -214,7 +214,7 @@ class Warehouse {
         }
         this.refreshChestSnapshot(chest, container)
       } finally {
-        container.close()
+        this.closeContainerQuietly(container)
       }
 
       if (movedInChest <= 0) {
@@ -449,7 +449,7 @@ class Warehouse {
             }
             this.debug(`withdraw empty window read attempt=${readAttempt}/${maxReadAttempts} ${this.describeChest(chest)} recorded=${group.recordedAmount} item=${allocation.itemKey}`)
             if (readAttempt === maxReadAttempts) break
-            container.close()
+            this.closeContainerQuietly(container)
             await sleep(Math.max(0, Number(this.config.timing.containerSettleMs ?? 250)))
             container = await this.openContainerAt(chest)
           }
@@ -475,7 +475,7 @@ class Warehouse {
             this.debug(`withdraw ${this.describeChest(chest)} 实际少于记录 recorded=${group.recordedAmount} actual=${available} 缺货换桶 ${missingBarrelHops}/${maxMissingBarrels}`)
           }
         } finally {
-          container.close()
+          this.closeContainerQuietly(container)
         }
       }
 
@@ -718,7 +718,7 @@ class Warehouse {
       await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
       this.refreshChestSnapshot(chest, container)
     } finally {
-      container.close()
+      this.closeContainerQuietly(container)
       await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
     }
 
@@ -747,7 +747,7 @@ class Warehouse {
       if (moved !== 1) throw new Error(`放回 ${this.describeChest(chest)} 失败，实际放入 ${moved} 个潜影盒。`)
       return normalized
     } finally {
-      container.close()
+      this.closeContainerQuietly(container)
       await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
     }
   }
@@ -1221,7 +1221,7 @@ class Warehouse {
         failures.push(failure)
         console.error(`[warehouse] sync failed: ${failure}`)
       } finally {
-        if (container) container.close()
+        this.closeContainerQuietly(container)
       }
     }
 
@@ -1254,7 +1254,7 @@ class Warehouse {
         }))
         rescanCount++
       } finally {
-        if (container) container.close()
+        this.closeContainerQuietly(container)
       }
     }
 
@@ -1547,6 +1547,16 @@ class Warehouse {
     try { this.bot.closeWindow(window) } catch {}
   }
 
+  closeContainerQuietly (container) {
+    if (!container) return
+    try {
+      container.close()
+    } catch (error) {
+      // 关窗只是收尾动作；失败时静默记日志，避免 finally 里抛错掩盖真实业务异常。
+      this.debug(`close container failed: ${error?.message || error}`)
+    }
+  }
+
   timeoutForOpenAttempt (attempt) {
     const raw = this.config.timing?.openContainerTimeoutsMs
     const schedule = Array.isArray(raw)
@@ -1569,11 +1579,24 @@ class Warehouse {
         this.closeLingeringWindow()
         await this.lookAtBlock(candidate)
         this.ensureSafeHandForContainerOpen()
-        return await this.withTimeout(
+        const container = await this.withTimeout(
           this.bot.openContainer(candidate, direction, new Vec3(0.5, 0.5, 0.5)),
           timeoutMs,
           `打开箱子超时 ${this.describeBlock(candidate)} face=${this.describeVector(direction)}`
         )
+        // 服务器偶尔会在开箱瞬间又立即关窗（卡顿/反作弊），bot.openContainer 会 resolve 出空窗口；
+        // 这里不能把空窗口当成功返回，否则下游 countContainerItem(null) 与 finally 里的
+        // container.close() 会连环报 "Cannot read properties of null (reading 'close')" 并掩盖真实错误。
+        if (!container) {
+          throw new Error(`打开箱子后没有收到窗口 ${this.describeBlock(candidate)} face=${this.describeVector(direction)}`)
+        }
+        this.warnUnexpectedContainerWindow(container, {
+          blockName: candidate.name,
+          x: candidate.position.x,
+          y: candidate.position.y,
+          z: candidate.position.z
+        })
+        return container
       } catch (error) {
         if (error?.code === 'FATAL_PROTOCOL_READ' || this.connectionAbortController.signal.aborted) throw error
         errors.push(`${this.describeBlock(candidate)} face=${this.describeVector(direction)} ${error.message}`)
@@ -1582,8 +1605,8 @@ class Warehouse {
     }
 
     const failure = new Error(errors.join(' ; '))
-    // 全部候选方块都只是超时（而非协议错误等）时，允许上层关窗后重试。
-    failure.allOpenTimeouts = errors.every(message => message.includes('打开箱子超时'))
+    // 全部候选方块都只是超时或空窗口（而非协议错误等）时，允许上层关窗后重试。
+    failure.allOpenTimeouts = errors.every(message => message.includes('打开箱子超时') || message.includes('没有收到窗口'))
     throw failure
   }
 
