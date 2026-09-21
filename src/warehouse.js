@@ -521,172 +521,204 @@ class Warehouse {
     let remaining = Number(allocation.amount || 0)
     let boxesRemaining = Math.max(0, Number(allocation.sourceBoxCount || 0))
     const withdrawn = []
-    const slots = this.db.listSlotsForItemKey(sourceKey)
-    const chestGroups = this.groupSlotsForWithdrawal(slots)
 
-    this.debug(`shulker extract ${targetItem.displayName || allocation.itemKey} need=${remaining} boxes=${boxesRemaining} source=${sourceItem.displayName || sourceKey}`)
+    // 同一个取盒流程可能换源盒 key 执行多次：计划源盒在木桶记录里没有实物时，
+    // 会回退到其他"账本有、木桶也有记录"的同内容盒子，避免账实漂移直接导致取货失败。
+    const extractFromSource = async (sourceKey, sourceItem) => {
+      const slots = this.db.listSlotsForItemKey(sourceKey)
+      const chestGroups = this.groupSlotsForWithdrawal(slots)
 
-    for (const group of chestGroups) {
-      if (remaining <= 0 || boxesRemaining <= 0) break
-      const slot = group.slots[0]
-      const chest = { chestId: group.chestId, x: slot.x, y: slot.y, z: slot.z, blockName: slot.blockName }
+      this.debug(`shulker extract ${targetItem.displayName || allocation.itemKey} need=${remaining} boxes=${boxesRemaining} source=${sourceItem.displayName || sourceKey}`)
 
-      while (remaining > 0 && boxesRemaining > 0) {
-        const sourceBox = await this.takeOneShulkerFromChest(chest, sourceKey, group.slots.map(row => row.slot))
-        if (!sourceBox) break
-        boxesRemaining--
+      for (const group of chestGroups) {
+        if (remaining <= 0 || boxesRemaining <= 0) break
+        const slot = group.slots[0]
+        const chest = { chestId: group.chestId, x: slot.x, y: slot.y, z: slot.z, blockName: slot.blockName }
 
-        let quickWindow = null
-        let boxToReturn = sourceBox
-        let returned = false
-        let repackState = ''
-        try {
-          await this.equipItemInHand(sourceBox)
-          // 服务器偶尔会在快捷开盒后返回空窗口（数量 0），与盒内应有物品对不上；
-          // 关窗重开最多 quickShulkerOpenAttempts 次，仍为 0 才跳过该盒。
-          let available = 0
-          const maxOpenAttempts = Math.max(1, Number(this.config.timing?.quickShulkerOpenAttempts ?? 3))
-          for (let openAttempt = 1; openAttempt <= maxOpenAttempts; openAttempt++) {
-            quickWindow = await this.openQuickShulkerWindow(sourceKey)
-            available = await this.waitForContainerItemCount(quickWindow, allocation.itemKey)
-            if (available > 0) break
-            this.debug(`quick shulker window empty (attempt ${openAttempt}/${maxOpenAttempts}) source=${sourceKey} target=${allocation.itemKey}`)
-            quickWindow.close()
-            quickWindow = null
-            if (openAttempt < maxOpenAttempts) await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
-          }
-          if (available <= 0) {
-            console.warn(`[shulker-extract] 快捷开盒连续 ${maxOpenAttempts} 次读取数量为 0：source=${sourceKey}，本次跳过该盒。`)
-          }
-          const toTake = Math.min(remaining, available)
-          if (toTake > 0) {
-            const pending = this.db.getShulkerRepackRecovery?.(this.botId)
-            if (pending) {
-              if (pending.state === 'prepared' && pending.oldBoxItemKey === sourceKey) {
-                this.db.clearShulkerRepackRecovery(this.botId)
-                console.warn(`[shulker-repack-recovery] cleared unchanged stale prepared record before retry: bot=${this.botId} old=${sourceKey}`)
-              } else if (this.resolveStuckShulkerRepackSelfHeal(pending, sourceKey)) {
-                // 上次换盒已实际完成，这里补账后继续本次拆盒
-              } else {
-                const conflict = new Error(`bot ${this.botId} has an unresolved shulker repack recovery`)
-                logLocalError('shulker-repack-conflict', conflict, {
-                  botId: this.botId,
-                  sourceChestId: chest.chestId,
-                  sourceKey,
-                  pendingState: pending.state,
-                  pendingOldBoxItemKey: pending.oldBoxItemKey,
-                  ownerUuid: allocation.ownerUuid
-                }, { directory: this.config.localLogDirectory })
-                console.error(`[shulker-repack-recovery] unresolved record blocks extraction; returning box and continuing: bot=${this.botId} state=${pending.state} old=${pending.oldBoxItemKey}`)
-                quickWindow.close()
-                quickWindow = null
-                boxToReturn = this.findInventoryItemByKey(sourceKey) || sourceBox
-                await this.returnShulkerToChest(chest, boxToReturn)
-                returned = true
-                continue
-              }
+        while (remaining > 0 && boxesRemaining > 0) {
+          const sourceBox = await this.takeOneShulkerFromChest(chest, sourceKey, group.slots.map(row => row.slot))
+          if (!sourceBox) break
+          boxesRemaining--
+
+          let quickWindow = null
+          let boxToReturn = sourceBox
+          let returned = false
+          let repackState = ''
+          try {
+            await this.equipItemInHand(sourceBox)
+            // 服务器偶尔会在快捷开盒后返回空窗口（数量 0），与盒内应有物品对不上；
+            // 关窗重开最多 quickShulkerOpenAttempts 次，仍为 0 才跳过该盒。
+            let available = 0
+            const maxOpenAttempts = Math.max(1, Number(this.config.timing?.quickShulkerOpenAttempts ?? 3))
+            for (let openAttempt = 1; openAttempt <= maxOpenAttempts; openAttempt++) {
+              quickWindow = await this.openQuickShulkerWindow(sourceKey)
+              available = await this.waitForContainerItemCount(quickWindow, allocation.itemKey)
+              if (available > 0) break
+              this.debug(`quick shulker window empty (attempt ${openAttempt}/${maxOpenAttempts}) source=${sourceKey} target=${allocation.itemKey}`)
+              quickWindow.close()
+              quickWindow = null
+              if (openAttempt < maxOpenAttempts) await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
             }
-            this.db.beginShulkerRepackRecovery(this.botId, {
-              ownerUuid: allocation.ownerUuid,
-              ownerUsername: allocation.ownerUsername || '',
-              oldBoxItemKey: sourceKey,
-              sourceChestId: chest.chestId,
-              targetItem,
-              beforeAmount: available,
-              requestedAmount: toTake,
-              message: `source_chest=${chest.chestId}, old_box=${sourceKey}`
-            })
-            repackState = 'prepared'
-          }
-          const moved = await this.tryWithdrawExactFrom(quickWindow, allocation.itemKey, toTake)
-          this.debug(`shulker extract open source=${sourceKey} available=${available} moved=${moved} remaining=${remaining}`)
+            if (available <= 0) {
+              console.warn(`[shulker-extract] 快捷开盒连续 ${maxOpenAttempts} 次读取数量为 0：source=${sourceKey}，本次跳过该盒。`)
+            }
+            const toTake = Math.min(remaining, available)
+            if (toTake > 0) {
+              const pending = this.db.getShulkerRepackRecovery?.(this.botId)
+              if (pending) {
+                if (pending.state === 'prepared' && pending.oldBoxItemKey === sourceKey) {
+                  this.db.clearShulkerRepackRecovery(this.botId)
+                  console.warn(`[shulker-repack-recovery] cleared unchanged stale prepared record before retry: bot=${this.botId} old=${sourceKey}`)
+                } else if (this.resolveStuckShulkerRepackSelfHeal(pending, sourceKey)) {
+                  // 上次换盒已实际完成，这里补账后继续本次拆盒
+                } else {
+                  const conflict = new Error(`bot ${this.botId} has an unresolved shulker repack recovery`)
+                  logLocalError('shulker-repack-conflict', conflict, {
+                    botId: this.botId,
+                    sourceChestId: chest.chestId,
+                    sourceKey,
+                    pendingState: pending.state,
+                    pendingOldBoxItemKey: pending.oldBoxItemKey,
+                    ownerUuid: allocation.ownerUuid
+                  }, { directory: this.config.localLogDirectory })
+                  console.error(`[shulker-repack-recovery] unresolved record blocks extraction; returning box and continuing: bot=${this.botId} state=${pending.state} old=${pending.oldBoxItemKey}`)
+                  quickWindow.close()
+                  quickWindow = null
+                  boxToReturn = this.findInventoryItemByKey(sourceKey) || sourceBox
+                  await this.returnShulkerToChest(chest, boxToReturn)
+                  returned = true
+                  continue
+                }
+              }
+              this.db.beginShulkerRepackRecovery(this.botId, {
+                ownerUuid: allocation.ownerUuid,
+                ownerUsername: allocation.ownerUsername || '',
+                oldBoxItemKey: sourceKey,
+                sourceChestId: chest.chestId,
+                targetItem,
+                beforeAmount: available,
+                requestedAmount: toTake,
+                message: `source_chest=${chest.chestId}, old_box=${sourceKey}`
+              })
+              repackState = 'prepared'
+            }
+            const moved = await this.tryWithdrawExactFrom(quickWindow, allocation.itemKey, toTake)
+            this.debug(`shulker extract open source=${sourceKey} available=${available} moved=${moved} remaining=${remaining}`)
 
-          // 连续开盒读到 0 时 quickWindow 已在上面重开循环里关掉置空，这里不能再重复关
-          if (quickWindow) {
-            quickWindow.close()
-            quickWindow = null
-          }
-          await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
+            // 连续开盒读到 0 时 quickWindow 已在上面重开循环里关掉置空，这里不能再重复关
+            if (quickWindow) {
+              quickWindow.close()
+              quickWindow = null
+            }
+            await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
 
-          if (moved <= 0) {
-            if (repackState) this.db.clearShulkerRepackRecovery(this.botId)
-            repackState = ''
-            boxToReturn = this.findInventoryItemByKey(sourceKey) || sourceBox
-            // 盒里实际取不到目标物品：用手上盒子的真实 NBT 重建这个盒的内容记录，
-            // 让记录与实物对齐，后续任务不再按旧记录扑空；
-            // 若只是卡顿误读（盒里其实有），NBT 同样能还原正确记录，不会误清。
-            this.syncShulkerBoxContents(boxToReturn)
-            await this.returnShulkerToChest(chest, boxToReturn)
-            returned = true
-            continue
-          }
-
-          boxToReturn = await this.waitForChangedShulkerItem(sourceKey, sourceItem.itemId)
-          const newBox = this.catalog.fromPrismarineItem(boxToReturn)
-          this.verifyShulkerExtraction(newBox, allocation.itemKey, available, moved)
-
-          this.db.markShulkerRepackPhysicalChange(
-            this.botId,
-            { ...newBox, amount: 1 },
-            [{ ...targetItem, amount: moved }],
-            `source_chest=${chest.chestId}, old_box=${sourceKey}, new_box=${newBox.itemKey}`
-          )
-          repackState = 'physical_changed'
-
-          await this.returnShulkerToChest(chest, boxToReturn)
-          returned = true
-          this.db.commitShulkerRepackRecovery(this.botId)
-          repackState = ''
-
-          withdrawn.push({ ...targetItem, amount: moved })
-          remaining -= moved
-        } catch (error) {
-          if (repackState || /shulker repack recovery/i.test(String(error?.message || ''))) {
-            logLocalError('shulker-repack-error', error, {
-              botId: this.botId,
-              sourceChestId: chest.chestId,
-              sourceKey,
-              targetKey: allocation.itemKey,
-              recoveryState: repackState
-            }, { directory: this.config.localLogDirectory })
-          }
-          if (quickWindow) {
-            try { quickWindow.close() } catch {}
-            quickWindow = null
-          }
-          if (/already has a pending shulker repack recovery|unresolved shulker repack recovery/i.test(String(error?.message || ''))) {
-            const recoverableBox = this.findInventoryShulker(sourceItem.itemId, sourceKey) || boxToReturn
-            try {
-              await this.returnShulkerToChest(chest, recoverableBox)
+            if (moved <= 0) {
+              if (repackState) this.db.clearShulkerRepackRecovery(this.botId)
+              repackState = ''
+              boxToReturn = this.findInventoryItemByKey(sourceKey) || sourceBox
+              // 盒里实际取不到目标物品：用手上盒子的真实 NBT 重建这个盒的内容记录，
+              // 让记录与实物对齐，后续任务不再按旧记录扑空；
+              // 若只是卡顿误读（盒里其实有），NBT 同样能还原正确记录，不会误清。
+              this.syncShulkerBoxContents(boxToReturn)
+              await this.returnShulkerToChest(chest, boxToReturn)
               returned = true
               continue
-            } catch (returnError) {
-              error.message += `；潜影盒冲突后放回失败：${returnError.message}`
             }
-          }
-          if (repackState === 'prepared') {
-            const changedBox = this.findInventoryShulker(sourceItem.itemId, sourceKey) || boxToReturn
-            try {
-              const recovery = this.db.getShulkerRepackRecovery(this.botId)
-              if (recovery) {
-                this.resolvePreparedShulkerRepackFromItem(recovery, changedBox)
-                repackState = this.db.getShulkerRepackRecovery(this.botId)?.state || ''
+
+            boxToReturn = await this.waitForChangedShulkerItem(sourceKey, sourceItem.itemId)
+            const newBox = this.catalog.fromPrismarineItem(boxToReturn)
+            this.verifyShulkerExtraction(newBox, allocation.itemKey, available, moved)
+
+            this.db.markShulkerRepackPhysicalChange(
+              this.botId,
+              { ...newBox, amount: 1 },
+              [{ ...targetItem, amount: moved }],
+              `source_chest=${chest.chestId}, old_box=${sourceKey}, new_box=${newBox.itemKey}`
+            )
+            repackState = 'physical_changed'
+
+            await this.returnShulkerToChest(chest, boxToReturn)
+            returned = true
+            this.db.commitShulkerRepackRecovery(this.botId)
+            repackState = ''
+
+            withdrawn.push({ ...targetItem, amount: moved })
+            remaining -= moved
+          } catch (error) {
+            if (repackState || /shulker repack recovery/i.test(String(error?.message || ''))) {
+              logLocalError('shulker-repack-error', error, {
+                botId: this.botId,
+                sourceChestId: chest.chestId,
+                sourceKey,
+                targetKey: allocation.itemKey,
+                recoveryState: repackState
+              }, { directory: this.config.localLogDirectory })
+            }
+            if (quickWindow) {
+              try { quickWindow.close() } catch {}
+              quickWindow = null
+            }
+            if (/already has a pending shulker repack recovery|unresolved shulker repack recovery/i.test(String(error?.message || ''))) {
+              const recoverableBox = this.findInventoryShulker(sourceItem.itemId, sourceKey) || boxToReturn
+              try {
+                await this.returnShulkerToChest(chest, recoverableBox)
+                returned = true
+                continue
+              } catch (returnError) {
+                error.message += `；潜影盒冲突后放回失败：${returnError.message}`
               }
-            } catch (recoveryError) {
-              error.message += `；潜影盒重打包状态记录失败：${recoveryError.message}`
             }
-          }
-          if (!returned) {
-            const recoverableBox = this.findInventoryShulker(sourceItem.itemId, sourceKey) || boxToReturn
-            try {
-              await this.returnShulkerToChest(chest, recoverableBox)
-            } catch (returnError) {
-              error.message += `；潜影盒放回失败：${returnError.message}`
+            if (repackState === 'prepared') {
+              const changedBox = this.findInventoryShulker(sourceItem.itemId, sourceKey) || boxToReturn
+              try {
+                const recovery = this.db.getShulkerRepackRecovery(this.botId)
+                if (recovery) {
+                  this.resolvePreparedShulkerRepackFromItem(recovery, changedBox)
+                  repackState = this.db.getShulkerRepackRecovery(this.botId)?.state || ''
+                }
+              } catch (recoveryError) {
+                error.message += `；潜影盒重打包状态记录失败：${recoveryError.message}`
+              }
             }
+            if (!returned) {
+              const recoverableBox = this.findInventoryShulker(sourceItem.itemId, sourceKey) || boxToReturn
+              try {
+                await this.returnShulkerToChest(chest, recoverableBox)
+              } catch (returnError) {
+                error.message += `；潜影盒放回失败：${returnError.message}`
+              }
+            }
+            throw error
           }
-          throw error
         }
       }
+
+      return chestGroups.length
+    }
+
+    const plannedGroupCount = await extractFromSource(sourceKey, sourceItem)
+
+    if (remaining > 0) {
+      // 计划源盒没取够：按账本内容索引找同属该所有者、含目标物品的其他盒子，
+      // 且必须真的有木桶位置记录，逐个回退直至取够或用尽。
+      const fallbackRows = (typeof this.db.getOwnerShulkersContainingItemKey === 'function'
+        ? this.db.getOwnerShulkersContainingItemKey(allocation.ownerUuid, allocation.itemKey)
+        : []) || []
+      for (const row of fallbackRows) {
+        if (remaining <= 0) break
+        const fallbackKey = String(row.shulkerItemKey || '')
+        if (!fallbackKey || fallbackKey === sourceKey) continue
+        if (!this.db.listSlotsForItemKey(fallbackKey).length) continue
+        const fallbackItem = this.db.getItemByKey(fallbackKey)
+        if (!fallbackItem) continue
+        const perBox = Math.max(1, Number(row.containedAmount || 0))
+        const extraBoxes = Math.min(Math.max(0, Number(row.shulkerAmount || 0)), Math.ceil(remaining / perBox))
+        if (extraBoxes <= 0) continue
+        boxesRemaining += extraBoxes
+        console.warn(`[shulker-extract] 计划源盒 ${sourceKey}（${sourceItem.displayName || sourceKey}）在木桶记录中无实物，回退改用 ${fallbackKey}（${fallbackItem.displayName || fallbackKey}）`)
+        await extractFromSource(fallbackKey, fallbackItem)
+      }
+      if (plannedGroupCount === 0) this.reportMissingSourceBoxRecord(allocation, sourceItem)
     }
 
     return {
@@ -702,6 +734,29 @@ class Warehouse {
       this.db.upsertItem(normalized)
     } catch (error) {
       this.debug(`sync shulker contents failed: ${error?.message || error}`)
+    }
+  }
+
+  // 账本显示所有者拥有某 key 的潜影盒，但木桶位置记录里一个都没有（典型：盒子被人工移动）。
+  // 记一条库存异常（同一所有者+盒子 key 只记一条 open），供管理员在 Web 管理页看到并择机 !同步 对账。
+  reportMissingSourceBoxRecord (allocation, sourceItem) {
+    try {
+      if (typeof this.db.addInventoryMismatch !== 'function' || typeof this.db.getBalance !== 'function') return
+      const balance = Number(this.db.getBalance(allocation.ownerUuid, sourceItem.itemKey) || 0)
+      if (balance <= 0) return
+      if (typeof this.db.hasOpenInventoryMismatch === 'function' &&
+          this.db.hasOpenInventoryMismatch(allocation.ownerUuid, sourceItem.itemKey)) return
+      this.db.addInventoryMismatch(
+        'missing',
+        allocation.ownerUuid,
+        allocation.ownerUsername || '',
+        sourceItem,
+        balance,
+        '取货时发现：账本显示该潜影盒有库存，但木桶位置记录中没有任何实物（可能被人工移动或记录漂移）；系统已自动改用其他盒子取货。请择机执行 !同步 对账。'
+      )
+      console.warn(`[shulker-extract] 账本有 ${balance} 个 ${sourceItem.displayName || sourceItem.itemKey}（${sourceItem.itemKey}）但木桶记录中无实物，已记入库存异常。`)
+    } catch (error) {
+      this.debug(`report missing source box failed: ${error?.message || error}`)
     }
   }
 

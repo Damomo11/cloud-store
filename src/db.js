@@ -2969,6 +2969,14 @@ class StoreDb {
     return allocations
   }
 
+  hasOpenInventoryMismatch (ownerUuid, itemKey) {
+    return Boolean(this.db.prepare(`
+      SELECT 1 FROM inventory_mismatches
+      WHERE status = 'open' AND owner_uuid = ? AND item_key = ?
+      LIMIT 1
+    `).get(String(ownerUuid || ''), String(itemKey || '')))
+  }
+
   addInventoryMismatch (kind, ownerUuid, username, item, amount, note = '') {
     if (!amount || amount <= 0 || !item?.itemKey) return
     this.upsertItem(this.rowToItem(item))
