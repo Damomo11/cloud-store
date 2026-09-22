@@ -640,7 +640,12 @@ class Warehouse {
               continue
             }
 
-            boxToReturn = await this.waitForChangedShulkerItem(sourceKey, sourceItem.itemId)
+            boxToReturn = await this.waitForChangedShulkerItem(
+              sourceKey,
+              sourceItem.itemId,
+              allocation.itemKey,
+              Math.max(0, Number(available) - Number(moved))
+            )
             const newBox = this.catalog.fromPrismarineItem(boxToReturn)
             this.verifyShulkerExtraction(newBox, allocation.itemKey, available, moved)
 
@@ -864,14 +869,24 @@ class Warehouse {
       candidates.find(item => this.catalog.fromPrismarineItem(item).itemKey === preferredItemKey) || null
   }
 
-  async waitForChangedShulkerItem (oldItemKey, itemId) {
+  async waitForChangedShulkerItem (oldItemKey, itemId, targetItemKey = '', expectedTargetAmount = null) {
     const timeoutMs = Math.max(500, Number(this.config.timing?.inventoryUpdateTimeoutMs || 2000))
     const deadline = Date.now() + timeoutMs
+    let changedItem = null
     while (Date.now() < deadline) {
       const item = this.findInventoryShulker(itemId, oldItemKey)
-      if (item && this.catalog.fromPrismarineItem(item).itemKey !== oldItemKey) return item
+      if (item && this.catalog.fromPrismarineItem(item).itemKey !== oldItemKey) {
+        changedItem = item
+        if (!targetItemKey || expectedTargetAmount === null) return item
+        const normalized = this.catalog.fromPrismarineItem(item)
+        const amount = this.catalog.extractShulkerContents(normalized)
+          .filter(entry => entry.item.itemKey === targetItemKey)
+          .reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
+        if (amount === expectedTargetAmount) return item
+      }
       await sleep(50)
     }
+    if (changedItem) return changedItem
     throw new Error('快捷潜影盒内容已取出，但客户端没有收到盒子内容更新。')
   }
 
