@@ -24,6 +24,7 @@ class BotTaskPool {
     this.sequence = 0
     this.seenMessages = new Map()
     this.warehouseMutex = new AsyncMutex()
+    this.warehouseState = { revision: 0, chestRevisions: new Map() }
   }
 
   register (service) {

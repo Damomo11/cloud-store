@@ -20,6 +20,7 @@ function isFatalProtocolReadError (error) {
 function releaseBotConnection (state, bot, service, taskPool, reason, options = {}) {
   if (!state || state.bot !== bot) return false
   taskPool?.unregister?.(service)
+  service?.invalidateConnection?.(reason)
   state.bot = null
   if (state.service === service) state.service = null
   state.deviceCode = null

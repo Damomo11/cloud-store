@@ -6,12 +6,13 @@ const { logLocalError } = require('./localErrorLog')
 const { isFatalProtocolReadError } = require('./botConnection')
 
 class Warehouse {
-  constructor (bot, db, catalog, config, warehouseMutex = null) {
+  constructor (bot, db, catalog, config, warehouseMutex = null, warehouseState = null) {
     this.bot = bot
     this.db = db
     this.catalog = catalog
     this.config = config
     this.warehouseMutex = warehouseMutex
+    this.warehouseState = warehouseState || { revision: 0, chestRevisions: new Map() }
     this.botId = String(config.server?.botName || config.server?.username || bot.username || 'bot').toLowerCase()
     this.chestNames = new Set(config.warehouse.chestBlockNames || ['barrel'])
     this.homePosition = null
@@ -326,6 +327,8 @@ class Warehouse {
       return 0
     }
     const sourceCount = Math.max(0, Number(sourceWindowItem.count || item.count || 0))
+    const canObserveContainerContents = typeof container.containerItems === 'function' || typeof container.items === 'function'
+    const beforeContainerCount = canObserveContainerContents ? this.countContainerItem(container, normalized.itemKey) : 0
 
     try {
       await this.bot.clickWindow(windowSlot, 0, 1)
@@ -337,11 +340,23 @@ class Warehouse {
       const deadline = Date.now() + timeoutMs
       while (Date.now() < deadline) {
         const currentSlotItem = container.slots?.[windowSlot] || null
-        if (!currentSlotItem) return Math.min(sourceCount, free)
-        const currentCount = Math.max(0, Number(currentSlotItem.count || 0))
-        if (currentCount < sourceCount) return Math.min(sourceCount - currentCount, free)
+        const currentContainerCount = canObserveContainerContents
+          ? this.countContainerItem(container, normalized.itemKey)
+          : beforeContainerCount
+        const sourceDecrease = currentSlotItem
+          ? Math.max(0, sourceCount - Number(currentSlotItem.count || 0))
+          : sourceCount
+        const containerIncrease = canObserveContainerContents
+          ? Math.max(0, currentContainerCount - beforeContainerCount)
+          : sourceDecrease
+        const moved = Math.min(sourceDecrease, containerIncrease, free)
+        if (moved > 0) {
+          if (!container.selectedItem && (sourceDecrease >= moved || !currentSlotItem)) return moved
+        }
         await sleep(50)
       }
+      // A predicted inventory decrease without a matching container increase is
+      // not a successful deposit. Do not credit the owner's balance for it.
       return 0
     } catch (error) {
       this.debug(`deposit exact slot ${item.name}@${item.slot} failed: ${error.message}`)
@@ -1126,14 +1141,24 @@ class Warehouse {
 
         const take = Math.min(item.count, expectedTake - planned)
         try {
+          const inventoryBefore = this.hasInventoryItems() ? this.inventoryCountByItemKey(itemKey) : 0
           if (take >= item.count) {
             await this.moveContainerSlotToInventory(container, item.slot)
           } else {
             await this.movePartialContainerSlotToInventory(container, item.slot, take)
           }
+          if (this.hasInventoryItems()) {
+            const confirmed = await this.waitForInventoryIncrease(itemKey, inventoryBefore, take)
+            if (confirmed < take) {
+              const error = new Error(`取 ${itemKey} 后背包只确认增加 ${confirmed}/${take}，物理状态不确定。`)
+              error.uncertainTransfer = true
+              throw error
+            }
+          }
         } catch (error) {
           this.debug(`withdraw exact slot ${item.slot} failed: ${error.message}`)
           await this.ensureWindowCursorCleared(container)
+          if (error?.uncertainTransfer) throw error
           break
         }
         if (!(await this.ensureWindowCursorCleared(container))) break
@@ -1144,6 +1169,10 @@ class Warehouse {
       const moved = Math.max(0, containerBefore - this.countContainerItem(container, itemKey))
       if (moved <= 0) {
         this.debug(`withdraw batch pass ${pass + 1} moved nothing for ${itemKey}`)
+        if (pass + 1 < maxPasses) {
+          await sleep(Math.max(0, Number(this.config.timing?.inventoryUpdateTimeoutMs ?? 2000)))
+          continue
+        }
         break
       }
       movedTotal += moved
@@ -1151,6 +1180,21 @@ class Warehouse {
     }
 
     return movedTotal
+  }
+
+  hasInventoryItems () {
+    return Boolean(this.bot.inventory && typeof this.bot.inventory.items === 'function')
+  }
+
+  async waitForInventoryIncrease (itemKey, before, expected, timeoutMs = null) {
+    const timeout = Math.max(500, Number(timeoutMs ?? this.config.timing?.inventoryUpdateTimeoutMs ?? 2000))
+    const deadline = Date.now() + timeout
+    while (Date.now() < deadline) {
+      const increase = Math.max(0, this.inventoryCountByItemKey(itemKey) - Number(before || 0))
+      if (increase >= expected) return increase
+      await sleep(50)
+    }
+    return Math.max(0, this.inventoryCountByItemKey(itemKey) - Number(before || 0))
   }
 
   async ensureWindowCursorCleared (container) {
@@ -1223,7 +1267,10 @@ class Warehouse {
 
   noteChestMutation (chestId) {
     if (!chestId) return
-    this.chestMutationSeqs.set(String(chestId), ++this.mutationSeq)
+    const revision = ++this.warehouseState.revision
+    this.warehouseState.chestRevisions.set(String(chestId), revision)
+    this.chestMutationSeqs.set(String(chestId), revision)
+    this.mutationSeq = revision
   }
 
   refreshChestSnapshot (chest, container) {
@@ -1258,7 +1305,7 @@ class Warehouse {
       const block = blocks[index]
       const chest = this.blockToChest(block)
       this.debug(`sync open ${index + 1}/${blocks.length} ${this.describeChest(chest)}`)
-      const preReadSeq = ++this.mutationSeq
+      const preReadSeq = this.warehouseState.revision
       let container
       try {
         container = await this.openContainerAt(chest)
@@ -1293,12 +1340,13 @@ class Warehouse {
 
   async applyWarehouseScan (scan, radius) {
     const { blocks, snapshots } = scan
+    this.assertConnectionHealthy()
 
     // 重读同步扫描期间被业务存取改动过的木桶，避免用过期快照覆盖业务变更。
     // 任一重读失败都直接抛错：此时还没有写入任何新记录，旧库存原样保留。
     let rescanCount = 0
     for (const snapshot of snapshots) {
-      if ((this.chestMutationSeqs.get(snapshot.chest.chestId) || 0) <= snapshot.preReadSeq) continue
+      if ((this.warehouseState.chestRevisions.get(snapshot.chest.chestId) || 0) <= snapshot.preReadSeq) continue
       this.debug(`sync rescan mutated chest ${this.describeChest(snapshot.chest)}`)
       const container = await this.openContainerAt(snapshot.chest)
       try {
@@ -1313,7 +1361,9 @@ class Warehouse {
       }
     }
 
+    this.assertConnectionHealthy()
     const actualItems = snapshots.flatMap(snapshot => snapshot.slots)
+    this.assertConnectionHealthy()
     this.db.clearChests()
     for (const snapshot of snapshots) {
       this.db.upsertChest(snapshot.chest)
@@ -1415,6 +1465,13 @@ class Warehouse {
     } finally {
       this.openingChest = null
     }
+  }
+
+  invalidateConnection (reason = 'connection invalidated') {
+    if (this.connectionAbortController.signal.aborted) return
+    const error = new Error(`仓库连接已失效：${reason}`)
+    error.code = 'CONNECTION_INVALIDATED'
+    this.connectionAbortController.abort(error)
   }
 
   abortForProtocolReadError (error) {

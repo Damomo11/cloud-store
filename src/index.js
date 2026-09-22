@@ -277,7 +277,7 @@ function launchBot (state) {
   let lastDisconnectReason = ''
   const acceptedResourcePacks = new Set()
 
-  const warehouse = new Warehouse(bot, db, catalog, launchConfig, taskPool.warehouseMutex)
+  const warehouse = new Warehouse(bot, db, catalog, launchConfig, taskPool.warehouseMutex, taskPool.warehouseState)
   const service = new CloudStoreService(bot, db, catalog, warehouse, launchConfig, taskPool, subscriptions)
   service.setWebAuth(webServer)
   setupRegistryExport(bot, catalog, db)

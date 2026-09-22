@@ -144,6 +144,33 @@ test('web inventory exposes the localized base item name for variant searches', 
   }
 })
 
+test('withdraw deduction with the same key is applied only once', () => {
+  const fixture = createDb()
+  const item = {
+    itemKey: 'diamond-block',
+    itemId: 'minecraft:diamond_block',
+    displayName: '钻石块',
+    nbtJson: '',
+    metaJson: '',
+    amount: 2
+  }
+  try {
+    fixture.db.addBalanceItems('player-1', [item])
+    const group = [{ ownerUuid: 'player-1', username: 'Player1', items: [{ ...item, amount: 1 }] }]
+    fixture.db.applyWithdrawDeduction('batch-1', group, 'test')
+    fixture.db.applyWithdrawDeduction('batch-1', group, 'retry')
+
+    assert.equal(fixture.db.getBalance('player-1', item.itemKey), 1)
+    const rows = fixture.db.db.prepare(`
+      SELECT COUNT(*) AS count FROM transactions
+      WHERE type = 'withdraw' AND deduction_key = ?
+    `).get('batch-1')
+    assert.equal(rows.count, 1)
+  } finally {
+    fixture.close()
+  }
+})
+
 test('concurrent transaction records keep the executing bot', async () => {
   const fixture = createDb()
   try {

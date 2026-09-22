@@ -24,6 +24,11 @@ class CloudStoreService {
     this.accountedResidual = new Map()
   }
 
+  invalidateConnection (reason = 'connection invalidated') {
+    this.active && (this.active.cancelled = true)
+    this.warehouse.invalidateConnection(reason)
+  }
+
   setWebAuth (webAuth) {
     this.webAuth = webAuth
   }
@@ -110,7 +115,12 @@ class CloudStoreService {
         }
       } else if (context.type === 'withdraw') {
         const held = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
+        const recoveryTask = this.db.getRecoveryTask(this.botId)
+        const recoveryOwner = recoveryTask ? this.recoveryOwnerFromTask(recoveryTask) : (context.owner || context.player)
         const pendingRepack = this.resolvePreparedShulkerRepackRecovery()
+        const deliveredAfterDeath = recoveryTask?.type === 'withdraw' && this.isWithdrawDeliveryPhase(recoveryTask.phase) && recoveryTask.items?.length
+          ? this.subtractLeftoverFromDelivered(recoveryTask.items, held)
+          : []
         if (pendingRepack && !held.length) {
           if (pendingRepack.state === 'physical_changed') {
             const resolved = this.db.resolveStuckShulkerRepack?.(this.botId, [], 'death recovery with empty inventory')
@@ -122,6 +132,9 @@ class CloudStoreService {
           }
         }
         const result = await this.warehouse.depositInventoryWithoutBalance('withdraw_death_recovery', `player=${context.username}, phase=${context.phase || ''}`)
+        if (deliveredAfterDeath.length && recoveryOwner) {
+          this.recordWithdrawDeduction(recoveryOwner, deliveredAfterDeath, `player=${context.username}, recovery=death`, this.recoveryDeductionKey(recoveryTask))
+        }
         if (pendingRepack && held.length) this.commitRecoveredShulkerRepack(result, 'death')
         if (context.username) {
           this.msg(context.username, '机器人取物品过程中死亡，本次取物品已终止；身上剩余物品已回收入库，不会扣除未交付数量。')
@@ -138,7 +151,7 @@ class CloudStoreService {
     }
   }
 
-  saveRecoveryTask (type, actorUsername, owner, targetUsername, phase = '', items = []) {
+  saveRecoveryTask (type, actorUsername, owner, targetUsername, phase = '', items = [], deductionKey = '') {
     this.db.saveRecoveryTask({
       type,
       actorUsername,
@@ -148,8 +161,17 @@ class CloudStoreService {
       vaultName: owner?.vaultName || '',
       targetUsername,
       phase,
+      deductionKey: String(deductionKey || ''),
       items: this.mergeItems(items || [])
     }, this.botId)
+  }
+
+  recoveryDeductionKey (task) {
+    const existing = String(task?.deductionKey || '').trim()
+    if (existing) return existing
+    const legacy = `legacy:${this.botId}:${task?.updatedAt || task?.createdAt || 'unknown'}`
+    console.warn(`[withdraw-recovery] recovery task has no deduction key; using stable legacy key ${legacy}`)
+    return legacy
   }
 
   clearRecoveryTaskIfInventoryEmpty () {
@@ -251,7 +273,7 @@ class CloudStoreService {
       if (this.isWithdrawDeliveryPhase(task.phase) && task.items?.length) {
         const delivered = this.subtractLeftoverFromDelivered(task.items, held)
         if (delivered.length) {
-          this.recordWithdrawDeduction(owner, delivered, `actor=${task.actorUsername}, target=${task.targetUsername}, phase=${task.phase}, recovery=disconnect`)
+          this.recordWithdrawDeduction(owner, delivered, `actor=${task.actorUsername}, target=${task.targetUsername}, phase=${task.phase}, recovery=disconnect`, this.recoveryDeductionKey(task))
           if (task.actorUsername) {
             this.msg(task.actorUsername, `机器人重连后已补记上次已交付的取货：${this.formatWithdrawSummary(delivered)}。`)
           }
@@ -1129,8 +1151,9 @@ class CloudStoreService {
     let aborted = false
     for (let index = 0; index < batches.length; index++) {
       const batch = batches[index]
+      const batchId = `withdraw:${this.botId}:${this.active?.taskId || 'legacy'}:${index + 1}`
       this.setWithdrawBatchProgress(index + 1, batches.length, 'withdraw_from_chests')
-      this.saveRecoveryTask('withdraw', username, storageOwner, deliveryTarget, 'withdraw_from_chests')
+      this.saveRecoveryTask('withdraw', username, storageOwner, deliveryTarget, 'withdraw_from_chests', [], batchId)
       const physical = await this.withdrawBatchWithQuantityGuard(batch, {
         username,
         storageOwner,
@@ -1154,7 +1177,7 @@ class CloudStoreService {
       const teleported = await this.teleportToPlayer(deliveryTarget, { notify: false })
       if (!teleported) {
         this.setWithdrawBatchProgress(index + 1, batches.length, 'withdraw_tpa_timeout_return_home')
-        this.saveRecoveryTask('withdraw', username, storageOwner, deliveryTarget, 'withdraw_tpa_timeout_return_home')
+        this.saveRecoveryTask('withdraw', username, storageOwner, deliveryTarget, 'withdraw_tpa_timeout_return_home', [], batchId)
         await this.warehouse.goHome({ requireWarehouse: true })
         const result = await this.warehouse.depositInventoryWithoutBalance('withdraw_tpa_timeout', `actor=${username}, target=${deliveryTarget}`)
         if (result.leftover.length) {
@@ -1184,7 +1207,7 @@ class CloudStoreService {
       }
       const deliveryPhase = deliveryMode === 'repair' ? 'withdraw_repairing' : 'withdraw_dropping'
       this.setWithdrawBatchProgress(index + 1, batches.length, deliveryPhase)
-      this.saveRecoveryTask('withdraw', username, storageOwner, deliveryTarget, deliveryPhase, delivered)
+      this.saveRecoveryTask('withdraw', username, storageOwner, deliveryTarget, deliveryPhase, delivered, batchId)
       const dropped = deliveryMode === 'repair'
         ? await this.warehouse.repairPlayerWithExperienceBottles(deliveryTarget, {
             itemId: REPAIR_BOTTLE_ITEM_ID,
@@ -1199,11 +1222,11 @@ class CloudStoreService {
       const deduct = this.allocateWithdrawnToPlanned(delivered, dropped)
 
       if (deduct.length) {
-        this.recordWithdrawDeduction(storageOwner, deduct, `actor=${username}, target=${deliveryTarget}, batch=${index + 1}/${batches.length}`)
-        this.saveRecoveryTask('withdraw', username, storageOwner, deliveryTarget, 'withdraw_return_home')
+        this.recordWithdrawDeduction(storageOwner, deduct, `actor=${username}, target=${deliveryTarget}, batch=${index + 1}/${batches.length}`, batchId)
+        this.saveRecoveryTask('withdraw', username, storageOwner, deliveryTarget, 'withdraw_return_home', [], batchId)
         allDeducted.push(...deduct)
       } else {
-        this.saveRecoveryTask('withdraw', username, storageOwner, deliveryTarget, 'withdraw_return_home')
+        this.saveRecoveryTask('withdraw', username, storageOwner, deliveryTarget, 'withdraw_return_home', [], batchId)
       }
 
       const finalBatch = index === batches.length - 1
@@ -2186,22 +2209,24 @@ class CloudStoreService {
     return excess
   }
 
-  recordWithdrawDeduction (fallbackOwner, items, message) {
+  recordWithdrawDeduction (fallbackOwner, items, message, deductionKey = '') {
     const groups = new Map()
     for (const item of items || []) {
       const ownerUuid = item.ownerUuid || fallbackOwner.uuid
       let group = groups.get(ownerUuid)
       if (!group) {
         group = {
-          owner: {
-            uuid: ownerUuid,
-            username: item.ownerUsername || (ownerUuid === fallbackOwner.uuid ? fallbackOwner.username : this.db.ownerLabel(ownerUuid))
-          },
+          ownerUuid,
+          username: item.ownerUsername || (ownerUuid === fallbackOwner.uuid ? fallbackOwner.username : this.db.ownerLabel(ownerUuid)),
           items: []
         }
         groups.set(ownerUuid, group)
       }
       group.items.push(item)
+    }
+
+    if (deductionKey && typeof this.db.applyWithdrawDeduction === 'function') {
+      return this.db.applyWithdrawDeduction(deductionKey, [...groups.values()], message)
     }
 
     this.db.transaction(() => {
@@ -2221,9 +2246,9 @@ class CloudStoreService {
             throw new Error(`扣账物品记录不完整：${item.itemKey}`)
           }
           this.db.upsertItem(complete)
-          this.db.adjustBalance(group.owner.uuid, item.itemKey, -item.amount)
+          this.db.adjustBalance(group.ownerUuid, item.itemKey, -item.amount)
         }
-        this.db.addTransaction('withdraw', 'ok', group.owner.uuid, group.owner.username, merged, message)
+        this.db.addTransaction('withdraw', 'ok', group.ownerUuid, group.username, merged, message)
       }
     })
   }
@@ -2783,9 +2808,10 @@ class CloudStoreService {
       if (result.leftover?.length) {
         throw new Error(`机器人背包里还有上次取货未交付物品未能回收入库：${this.formatItemList(result.leftover)}。请先检查仓库路径或空间。`)
       }
-      if (delivered.length) {
-        this.recordWithdrawDeduction(owner, delivered, `actor=${task.actorUsername}, target=${task.targetUsername}, phase=${task.phase}, recovery=residual`)
-      }
+        if (delivered.length) {
+          this.recordWithdrawDeduction(owner, delivered, `actor=${task.actorUsername}, target=${task.targetUsername}, phase=${task.phase}, recovery=residual`, this.recoveryDeductionKey(task))
+        }
+
       if (pendingRepack) this.commitRecoveredShulkerRepack(result, 'residual')
       this.db.clearRecoveryTask(this.botId)
       return

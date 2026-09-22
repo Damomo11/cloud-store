@@ -70,6 +70,7 @@ class StoreDb {
         username TEXT NOT NULL,
         items_json TEXT NOT NULL,
         message TEXT NOT NULL DEFAULT '',
+        deduction_key TEXT NOT NULL DEFAULT '',
         bot_id TEXT NOT NULL DEFAULT '',
         bot_name TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -241,6 +242,7 @@ class StoreDb {
         vault_name TEXT NOT NULL DEFAULT '',
         target_username TEXT NOT NULL DEFAULT '',
         phase TEXT NOT NULL DEFAULT '',
+        deduction_key TEXT NOT NULL DEFAULT '',
         items_json TEXT NOT NULL DEFAULT '[]',
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -256,6 +258,7 @@ class StoreDb {
         vault_name TEXT NOT NULL DEFAULT '',
         target_username TEXT NOT NULL DEFAULT '',
         phase TEXT NOT NULL DEFAULT '',
+        deduction_key TEXT NOT NULL DEFAULT '',
         items_json TEXT NOT NULL DEFAULT '[]',
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -452,8 +455,16 @@ class StoreDb {
     this.ensureColumn('items', 'display_name_manual', 'INTEGER NOT NULL DEFAULT 0')
     this.ensureColumn('transactions', 'bot_id', "TEXT NOT NULL DEFAULT ''")
     this.ensureColumn('transactions', 'bot_name', "TEXT NOT NULL DEFAULT ''")
+    this.ensureColumn('transactions', 'deduction_key', "TEXT NOT NULL DEFAULT ''")
     this.ensureColumn('global_item_aliases', 'category', "TEXT NOT NULL DEFAULT 'normal'")
     this.ensureColumn('active_recovery_tasks', 'items_json', "TEXT NOT NULL DEFAULT '[]'")
+    this.ensureColumn('active_recovery_tasks', 'deduction_key', "TEXT NOT NULL DEFAULT ''")
+    this.ensureColumn('bot_recovery_tasks', 'deduction_key', "TEXT NOT NULL DEFAULT ''")
+    this.db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS uq_withdraw_deduction
+      ON transactions (deduction_key, player_uuid)
+      WHERE type = 'withdraw' AND deduction_key <> ''
+    `)
     this.ensureColumn('players', 'default_owner_uuid', "TEXT NOT NULL DEFAULT ''")
     this.migrateManualItemNamesToOverrides()
     this.migratePlayerItemNameOverridesToAliases()
@@ -618,10 +629,10 @@ class StoreDb {
     this.db.prepare(`
       INSERT INTO bot_recovery_tasks (
         bot_id, type, actor_username, owner_uuid, owner_username, owner_scope,
-        vault_name, target_username, phase, items_json, updated_at
+        vault_name, target_username, phase, deduction_key, items_json, updated_at
       )
       VALUES (@botId, @type, @actorUsername, @ownerUuid, @ownerUsername, @ownerScope,
-        @vaultName, @targetUsername, @phase, @itemsJson, CURRENT_TIMESTAMP)
+        @vaultName, @targetUsername, @phase, @deductionKey, @itemsJson, CURRENT_TIMESTAMP)
       ON CONFLICT(bot_id) DO UPDATE SET
         type = excluded.type,
         actor_username = excluded.actor_username,
@@ -631,6 +642,7 @@ class StoreDb {
         vault_name = excluded.vault_name,
         target_username = excluded.target_username,
         phase = excluded.phase,
+        deduction_key = excluded.deduction_key,
         items_json = excluded.items_json,
         updated_at = CURRENT_TIMESTAMP
     `).run({
@@ -643,6 +655,7 @@ class StoreDb {
       vaultName: String(task.vaultName || ''),
       targetUsername: String(task.targetUsername || ''),
       phase: String(task.phase || ''),
+      deductionKey: String(task.deductionKey || ''),
       itemsJson: JSON.stringify(Array.isArray(task.items) ? task.items : [])
     })
   }
@@ -652,7 +665,7 @@ class StoreDb {
       SELECT type, actor_username AS actorUsername, owner_uuid AS ownerUuid,
              owner_username AS ownerUsername, owner_scope AS ownerScope,
              vault_name AS vaultName, target_username AS targetUsername,
-             phase, items_json AS itemsJson, created_at AS createdAt, updated_at AS updatedAt
+             phase, deduction_key AS deductionKey, items_json AS itemsJson, created_at AS createdAt, updated_at AS updatedAt
       FROM bot_recovery_tasks
       WHERE bot_id = ?
     `).get(String(botId || 'legacy'))
@@ -899,7 +912,7 @@ class StoreDb {
         SELECT type, actor_username AS actorUsername, owner_uuid AS ownerUuid,
                owner_username AS ownerUsername, owner_scope AS ownerScope,
                vault_name AS vaultName, target_username AS targetUsername,
-               phase, items_json AS itemsJson
+               phase, deduction_key AS deductionKey, items_json AS itemsJson
         FROM active_recovery_tasks WHERE id = 1
       `).get()
       if (!legacy) return null
@@ -908,7 +921,7 @@ class StoreDb {
       } catch {
         legacy.items = []
       }
-      this.saveRecoveryTask(legacy, botId)
+      this.saveRecoveryTask({ ...legacy, deductionKey: legacy.deductionKey || '' }, botId)
       this.db.prepare('DELETE FROM active_recovery_tasks WHERE id = 1').run()
       return this.getRecoveryTask(botId)
     })
@@ -2157,11 +2170,57 @@ class StoreDb {
     return changed
   }
 
+  applyWithdrawDeduction (deductionKey, groups, message = '') {
+    const key = String(deductionKey || '').trim()
+    if (!key) throw new Error('取货扣账缺少幂等键。')
+    return this.transaction(() => {
+      let applied = false
+      for (const group of groups || []) {
+        const ownerUuid = String(group.ownerUuid || '')
+        if (!ownerUuid) continue
+        const items = (group.items || []).filter(item => Number(item.amount || 0) > 0)
+        if (!items.length) continue
+        const username = String(group.username || this.ownerLabel(ownerUuid))
+        const existing = this.db.prepare(`
+          SELECT 1 FROM transactions
+          WHERE type = 'withdraw' AND deduction_key = ? AND player_uuid = ?
+          LIMIT 1
+        `).get(key, ownerUuid)
+        if (existing) continue
+        const result = this.db.prepare(`
+          INSERT INTO transactions (
+            type, status, player_uuid, username, items_json, message, deduction_key, bot_id, bot_name
+          ) VALUES ('withdraw', 'ok', ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          ownerUuid,
+          username,
+          JSON.stringify(items),
+          String(message || ''),
+          key,
+          String(this.transactionContext.getStore()?.botId || ''),
+          String(this.transactionContext.getStore()?.botName || '')
+        )
+        if (!result.changes) continue
+        applied = true
+        for (const item of items) {
+          const stored = this.getItemByKey(item.itemKey)
+          const complete = { ...stored, ...item, itemId: item.itemId || stored?.itemId, displayName: item.displayName || stored?.displayName, nbtJson: item.nbtJson ?? stored?.nbtJson, metaJson: item.metaJson ?? stored?.metaJson }
+          if (!complete.itemId || !complete.displayName || complete.nbtJson === undefined || complete.metaJson === undefined) {
+            throw new Error(`扣账物品记录不完整：${item.itemKey}`)
+          }
+          this.upsertItem(complete)
+          this.adjustBalance(ownerUuid, item.itemKey, -Number(item.amount || 0))
+        }
+      }
+      return { applied }
+    })
+  }
+
   addTransaction (type, status, playerUuid, username, items, message = '') {
     const context = this.transactionContext.getStore() || {}
     this.db.prepare(`
-      INSERT INTO transactions (type, status, player_uuid, username, items_json, message, bot_id, bot_name)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO transactions (type, status, player_uuid, username, items_json, message, deduction_key, bot_id, bot_name)
+      VALUES (?, ?, ?, ?, ?, ?, '', ?, ?)
     `).run(type, status, playerUuid, username, JSON.stringify(items), message, String(context.botId || ''), String(context.botName || ''))
   }
 
