@@ -1142,18 +1142,25 @@ class Warehouse {
         const take = Math.min(item.count, expectedTake - planned)
         try {
           const inventoryBefore = this.hasInventoryItems() ? this.inventoryCountByItemKey(itemKey) : 0
+          const windowInventoryBefore = this.hasWindowItems(container)
+            ? this.windowInventoryCountByItemKey(container, itemKey)
+            : 0
           if (take >= item.count) {
             await this.moveContainerSlotToInventory(container, item.slot)
           } else {
             await this.movePartialContainerSlotToInventory(container, item.slot, take)
           }
-          if (this.hasInventoryItems()) {
-            const confirmed = await this.waitForInventoryIncrease(itemKey, inventoryBefore, take)
-            if (confirmed < take) {
-              const error = new Error(`取 ${itemKey} 后背包只确认增加 ${confirmed}/${take}，物理状态不确定。`)
-              error.uncertainTransfer = true
-              throw error
-            }
+          const confirmed = await this.waitForInventoryTransfer(
+            container,
+            itemKey,
+            inventoryBefore,
+            windowInventoryBefore,
+            take
+          )
+          if (confirmed < take) {
+            const error = new Error(`取 ${itemKey} 后背包只确认增加 ${confirmed}/${take}，物理状态不确定。`)
+            error.uncertainTransfer = true
+            throw error
           }
         } catch (error) {
           this.debug(`withdraw exact slot ${item.slot} failed: ${error.message}`)
@@ -1186,15 +1193,30 @@ class Warehouse {
     return Boolean(this.bot.inventory && typeof this.bot.inventory.items === 'function')
   }
 
-  async waitForInventoryIncrease (itemKey, before, expected, timeoutMs = null) {
+  hasWindowItems (window) {
+    return Boolean(window && typeof window.items === 'function')
+  }
+
+  async waitForInventoryTransfer (window, itemKey, inventoryBefore, windowInventoryBefore, expected, timeoutMs = null) {
     const timeout = Math.max(500, Number(timeoutMs ?? this.config.timing?.inventoryUpdateTimeoutMs ?? 2000))
     const deadline = Date.now() + timeout
     while (Date.now() < deadline) {
-      const increase = Math.max(0, this.inventoryCountByItemKey(itemKey) - Number(before || 0))
-      if (increase >= expected) return increase
+      const inventoryIncrease = this.hasInventoryItems()
+        ? Math.max(0, this.inventoryCountByItemKey(itemKey) - Number(inventoryBefore || 0))
+        : 0
+      const windowIncrease = this.hasWindowItems(window)
+        ? Math.max(0, this.windowInventoryCountByItemKey(window, itemKey) - Number(windowInventoryBefore || 0))
+        : 0
+      if (Math.max(inventoryIncrease, windowIncrease) >= expected) return Math.max(inventoryIncrease, windowIncrease)
       await sleep(50)
     }
-    return Math.max(0, this.inventoryCountByItemKey(itemKey) - Number(before || 0))
+    const inventoryIncrease = this.hasInventoryItems()
+      ? Math.max(0, this.inventoryCountByItemKey(itemKey) - Number(inventoryBefore || 0))
+      : 0
+    const windowIncrease = this.hasWindowItems(window)
+      ? Math.max(0, this.windowInventoryCountByItemKey(window, itemKey) - Number(windowInventoryBefore || 0))
+      : 0
+    return Math.max(inventoryIncrease, windowIncrease)
   }
 
   async ensureWindowCursorCleared (container) {
@@ -1212,7 +1234,10 @@ class Warehouse {
 
   windowInventoryCountByItemKey (window, itemKey) {
     let total = 0
+    const inventoryStart = Number.isInteger(window.inventoryStart) ? window.inventoryStart : this.expectedContainerSlots()
+    const inventoryEnd = Number.isInteger(window.inventoryEnd) ? window.inventoryEnd : Number.MAX_SAFE_INTEGER
     for (const item of window.items()) {
+      if (!Number.isInteger(item.slot) || item.slot < inventoryStart || item.slot >= inventoryEnd) continue
       const normalized = this.catalog.fromPrismarineItem(item)
       if (normalized.itemKey === itemKey) total += item.count
     }
