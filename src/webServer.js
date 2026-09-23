@@ -692,24 +692,46 @@ class CloudStoreWebServer {
       languageFile: path.resolve(process.cwd(), this.config.language?.file || 'data/zh_cn.json'),
       maxSlots: Number.MAX_SAFE_INTEGER
     })
+    // 散装视图（不显示潜影盒）下允许用盒内物品补足；仓库关闭快捷潜影盒取货时保持只取散装。
+    const includeBoxed = body.includeBoxed === true &&
+      (!this.db.isQuickShulkerExtractionEnabled || this.db.isQuickShulkerExtractionEnabled(ownerUuid))
     return {
       ok: true,
-      ...this.buildLitematicWithdrawPlan(ownerUuid, materials, user.uuid)
+      ...this.buildLitematicWithdrawPlan(ownerUuid, materials, user.uuid, { includeBoxed })
     }
   }
 
-  buildLitematicWithdrawPlan (ownerUuid, parsed, viewerUuid = '') {
+  buildLitematicWithdrawPlan (ownerUuid, parsed, viewerUuid = '', options = {}) {
+    const includeBoxed = options.includeBoxed === true
     const selected = []
     const missing = []
     const unavailable = parsed.unavailable || []
     let usedSlots = 0
+    let boxedSelectedAmount = 0
+    const findSelected = itemKey => selected.find(row => row.itemKey === itemKey)
 
     for (const material of parsed.materials || []) {
       const rows = this.db.getOwnerItemsByItemId(ownerUuid, material.itemId)
-      const aliases = this.db.getPlayerItemNameOverrides(viewerUuid, rows.map(row => row.itemKey))
-      let remaining = Number(material.amount || 0)
-      const available = rows.reduce((sum, row) => sum + Number(row.amount || 0), 0)
-      const wanted = remaining
+      const shulkerRows = includeBoxed
+        ? this.db.getOwnerShulkersContainingItemId(ownerUuid, material.itemId)
+        : []
+      const aliases = this.db.getPlayerItemNameOverrides(viewerUuid, [
+        ...rows.map(row => row.itemKey),
+        ...shulkerRows.map(row => row.containedItemKey)
+      ].filter(Boolean))
+      const stackSize = Number(material.stackSize || 64)
+      const looseAvailable = rows.reduce((sum, row) => sum + Number(row.amount || 0), 0)
+      const boxedByItemKey = new Map()
+      let boxedAvailable = 0
+      for (const row of shulkerRows) {
+        const perBox = Number(row.containedAmount || 0)
+        const boxes = Math.max(0, Number(row.shulkerAmount || 0))
+        if (!row.containedItemKey || perBox <= 0 || boxes <= 0) continue
+        boxedAvailable += perBox * boxes
+        boxedByItemKey.set(row.containedItemKey, (boxedByItemKey.get(row.containedItemKey) || 0) + perBox * boxes)
+      }
+      const wanted = Number(material.amount || 0)
+      const available = looseAvailable + boxedAvailable
       const takeTotal = Math.min(wanted, available)
 
       if (takeTotal <= 0) {
@@ -721,28 +743,67 @@ class CloudStoreWebServer {
         missing.push({ ...material, available, selected: takeTotal, missing: wanted - available, reason: 'short' })
       }
 
-      remaining = takeTotal
+      // 和游戏内 !取 一致：优先散装，不够时再从潜影盒内补足。
+      let remaining = takeTotal
       for (const row of rows) {
         if (remaining <= 0) break
-        const stackSize = Number(material.stackSize || 64)
         const amount = Math.min(Number(row.amount || 0), remaining)
         const slots = Math.ceil(amount / Math.max(1, stackSize))
         if (amount <= 0 || slots <= 0) continue
-        selected.push({
-          itemKey: row.itemKey,
-          itemId: row.itemId,
-          displayName: aliases.get(row.itemKey) || row.displayName || material.displayName || row.itemId,
-          amount,
-          max: Number(row.amount || 0),
-          required: wanted,
-          available,
-          stackSize,
-          slots,
-          sourceItemId: material.itemId,
-          sourceDisplayName: material.displayName || material.itemId
-        })
+        const entry = findSelected(row.itemKey)
+        if (entry) {
+          entry.amount += amount
+          entry.slots += slots
+        } else {
+          selected.push({
+            itemKey: row.itemKey,
+            itemId: row.itemId,
+            displayName: aliases.get(row.itemKey) || row.displayName || material.displayName || row.itemId,
+            amount,
+            max: Number(row.amount || 0),
+            required: wanted,
+            available,
+            stackSize,
+            slots,
+            sourceItemId: material.itemId,
+            sourceDisplayName: material.displayName || material.itemId
+          })
+        }
         usedSlots += slots
         remaining -= amount
+      }
+
+      for (const [itemKey, keyBoxedAvailable] of boxedByItemKey) {
+        if (remaining <= 0) break
+        const take = Math.min(remaining, keyBoxedAvailable)
+        if (take <= 0) continue
+        const row = shulkerRows.find(item => item.containedItemKey === itemKey)
+        const slots = Math.ceil(take / Math.max(1, stackSize))
+        const entry = findSelected(itemKey)
+        if (entry) {
+          entry.max += keyBoxedAvailable
+          entry.amount += take
+          entry.slots += slots
+          entry.boxedAmount = Number(entry.boxedAmount || 0) + take
+        } else {
+          selected.push({
+            itemKey,
+            itemId: row?.containedItemId || material.itemId,
+            displayName: aliases.get(itemKey) || row?.containedDisplayName || material.displayName || material.itemId,
+            amount: take,
+            max: keyBoxedAvailable,
+            required: wanted,
+            available,
+            stackSize,
+            slots,
+            boxedAmount: take,
+            sourceItemId: material.itemId,
+            sourceDisplayName: material.displayName || material.itemId
+          })
+        }
+        usedSlots += slots
+        boxedSelectedAmount += take
+        remaining -= take
       }
     }
 
@@ -765,7 +826,8 @@ class CloudStoreWebServer {
         usedSlots,
         maxSlots: null,
         missingTypes: missing.length,
-        unavailableTypes: unavailable.length
+        unavailableTypes: unavailable.length,
+        boxedSelectedAmount
       }
     }
   }
@@ -4325,6 +4387,7 @@ const HTML = `<!doctype html>
       const missing = plan.missing || [];
       const unavailable = plan.unavailable || [];
       const warnings = [];
+      const boxedAmount = Number(plan.stats?.boxedSelectedAmount || 0);
       if (missing.length) {
         warnings.push('缺少：' + missing.map(row => esc(row.displayName || row.itemId) + ' x' + num(row.missing || row.amount)).join('，'));
       }
@@ -4338,10 +4401,11 @@ const HTML = `<!doctype html>
         '<div class="litematic-lines">' +
           '<span>已选 ' + num(plan.stats?.selectedTypes || 0) + ' 行</span>' +
           '<span>物品 ' + num(plan.stats?.selectedAmount || 0) + ' 个</span>' +
+          (boxedAmount > 0 ? '<span>盒内补足 ' + num(boxedAmount) + ' 个</span>' : '') +
           '<span>预计格数 ' + num(plan.stats?.usedSlots || 0) + '</span>' +
           '<span>蓝图材料 ' + num(plan.blueprint?.materialTypes || 0) + ' 种</span>' +
         '</div>' +
-        (warnings.length ? '<div class="litematic-warn">' + warnings.join('<br>') + '</div>' : '<div class="muted" style="margin-top:5px">材料已按当前库存自动加入待取列表。</div>');
+        (warnings.length ? '<div class="litematic-warn">' + warnings.join('<br>') + '</div>' : '<div class="muted" style="margin-top:5px">材料已按当前库存自动加入待取列表' + (boxedAmount > 0 ? '，散装不足的部分会拆潜影盒取出' : '') + '。</div>');
     }
 
     function applyLitematicSelection(plan) {
@@ -4371,7 +4435,8 @@ const HTML = `<!doctype html>
         const data = await post('/api/litematic/plan', {
           ownerUuid: state.owner,
           fileName: file.name,
-          dataBase64: dataUrl
+          dataBase64: dataUrl,
+          includeBoxed: !state.shulkerBoxView
         });
         applyLitematicSelection(data);
         renderLitematicPlan(data);
