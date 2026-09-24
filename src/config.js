@@ -72,6 +72,13 @@ const DEFAULT_CONFIG = {
   debug: true,
   debugChat: true,
   debugRawChat: false,
+  traceLog: {
+    // 取货链路日志（logs/withdraw-trace-日期.jsonl）：记录取什么、定位到哪个木桶、
+    // 打开后内容、拆盒过程、取出数量、放回结果和每个决策；排查取货失败时把日志发回即可。
+    enabled: true,
+    directory: 'logs',
+    retentionDays: 14
+  },
   resourcePack: {
     autoAccept: true
   },

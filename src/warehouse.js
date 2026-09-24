@@ -4,6 +4,7 @@ const Vec3 = require('vec3')
 const { sleep, sumBy } = require('./utils')
 const { logLocalError } = require('./localErrorLog')
 const { isFatalProtocolReadError } = require('./botConnection')
+const { traceEvent, shortKey } = require('./traceLog')
 
 class Warehouse {
   constructor (bot, db, catalog, config, warehouseMutex = null, warehouseState = null) {
@@ -20,6 +21,8 @@ class Warehouse {
     this.connectionAbortController = new AbortController()
     this.mutationSeq = 0
     this.chestMutationSeqs = new Map()
+    // 当前取货/同步任务的链路日志上下文（由 service 挂载）；仓库操作都经仓库锁串行执行。
+    this.activeTrace = null
   }
 
   withWarehouseLock (fn) {
@@ -28,6 +31,55 @@ class Warehouse {
 
   debug (message) {
     if (this.config.debug) console.log(`[warehouse] ${message}`)
+  }
+
+  attachTrace (trace) {
+    this.activeTrace = trace || null
+    return this.activeTrace
+  }
+
+  detachTrace () {
+    const trace = this.activeTrace
+    this.activeTrace = null
+    return trace
+  }
+
+  trace (phase, event, data = {}) {
+    traceEvent(this.activeTrace, phase, event, data)
+  }
+
+  // 快照一个容器的实际内容（“打开后是什么样”），条目精简便于日志阅读与回传分析。
+  snapshotContainerContents (container) {
+    try {
+      return this.containerContentItems(container).map(item => {
+        const normalized = this.catalog.fromPrismarineItem(item)
+        return {
+          slot: item.slot,
+          id: normalized.itemId,
+          name: normalized.displayName || normalized.itemId,
+          n: item.count,
+          key: shortKey(normalized.itemKey)
+        }
+      })
+    } catch (error) {
+      return [{ error: String(error?.message || error) }]
+    }
+  }
+
+  // 从物品档案（NBT）提取潜影盒内容摘要，用于“取完后盒子是什么样”。
+  snapshotShulkerContents (normalized) {
+    try {
+      if (!this.catalog.isShulkerBox(normalized?.itemId)) return null
+      return this.catalog.extractShulkerContents(normalized).map(entry => ({
+        id: entry.item.itemId,
+        name: entry.item.displayName || entry.item.itemId,
+        n: entry.amount,
+        slots: entry.slotCount,
+        key: shortKey(entry.item.itemKey)
+      }))
+    } catch (error) {
+      return [{ error: String(error?.message || error) }]
+    }
   }
 
   async goHome (options = {}) {
@@ -426,6 +478,13 @@ class Warehouse {
       let remaining = allocation.amount
       const itemInfo = this.db.getItemByKey(allocation.itemKey)
       if (!itemInfo) {
+        this.trace('plan', 'allocate_item_unknown', {
+          item: allocation.displayName || allocation.itemKey,
+          key: allocation.itemKey,
+          keyTail: shortKey(allocation.itemKey),
+          need: allocation.amount,
+          decision: '账本里找不到该物品档案，直接计入缺失'
+        })
         missing.push({ ...allocation })
         continue
       }
@@ -433,6 +492,23 @@ class Warehouse {
       const slots = this.db.listSlotsForItemKey(allocation.itemKey)
       const chestGroups = this.groupSlotsForWithdrawal(slots)
       this.debug(`withdraw plan ${itemInfo.displayName || allocation.itemKey} need=${allocation.amount} chests=${chestGroups.map(group => `${group.chestId}:${group.recordedAmount}`).join(' | ') || 'none'}`)
+
+      // 链路日志：这次要取什么、账本说这些货放在哪些木桶。
+      this.trace('plan', 'allocate_start', {
+        item: itemInfo.displayName || allocation.itemKey,
+        key: allocation.itemKey,
+        keyTail: shortKey(allocation.itemKey),
+        need: allocation.amount,
+        ownerUuid: allocation.ownerUuid || '',
+        barrelPlan: chestGroups.map(group => ({
+          chest: group.chestId,
+          recorded: group.recordedAmount,
+          slots: group.slots.map(row => row.slot)
+        })),
+        decision: chestGroups.length
+          ? `要取 ${allocation.amount} 个，按账本记录依次开 ${chestGroups.length} 个木桶`
+          : '账本有库存但没有任何木桶位置记录'
+      })
 
       // 记录说这个桶有货、实际却没取到（含整桶读空疑似卡顿）时，就地同步这一个桶的记录，
       // 然后换下一个有记录的桶接着找；这样的“缺货换桶”最多 maxMissingBarrels 次（可配置），
@@ -443,12 +519,29 @@ class Warehouse {
         if (remaining <= 0) break
         if (missingBarrelHops >= maxMissingBarrels) {
           this.debug(`withdraw ${itemInfo.displayName || allocation.itemKey} 缺货换桶已达上限 ${missingBarrelHops}/${maxMissingBarrels}，停止继续找桶，剩余计入缺失`)
+          this.trace('decision', 'barrel_hops_exhausted', {
+            item: itemInfo.displayName || allocation.itemKey,
+            hops: missingBarrelHops,
+            max: maxMissingBarrels,
+            remaining,
+            decision: `连续 ${missingBarrelHops} 个木桶实物少于账本，停止换桶，剩余 ${remaining} 计入缺失`
+          })
           break
         }
         const slot = group.slots[0]
         const chestId = group.chestId
         const chest = { chestId, x: slot.x, y: slot.y, z: slot.z, blockName: slot.blockName }
         const maxReadAttempts = Math.max(1, Number(this.config.timing?.barrelEmptyRereadAttempts ?? 3))
+        this.trace('locate', 'barrel_locate', {
+          item: itemInfo.displayName || allocation.itemKey,
+          chest: this.describeChest(chest),
+          chestId,
+          recorded: group.recordedAmount,
+          slots: group.slots.map(row => row.slot),
+          need: remaining,
+          hop: missingBarrelHops,
+          decision: `定位到木桶 ${this.describeChest(chest)}（账本 ${group.recordedAmount} 个），走去打开`
+        })
         let container = await this.openContainerAt(chest)
         try {
           // 木桶整个读出来一个物品都没有，多半是服务器卡顿返回了空窗口，而不是真实缺货：
@@ -463,6 +556,14 @@ class Warehouse {
               break
             }
             this.debug(`withdraw empty window read attempt=${readAttempt}/${maxReadAttempts} ${this.describeChest(chest)} recorded=${group.recordedAmount} item=${allocation.itemKey}`)
+            this.trace('open', 'barrel_read_empty_retry', {
+              chest: this.describeChest(chest),
+              attempt: readAttempt,
+              max: maxReadAttempts,
+              recorded: group.recordedAmount,
+              contents: this.snapshotContainerContents(container),
+              decision: `第 ${readAttempt} 次读到的木桶是空的，疑似服务器卡顿，关窗重开确认`
+            })
             if (readAttempt === maxReadAttempts) break
             this.closeContainerQuietly(container)
             await sleep(Math.max(0, Number(this.config.timing.containerSettleMs ?? 250)))
@@ -470,31 +571,81 @@ class Warehouse {
           }
           if (!trustedRead) {
             console.warn(`[withdraw] ${this.describeChest(chest)} 连续 ${maxReadAttempts} 次读到空木桶，疑似服务器卡顿；跳过该木桶并保留原记录 item=${allocation.itemKey} recorded=${group.recordedAmount}`)
+            this.trace('decision', 'barrel_read_empty_skip', {
+              chest: this.describeChest(chest),
+              attempts: maxReadAttempts,
+              recorded: group.recordedAmount,
+              decision: `连续 ${maxReadAttempts} 次读到空桶，按服务器卡顿处理：保留原记录，跳过该木桶`
+            })
             missingBarrelHops++
             continue
           }
           this.debug(`window slots container=0..${container.inventoryStart - 1} inventory=${container.inventoryStart}..${container.inventoryEnd - 1}`)
           const toTake = Math.min(remaining, available)
           this.debug(`withdraw open ${this.describeChest(chest)} recorded=${group.recordedAmount} actual=${available} need=${remaining}`)
+          this.trace('open', 'barrel_open', {
+            chest: this.describeChest(chest),
+            recorded: group.recordedAmount,
+            actual: available,
+            need: remaining,
+            toTake,
+            contents: this.snapshotContainerContents(container),
+            decision: `打开木桶：目标物品实际 ${available} 个（账本 ${group.recordedAmount}），本次计划取 ${toTake}`
+          })
           const moved = await this.tryWithdrawExactFrom(container, allocation.itemKey, toTake, group.slots.map(row => row.slot))
           if (moved > 0) {
             withdrawn.push({ ...itemInfo, amount: moved })
             remaining -= moved
             await sleep(this.config.timing.containerSettleMs)
             this.debug(`withdraw moved ${moved} ${itemInfo.displayName || allocation.itemKey} from ${this.describeChest(chest)} remaining=${remaining}`)
+            this.trace('take', 'barrel_take_result', {
+              chest: this.describeChest(chest),
+              planned: toTake,
+              moved,
+              remaining,
+              decision: `从该木桶取出 ${moved} 个，还差 ${remaining} 个`
+            })
+          } else {
+            this.trace('take', 'barrel_take_none', {
+              chest: this.describeChest(chest),
+              planned: toTake,
+              actual: available,
+              decision: '点击后没有确认到任何物品进入背包'
+            })
           }
           // 实物比记录少（含物品被换成别的东西）时，当场把这一个木桶的记录刷新成实际内容
           this.refreshChestSnapshot(chest, container)
           if (available < group.recordedAmount) {
             missingBarrelHops++
             this.debug(`withdraw ${this.describeChest(chest)} 实际少于记录 recorded=${group.recordedAmount} actual=${available} 缺货换桶 ${missingBarrelHops}/${maxMissingBarrels}`)
+            this.trace('decision', 'barrel_shortage_skip', {
+              chest: this.describeChest(chest),
+              recorded: group.recordedAmount,
+              actual: available,
+              hops: missingBarrelHops,
+              max: maxMissingBarrels,
+              decision: `实物(${available})比账本(${group.recordedAmount})少，已刷新该桶记录，换下一个木桶`
+            })
           }
+        } catch (error) {
+          this.trace('error', 'barrel_error', {
+            chest: this.describeChest(chest),
+            message: error?.message || String(error),
+            decision: '该木桶处理中断'
+          })
+          throw error
         } finally {
           this.closeContainerQuietly(container)
         }
       }
 
       if (remaining > 0) {
+        this.trace('result', 'allocate_missing', {
+          item: itemInfo.displayName || allocation.itemKey,
+          keyTail: shortKey(allocation.itemKey),
+          missing: remaining,
+          decision: `该物品最终还有 ${remaining} 个没有取到，计入缺失`
+        })
         missing.push({ ...itemInfo, amount: remaining })
       }
     }
@@ -537,6 +688,22 @@ class Warehouse {
     let boxesRemaining = Math.max(0, Number(allocation.sourceBoxCount || 0))
     const withdrawn = []
 
+    this.trace('plan', 'shulker_extract_start', {
+      item: targetItem.displayName || allocation.itemKey,
+      key: allocation.itemKey,
+      keyTail: shortKey(allocation.itemKey),
+      need: Number(allocation.amount || 0),
+      boxes: boxesRemaining,
+      sourceBox: {
+        name: sourceItem.displayName || sourceKey,
+        key: sourceKey,
+        keyTail: shortKey(sourceKey)
+      },
+      ownerUuid: allocation.ownerUuid || '',
+      perBox: Number(allocation.sourceContainedAmountPerBox || 0),
+      decision: `盒装取货：拆${sourceItem.displayName || sourceKey}（短码 ${shortKey(sourceKey)}）×${boxesRemaining} 取 ${allocation.amount} 个${targetItem.displayName || allocation.itemKey}`
+    })
+
     // 同一个取盒流程可能换源盒 key 执行多次：计划源盒在木桶记录里没有实物时，
     // 会回退到其他"账本有、木桶也有记录"的同内容盒子，避免账实漂移直接导致取货失败。
     const extractFromSource = async (sourceKey, sourceItem) => {
@@ -544,6 +711,19 @@ class Warehouse {
       const chestGroups = this.groupSlotsForWithdrawal(slots)
 
       this.debug(`shulker extract ${targetItem.displayName || allocation.itemKey} need=${remaining} boxes=${boxesRemaining} source=${sourceItem.displayName || sourceKey}`)
+      this.trace('locate', 'shulker_box_locate', {
+        sourceBox: { name: sourceItem.displayName || sourceKey, key: sourceKey, keyTail: shortKey(sourceKey) },
+        need: remaining,
+        boxes: boxesRemaining,
+        barrelPlan: chestGroups.map(group => ({
+          chest: group.chestId,
+          recordedBoxes: group.recordedAmount,
+          slots: group.slots.map(row => row.slot)
+        })),
+        decision: chestGroups.length
+          ? `账本显示源盒放在 ${chestGroups.length} 个木桶，依次去取盒`
+          : '账本显示有源盒，但没有任何木桶位置记录（盒子可能被人工移动）'
+      })
 
       for (const group of chestGroups) {
         if (remaining <= 0 || boxesRemaining <= 0) break
@@ -552,8 +732,27 @@ class Warehouse {
 
         while (remaining > 0 && boxesRemaining > 0) {
           const sourceBox = await this.takeOneShulkerFromChest(chest, sourceKey, group.slots.map(row => row.slot))
-          if (!sourceBox) break
+          if (!sourceBox) {
+            this.trace('decision', 'shulker_take_box_none', {
+              chest: this.describeChest(chest),
+              sourceBox: { key: sourceKey, keyTail: shortKey(sourceKey), name: sourceItem.displayName || sourceKey },
+              boxesLeft: boxesRemaining,
+              decision: '木桶里实际没有该源盒，已刷新桶记录，停止从该桶取盒'
+            })
+            break
+          }
           boxesRemaining--
+          this.trace('locate', 'shulker_take_box', {
+            chest: this.describeChest(chest),
+            sourceBox: {
+              name: sourceItem.displayName || sourceKey,
+              key: sourceKey,
+              keyTail: shortKey(sourceKey),
+              slot: sourceBox.slot
+            },
+            boxesLeft: boxesRemaining,
+            decision: `从 ${this.describeChest(chest)} 取出 1 个源盒（短码 ${shortKey(sourceKey)}）到手上`
+          })
 
           let quickWindow = null
           let boxToReturn = sourceBox
@@ -561,6 +760,10 @@ class Warehouse {
           let repackState = ''
           try {
             await this.equipItemInHand(sourceBox)
+            this.trace('open', 'shulker_equip', {
+              sourceBox: { key: sourceKey, keyTail: shortKey(sourceKey), slot: sourceBox.slot },
+              decision: '已把源盒拿在主手，对空气右键快捷开盒'
+            })
             // 服务器偶尔会在快捷开盒后返回空窗口（数量 0），与盒内应有物品对不上；
             // 关窗重开最多 quickShulkerOpenAttempts 次，仍为 0 才跳过该盒。
             let available = 0
@@ -570,22 +773,56 @@ class Warehouse {
               available = await this.waitForContainerItemCount(quickWindow, allocation.itemKey)
               if (available > 0) break
               this.debug(`quick shulker window empty (attempt ${openAttempt}/${maxOpenAttempts}) source=${sourceKey} target=${allocation.itemKey}`)
+              this.trace('open', 'shulker_open_empty_retry', {
+                attempt: openAttempt,
+                max: maxOpenAttempts,
+                sourceBox: { key: sourceKey, keyTail: shortKey(sourceKey) },
+                contents: this.snapshotContainerContents(quickWindow),
+                decision: `第 ${openAttempt} 次开盒没读到目标物品（疑似卡顿空窗口），关窗重开`
+              })
               quickWindow.close()
               quickWindow = null
               if (openAttempt < maxOpenAttempts) await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
             }
             if (available <= 0) {
               console.warn(`[shulker-extract] 快捷开盒连续 ${maxOpenAttempts} 次读取数量为 0：source=${sourceKey}，本次跳过该盒。`)
+              this.trace('decision', 'shulker_open_empty_skip', {
+                attempts: maxOpenAttempts,
+                sourceBox: { key: sourceKey, keyTail: shortKey(sourceKey) },
+                decision: `连续 ${maxOpenAttempts} 次开盒都读不到目标物品，跳过该盒放回`
+              })
+            } else {
+              this.trace('open', 'shulker_open', {
+                sourceBox: { key: sourceKey, keyTail: shortKey(sourceKey), name: sourceItem.displayName || sourceKey },
+                targetAvailable: available,
+                contents: this.snapshotContainerContents(quickWindow),
+                decision: `打开盒子：目标物品 ${available} 个，本次计划取 ${Math.min(remaining, available)} 个`
+              })
             }
             const toTake = Math.min(remaining, available)
+            this.trace('decision', 'shulker_take_plan', {
+              sourceBox: { key: sourceKey, keyTail: shortKey(sourceKey) },
+              available,
+              need: remaining,
+              toTake,
+              decision: `盒内有 ${available} 个，计划取 ${toTake} 个`
+            })
             if (toTake > 0) {
               const pending = this.db.getShulkerRepackRecovery?.(this.botId)
               if (pending) {
                 if (pending.state === 'prepared' && pending.oldBoxItemKey === sourceKey) {
                   this.db.clearShulkerRepackRecovery(this.botId)
                   console.warn(`[shulker-repack-recovery] cleared unchanged stale prepared record before retry: bot=${this.botId} old=${sourceKey}`)
+                  this.trace('decision', 'repack_stale_prepared_cleared', {
+                    oldBox: sourceKey,
+                    decision: '发现上次遗留的未变化 prepared 记录且源盒相同，清空后重试拆盒'
+                  })
                 } else if (this.resolveStuckShulkerRepackSelfHeal(pending, sourceKey)) {
                   // 上次换盒已实际完成，这里补账后继续本次拆盒
+                  this.trace('decision', 'repack_self_heal', {
+                    oldBox: pending.oldBoxItemKey,
+                    decision: '上次换盒实际已完成，自动补账后继续本次拆盒'
+                  })
                 } else {
                   const conflict = new Error(`bot ${this.botId} has an unresolved shulker repack recovery`)
                   logLocalError('shulker-repack-conflict', conflict, {
@@ -597,6 +834,11 @@ class Warehouse {
                     ownerUuid: allocation.ownerUuid
                   }, { directory: this.config.localLogDirectory })
                   console.error(`[shulker-repack-recovery] unresolved record blocks extraction; returning box and continuing: bot=${this.botId} state=${pending.state} old=${pending.oldBoxItemKey}`)
+                  this.trace('decision', 'repack_conflict_return_box', {
+                    pendingState: pending.state,
+                    oldBox: pending.oldBoxItemKey,
+                    decision: '存在未决的重打包恢复记录，为安全起见放回盒子跳过本次拆盒'
+                  })
                   quickWindow.close()
                   quickWindow = null
                   boxToReturn = this.findInventoryItemByKey(sourceKey) || sourceBox
@@ -616,9 +858,25 @@ class Warehouse {
                 message: `source_chest=${chest.chestId}, old_box=${sourceKey}`
               })
               repackState = 'prepared'
+              this.trace('ledger', 'repack_prepared', {
+                oldBox: sourceKey,
+                chest: this.describeChest(chest),
+                beforeAmount: available,
+                requestedAmount: toTake,
+                decision: '已写入重打包恢复记录（防断线丢账），开始从盒内取物'
+              })
             }
             const moved = await this.tryWithdrawExactFrom(quickWindow, allocation.itemKey, toTake)
             this.debug(`shulker extract open source=${sourceKey} available=${available} moved=${moved} remaining=${remaining}`)
+            this.trace('take', 'shulker_take_result', {
+              sourceBox: { key: sourceKey, keyTail: shortKey(sourceKey) },
+              planned: toTake,
+              moved,
+              remainingBefore: remaining,
+              decision: moved > 0
+                ? `从盒内取出 ${moved}/${toTake} 个${targetItem.displayName || allocation.itemKey}`
+                : '点击后没有确认到物品从盒内进入背包'
+            })
 
             // 连续开盒读到 0 时 quickWindow 已在上面重开循环里关掉置空，这里不能再重复关
             if (quickWindow) {
@@ -634,6 +892,11 @@ class Warehouse {
               // 盒里实际取不到目标物品：用手上盒子的真实 NBT 重建这个盒的内容记录，
               // 让记录与实物对齐，后续任务不再按旧记录扑空；
               // 若只是卡顿误读（盒里其实有），NBT 同样能还原正确记录，不会误清。
+              this.trace('decision', 'shulker_take_none_return_box', {
+                sourceBox: { key: sourceKey, keyTail: shortKey(sourceKey) },
+                boxContents: this.snapshotShulkerContents(this.catalog.fromPrismarineItem(boxToReturn)),
+                decision: '盒内取物失败：按盒子真实 NBT 重建内容记录后原样放回木桶'
+              })
               this.syncShulkerBoxContents(boxToReturn)
               await this.returnShulkerToChest(chest, boxToReturn)
               returned = true
@@ -647,6 +910,12 @@ class Warehouse {
               Math.max(0, Number(available) - Number(moved))
             )
             const newBox = this.catalog.fromPrismarineItem(boxToReturn)
+            this.trace('result', 'shulker_box_after', {
+              oldBox: { key: sourceKey, keyTail: shortKey(sourceKey) },
+              newBox: { key: newBox.itemKey, keyTail: shortKey(newBox.itemKey), name: newBox.displayName || newBox.itemId },
+              contents: this.snapshotShulkerContents(newBox),
+              decision: `取完后盒子内容已变化（新短码 ${shortKey(newBox.itemKey)}），按 NBT 校验剩余数量`
+            })
             this.verifyShulkerExtraction(newBox, allocation.itemKey, available, moved)
 
             this.db.markShulkerRepackPhysicalChange(
@@ -661,10 +930,24 @@ class Warehouse {
             returned = true
             this.db.commitShulkerRepackRecovery(this.botId)
             repackState = ''
+            this.trace('ledger', 'repack_committed', {
+              oldBox: { key: sourceKey, keyTail: shortKey(sourceKey) },
+              newBox: { key: newBox.itemKey, keyTail: shortKey(newBox.itemKey) },
+              moved,
+              decision: `盒子已放回木桶，账本换盒并扣除 ${moved} 个目标物品`
+            })
 
             withdrawn.push({ ...targetItem, amount: moved })
             remaining -= moved
           } catch (error) {
+            this.trace('error', 'shulker_error', {
+              sourceBox: { key: sourceKey, keyTail: shortKey(sourceKey) },
+              chest: this.describeChest(chest),
+              repackState,
+              returned,
+              message: error?.message || String(error),
+              decision: '拆盒过程出错，按恢复流程兜底后终止/继续'
+            })
             if (repackState || /shulker repack recovery/i.test(String(error?.message || ''))) {
               logLocalError('shulker-repack-error', error, {
                 botId: this.botId,
@@ -724,6 +1007,12 @@ class Warehouse {
       const fallbackRows = (typeof this.db.getOwnerShulkersContainingItemKey === 'function'
         ? this.db.getOwnerShulkersContainingItemKey(allocation.ownerUuid, allocation.itemKey)
         : []) || []
+      this.trace('decision', 'shulker_fallback_search', {
+        sourceBox: { key: sourceKey, keyTail: shortKey(sourceKey) },
+        remaining,
+        fallbackCandidates: fallbackRows.length,
+        decision: `计划源盒没取够（还差 ${remaining}），在账本里找含该物品的其他盒子回退`
+      })
       for (const row of fallbackRows) {
         if (remaining <= 0) break
         const fallbackKey = String(row.shulkerItemKey || '')
@@ -736,10 +1025,26 @@ class Warehouse {
         if (extraBoxes <= 0) continue
         boxesRemaining += extraBoxes
         console.warn(`[shulker-extract] 计划源盒 ${sourceKey}（${sourceItem.displayName || sourceKey}）在木桶记录中无实物，回退改用 ${fallbackKey}（${fallbackItem.displayName || fallbackKey}）`)
+        this.trace('decision', 'shulker_source_fallback', {
+          from: { key: sourceKey, keyTail: shortKey(sourceKey) },
+          to: { key: fallbackKey, keyTail: shortKey(fallbackKey), name: fallbackItem.displayName || fallbackKey },
+          extraBoxes,
+          perBox,
+          decision: `源盒记录无实物，改用同内容盒子（短码 ${shortKey(fallbackKey)}）×${extraBoxes} 继续取`
+        })
         await extractFromSource(fallbackKey, fallbackItem)
       }
       if (plannedGroupCount === 0) this.reportMissingSourceBoxRecord(allocation, sourceItem)
     }
+
+    this.trace('result', 'shulker_extract_result', {
+      item: targetItem.displayName || allocation.itemKey,
+      withdrawn: withdrawn.reduce((sum, item) => sum + Number(item.amount || 0), 0),
+      missing: Math.max(0, remaining),
+      decision: remaining > 0
+        ? `盒装取货结束，仍有 ${remaining} 个没取到`
+        : '盒装取货结束，数量已取够'
+    })
 
     return {
       withdrawn: this.mergeItems(withdrawn),
@@ -785,6 +1090,15 @@ class Warehouse {
     let moved = 0
     try {
       const available = this.countContainerItem(container, itemKey)
+      this.trace('open', 'shulker_source_barrel_open', {
+        chest: this.describeChest(chest),
+        sourceBox: { key: itemKey, keyTail: shortKey(itemKey) },
+        availableBoxes: available,
+        contents: this.snapshotContainerContents(container),
+        decision: available > 0
+          ? `打开木桶：里面有 ${available} 个该源盒`
+          : '打开木桶：里面没有该源盒'
+      })
       if (available <= 0) {
         this.refreshChestSnapshot(chest, container)
         return null
@@ -797,9 +1111,24 @@ class Warehouse {
       await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
     }
 
-    if (moved !== 1) throw new Error(`从 ${this.describeChest(chest)} 取潜影盒失败，实际取出 ${moved} 个。`)
+    if (moved !== 1) {
+      this.trace('error', 'shulker_take_box_failed', {
+        chest: this.describeChest(chest),
+        sourceBox: { key: itemKey, keyTail: shortKey(itemKey) },
+        moved,
+        decision: '取盒点击未确认成功'
+      })
+      throw new Error(`从 ${this.describeChest(chest)} 取潜影盒失败，实际取出 ${moved} 个。`)
+    }
     const item = await this.waitForInventoryItemByKey(itemKey)
-    if (!item) throw new Error(`已从 ${this.describeChest(chest)} 取出潜影盒，但客户端背包没有收到该物品。`)
+    if (!item) {
+      this.trace('error', 'shulker_take_box_failed', {
+        chest: this.describeChest(chest),
+        sourceBox: { key: itemKey, keyTail: shortKey(itemKey) },
+        decision: '点击已确认，但客户端背包没有收到该盒子'
+      })
+      throw new Error(`已从 ${this.describeChest(chest)} 取出潜影盒，但客户端背包没有收到该物品。`)
+    }
     return item
   }
 
@@ -808,6 +1137,12 @@ class Warehouse {
     const normalized = this.catalog.fromPrismarineItem(item)
     if (!this.catalog.isShulkerBox(normalized.itemId)) throw new Error(`待放回物品不是潜影盒：${normalized.displayName}`)
 
+    this.trace('return', 'shulker_return_start', {
+      chest: this.describeChest(chest),
+      box: { key: normalized.itemKey, keyTail: shortKey(normalized.itemKey), name: normalized.displayName || normalized.itemId },
+      boxContents: this.snapshotShulkerContents(normalized),
+      decision: `把盒子（短码 ${shortKey(normalized.itemKey)}）放回 ${this.describeChest(chest)}`
+    })
     const container = await this.openContainerAt(chest)
     try {
       let moved = await this.tryDepositInto(container, item)
@@ -819,7 +1154,20 @@ class Warehouse {
       }
       await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
       this.refreshChestSnapshot(chest, container)
-      if (moved !== 1) throw new Error(`放回 ${this.describeChest(chest)} 失败，实际放入 ${moved} 个潜影盒。`)
+      if (moved !== 1) {
+        this.trace('error', 'shulker_return_failed', {
+          chest: this.describeChest(chest),
+          box: { keyTail: shortKey(normalized.itemKey) },
+          moved,
+          decision: '放回点击未确认成功，盒子可能还在背包'
+        })
+        throw new Error(`放回 ${this.describeChest(chest)} 失败，实际放入 ${moved} 个潜影盒。`)
+      }
+      this.trace('return', 'shulker_return_done', {
+        chest: this.describeChest(chest),
+        box: { keyTail: shortKey(normalized.itemKey) },
+        decision: '盒子已放回木桶（放回后的桶内内容见同 traceId 的 chest_record_refresh 事件）'
+      })
       return normalized
     } finally {
       this.closeContainerQuietly(container)
@@ -1155,6 +1503,16 @@ class Warehouse {
         if (!item) break
 
         const take = Math.min(item.count, expectedTake - planned)
+        this.trace('take', 'slot_take_plan', {
+          pass: pass + 1,
+          slot: item.slot,
+          slotCount: item.count,
+          take,
+          mode: take >= item.count ? 'whole_stack' : 'split_stack',
+          keyTail: shortKey(itemKey),
+          preferred: preferredOrder.has(item.slot),
+          decision: `从槽位 ${item.slot} 取 ${take} 个（${take >= item.count ? '整组' : '拆分组'}）`
+        })
         try {
           const inventoryBefore = this.hasInventoryItems() ? this.inventoryCountByItemKey(itemKey) : 0
           const windowInventoryBefore = this.hasWindowItems(container)
@@ -1177,8 +1535,25 @@ class Warehouse {
             error.uncertainTransfer = true
             throw error
           }
+          this.trace('take', 'slot_take_confirmed', {
+            pass: pass + 1,
+            slot: item.slot,
+            take,
+            confirmed,
+            decision: `槽位 ${item.slot} 取出 ${confirmed} 个已确认进入背包`
+          })
         } catch (error) {
           this.debug(`withdraw exact slot ${item.slot} failed: ${error.message}`)
+          this.trace('take', 'slot_take_failed', {
+            pass: pass + 1,
+            slot: item.slot,
+            take,
+            uncertain: Boolean(error?.uncertainTransfer),
+            message: error.message,
+            decision: error?.uncertainTransfer
+              ? '物理状态不确定，终止本次取物并交给上层兜底'
+              : '该槽位取物失败，尝试下一槽位'
+          })
           await this.ensureWindowCursorCleared(container)
           if (error?.uncertainTransfer) throw error
           break
@@ -1191,6 +1566,11 @@ class Warehouse {
       const moved = Math.max(0, containerBefore - this.countContainerItem(container, itemKey))
       if (moved <= 0) {
         this.debug(`withdraw batch pass ${pass + 1} moved nothing for ${itemKey}`)
+        this.trace('take', 'take_pass_no_progress', {
+          pass: pass + 1,
+          expectedTake,
+          decision: pass + 1 < maxPasses ? '本轮点击没有任何数量变化，等待后重试一轮' : '重试后仍无变化，放弃本轮取物'
+        })
         if (pass + 1 < maxPasses) {
           await sleep(Math.max(0, Number(this.config.timing?.inventoryUpdateTimeoutMs ?? 2000)))
           continue
@@ -1199,6 +1579,12 @@ class Warehouse {
       }
       movedTotal += moved
       remaining -= moved
+      this.trace('take', 'take_pass_result', {
+        pass: pass + 1,
+        moved,
+        remaining,
+        decision: `第 ${pass + 1} 轮取走 ${moved} 个，还差 ${remaining} 个`
+      })
     }
 
     return movedTotal
@@ -1322,6 +1708,11 @@ class Warehouse {
       amount: item.count
     }))
     this.db.replaceChestSlots(chest.chestId, slots)
+    this.trace('record', 'chest_record_refresh', {
+      chest: this.describeChest(chest),
+      contents: this.snapshotContainerContents(container),
+      decision: '已按当前窗口内容刷新该木桶的本地槽位记录'
+    })
   }
 
   async syncWarehouse (radius) {
@@ -1333,9 +1724,18 @@ class Warehouse {
 
   async scanWarehouseContainers (radius) {
     this.debug(`sync start radius=${radius}`)
+    this.trace('sync', 'sync_start', {
+      radius,
+      decision: `开始全仓同步：扫描半径 ${radius} 内的全部木桶`
+    })
     await this.goHome({ requireWarehouse: this.db.listChests().length > 0 })
     const blocks = this.findContainerBlocks(radius)
     this.debug(`found ${blocks.length} openable container blocks: ${blocks.map(block => this.describeBlock(block)).join(' | ')}`)
+    this.trace('sync', 'sync_blocks_found', {
+      radius,
+      count: blocks.length,
+      blocks: blocks.map(block => this.describeBlock(block))
+    })
 
     const actualItems = []
     const snapshots = []
@@ -1357,11 +1757,23 @@ class Warehouse {
         snapshots.push({ chest, slots, preReadSeq })
         actualItems.push(...slots)
         this.debug(`sync read ${this.describeChest(chest)} slots=${slots.length} items=${slots.reduce((sum, item) => sum + item.amount, 0)}`)
+        this.trace('sync', 'sync_barrel', {
+          index: index + 1,
+          total: blocks.length,
+          chest: this.describeChest(chest),
+          slots: slots.length,
+          items: slots.reduce((sum, item) => sum + item.amount, 0),
+          contents: this.snapshotContainerContents(container)
+        })
       } catch (error) {
         if (error?.code === 'FATAL_PROTOCOL_READ' || this.connectionAbortController.signal.aborted) throw error
         const failure = `${this.describeChest(chest)} ${error.message}`
         failures.push(failure)
         console.error(`[warehouse] sync failed: ${failure}`)
+        this.trace('error', 'sync_barrel_failed', {
+          chest: this.describeChest(chest),
+          message: error.message
+        })
       } finally {
         this.closeContainerQuietly(container)
       }
@@ -1388,6 +1800,10 @@ class Warehouse {
     for (const snapshot of snapshots) {
       if ((this.warehouseState.chestRevisions.get(snapshot.chest.chestId) || 0) <= snapshot.preReadSeq) continue
       this.debug(`sync rescan mutated chest ${this.describeChest(snapshot.chest)}`)
+      this.trace('sync', 'sync_rescan_mutated', {
+        chest: this.describeChest(snapshot.chest),
+        decision: '扫描期间该木桶被业务存取改动过，重读后再采用'
+      })
       const container = await this.openContainerAt(snapshot.chest)
       try {
         snapshot.slots = this.containerContentItems(container).map(item => ({
@@ -1421,6 +1837,81 @@ class Warehouse {
       failures: [],
       totals,
       ...reconcile
+    }
+  }
+
+  // 调试命令 !同步木桶：只打开并重读一个木桶，替换其槽位记录，
+  // 并返回该桶的详细物品信息（含潜影盒内容展开）。不动账本、不做全仓对账。
+  async syncSingleBarrel (chest) {
+    return this.withWarehouseLock(() => this.syncSingleBarrelLocked(chest))
+  }
+
+  async syncSingleBarrelLocked (chest) {
+    this.trace('debug', 'barrel_debug_start', {
+      chest: `${chest.x},${chest.y},${chest.z}`,
+      decision: '单桶调试同步：只重读这一个木桶'
+    })
+    await this.goHome({ requireWarehouse: this.db.listChests().length > 0 })
+    const block = this.bot.blockAt(new Vec3(chest.x, chest.y, chest.z))
+    if (!block || !this.chestNames.has(block.name)) {
+      this.trace('error', 'barrel_debug_block_missing', {
+        chest: `${chest.x},${chest.y},${chest.z}`,
+        actualBlock: block?.name || 'none',
+        decision: '目标坐标不是可同步的木桶'
+      })
+      throw new Error(`坐标 ${chest.x},${chest.y},${chest.z} 处不是可同步的木桶（实际方块：${block?.name || '无'}）。`)
+    }
+    // 与 blockToChest 相同的记录形态：chestId 用坐标，blockName 用实际读到的方块。
+    const record = {
+      chestId: `${chest.x},${chest.y},${chest.z}`,
+      x: chest.x,
+      y: chest.y,
+      z: chest.z,
+      blockName: block.name
+    }
+    const container = await this.openContainerAt(record)
+    try {
+      const slots = this.containerContentItems(container).map(item => ({
+        ...this.catalog.fromPrismarineItem(item),
+        slot: item.slot,
+        amount: item.count
+      }))
+      const detail = this.buildBarrelDetail(slots)
+      this.noteChestMutation(record.chestId)
+      this.db.upsertChest(record)
+      this.db.replaceChestSlots(record.chestId, slots)
+      this.trace('debug', 'barrel_debug_result', {
+        chest: this.describeChest(record),
+        ...detail,
+        decision: '已按实际内容替换该木桶的槽位记录（不调整账本）'
+      })
+      return { chest: { ...record, describe: this.describeChest(record) }, ...detail }
+    } finally {
+      this.closeContainerQuietly(container)
+    }
+  }
+
+  buildBarrelDetail (slots) {
+    const items = slots
+      .slice()
+      .sort((a, b) => a.slot - b.slot)
+      .map(slot => {
+        const entry = {
+          slot: slot.slot,
+          id: slot.itemId,
+          name: slot.displayName || slot.itemId,
+          amount: slot.amount,
+          keyTail: shortKey(slot.itemKey)
+        }
+        if (this.catalog.isShulkerBox(slot.itemId)) {
+          entry.shulkerContents = this.snapshotShulkerContents(slot)
+        }
+        return entry
+      })
+    return {
+      types: items.length,
+      total: items.reduce((sum, item) => sum + item.amount, 0),
+      items
     }
   }
 
@@ -1481,9 +1972,18 @@ class Warehouse {
   async openContainerAt (chest) {
     this.assertConnectionHealthy()
     this.debug(`goto ${this.describeChest(chest)} from ${this.describePosition(this.bot.entity.position)}`)
+    this.trace('move', 'goto_barrel', {
+      chest: this.describeChest(chest),
+      from: this.describePosition(this.bot.entity.position)
+    })
     await this.gotoForContainer(chest)
     const block = this.bot.blockAt(new Vec3(chest.x, chest.y, chest.z))
     if (!block || !this.chestNames.has(block.name)) {
+      this.trace('error', 'goto_barrel_block_missing', {
+        chest: this.describeChest(chest),
+        actualBlock: block?.name || 'none',
+        decision: '走到目标坐标后发现不是可打开的木桶（可能被拆/换）'
+      })
       throw new Error(`找不到箱子：${chest.x},${chest.y},${chest.z}`)
     }
     this.openingChest = chest
@@ -1497,8 +1997,24 @@ class Warehouse {
           this.warnUnexpectedContainerWindow(container, chest)
           return container
         } catch (error) {
-          if (!error?.allOpenTimeouts || attempt + 1 >= maxAttempts) throw error
+          if (!error?.allOpenTimeouts || attempt + 1 >= maxAttempts) {
+            this.trace('error', 'open_barrel_failed', {
+              chest: this.describeChest(chest),
+              attempt: attempt + 1,
+              maxAttempts,
+              message: error?.message || String(error),
+              decision: '打开木桶失败（超时/无窗口/协议错误）'
+            })
+            throw error
+          }
           this.debug(`open ${this.describeChest(chest)} timed out (attempt ${attempt + 1}/${maxAttempts}), retrying with timeout ${this.timeoutForOpenAttempt(attempt + 1)}ms`)
+          this.trace('open', 'open_barrel_retry', {
+            chest: this.describeChest(chest),
+            attempt: attempt + 1,
+            maxAttempts,
+            nextTimeoutMs: this.timeoutForOpenAttempt(attempt + 1),
+            decision: `第 ${attempt + 1} 次开桶超时，加长超时重试`
+          })
           await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
         }
       }

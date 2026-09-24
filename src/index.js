@@ -20,6 +20,7 @@ const {
 } = require('./authCache')
 const { installFatalProtocolPacketCapture, isFatalProtocolReadError, releaseBotConnection, terminateBotTransport } = require('./botConnection')
 const { logLocalError } = require('./localErrorLog')
+const { configureTraceLog } = require('./traceLog')
 
 function createBot (config, onMsaCode) {
   const options = {
@@ -81,6 +82,7 @@ function isSocketDisconnectError (error) {
 }
 
 const config = loadConfig(path.resolve(process.cwd(), 'config.json'), { autoUpdate: true })
+configureTraceLog(config.traceLog)
 const db = new StoreDb(path.resolve(process.cwd(), 'data', 'cloud-store.sqlite'), config)
 const subscriptions = new SubscriptionManager(db, config)
 const catalog = createCatalogForVersion(config.server.version)

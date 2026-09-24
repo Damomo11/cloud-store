@@ -181,6 +181,16 @@
   // Raw chat packet logging. Enable only when diagnosing custom chat formats.
   "debugRawChat": false,
 
+  // Withdraw/sync trace log (logs/withdraw-trace-<date>.jsonl). One traceId per
+  // withdraw task: what item, which barrel it was located in, window contents after
+  // opening, shulker box chain, how much was taken/returned and every decision.
+  // Keep the file for the day of a failure and share it to diagnose the failing step.
+  "traceLog": {
+    "enabled": true,
+    "directory": "logs",
+    "retentionDays": 14
+  },
+
   // Server resource pack behavior.
   "resourcePack": {
     // Automatically accept forced server resource packs.

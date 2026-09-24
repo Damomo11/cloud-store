@@ -1,4 +1,5 @@
 const { clampInt, sleep, sumBy } = require('./utils')
+const { startTrace, traceEvent, traceSummary, traceStandalone, shortKey } = require('./traceLog')
 
 const REPAIR_BOTTLE_ITEM_ID = 'minecraft:experience_bottle'
 const REPAIR_BOTTLE_AMOUNT = 64
@@ -27,6 +28,15 @@ class CloudStoreService {
   invalidateConnection (reason = 'connection invalidated') {
     this.active && (this.active.cancelled = true)
     this.warehouse.invalidateConnection(reason)
+  }
+
+  // 链路日志挂载/摘除。warehouse 可能是测试桩或旧实现（没有这两个方法），此时静默跳过。
+  attachWarehouseTrace (trace) {
+    if (typeof this.warehouse?.attachTrace === 'function') this.warehouse.attachTrace(trace)
+  }
+
+  detachWarehouseTrace () {
+    if (typeof this.warehouse?.detachTrace === 'function') this.warehouse.detachTrace()
   }
 
   setWebAuth (webAuth) {
@@ -96,6 +106,15 @@ class CloudStoreService {
     const context = this.deathContext
     this.deathContext = null
 
+    const trace = startTrace({
+      bot: this.botId,
+      kind: 'recovery',
+      reason: 'death',
+      type: context.type,
+      actor: context.username || '',
+      phase: context.phase || ''
+    })
+    this.attachWarehouseTrace(trace)
     try {
       await sleep(1500)
       console.log(`[death-recovery] respawned, going home. context=${context.type}:${context.username || ''}:${context.phase || ''}`)
@@ -146,7 +165,13 @@ class CloudStoreService {
 
       this.db.clearRecoveryTask(this.botId)
       if (this.active?.dead) this.active = null
+      traceSummary(trace, { status: 'done', reason: 'death' })
+    } catch (error) {
+      traceEvent(trace, 'error', 'recovery_error', { message: error?.message || String(error) })
+      traceSummary(trace, { status: 'failed', reason: 'death', message: error?.message || String(error) })
+      throw error
     } finally {
+      this.detachWarehouseTrace()
       this.recoveringFromDeath = false
     }
   }
@@ -254,44 +279,64 @@ class CloudStoreService {
       return
     }
 
-    console.warn(`[disconnect-recovery] restoring persisted task: task=${task.type}:${task.actorUsername}:${task.phase} held=${held.length ? this.formatItemList(held) : 'empty'}`)
-    if (held.length) await this.warehouse.goHome({ requireWarehouse: true })
+    const trace = startTrace({
+      bot: this.botId,
+      kind: 'recovery',
+      reason: 'disconnect',
+      type: task.type,
+      actor: task.actorUsername || '',
+      target: task.targetUsername || '',
+      phase: task.phase || '',
+      held: held.map(item => ({ name: item.displayName || item.itemId, amount: item.amount }))
+    })
+    this.attachWarehouseTrace(trace)
+    try {
+      console.warn(`[disconnect-recovery] restoring persisted task: task=${task.type}:${task.actorUsername}:${task.phase} held=${held.length ? this.formatItemList(held) : 'empty'}`)
+      if (held.length) await this.warehouse.goHome({ requireWarehouse: true })
 
-    if (task.type === 'deposit') {
-      const result = await this.warehouse.depositInventoryForOwner(owner.uuid, owner.username)
-      this.db.addTransaction('disconnect_recovery_deposit', result.deposited.length ? 'ok' : 'empty', owner.uuid, owner.username, result.deposited.length ? result.deposited : result.leftover, `actor=${task.actorUsername}, phase=${task.phase}`)
-      if (result.leftover.length) {
-        this.accountResidualAsMomo(result.leftover, `disconnect deposit leftover, actor=${task.actorUsername}, owner=${owner.uuid}, phase=${task.phase}`)
-      }
-      if (task.actorUsername && result.deposited.length) {
-        this.msg(task.actorUsername, `机器人重连后已继续存入${this.ownerScopeName(owner)}：${this.formatDepositSummary(result.deposited)}。`)
-      }
-    } else if (task.type === 'withdraw') {
-      const result = held.length
-        ? await this.warehouse.depositInventoryWithoutBalance('disconnect_recovery_withdraw', `actor=${task.actorUsername}, target=${task.targetUsername}, phase=${task.phase}`)
-        : { deposited: [], leftover: [] }
-      if (this.isWithdrawDeliveryPhase(task.phase) && task.items?.length) {
-        const delivered = this.subtractLeftoverFromDelivered(task.items, held)
-        if (delivered.length) {
-          this.recordWithdrawDeduction(owner, delivered, `actor=${task.actorUsername}, target=${task.targetUsername}, phase=${task.phase}, recovery=disconnect`, this.recoveryDeductionKey(task))
-          if (task.actorUsername) {
-            this.msg(task.actorUsername, `机器人重连后已补记上次已交付的取货：${this.formatWithdrawSummary(delivered)}。`)
+      if (task.type === 'deposit') {
+        const result = await this.warehouse.depositInventoryForOwner(owner.uuid, owner.username)
+        this.db.addTransaction('disconnect_recovery_deposit', result.deposited.length ? 'ok' : 'empty', owner.uuid, owner.username, result.deposited.length ? result.deposited : result.leftover, `actor=${task.actorUsername}, phase=${task.phase}`)
+        if (result.leftover.length) {
+          this.accountResidualAsMomo(result.leftover, `disconnect deposit leftover, actor=${task.actorUsername}, owner=${owner.uuid}, phase=${task.phase}`)
+        }
+        if (task.actorUsername && result.deposited.length) {
+          this.msg(task.actorUsername, `机器人重连后已继续存入${this.ownerScopeName(owner)}：${this.formatDepositSummary(result.deposited)}。`)
+        }
+      } else if (task.type === 'withdraw') {
+        const result = held.length
+          ? await this.warehouse.depositInventoryWithoutBalance('disconnect_recovery_withdraw', `actor=${task.actorUsername}, target=${task.targetUsername}, phase=${task.phase}`)
+          : { deposited: [], leftover: [] }
+        if (this.isWithdrawDeliveryPhase(task.phase) && task.items?.length) {
+          const delivered = this.subtractLeftoverFromDelivered(task.items, held)
+          if (delivered.length) {
+            this.recordWithdrawDeduction(owner, delivered, `actor=${task.actorUsername}, target=${task.targetUsername}, phase=${task.phase}, recovery=disconnect`, this.recoveryDeductionKey(task))
+            if (task.actorUsername) {
+              this.msg(task.actorUsername, `机器人重连后已补记上次已交付的取货：${this.formatWithdrawSummary(delivered)}。`)
+            }
           }
         }
+        if (pendingRepack && held.length) this.commitRecoveredShulkerRepack(result, 'disconnect')
+        if (task.actorUsername && result.deposited.length) {
+          this.msg(task.actorUsername, `机器人重连后已把未交付的取货物品回收入库；这部分不会扣除库存。`)
+        }
+        if (result.leftover.length && task.actorUsername) {
+          this.msg(task.actorUsername, `机器人重连恢复时仍有物品未能放回仓库：${this.formatItemList(result.leftover)}`)
+        }
+      } else {
+        console.warn(`[disconnect-recovery] unknown task type ${task.type}, keeping held items in inventory`)
+        return
       }
-      if (pendingRepack && held.length) this.commitRecoveredShulkerRepack(result, 'disconnect')
-      if (task.actorUsername && result.deposited.length) {
-        this.msg(task.actorUsername, `机器人重连后已把未交付的取货物品回收入库；这部分不会扣除库存。`)
-      }
-      if (result.leftover.length && task.actorUsername) {
-        this.msg(task.actorUsername, `机器人重连恢复时仍有物品未能放回仓库：${this.formatItemList(result.leftover)}`)
-      }
-    } else {
-      console.warn(`[disconnect-recovery] unknown task type ${task.type}, keeping held items in inventory`)
-      return
-    }
 
-    this.db.clearRecoveryTask(this.botId)
+      this.db.clearRecoveryTask(this.botId)
+      traceSummary(trace, { status: 'done', reason: 'disconnect' })
+    } catch (error) {
+      traceEvent(trace, 'error', 'recovery_error', { message: error?.message || String(error) })
+      traceSummary(trace, { status: 'failed', reason: 'disconnect', message: error?.message || String(error) })
+      throw error
+    } finally {
+      this.detachWarehouseTrace()
+    }
   }
 
   handlePlayerChatPacket (packet) {
@@ -324,17 +369,42 @@ class CloudStoreService {
 
     const commandMessage = this.normalizePrivateCommandText(message, source)
     const normalizedCommand = this.normalizeCommandText(commandMessage)
-    const botGameCommand = this.isBotGameCommand(normalizedCommand)
-    if (botGameCommand && this.isDuplicateCommand(username, normalizedCommand, source)) return
-    if (this.taskPool && !botGameCommand && !this.taskPool.acceptIncoming(username, normalizedCommand)) return
-    if (!this.taskPool && !botGameCommand && this.isDuplicateCommand(username, normalizedCommand, source)) return
     if (!normalizedCommand.startsWith('!')) return
+    // 玩家输入记录：原样保留玩家怎么输入的（公屏/私聊渠道、原始文本），
+    // 后续是受理还是被去重/繁忙拦截，也挂在同一个 command trace 上。
+    const inputTrace = startTrace({
+      bot: this.botId,
+      kind: 'command',
+      actor: username,
+      source,
+      channel: context.channel || '',
+      rawMessage: String(message || ''),
+      command: normalizedCommand
+    })
+    const botGameCommand = this.isBotGameCommand(normalizedCommand)
+    if (botGameCommand && this.isDuplicateCommand(username, normalizedCommand, source)) {
+      traceEvent(inputTrace, 'input', 'command_rejected_duplicate', { decision: '重复命令，在去重窗口内忽略' })
+      return
+    }
+    if (this.taskPool && !botGameCommand && !this.taskPool.acceptIncoming(username, normalizedCommand)) {
+      traceEvent(inputTrace, 'input', 'command_rejected_busy', { decision: '机器人正忙或重复消息被拦截，命令未受理' })
+      return
+    }
+    if (!this.taskPool && !botGameCommand && this.isDuplicateCommand(username, normalizedCommand, source)) {
+      traceEvent(inputTrace, 'input', 'command_rejected_duplicate', { decision: '重复命令，在去重窗口内忽略' })
+      return
+    }
+    traceEvent(inputTrace, 'input', 'command_accepted', { decision: '命令受理，进入处理流程' })
     const commandLogId = this.db.createCommandLog({
       username,
       commandText: this.redactSensitiveText(normalizedCommand),
       channel: context.channel || 'private',
       receiverBotId: this.botId,
       receiverBotName: this.bot.username || this.config.server?.botName || this.botId
+    })
+    traceEvent(inputTrace, 'input', 'command_context', {
+      commandLogId,
+      decision: 'commandLogId 可与后续取货 trace（trace_start.commandLogId）互相索引'
     })
     this.db.runWithCommandContext(commandLogId, () => this.withBotContext(() => this.handleChat(username, normalizedCommand, { ...context, source })))
       .catch(error => this.db.runWithCommandContext(commandLogId, () => this.withBotContext(() => this.handleCommandError(username, error))))
@@ -649,6 +719,11 @@ class CloudStoreService {
       return
     }
 
+    if (text.startsWith('!同步木桶')) {
+      await this.handleSyncBarrel(username, text)
+      return
+    }
+
     if (text.startsWith('!同步仓库') || text.startsWith('!同步')) {
       await this.handleSync(username, text)
       return
@@ -758,6 +833,21 @@ class CloudStoreService {
       return { ...resolved, amount: count }
     })
 
+    // Web 端取货输入记录：谁在网页上取了什么、交给谁、从哪个仓库取。
+    traceStandalone('command', 'input', 'web_withdraw_request', {
+      bot: this.botId,
+      actor: user.username,
+      source: 'web',
+      owner,
+      ownerLabel: this.ownerScopeName(owner),
+      target,
+      requests: requests.map(request => ({
+        name: request.displayName || request.itemId,
+        amount: request.amount,
+        keyTail: shortKey(request.itemKey)
+      })),
+      decision: '玩家通过 Web 面板提交取货任务'
+    })
     this.enqueueTask(user.username, 'withdraw', worker => worker.handleWithdraw(user.username, '', owner, requests, target))
       .catch(error => this.handleCommandError(user.username, error))
     return target === user.username
@@ -1015,10 +1105,6 @@ class CloudStoreService {
     if (continueWithDeposit && deliveryToOther) {
       throw new Error('存取/取存只能由本人接收物品，不能指定其他目标玩家。')
     }
-    const msgActor = message => {
-      this.msg(username, message)
-    }
-    const msgTarget = message => this.msg(deliveryTarget, message)
     if (this.active) {
       this.active.player = player
       this.active.owner = storageOwner
@@ -1028,16 +1114,86 @@ class CloudStoreService {
     }
     const requests = parsedWithdraw.requests
     if (!requests.length) {
-      msgActor(`格式示例：${storageOwner.scope === 'custom' ? `!${storageOwner.vaultName} 取 石英块64` : '!取 石英块64 石头128 红石块3'}`)
+      this.msg(username, `格式示例：${storageOwner.scope === 'custom' ? `!${storageOwner.vaultName} 取 石英块64` : '!取 石英块64 石头128 红石块3'}`)
       return
     }
 
+    // 链路日志：从这一刻起，本次取货的每个动作/决策都写入 logs/withdraw-trace-日期.jsonl，
+    // 出问题时把对应日期的文件和里面的 traceId 发回来即可逐环节排查。
+    const trace = startTrace({
+      bot: this.botId,
+      kind: 'withdraw',
+      actor: username,
+      target: deliveryTarget,
+      owner: storageOwner.uuid,
+      ownerLabel: this.ownerScopeName(storageOwner),
+      mode: deliveryMode,
+      source: prebuiltRequests ? 'web' : 'chat',
+      commandText: prebuiltRequests ? '' : String(text || ''),
+      commandLogId: this.db.currentCommandLogId?.() || 0,
+      requests: requests.map(request => ({
+        name: request.displayName || request.itemId,
+        amount: request.amount,
+        keyTail: shortKey(request.itemKey)
+      }))
+    })
+    this.attachWarehouseTrace(trace)
+    let summary = { status: 'interrupted', delivered: [], missing: [] }
+    try {
+      summary = await this.runWithdrawFlow({
+        username,
+        player,
+        storageOwner,
+        requests,
+        deliveryTarget,
+        deliveryToOther,
+        deliveryMode,
+        continueWithDeposit,
+        trace
+      }) || summary
+    } catch (error) {
+      traceEvent(trace, 'error', 'task_error', {
+        message: error?.message || String(error),
+        phase: this.active?.phase || ''
+      })
+      throw error
+    } finally {
+      traceSummary(trace, {
+        status: summary.status,
+        deliveredTypes: this.itemTypeCount(summary.delivered || []),
+        deliveredTotal: this.totalAmount(summary.delivered || []),
+        missingTypes: this.itemTypeCount(summary.missing || []),
+        missingTotal: this.totalAmount(summary.missing || [])
+      })
+      this.detachWarehouseTrace()
+    }
+  }
+
+  async runWithdrawFlow ({ username, player, storageOwner, requests, deliveryTarget, deliveryToOther, deliveryMode, continueWithDeposit, trace }) {
+    const msgActor = message => {
+      this.msg(username, message)
+    }
+    const msgTarget = message => this.msg(deliveryTarget, message)
     await this.warehouse.goHomeIfAway()
-    if (this.isActiveCancelled()) return
+    if (this.isActiveCancelled()) return { status: 'cancelled', delivered: [], missing: [] }
     await this.flushResidual()
-    if (this.isActiveCancelled()) return
+    if (this.isActiveCancelled()) return { status: 'cancelled', delivered: [], missing: [] }
 
     const plan = this.buildWithdrawPlanForRequest(player, storageOwner, requests)
+    traceEvent(trace, 'plan', 'plan_result', {
+      notices: plan.notices,
+      allocations: plan.allocations.map(item => ({
+        name: item.displayName || item.itemId,
+        amount: item.amount,
+        mode: item.withdrawMode === 'shulker_extract' ? 'shulker_extract' : 'loose',
+        sourceBox: item.withdrawMode === 'shulker_extract'
+          ? { name: item.sourceShulkerDisplayName || item.sourceShulkerItemKey || '', keyTail: shortKey(item.sourceShulkerItemKey || ''), boxes: item.sourceBoxCount || 0 }
+          : undefined,
+        keyTail: shortKey(item.itemKey),
+        ownerScope: item.ownerScope || storageOwner.scope || ''
+      })),
+      decision: `按账本拆解为 ${plan.allocations.length} 条取货计划（散装/拆盒），预留库存后逐批执行`
+    })
     if (!deliveryToOther) {
       for (const notice of plan.notices) this.msg(username, notice)
     }
@@ -1052,14 +1208,19 @@ class CloudStoreService {
           : `给 ${deliveryTarget} 的取货失败：仓库没有可取出的物品。`)
       }
       else this.msg(username, '没有可取出的物品。')
-      return
+      return { status: 'empty_plan', delivered: [], missing: [] }
     }
 
     const reservationId = `${this.botId}:${this.active?.taskId || Date.now()}`
     this.db.reserveInventory(reservationId, plan.allocations)
     if (this.active) this.active.reservationId = reservationId
+    traceEvent(trace, 'plan', 'reserve_inventory', { reservationId })
 
     const batches = this.splitAllocationsIntoInventoryBatches(plan.allocations, 36)
+    traceEvent(trace, 'plan', 'batches_split', {
+      batches: batches.length,
+      batchItems: batches.map(batch => batch.map(item => `${item.displayName || item.itemId}x${item.amount}${item.withdrawMode === 'shulker_extract' ? '(拆盒)' : ''}`))
+    })
 
     const teleportNotice = deliveryMode === 'repair'
       ? `正在从${this.ownerScopeName(storageOwner)}取经验瓶给你修装备，离开4格后自动结束。`
@@ -1078,27 +1239,34 @@ class CloudStoreService {
       batches,
       continueWithDeposit,
       msgActor,
-      msgTarget
+      msgTarget,
+      trace
     })
 
     let attempt = await runBatches()
-    if (attempt.cancelled || attempt.aborted) return
+    if (attempt.cancelled || attempt.aborted) return { status: attempt.aborted ? 'aborted' : 'cancelled', delivered: [], missing: [] }
 
     let deliveredTotal = this.mergeItems(attempt.allDeducted)
     if (!deliveredTotal.length) {
       // 取货时已就地核对每个木桶：实物少了当场刷新该木桶记录，读到整桶为空按服务器卡顿处理并保留原记录。
       // 这里先把残余放回清点，再按最新木桶记录立即重试一次，不做耗时的全仓同步。
+      traceEvent(trace, 'decision', 'retry_after_recheck', {
+        decision: '一批都没取到：先回仓把残余放回清点，按刚刷新的木桶记录立即重试一轮'
+      })
       await this.warehouse.goHome({ requireWarehouse: true })
       const returned = await this.warehouse.depositInventoryWithoutBalance('withdraw_failed_return', `owner=${storageOwner.uuid}, actor=${username}`)
       if (!returned.leftover.length) {
         msgActor('账本有库存但没有取出任何物品，已逐个木桶核对实际库存，正在按最新记录重试……')
         attempt = await runBatches()
-        if (attempt.cancelled || attempt.aborted) return
+        if (attempt.cancelled || attempt.aborted) return { status: attempt.aborted ? 'aborted' : 'cancelled', delivered: [], missing: [] }
         deliveredTotal = this.mergeItems(attempt.allDeducted)
       }
     }
 
     if (!deliveredTotal.length) {
+      traceEvent(trace, 'result', 'task_failed_no_withdraw', {
+        decision: '就地核对并重试后仍然一无所获，本次取货失败（未扣账）'
+      })
       await this.warehouse.goHome({ requireWarehouse: true })
       const returned = await this.warehouse.depositInventoryWithoutBalance('withdraw_failed_return', `owner=${storageOwner.uuid}, actor=${username}`)
       if (returned.leftover.length) {
@@ -1114,10 +1282,15 @@ class CloudStoreService {
         this.msg(username, `账本有库存，但按本地木桶记录没有取出：${this.formatItemList(plan.allocations)}。已就地核对各木桶并重试仍未取到，请稍后再试；若持续出现，请管理员在Web管理页检查库存异常。`)
       }
       this.db.clearRecoveryTask(this.botId)
-      return
+      return { status: 'failed_no_withdraw', delivered: [], missing: this.mergeItems(plan.allocations) }
     }
 
     const missingByItem = this.groupMissingByDisplay(plan.allocations, attempt.allWithdrawn)
+    traceEvent(trace, 'result', 'task_delivered', {
+      delivered: deliveredTotal.map(item => ({ name: item.displayName || item.itemId, amount: item.amount, keyTail: shortKey(item.itemKey) })),
+      missingNotices: missingByItem,
+      decision: '实物已交付，交付部分已按计划扣账'
+    })
     if (!deliveryToOther) {
       for (const notice of missingByItem) this.msg(username, notice)
     }
@@ -1138,14 +1311,16 @@ class CloudStoreService {
 
     if (continueWithDeposit) {
       await this.handleDeposit(username, storageOwner, { alreadyAtPlayer: attempt.stayedWithPlayerForDeposit })
-      return
+      return { status: 'delivered_then_deposit', delivered: deliveredTotal, missing: attempt.allMissing || [] }
     }
     this.db.clearRecoveryTask(this.botId)
+    return { status: 'delivered', delivered: deliveredTotal, missing: attempt.allMissing || [] }
   }
 
-  async runWithdrawBatches ({ username, storageOwner, deliveryTarget, deliveryToOther, deliveryMode, batches, continueWithDeposit, msgActor, msgTarget }) {
+  async runWithdrawBatches ({ username, storageOwner, deliveryTarget, deliveryToOther, deliveryMode, batches, continueWithDeposit, msgActor, msgTarget, trace }) {
     const allWithdrawn = []
     const allDeducted = []
+    const allMissing = []
     let stayedWithPlayerForDeposit = false
     let cancelled = false
     let aborted = false
@@ -1154,13 +1329,31 @@ class CloudStoreService {
       const batchId = `withdraw:${this.botId}:${this.active?.taskId || 'legacy'}:${index + 1}`
       this.setWithdrawBatchProgress(index + 1, batches.length, 'withdraw_from_chests')
       this.saveRecoveryTask('withdraw', username, storageOwner, deliveryTarget, 'withdraw_from_chests', [], batchId)
+      traceEvent(trace, 'batch', 'batch_start', {
+        batchId,
+        index: index + 1,
+        total: batches.length,
+        items: batch.map(item => ({
+          name: item.displayName || item.itemId,
+          amount: item.amount,
+          mode: item.withdrawMode === 'shulker_extract' ? 'shulker_extract' : 'loose',
+          keyTail: shortKey(item.itemKey)
+        }))
+      })
       const physical = await this.withdrawBatchWithQuantityGuard(batch, {
         username,
         storageOwner,
         deliveryTarget,
         batchIndex: index + 1,
-        totalBatches: batches.length
+        totalBatches: batches.length,
+        trace
       })
+      traceEvent(trace, 'batch', 'batch_physical_result', {
+        batchId,
+        withdrawn: (physical.withdrawn || []).map(item => ({ name: item.displayName || item.itemId, amount: item.amount })),
+        missing: (physical.missing || []).map(item => ({ name: item.displayName || item.itemId, amount: item.amount }))
+      })
+      if (physical.missing?.length) allMissing.push(...physical.missing)
       if (this.isActiveCancelled()) {
         cancelled = true
         break
@@ -1169,12 +1362,21 @@ class CloudStoreService {
       const delivered = this.allocateWithdrawnToPlanned(batch, physical.withdrawn)
 
       if (!delivered.length) {
+        traceEvent(trace, 'batch', 'batch_no_delivery', {
+          batchId,
+          decision: '该批计划物品一个都没取到，直接进入下一批'
+        })
         continue
       }
       allWithdrawn.push(...delivered)
 
       this.setWithdrawBatchProgress(index + 1, batches.length, 'withdraw_teleport_to_player')
       const teleported = await this.teleportToPlayer(deliveryTarget, { notify: false })
+      traceEvent(trace, 'delivery', 'teleport_to_player', {
+        batchId,
+        target: deliveryTarget,
+        ok: Boolean(teleported)
+      })
       if (!teleported) {
         this.setWithdrawBatchProgress(index + 1, batches.length, 'withdraw_tpa_timeout_return_home')
         this.saveRecoveryTask('withdraw', username, storageOwner, deliveryTarget, 'withdraw_tpa_timeout_return_home', [], batchId)
@@ -1214,12 +1416,23 @@ class CloudStoreService {
             maxDistance: REPAIR_MAX_DISTANCE
           })
         : await this.dropWithdrawItemsToPlayer(deliveryTarget, delivered)
+      traceEvent(trace, 'delivery', 'deliver_to_player', {
+        batchId,
+        target: deliveryTarget,
+        mode: deliveryMode,
+        dropped: (dropped || []).map(item => ({ name: item.displayName || item.itemId, amount: item.amount }))
+      })
       if (this.isActiveCancelled()) {
         cancelled = true
         break
       }
 
       const deduct = this.allocateWithdrawnToPlanned(delivered, dropped)
+      traceEvent(trace, 'ledger', 'deduct_plan', {
+        batchId,
+        deduct: (deduct || []).map(item => ({ name: item.displayName || item.itemId, amount: item.amount })),
+        undeliveredReturned: (dropped || []).length ? undefined : '本轮没有成功丢出任何物品，不扣账'
+      })
 
       if (deduct.length) {
         this.recordWithdrawDeduction(storageOwner, deduct, `actor=${username}, target=${deliveryTarget}, batch=${index + 1}/${batches.length}`, batchId)
@@ -1253,7 +1466,7 @@ class CloudStoreService {
       }
     }
 
-    return { allWithdrawn, allDeducted, stayedWithPlayerForDeposit, cancelled, aborted }
+    return { allWithdrawn, allDeducted, allMissing, stayedWithPlayerForDeposit, cancelled, aborted }
   }
 
   async dropWithdrawItemsToPlayer (username, requestedItems) {
@@ -1316,6 +1529,11 @@ class CloudStoreService {
       const held = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
       const excess = this.itemsExceedingPlan(held, batch)
       if (!excess.length) {
+        traceEvent(context.trace, 'ledger', 'quantity_guard_ok', {
+          attempt,
+          held: held.map(item => ({ name: item.displayName || item.itemId, amount: item.amount })),
+          decision: '背包实际物品与取货计划核对一致'
+        })
         return {
           ...physical,
           withdrawn: held
@@ -1331,6 +1549,12 @@ class CloudStoreService {
         `excess=${this.formatItemList(excess)}`
       ].join(', ')
       console.warn(`[withdraw-quantity-guard] ${details}`)
+      traceEvent(context.trace, 'decision', 'quantity_guard_overage', {
+        attempt,
+        maxAttempts,
+        excess: excess.map(item => ({ name: item.displayName || item.itemId, amount: item.amount })),
+        decision: '背包里多出了计划之外的物品（数量异常），先全部回库再重试'
+      })
 
       const returned = await this.warehouse.depositInventoryWithoutBalance('withdraw_overage_return', details)
       if (returned.leftover?.length) {
@@ -1889,13 +2113,109 @@ class CloudStoreService {
         1,
         this.config.warehouse.maxSyncRadius
       )
+      const trace = startTrace({ bot: this.botId, kind: 'sync', actor: username, radius })
+      this.attachWarehouseTrace(trace)
       this.msg(username, `开始同步仓库，半径 ${radius}。`)
-      const result = await worker.warehouse.syncWarehouse(radius)
-      const addedAmount = this.totalAmount(result.addedToMomo)
-      const unresolvedAmount = this.totalAmount(result.unresolved)
-      const failureText = result.failures.length ? `，失败${result.failures.length}` : ''
-      this.msg(username, `同步完成：木桶${result.chestCount}，打开${result.openedChestCount}，重读${result.rescanCount || 0}${failureText}，多余${addedAmount}/${this.itemTypeCount(result.addedToMomo)}种，缺失${unresolvedAmount}/${this.itemTypeCount(result.unresolved)}种。详情见Web管理页。`)
+      try {
+        const result = await worker.warehouse.syncWarehouse(radius)
+        const addedAmount = this.totalAmount(result.addedToMomo)
+        const unresolvedAmount = this.totalAmount(result.unresolved)
+        const failureText = result.failures.length ? `，失败${result.failures.length}` : ''
+        this.msg(username, `同步完成：木桶${result.chestCount}，打开${result.openedChestCount}，重读${result.rescanCount || 0}${failureText}，多余${addedAmount}/${this.itemTypeCount(result.addedToMomo)}种，缺失${unresolvedAmount}/${this.itemTypeCount(result.unresolved)}种。详情见Web管理页。`)
+        traceSummary(trace, {
+          status: 'ok',
+          chests: result.chestCount,
+          opened: result.openedChestCount,
+          rescan: result.rescanCount || 0,
+          addedTotal: addedAmount,
+          unresolvedTotal: unresolvedAmount
+        })
+      } catch (error) {
+        traceEvent(trace, 'error', 'sync_error', { message: error?.message || String(error) })
+        traceSummary(trace, { status: 'failed', message: error?.message || String(error) })
+        throw error
+      } finally {
+        this.detachWarehouseTrace()
+      }
     }, { exclusive: true })
+  }
+
+  // 调试命令 !同步木桶：只同步一个木桶并回报该桶的详细物品信息（含潜影盒内容展开），
+  // 用于快速核对“账本 vs 实物”而不用跑一次耗时的全仓同步。
+  parseBarrelCoords (text) {
+    const match = String(text || '').match(/^!同步木桶\s+(.+)$/)
+    if (!match) return null
+    const parts = match[1].trim().split(/[\s,，]+/).filter(Boolean)
+    if (parts.length !== 3) return null
+    const coords = parts.map(part => Number(part))
+    if (coords.some(value => !Number.isFinite(value))) return null
+    const [x, y, z] = coords
+    return { x: Math.floor(x), y: Math.floor(y), z: Math.floor(z) }
+  }
+
+  async handleSyncBarrel (username, text) {
+    if (!this.isAdmin(username)) {
+      this.msg(username, '你没有权限同步木桶。')
+      return
+    }
+
+    const coords = this.parseBarrelCoords(text)
+    if (!coords) {
+      this.msg(username, '格式：!同步木桶 x y z（也支持 x,y,z）。坐标可用 !查 或 Web 管理页里的木桶位置。')
+      return
+    }
+
+    await this.enqueueTask(username, 'sync', async worker => {
+      const chestLabel = `${coords.x},${coords.y},${coords.z}`
+      const trace = startTrace({
+        bot: this.botId,
+        kind: 'barrel-debug',
+        actor: username,
+        chest: chestLabel,
+        commandText: String(text || '')
+      })
+      this.attachWarehouseTrace(trace)
+      this.msg(username, `开始同步木桶 ${chestLabel}……`)
+      try {
+        const detail = await worker.warehouse.syncSingleBarrel(coords)
+        traceSummary(trace, {
+          status: 'ok',
+          chest: detail.chest?.describe || chestLabel,
+          types: detail.types,
+          total: detail.total
+        })
+        const lines = this.formatBarrelDetailLines(detail)
+        for (const chunk of lines) this.msg(username, chunk)
+      } catch (error) {
+        traceEvent(trace, 'error', 'barrel_debug_error', { message: error?.message || String(error) })
+        traceSummary(trace, { status: 'failed', message: error?.message || String(error) })
+        throw error
+      } finally {
+        this.detachWarehouseTrace()
+      }
+    }, { exclusive: true })
+  }
+
+  formatBarrelDetailLines (detail) {
+    const chestLabel = detail.chest?.describe || `${detail.chest?.x},${detail.chest?.y},${detail.chest?.z}`
+    const lines = [`木桶 ${chestLabel} 同步完成：${detail.types} 种物品，共 ${detail.total} 个。`]
+    if (!detail.items.length) {
+      lines.push('（桶是空的）')
+      return lines
+    }
+    for (const item of detail.items) {
+      let line = `槽${item.slot}：${item.name} x${item.amount}（短码 ${item.keyTail}）`
+      if (Array.isArray(item.shulkerContents) && item.shulkerContents.length) {
+        const contents = item.shulkerContents
+          .map(entry => `${entry.name}x${entry.n}`)
+          .join('、')
+        line += `，盒内：${contents}`
+      } else if (Array.isArray(item.shulkerContents)) {
+        line += '，盒内：空'
+      }
+      lines.push(line)
+    }
+    return lines
   }
 
   async handleClearInventory (username, text) {
@@ -2210,6 +2530,17 @@ class CloudStoreService {
   }
 
   recordWithdrawDeduction (fallbackOwner, items, message, deductionKey = '') {
+    traceEvent(this.warehouse.activeTrace, 'ledger', 'deduct_commit', {
+      deductionKey: deductionKey || '',
+      message,
+      items: (items || []).map(item => ({
+        name: item.displayName || item.itemId,
+        amount: item.amount,
+        owner: item.ownerUuid || fallbackOwner.uuid,
+        keyTail: shortKey(item.itemKey)
+      })),
+      decision: '按已确认交付数量扣减账本库存（幂等键防重复扣）'
+    })
     const groups = new Map()
     for (const item of items || []) {
       const ownerUuid = item.ownerUuid || fallbackOwner.uuid
@@ -3076,9 +3407,11 @@ class CloudStoreService {
   msg (username, message) {
     const template = this.config.commands.msg
     const chunks = this.splitMessage(String(message), 80)
-    for (const chunk of chunks) {
+    for (let index = 0; index < chunks.length; index++) {
+      const chunk = chunks[index]
       const privateCommand = template.replace('{player}', username).replace('{message}', chunk)
       if (this.config.debugChat) console.log(`[reply] ${this.redactSensitiveText(privateCommand)}`)
+      this.traceReply(username, chunk, chunks.length > 1 ? `${index + 1}/${chunks.length}` : '')
       this.bot.chat(privateCommand)
       this.db.addCommandReply({
         targetUsername: username,
@@ -3100,6 +3433,15 @@ class CloudStoreService {
         })
       }
     }
+  }
+
+  // 机器人回复玩家：挂在当前任务链路上；任务之外的回复（如机器人忙、查询结果）单独成行。
+  traceReply (to, message, chunk = '') {
+    const data = { to, message: this.redactSensitiveText(message) }
+    if (chunk) data.chunk = chunk
+    const trace = this.warehouse?.activeTrace
+    if (trace) traceEvent(trace, 'reply', 'bot_reply', data)
+    else traceStandalone('reply', 'reply', 'bot_reply', { bot: this.botId, ...data })
   }
 
   redactSensitiveText (text) {
@@ -3149,6 +3491,7 @@ class CloudStoreService {
       '减少',
       '清空库存',
       '清理库存',
+      '同步木桶',
       '同步仓库',
       '同步',
       '存物品',
