@@ -135,6 +135,11 @@
     // this is how many extra passes are used to re-take whatever did not move.
     "withdrawConfirmPasses": 2,
 
+    // When a withdrawal click gets no server confirmation (uncertain physical state),
+    // clear the cursor and retry from the live container state up to this many extra
+    // times before skipping the barrel. 0 restores the old fail-fast behavior.
+    "withdrawUncertainRetries": 2,
+
     // The server may occasionally answer a quick shulker open with an empty window;
     // close and reopen up to this many times before skipping the box.
     "quickShulkerOpenAttempts": 3,

@@ -51,6 +51,7 @@ const DEFAULT_CONFIG = {
     dropConfirmTimeoutMs: 5000,
     dropConfirmRounds: 3,
     withdrawConfirmPasses: 2,
+    withdrawUncertainRetries: 2,
     quickShulkerOpenAttempts: 3,
     barrelEmptyRereadAttempts: 3,
     withdrawMaxMissingBarrels: 5,

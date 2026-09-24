@@ -466,6 +466,7 @@ class Warehouse {
   async withdrawAllocationsLocked (allocations) {
     const withdrawn = []
     const missing = []
+    const unlocated = []
 
     for (const allocation of allocations) {
       if (allocation.withdrawMode === 'shulker_extract') {
@@ -492,6 +493,13 @@ class Warehouse {
       const slots = this.db.listSlotsForItemKey(allocation.itemKey)
       const chestGroups = this.groupSlotsForWithdrawal(slots)
       this.debug(`withdraw plan ${itemInfo.displayName || allocation.itemKey} need=${allocation.amount} chests=${chestGroups.map(group => `${group.chestId}:${group.recordedAmount}`).join(' | ') || 'none'}`)
+
+      // 账本有量但一个槽位记录都没有（物品被人工移动/记录漂移）：登记库存异常并计入 unlocated，
+      // 上层据此跳过"就地核对重试"——没有位置记录就无桶可核对，重试必然无效。
+      if (!chestGroups.length) {
+        this.reportMissingLooseRecord(allocation, itemInfo)
+        unlocated.push({ ...itemInfo, amount: allocation.amount })
+      }
 
       // 链路日志：这次要取什么、账本说这些货放在哪些木桶。
       this.trace('plan', 'allocate_start', {
@@ -628,6 +636,21 @@ class Warehouse {
             })
           }
         } catch (error) {
+          if (error?.uncertainTransfer) {
+            // 点击级重试已用尽仍无法确认实物状态：不刷新该桶记录（窗口内容存疑，避免写入过期状态），
+            // 保留原记录并换下一个木桶，任务继续，剩余数量最终计入缺失。
+            missingBarrelHops++
+            this.trace('decision', 'barrel_uncertain_skip', {
+              chest: this.describeChest(chest),
+              item: itemInfo.displayName || allocation.itemKey,
+              remaining,
+              hops: missingBarrelHops,
+              max: maxMissingBarrels,
+              message: error.message,
+              decision: '重试后仍无法确认实物状态：保留该木桶原记录，换下一个木桶继续'
+            })
+            continue
+          }
           this.trace('error', 'barrel_error', {
             chest: this.describeChest(chest),
             message: error?.message || String(error),
@@ -652,7 +675,36 @@ class Warehouse {
 
     return {
       withdrawn: this.mergeItems(withdrawn),
-      missing: this.mergeItems(missing)
+      missing: this.mergeItems(missing),
+      unlocated: this.mergeItems(unlocated)
+    }
+  }
+
+  // 账本有余额、但没有任何木桶槽位记录的散装物品：登记库存异常供 Web 管理页展示与对账，
+  // 同 owner+itemKey 只保留一条 open，避免重复刷屏。
+  reportMissingLooseRecord (allocation, itemInfo) {
+    try {
+      const ownerUuid = allocation.ownerUuid
+      if (!ownerUuid) return
+      if (typeof this.db.addInventoryMismatch !== 'function' || typeof this.db.hasOpenInventoryMismatch !== 'function') return
+      this.trace('decision', 'unlocated_recorded', {
+        item: itemInfo.displayName || itemInfo.itemKey,
+        keyTail: shortKey(itemInfo.itemKey),
+        ownerUuid,
+        amount: allocation.amount,
+        decision: '账本有库存但无位置记录：登记库存异常，请管理员 !同步 对账'
+      })
+      if (this.db.hasOpenInventoryMismatch(ownerUuid, itemInfo.itemKey)) return
+      this.db.addInventoryMismatch(
+        'missing',
+        ownerUuid,
+        allocation.ownerUsername || '',
+        itemInfo,
+        allocation.amount,
+        '取货时发现：账本有库存但木桶位置记录中没有任何实物（可能被人工移动或账实漂移）；请择机 !同步 对账。'
+      )
+    } catch (error) {
+      this.debug(`report missing loose record failed: ${error?.message || error}`)
     }
   }
 
@@ -1478,8 +1530,10 @@ class Warehouse {
   async tryWithdrawExactFrom (container, itemKey, amount, preferredSlots = []) {
     let movedTotal = 0
     let remaining = amount
+    let uncertainStreak = 0
     const preferredOrder = new Map(preferredSlots.map((slot, index) => [slot, index]))
     const maxPasses = Math.max(1, Number(this.config.timing?.withdrawConfirmPasses ?? 2))
+    const maxUncertainRetries = Math.max(0, Number(this.config.timing?.withdrawUncertainRetries ?? 2))
 
     // 整批点击、末端一次确认：点击期间不等服务器逐条确认，
     // 少拿的数量在下一轮补取，避免逐次等待拖慢整批取货。
@@ -1502,16 +1556,18 @@ class Warehouse {
           })[0]
         if (!item) break
 
+        // mineflayer 会在点击后回写 item.slot（移动到窗口背包区），先快照真实来源槽位供日志使用。
+        const sourceSlot = item.slot
         const take = Math.min(item.count, expectedTake - planned)
         this.trace('take', 'slot_take_plan', {
           pass: pass + 1,
-          slot: item.slot,
+          slot: sourceSlot,
           slotCount: item.count,
           take,
           mode: take >= item.count ? 'whole_stack' : 'split_stack',
           keyTail: shortKey(itemKey),
-          preferred: preferredOrder.has(item.slot),
-          decision: `从槽位 ${item.slot} 取 ${take} 个（${take >= item.count ? '整组' : '拆分组'}）`
+          preferred: preferredOrder.has(sourceSlot),
+          decision: `从槽位 ${sourceSlot} 取 ${take} 个（${take >= item.count ? '整组' : '拆分组'}）`
         })
         try {
           const inventoryBefore = this.hasInventoryItems() ? this.inventoryCountByItemKey(itemKey) : 0
@@ -1519,9 +1575,9 @@ class Warehouse {
             ? this.windowInventoryCountByItemKey(container, itemKey)
             : 0
           if (take >= item.count) {
-            await this.moveContainerSlotToInventory(container, item.slot)
+            await this.moveContainerSlotToInventory(container, sourceSlot)
           } else {
-            await this.movePartialContainerSlotToInventory(container, item.slot, take)
+            await this.movePartialContainerSlotToInventory(container, sourceSlot, take)
           }
           const confirmed = await this.waitForInventoryTransfer(
             container,
@@ -1531,27 +1587,47 @@ class Warehouse {
             take
           )
           if (confirmed < take) {
+            uncertainStreak += 1
             const error = new Error(`取 ${itemKey} 后背包只确认增加 ${confirmed}/${take}，物理状态不确定。`)
             error.uncertainTransfer = true
+            // 点击可能只是确认迟到（物品实际已移动）：清光标后重新按容器当前状态挑槽再点，
+            // 已移动的物品重挑时自然消失，不会重复取；重试次数受 withdrawUncertainRetries 限制。
+            if (uncertainStreak <= maxUncertainRetries) {
+              this.debug(`withdraw exact slot ${sourceSlot} uncertain (${confirmed}/${take}, streak ${uncertainStreak}/${maxUncertainRetries + 1}), retrying`)
+              this.trace('take', 'slot_take_uncertain_retry', {
+                pass: pass + 1,
+                slot: sourceSlot,
+                take,
+                confirmed,
+                streak: uncertainStreak,
+                maxRetries: maxUncertainRetries,
+                decision: '点击未得到服务器确认，先清空光标再按当前实物状态重试（未确认不计成功）'
+              })
+              await this.ensureWindowCursorCleared(container)
+              await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
+              continue
+            }
             throw error
           }
+          uncertainStreak = 0
           this.trace('take', 'slot_take_confirmed', {
             pass: pass + 1,
-            slot: item.slot,
+            slot: sourceSlot,
             take,
             confirmed,
-            decision: `槽位 ${item.slot} 取出 ${confirmed} 个已确认进入背包`
+            decision: `槽位 ${sourceSlot} 取出 ${confirmed} 个已确认进入背包`
           })
         } catch (error) {
-          this.debug(`withdraw exact slot ${item.slot} failed: ${error.message}`)
+          this.debug(`withdraw exact slot ${sourceSlot} failed: ${error.message}`)
           this.trace('take', 'slot_take_failed', {
             pass: pass + 1,
-            slot: item.slot,
+            slot: sourceSlot,
             take,
             uncertain: Boolean(error?.uncertainTransfer),
+            retriesExhausted: Boolean(error?.uncertainTransfer),
             message: error.message,
             decision: error?.uncertainTransfer
-              ? '物理状态不确定，终止本次取物并交给上层兜底'
+              ? `连续 ${uncertainStreak} 次点击都无法确认实物状态，交由上层跳过该木桶`
               : '该槽位取物失败，尝试下一槽位'
           })
           await this.ensureWindowCursorCleared(container)

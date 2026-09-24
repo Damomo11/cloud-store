@@ -1248,6 +1248,25 @@ class CloudStoreService {
 
     let deliveredTotal = this.mergeItems(attempt.allDeducted)
     if (!deliveredTotal.length) {
+      // 缺失物品全部没有木桶位置记录（有账无物）：就地核对重试必然无效，
+      // 直接失败并提示管理员对账；warehouse 侧已登记库存异常供 Web 管理页展示。
+      const unlocatedKeys = new Set((attempt.allUnlocated || []).map(item => item.itemKey))
+      const missingItems = attempt.allMissing || []
+      if (missingItems.length && missingItems.every(item => unlocatedKeys.has(item.itemKey))) {
+        traceEvent(trace, 'decision', 'skip_retry_unlocated', {
+          missing: missingItems.map(item => ({ name: item.displayName || item.itemId, amount: item.amount, keyTail: shortKey(item.itemKey) })),
+          decision: '缺失物品全部没有位置记录：跳过就地核对重试，提示管理员 !同步 对账'
+        })
+        await this.warehouse.goHome({ requireWarehouse: true })
+        const returned = await this.warehouse.depositInventoryWithoutBalance('withdraw_failed_return', `owner=${storageOwner.uuid}, actor=${username}`)
+        if (returned.leftover.length) {
+          msgActor(`机器人身上仍有未能放回仓库的物品：${this.formatItemList(returned.leftover)}`)
+        }
+        msgActor(`账本有库存，但仓库木桶里找不到实物位置（可能被人工移动或账实漂移）：${this.formatItemList(missingItems)}。已登记库存异常，请管理员执行 !同步 对账后再试。`)
+        this.db.clearRecoveryTask(this.botId)
+        return { status: 'failed_no_location', delivered: [], missing: this.mergeItems(missingItems) }
+      }
+
       // 取货时已就地核对每个木桶：实物少了当场刷新该木桶记录，读到整桶为空按服务器卡顿处理并保留原记录。
       // 这里先把残余放回清点，再按最新木桶记录立即重试一次，不做耗时的全仓同步。
       traceEvent(trace, 'decision', 'retry_after_recheck', {
@@ -1321,6 +1340,7 @@ class CloudStoreService {
     const allWithdrawn = []
     const allDeducted = []
     const allMissing = []
+    const allUnlocated = []
     let stayedWithPlayerForDeposit = false
     let cancelled = false
     let aborted = false
@@ -1354,6 +1374,7 @@ class CloudStoreService {
         missing: (physical.missing || []).map(item => ({ name: item.displayName || item.itemId, amount: item.amount }))
       })
       if (physical.missing?.length) allMissing.push(...physical.missing)
+      if (physical.unlocated?.length) allUnlocated.push(...physical.unlocated)
       if (this.isActiveCancelled()) {
         cancelled = true
         break
@@ -1466,7 +1487,7 @@ class CloudStoreService {
       }
     }
 
-    return { allWithdrawn, allDeducted, allMissing, stayedWithPlayerForDeposit, cancelled, aborted }
+    return { allWithdrawn, allDeducted, allMissing, allUnlocated, stayedWithPlayerForDeposit, cancelled, aborted }
   }
 
   async dropWithdrawItemsToPlayer (username, requestedItems) {
@@ -1565,7 +1586,7 @@ class CloudStoreService {
       }
     }
 
-    return { withdrawn: [], missing: batch }
+    return { withdrawn: [], missing: batch, unlocated: [] }
   }
 
   async handleQuery (username, text, storageOwner = null) {

@@ -67,6 +67,13 @@ function createFixture (withdrawAmounts, options = {}) {
       const amount = withdrawAmounts[Math.min(withdrawCalls, withdrawAmounts.length - 1)]
       withdrawCalls++
       inventory = amount > 0 ? [{ ...item, count: amount }] : []
+      if (options.unlocatedMissing && amount === 0) {
+        return {
+          withdrawn: [],
+          missing: [{ ...item, amount: 10 }],
+          unlocated: [{ ...item, amount: 10 }]
+        }
+      }
       return { withdrawn: amount > 0 ? [{ ...item, amount }] : [], missing: [] }
     },
     depositInventoryWithoutBalance: async type => {
@@ -172,6 +179,20 @@ test('items that cannot be returned to chests skip the retry', async () => {
   assert.ok(finalMessage)
   assert.ok(fixture.sent.some(message => message.includes('机器人身上仍有未能放回仓库的物品')))
   assert.deepEqual(fixture.balanceChanges, [])
+})
+
+test('fully unlocated missing skips the pointless recheck retry and asks for a sync', async () => {
+  const fixture = createFixture([0], { unlocatedMissing: true })
+
+  await fixture.service.handleWithdraw('Alice', '', owner, request)
+
+  assert.equal(fixture.getWithdrawCalls(), 1, 'no second round when nothing has a barrel record')
+  assert.equal(fixture.syncCalls.length, 0)
+  assert.equal(fixture.depositCalls.filter(type => type === 'withdraw_failed_return').length, 1)
+  const finalMessage = fixture.sent.find(message => message.includes('找不到实物位置'))
+  assert.ok(finalMessage, 'the player is told the ledger has stock but no physical location')
+  assert.ok(finalMessage.includes('!同步'))
+  assert.deepEqual(fixture.balanceChanges, [], 'nothing is deducted')
 })
 
 function fixtureItem () {
