@@ -881,10 +881,26 @@ class CloudStoreService {
     const storageOwner = owner || { ...player, scope: 'personal' }
     const alreadyAtPlayer = Boolean(options.alreadyAtPlayer)
     let sessionLogged = false
+    // 存货链路日志：与取货同格式，写入 logs/withdraw-trace-日期.jsonl（kind=deposit）。
+    const trace = startTrace({
+      bot: this.botId,
+      kind: 'deposit',
+      actor: username,
+      owner: storageOwner.uuid,
+      ownerLabel: this.ownerScopeName(storageOwner),
+      source: alreadyAtPlayer ? 'withdraw_continue' : 'deposit'
+    })
+    this.attachWarehouseTrace(trace)
     const logSession = (status, items = [], extra = {}) => {
       if (sessionLogged) return
       sessionLogged = true
       this.logDepositSession(username, storageOwner, status, items, extra)
+      traceSummary(trace, {
+        status,
+        itemCount: this.totalAmount(items || []),
+        phase: extra.phase || '',
+        reason: extra.reason || ''
+      })
     }
     const logCancelledSession = () => {
       const held = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
@@ -903,6 +919,9 @@ class CloudStoreService {
       if (!alreadyAtPlayer) {
         this.msg(username, `准备存入${this.ownerScopeName(storageOwner)}，请稍等。`)
         if (this.bot.inventory.items().length) {
+          traceEvent(trace, 'deposit', 'residual_flush_start', {
+            decision: '背包有上次残留物品，先回仓清点入库再开始本次存货'
+          })
           await this.warehouse.goHomeIfAway()
           if (this.isActiveCancelled()) {
             logCancelledSession()
@@ -922,16 +941,29 @@ class CloudStoreService {
             usedSlots: quota.usedSlots,
             quotaSlots: quota.quotaSlots
           })
+          traceEvent(trace, 'decision', 'quota_full', {
+            usedSlots: quota.usedSlots,
+            quotaSlots: quota.quotaSlots,
+            decision: '库存额度已满，拒绝存货'
+          })
           this.msg(username, `${this.ownerSubjectName(storageOwner)}额度已满：${quota.usedSlots}/${quota.quotaSlots} 格。请先取出一些物品。`)
           return
         }
 
         if (this.active) this.active.phase = 'deposit_teleport_to_player'
         const teleported = await this.teleportToPlayer(username)
+        traceEvent(trace, 'delivery', 'teleport_to_player', {
+          target: username,
+          ok: Boolean(teleported)
+        })
         if (!teleported) {
           await this.warehouse.waitForPickupSettle()
           const receivedAfterTimeout = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
           if (receivedAfterTimeout.length) {
+            traceEvent(trace, 'decision', 'teleport_timeout_but_received', {
+              held: receivedAfterTimeout.map(item => ({ name: item.displayName || item.itemId, amount: item.amount })),
+              decision: '传送超时但已收到物品，直接回仓入库'
+            })
             this.msg(username, `没有检测到你在附近，但已收到物品，正在存入${this.ownerScopeName(storageOwner)}。`)
             if (this.active) this.active.phase = 'deposit_return_home'
             this.saveRecoveryTask('deposit', username, storageOwner, username, 'deposit_return_home')
@@ -1004,6 +1036,14 @@ class CloudStoreService {
         return
       }
       await this.warehouse.waitForPickupSettle()
+      const collected = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
+      traceEvent(trace, 'deposit', 'collect_done', {
+        stopReason: this.active?.depositStopReason || 'timeout',
+        held: collected.map(item => ({ name: item.displayName || item.itemId, amount: item.amount })),
+        decision: collected.length
+          ? `收集结束：收到 ${collected.reduce((sum, item) => sum + item.amount, 0)} 个物品`
+          : '收集结束：没有收到物品'
+      })
 
       if (this.active) this.active.phase = 'deposit_return_home'
       await this.warehouse.goHome({ requireWarehouse: true })
@@ -1014,6 +1054,14 @@ class CloudStoreService {
       if (this.active) this.active.phase = 'deposit_storing'
       this.saveRecoveryTask('deposit', username, storageOwner, username, 'deposit_storing')
       const result = await this.warehouse.depositInventoryForOwner(storageOwner.uuid, storageOwner.username)
+      traceEvent(trace, 'deposit', 'deposit_flow_result', {
+        deposited: (result.deposited || []).map(item => ({ name: item.displayName || item.itemId, amount: item.amount })),
+        leftover: (result.leftover || []).map(item => ({ name: item.displayName || item.itemId, amount: item.amount })),
+        stopReason: result.stopReason || '',
+        decision: result.deposited.length
+          ? `入库 ${this.totalAmount(result.deposited)} 个${result.leftover.length ? `，剩余 ${this.totalAmount(result.leftover)} 个无法入库` : ''}`
+          : (result.leftover.length ? '没有任何物品入库' : '背包是空的，没有可入库物品')
+      })
       const status = result.deposited.length
         ? (result.leftover.length ? 'partial' : 'ok')
         : (result.leftover.length ? 'no_space' : 'empty')
@@ -1032,6 +1080,11 @@ class CloudStoreService {
       }
 
       if (result.leftover.length) {
+        traceEvent(trace, 'decision', 'leftover_to_momo', {
+          leftover: (result.leftover || []).map(item => ({ name: item.displayName || item.itemId, amount: item.amount })),
+          reason: result.stopReason || '仓库空间不足',
+          decision: '未能入库的剩余物品转记为 momo'
+        })
         this.accountResidualAsMomo(result.leftover, `deposit leftover, actor=${username}, owner=${storageOwner.uuid}`)
         const reason = result.stopReason ? `${result.stopReason} ` : '仓库空间不足，'
         this.msg(username, `${reason}剩余${this.formatDepositSummary(result.leftover)}已转记为 momo，避免影响下一个玩家。`)
@@ -1043,7 +1096,13 @@ class CloudStoreService {
         phase: this.active?.phase || 'unknown',
         error: error.message
       })
+      traceEvent(trace, 'error', 'deposit_error', {
+        message: error?.message || String(error),
+        phase: this.active?.phase || ''
+      })
       throw error
+    } finally {
+      this.detachWarehouseTrace()
     }
   }
 

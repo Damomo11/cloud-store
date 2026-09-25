@@ -259,6 +259,59 @@ test('parseBarrelCoords accepts space and comma separated coordinates', () => {
   assert.equal(service.parseBarrelCoords('!同步木桶 a b c'), null)
 })
 
+test('deposit flow writes its own trace with kind=deposit', async () => {
+  const directory = makeTempDir()
+  configureTraceLog({ enabled: true, directory, retentionDays: 14 })
+  const db = {
+    addCommandReply: () => {},
+    saveRecoveryTask: () => {},
+    clearRecoveryTask: () => {},
+    getRecoveryTask: () => null,
+    addTransaction: () => {}
+  }
+  const config = structuredClone(DEFAULT_CONFIG)
+  config.debugChat = false
+  config.timing.pickupWindowMs = 10
+  const service = new CloudStoreService(
+    { username: 'BotA', players: {}, chat: () => {}, inventory: { items: () => [] } },
+    db,
+    { aggregatePrismarineItems: () => [] },
+    {
+      activeTrace: null,
+      attachTrace(t) { this.activeTrace = t },
+      detachTrace() { this.activeTrace = null },
+      goHomeIfAway: async () => {},
+      goHome: async () => {},
+      collectNearbyDropsUntil: async () => {},
+      waitForPickupSettle: async () => {},
+      depositInventoryForOwner: async () => ({
+        deposited: [{ itemKey: 'minecraft:stone|plain', itemId: 'minecraft:stone', displayName: '石头', amount: 5 }],
+        leftover: [],
+        stopReason: ''
+      })
+    },
+    config
+  )
+  service.getPlayer = () => ({ uuid: 'uuid-alice', username: 'Alice' })
+  service.getStorageQuota = () => ({ usedSlots: 0, quotaSlots: 270 })
+  service.teleportToPlayer = async () => true
+
+  await service.handleDeposit('Alice', { uuid: 'uuid-alice', username: 'Alice', scope: 'personal' })
+
+  const lines = readTraceLines(directory)
+  assert.equal(lines[0].kind, 'deposit')
+  assert.equal(lines[0].actor, 'Alice')
+  assert.equal(lines.filter(line => line.event === 'trace_start').length, 1)
+  const events = lines.map(line => line.event)
+  for (const expected of ['teleport_to_player', 'collect_done', 'deposit_flow_result', 'task_summary']) {
+    assert.ok(events.includes(expected), `expected event ${expected} in ${JSON.stringify(events)}`)
+  }
+  const summary = lines.find(line => line.event === 'task_summary')
+  assert.equal(summary.status, 'ok')
+  const flow = lines.find(line => line.event === 'deposit_flow_result')
+  assert.deepEqual(flow.deposited.map(item => [item.name, item.amount]), [['石头', 5]])
+})
+
 test('private message 同步木桶 gains the ! prefix like other admin commands', () => {
   const service = new CloudStoreService({ username: 'BotA' }, {}, {}, {}, DEFAULT_CONFIG)
   assert.equal(service.normalizePrivateCommandText('同步木桶 120 64 -35', 'whisper'), '!同步木桶 120 64 -35')

@@ -165,6 +165,13 @@ class Warehouse {
     const before = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
     if (!before.length) return { deposited: [], leftover: [] }
 
+    this.trace('deposit', 'deposit_start', {
+      ownerUuid,
+      username,
+      held: before.map(item => ({ name: item.displayName || item.itemId, amount: item.amount })),
+      decision: `开始入库：背包共 ${before.reduce((sum, item) => sum + item.amount, 0)} 个`
+    })
+
     const depositResult = await this.depositAllPossible()
 
     const after = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
@@ -177,6 +184,16 @@ class Warehouse {
       const amount = item.amount - left
       if (amount > 0) deposited.push({ ...item, amount })
     }
+
+    this.trace('deposit', 'deposit_result', {
+      ownerUuid,
+      deposited: deposited.map(item => ({ name: item.displayName || item.itemId, amount: item.amount })),
+      leftover: after.map(item => ({ name: item.displayName || item.itemId, amount: item.amount })),
+      stopReason: depositResult.stopReason || '',
+      decision: deposited.length
+        ? `入库完成：${deposited.reduce((sum, item) => sum + item.amount, 0)} 个已记入账本`
+        : '没有物品成功入库'
+    })
 
     if (deposited.length) {
       this.db.addBalanceItems(ownerUuid, deposited)
@@ -221,6 +238,9 @@ class Warehouse {
   async depositAllPossible () {
     const chests = this.db.listChests()
     if (!chests.length) {
+      this.trace('error', 'deposit_no_registered_chests', {
+        decision: '没有任何已登记的木桶，无法入库'
+      })
       throw new Error('没有已登记的箱子，请管理员先执行 !同步仓库 半径')
     }
 
@@ -243,11 +263,23 @@ class Warehouse {
       if (!chest) {
         stopReason = `没有本地记录可用的入库木桶；已尝试空槽木桶 ${emptyAttempts} 个、满记录木桶 ${fullAttempts} 个。请管理员执行 !同步 后再试。`
         this.debug('deposit no local candidate chest left')
+        this.trace('decision', 'deposit_stop', {
+          stopReason,
+          emptyAttempts,
+          fullAttempts,
+          decision: '找不到可用的入库木桶，停止入库'
+        })
         break
       }
 
       const emptyOnlyCandidate = chest.sameItemFree <= 0
       const fullRecordCandidate = chest.sameItemFree <= 0 && chest.emptySlots <= 0
+      this.trace('deposit', 'deposit_candidate', {
+        chest: this.describeChest(chest),
+        sameItemFree: chest.sameItemFree,
+        emptySlots: chest.emptySlots,
+        decision: `选择木桶 ${this.describeChest(chest)} 入库（同类可叠加 ${chest.sameItemFree}，空槽 ${chest.emptySlots}）`
+      })
       const container = await this.openContainerAt(chest)
       let movedInChest = 0
       try {
@@ -261,6 +293,12 @@ class Warehouse {
               progress = true
               movedInChest += moved
               this.debug(`deposited ${moved} ${item.name} into ${this.describeChest(chest)}`)
+              this.trace('deposit', 'deposit_item', {
+                chest: this.describeChest(chest),
+                slot: item.slot,
+                moved,
+                decision: `存入 ${moved} 个 ${item.name}`
+              })
               await sleep(this.config.timing.containerSettleMs)
             }
           }
@@ -274,7 +312,16 @@ class Warehouse {
         skippedNoProgress.add(chest.chestId)
         if (fullRecordCandidate) fullAttempts++
         else if (emptyOnlyCandidate) emptyAttempts++
+        this.trace('decision', 'deposit_no_progress', {
+          chest: this.describeChest(chest),
+          decision: '该木桶没有存入任何物品，跳过并尝试下一个'
+        })
       } else {
+        this.trace('deposit', 'deposit_barrel_result', {
+          chest: this.describeChest(chest),
+          moved: movedInChest,
+          decision: `该木桶共存入 ${movedInChest} 个`
+        })
         skippedNoProgress.clear()
         emptyAttempts = 0
         fullAttempts = 0
