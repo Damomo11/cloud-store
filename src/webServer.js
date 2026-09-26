@@ -213,6 +213,14 @@ class CloudStoreWebServer {
         const body = await this.readBody(req)
         return this.sendJson(res, this.apiAdminMismatchResolve(session, body))
       }
+      if (req.method === 'POST' && url.pathname === '/api/admin/mismatch/batch-deduct') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiAdminMismatchBatchDeduct(session, body))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/admin/mismatch/batch-resolve') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiAdminMismatchBatchResolve(session, body))
+      }
       if (req.method === 'POST' && url.pathname === '/api/admin/alias/save') {
         const body = await this.readBody(req)
         return this.sendJson(res, this.apiAdminAliasSave(session, body))
@@ -1789,6 +1797,62 @@ class CloudStoreWebServer {
     const user = this.requireAdmin(session)
     const id = Number.parseInt(body.id, 10)
     if (!Number.isInteger(id) || id <= 0) throw new Error('异常 ID 必须是正整数。')
+    return { ok: true, message: this.deductMismatchRow(user, id) }
+  }
+
+  parseMismatchIdList (value) {
+    if (!Array.isArray(value)) return []
+    const ids = []
+    for (const entry of value) {
+      const id = Number.parseInt(entry, 10)
+      if (Number.isInteger(id) && id > 0 && !ids.includes(id)) ids.push(id)
+      if (ids.length >= 1000) break
+    }
+    return ids
+  }
+
+  apiAdminMismatchBatchDeduct (session, body) {
+    const user = this.requireAdmin(session)
+    const ids = this.parseMismatchIdList(body.ids)
+    if (!ids.length) throw new Error('请先勾选要批量清除的异常记录。')
+    const results = []
+    for (const id of ids) {
+      try {
+        results.push({ id, ok: true, message: this.deductMismatchRow(user, id) })
+      } catch (error) {
+        results.push({ id, ok: false, message: error.message })
+      }
+    }
+    const failCount = results.filter(row => !row.ok).length
+    return {
+      ok: true,
+      results,
+      message: `批量清除完成：成功 ${results.length - failCount} 条${failCount ? `，失败 ${failCount} 条` : ''}。`
+    }
+  }
+
+  apiAdminMismatchBatchResolve (session, body) {
+    const user = this.requireAdmin(session)
+    const ids = this.parseMismatchIdList(body.ids)
+    if (!ids.length) throw new Error('请先勾选要批量转入的异常记录。')
+    if (!this.resolveAdminOwnerArgument(body.targetOwnerUuid || body.targetOwnerText || '')) throw new Error('请先选择批量转入的目标仓库。')
+    const results = []
+    for (const id of ids) {
+      try {
+        results.push({ id, ok: true, message: this.resolveMismatchRow(user, id, body.targetOwnerUuid || body.targetOwnerText || '') })
+      } catch (error) {
+        results.push({ id, ok: false, message: error.message })
+      }
+    }
+    const failCount = results.filter(row => !row.ok).length
+    return {
+      ok: true,
+      results,
+      message: `批量转入完成：成功 ${results.length - failCount} 条${failCount ? `，失败 ${failCount} 条` : ''}。`
+    }
+  }
+
+  deductMismatchRow (user, id) {
     const row = this.db.db.prepare(`
       SELECT id, kind, status, owner_uuid AS ownerUuid, username,
              item_key AS itemKey, item_id AS itemId, display_name AS displayName,
@@ -1798,7 +1862,7 @@ class CloudStoreWebServer {
       LIMIT 1
     `).get(id)
     if (!row) throw new Error('没有找到这条异常记录。')
-    if (row.status !== 'open') return { ok: true, message: '这条异常已经处理过。' }
+    if (row.status !== 'open') return '这条异常已经处理过。'
     if (!row.ownerUuid) throw new Error('这条异常没有明确归属，不能直接扣除。')
     const item = this.db.getItemByKey(row.itemKey) || this.db.rowToItem(row)
     const current = this.db.getBalance(row.ownerUuid, row.itemKey)
@@ -1820,13 +1884,17 @@ class CloudStoreWebServer {
         WHERE id = ?
       `).run(`Web已扣除账本库存 x${amount}`, `Web已扣除账本库存 x${amount}`, id)
     })
-    return { ok: true, message: `已扣除 ${this.db.ownerLabel(row.ownerUuid)} 的 ${row.displayName || row.itemId} x${amount}，异常已处理。` }
+    return `已扣除 ${this.db.ownerLabel(row.ownerUuid)} 的 ${row.displayName || row.itemId} x${amount}，异常已处理。`
   }
 
   apiAdminMismatchResolve (session, body) {
     const user = this.requireAdmin(session)
     const id = Number.parseInt(body.id, 10)
     if (!Number.isInteger(id) || id <= 0) throw new Error('异常 ID 必须是正整数。')
+    return { ok: true, message: this.resolveMismatchRow(user, id, body.targetOwnerUuid || body.targetOwnerText || '') }
+  }
+
+  resolveMismatchRow (user, id, targetOwnerArgument) {
     const row = this.db.db.prepare(`
       SELECT id, kind, status, owner_uuid AS ownerUuid, username,
              item_key AS itemKey, item_id AS itemId, display_name AS displayName,
@@ -1834,10 +1902,10 @@ class CloudStoreWebServer {
       FROM inventory_mismatches WHERE id = ? LIMIT 1
     `).get(id)
     if (!row) throw new Error('没有找到这条异常记录。')
-    if (row.status !== 'open') return { ok: true, message: '这条异常已经处理过。' }
-    if (row.kind === 'missing') return this.apiAdminMismatchDeduct(session, body)
+    if (row.status !== 'open') return '这条异常已经处理过。'
+    if (row.kind === 'missing') return this.deductMismatchRow(user, id)
 
-    const targetOwnerUuid = this.resolveAdminOwnerArgument(body.targetOwnerUuid || body.targetOwnerText || '')
+    const targetOwnerUuid = this.resolveAdminOwnerArgument(targetOwnerArgument)
     if (!targetOwnerUuid) throw new Error('多余物品需要选择转入的目标仓库。')
     const amount = Number(row.amount || 0)
     if (amount <= 0) throw new Error('异常数量无效。')
@@ -1863,7 +1931,7 @@ class CloudStoreWebServer {
         WHERE id = ?
       `).run(targetOwnerUuid, this.db.ownerLabel(targetOwnerUuid), `Web已转入目标库存 x${amount}`, `Web已转入目标库存 x${amount}`, id)
     })
-    return { ok: true, message: `已把多余的 ${row.displayName || row.itemId} x${amount} 转入 ${this.db.ownerLabel(targetOwnerUuid)}。` }
+    return `已把多余的 ${row.displayName || row.itemId} x${amount} 转入 ${this.db.ownerLabel(targetOwnerUuid)}。`
   }
 
   resolveAdminOwnerArgument (value) {
@@ -2924,6 +2992,11 @@ const HTML = `<!doctype html>
     .mismatch-actions { display: flex; gap: 6px; margin-top: 9px; }
     .mismatch-actions select { min-width: 0; width: 100%; padding: 6px; }
     .mismatch-actions button { padding: 6px 8px; white-space: nowrap; }
+    .mismatch-actions .mm-check { display: inline-flex; align-items: center; gap: 3px; white-space: nowrap; font-size: 12px; color: var(--muted); cursor: pointer; user-select: none; }
+    .mismatch-actions .mm-check input { accent-color: var(--gold); cursor: pointer; }
+    .mismatch-batch { flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
+    .mismatch-batch #adminMmBatchCount { min-width: 0; align-self: center; }
+    .mismatch-batch select { max-width: 220px; }
     .alias-tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
     .alias-tag { display: inline-flex; gap: 5px; align-items: center; border: 1px solid #493a25; background: #201a12; color: #f4d48a; border-radius: 99px; padding: 3px 7px; font-size: 12px; }
     .transaction-shulker { cursor: help; text-decoration: underline dotted rgba(244, 212, 138, .7); text-underline-offset: 3px; }
@@ -3488,6 +3561,15 @@ const HTML = `<!doctype html>
             <button id="adminMmLoad" class="primary">查询</button>
           </div>
           <div id="adminMmStats" class="stats"></div>
+          <div class="toolbar mismatch-batch">
+            <span id="adminMmBatchCount" class="muted">未勾选</span>
+            <button type="button" data-admin-mm-select="extra">全选多余</button>
+            <button type="button" data-admin-mm-select="missing">全选缺失</button>
+            <button type="button" data-admin-mm-select="none">取消勾选</button>
+            <select id="adminMmBatchTarget" title="批量转入目标仓库"><option value="">批量转入目标仓库</option></select>
+            <button id="adminMmBatchResolve" class="primary">批量转入</button>
+            <button id="adminMmBatchDeduct" class="danger">批量清除</button>
+          </div>
           <div class="mismatch-columns">
             <div><h3>多余物品</h3><div id="adminMmExtra" class="panel admin-grid-panel"></div></div>
             <div><h3>缺失物品</h3><div id="adminMmMissing" class="panel admin-grid-panel"></div></div>
@@ -4889,22 +4971,64 @@ const HTML = `<!doctype html>
         '缺失数量': data.stats?.missingAmount || 0
       });
       await loadAdminOwners();
+      const batchTarget = $('adminMmBatchTarget');
+      const batchTargetValue = batchTarget.value;
+      batchTarget.innerHTML = '<option value="">批量转入目标仓库</option>' + ownerOptions();
+      if ([...batchTarget.options].some(option => option.value === batchTargetValue)) batchTarget.value = batchTargetValue;
       const rows = data.rows || [];
       state.adminMismatchRows = new Map(rows.map(row => ['mm-' + row.id, row]));
       const mismatchHtml = row => {
         const detailButton = '<button class="ghost" data-admin-mm-components="' + esc(row.id) + '">查看组件</button>';
+        const checkLabel = row.status === 'open'
+          ? '<label class="mm-check"><input type="checkbox" data-mm-check="' + esc(row.id) + '" data-mm-kind="' + esc(row.kind) + '">选择</label>'
+          : '';
         const actions = row.status !== 'open'
           ? '<div class="mismatch-actions">' + detailButton + '<span class="admin-item-meta">已处理 ' + esc(row.resolvedAt || '') + '</span></div>'
           : row.kind === 'extra'
-            ? '<div class="mismatch-actions"><select data-mm-target><option value="">目标仓库</option>' + ownerOptions() + '</select><button data-admin-mm-resolve="' + esc(row.id) + '">转入</button>' + detailButton + '</div>'
-            : '<div class="mismatch-actions"><button data-admin-mm-deduct="' + esc(row.id) + '">清除库存</button>' + detailButton + '</div>';
+            ? '<div class="mismatch-actions">' + checkLabel + '<select data-mm-target><option value="">目标仓库</option>' + ownerOptions() + '</select><button data-admin-mm-resolve="' + esc(row.id) + '">转入</button>' + detailButton + '</div>'
+            : '<div class="mismatch-actions">' + checkLabel + '<button data-admin-mm-deduct="' + esc(row.id) + '">清除库存</button>' + detailButton + '</div>';
         return adminCardHtml(row, 'mm-' + row.id, { className: 'mismatch-card', actions });
       };
       const extra = rows.filter(row => row.kind === 'extra');
       const missing = rows.filter(row => row.kind === 'missing');
       $('adminMmExtra').innerHTML = extra.length ? '<div class="admin-item-grid">' + extra.map(mismatchHtml).join('') + '</div>' : '<p class="muted">没有多余物品。</p>';
       $('adminMmMissing').innerHTML = missing.length ? '<div class="admin-item-grid">' + missing.map(mismatchHtml).join('') + '</div>' : '<p class="muted">没有缺失物品。</p>';
+      updateAdminMmBatchCount();
       bindAdminMismatchTooltips();
+    }
+
+    function updateAdminMmBatchCount() {
+      const boxes = [...document.querySelectorAll('[data-mm-check]')];
+      const extraChecked = boxes.filter(box => box.checked && box.dataset.mmKind === 'extra').length;
+      const missingChecked = boxes.filter(box => box.checked && box.dataset.mmKind === 'missing').length;
+      const total = extraChecked + missingChecked;
+      $('adminMmBatchCount').textContent = total
+        ? '已勾选 ' + total + ' 条（多余 ' + extraChecked + '、缺失 ' + missingChecked + '）'
+        : '未勾选';
+    }
+
+    async function runAdminMmBatch(kind) {
+      const ids = [...document.querySelectorAll('[data-mm-check]:checked')]
+        .filter(box => box.dataset.mmKind === kind)
+        .map(box => box.dataset.mmCheck);
+      if (!ids.length) {
+        toast(kind === 'extra' ? '请先勾选要批量转入的多余物品。' : '请先勾选要批量清除的缺失物品。');
+        return;
+      }
+      if (kind === 'extra' && !$('adminMmBatchTarget').value) {
+        toast('请先选择批量转入的目标仓库。');
+        return;
+      }
+      const actionLabel = kind === 'extra'
+        ? '把勾选的 ' + ids.length + ' 条多余物品转入所选仓库'
+        : '清除勾选的 ' + ids.length + ' 条缺失物品对应的账本库存';
+      if (!confirm('确认' + actionLabel + '吗？')) return;
+      const body = { ids };
+      if (kind === 'extra') body.targetOwnerUuid = $('adminMmBatchTarget').value;
+      const data = await post(kind === 'extra' ? '/api/admin/mismatch/batch-resolve' : '/api/admin/mismatch/batch-deduct', body);
+      const failures = (data.results || []).filter(item => !item.ok);
+      toast(failures.length ? data.message + ' 第一条失败：' + failures[0].message : data.message);
+      await loadAdminMismatches();
     }
 
     async function loadAdminWarehouseProvisioning() {
@@ -5325,6 +5449,16 @@ const HTML = `<!doctype html>
     $('adminInvLoad').addEventListener('click', () => loadAdminInventory({ owner: $('adminInvOwner').value }).catch(error => toast(error.message)));
     $('adminInvOwner').addEventListener('change', event => loadAdminInventory({ owner: event.currentTarget.value }).catch(error => toast(error.message)));
     $('adminMmLoad').addEventListener('click', () => loadAdminMismatches().catch(error => toast(error.message)));
+    $('adminMmBatchResolve').addEventListener('click', () => runAdminMmBatch('extra').catch(error => toast(error.message)));
+    $('adminMmBatchDeduct').addEventListener('click', () => runAdminMmBatch('missing').catch(error => toast(error.message)));
+    document.querySelectorAll('[data-admin-mm-select]').forEach(button => button.addEventListener('click', () => {
+      const mode = button.dataset.adminMmSelect;
+      document.querySelectorAll('[data-mm-check]').forEach(box => {
+        if (mode === 'none') box.checked = false;
+        else if (box.dataset.mmKind === mode) box.checked = true;
+      });
+      updateAdminMmBatchCount();
+    }));
     $('adminTransferRun').addEventListener('click', () => runAdminTransfer().catch(error => toast(error.message)));
     $('adminAliasMode').addEventListener('click', () => setAdminAliasMode(!state.adminAliasMode));
     $('globalAliasSave').addEventListener('click', () => saveGlobalAliasFromModal().catch(error => toast(error.message)));
@@ -5643,6 +5777,10 @@ const HTML = `<!doctype html>
     });
 
     document.addEventListener('change', async event => {
+      if (event.target.closest('[data-mm-check]')) {
+        updateAdminMmBatchCount();
+        return;
+      }
       const adminAmount = event.target.closest('[data-admin-pick-amount]');
       if (adminAmount) {
         const key = adminAmount.closest('[data-admin-pick]').dataset.adminPick;

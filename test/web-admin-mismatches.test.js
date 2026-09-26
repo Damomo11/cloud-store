@@ -116,3 +116,81 @@ test('assigning an extra mismatch to momo does not duplicate its balance', () =>
     fixture.close()
   }
 })
+
+function makeItem (key, itemId, displayName) {
+  return { itemKey: key, itemId, displayName, nbtJson: '', metaJson: '' }
+}
+
+test('batch deduct resolves many missing mismatches and reports per-item failures', () => {
+  const fixture = createFixture()
+  const okItem = makeItem('missing-diamond-key', 'minecraft:diamond', '钻石')
+  const brokeItem = makeItem('missing-iron-key', 'minecraft:iron_ingot', '铁锭')
+  const ownerUuid = 'player-a'
+
+  try {
+    fixture.db.addBalanceItems(ownerUuid, [{ ...okItem, amount: 5 }])
+    fixture.db.addInventoryMismatch('missing', ownerUuid, 'player-a', okItem, 2)
+    fixture.db.addInventoryMismatch('missing', ownerUuid, 'player-a', brokeItem, 1)
+    const open = fixture.db.db.prepare("SELECT id FROM inventory_mismatches WHERE status = 'open' ORDER BY id").all()
+
+    const result = fixture.server.apiAdminMismatchBatchDeduct({}, { ids: open.map(row => row.id) })
+
+    assert.equal(result.ok, true)
+    assert.equal(result.results.length, 2)
+    assert.deepEqual(result.results.map(row => row.ok), [true, false])
+    assert.match(result.message, /成功 1 条，失败 1 条/)
+    assert.equal(fixture.db.getBalance(ownerUuid, okItem.itemKey), 3)
+    assert.equal(fixture.db.getBalance(ownerUuid, brokeItem.itemKey), 0)
+    assert.equal(
+      fixture.db.db.prepare("SELECT COUNT(*) AS count FROM inventory_mismatches WHERE status = 'resolved'").get().count,
+      1
+    )
+  } finally {
+    fixture.close()
+  }
+})
+
+test('batch deduct rejects an empty selection', () => {
+  const fixture = createFixture()
+  try {
+    assert.throws(() => fixture.server.apiAdminMismatchBatchDeduct({}, { ids: [] }), /请先勾选/)
+    assert.throws(() => fixture.server.apiAdminMismatchBatchDeduct({}, {}), /请先勾选/)
+  } finally {
+    fixture.close()
+  }
+})
+
+test('batch resolve transfers many extras to one target and skips failures', () => {
+  const fixture = createFixture()
+  const okItem = makeItem('extra-diamond-key', 'minecraft:diamond', '钻石')
+  const shortItem = makeItem('extra-emerald-key', 'minecraft:emerald', '绿宝石')
+  const targetOwnerUuid = 'target-player'
+
+  try {
+    fixture.db.addBalanceItems(fixture.db.momoOwner, [{ ...okItem, amount: 5 }])
+    fixture.db.addInventoryMismatch('extra', fixture.db.momoOwner, 'momo', okItem, 3)
+    fixture.db.addInventoryMismatch('extra', fixture.db.momoOwner, 'momo', shortItem, 3)
+    const open = fixture.db.db.prepare("SELECT id FROM inventory_mismatches WHERE status = 'open' ORDER BY id").all()
+    fixture.server.resolveAdminOwnerArgument = value => (value === targetOwnerUuid ? targetOwnerUuid : '')
+
+    assert.throws(
+      () => fixture.server.apiAdminMismatchBatchResolve({}, { ids: open.map(row => row.id) }),
+      /请先选择批量转入的目标仓库/
+    )
+
+    const result = fixture.server.apiAdminMismatchBatchResolve({}, { ids: open.map(row => row.id), targetOwnerUuid })
+
+    assert.equal(result.ok, true)
+    assert.deepEqual(result.results.map(row => row.ok), [true, false])
+    assert.match(result.message, /成功 1 条，失败 1 条/)
+    assert.equal(fixture.db.getBalance(targetOwnerUuid, okItem.itemKey), 3)
+    assert.equal(fixture.db.getBalance(targetOwnerUuid, shortItem.itemKey), 0)
+    assert.equal(fixture.db.getBalance(fixture.db.momoOwner, okItem.itemKey), 2)
+    assert.equal(
+      fixture.db.db.prepare("SELECT COUNT(*) AS count FROM inventory_mismatches WHERE status = 'resolved'").get().count,
+      1
+    )
+  } finally {
+    fixture.close()
+  }
+})
