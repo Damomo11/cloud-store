@@ -286,7 +286,11 @@ class Warehouse {
         let progress = true
         while (progress && this.bot.inventory.items().length) {
           progress = false
-          const items = [...this.bot.inventory.items()]
+          // The bot inventory snapshot can lag behind the open window after a
+          // shift-click. Use the window's live player-inventory slots so a
+          // moved item is not clicked again through its stale slot number.
+          const items = this.currentDepositItemsFromContainer(container)
+          if (!items.length) break
           for (const item of items) {
             const moved = await this.tryDepositInto(container, item)
             if (moved > 0) {
@@ -410,6 +414,18 @@ class Warehouse {
     return map
   }
 
+  currentDepositItemsFromContainer (container) {
+    const items = []
+    const start = Number(container?.inventoryStart)
+    const end = Number(container?.inventoryEnd)
+    if (!Array.isArray(container?.slots) || !Number.isInteger(start) || !Number.isInteger(end)) return items
+    for (let slot = start; slot < end; slot++) {
+      const item = container.slots[slot]
+      if (item) items.push({ ...item, windowSlot: slot })
+    }
+    return items
+  }
+
   async tryDepositInto (container, item) {
     const normalized = this.catalog.fromPrismarineItem(item)
     const free = this.containerFreeSpaceFor(container, normalized.itemKey, item)
@@ -418,7 +434,9 @@ class Warehouse {
       return 0
     }
 
-    const windowSlot = this.windowSlotFromBotInventorySlot(container, item.slot)
+    const windowSlot = Number.isInteger(item.windowSlot)
+      ? item.windowSlot
+      : this.windowSlotFromBotInventorySlot(container, item.slot)
     if (windowSlot === null) return 0
     const sourceWindowItem = container.slots?.[windowSlot] || null
     if (!sourceWindowItem) {
