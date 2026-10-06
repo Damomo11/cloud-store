@@ -20,6 +20,7 @@ class CloudStoreService {
     this.active = null
     this.deathContext = null
     this.recoveringFromDeath = false
+    this.emergencyRescueActive = false
     this.seenMessages = new Map()
     this.webAuth = null
     this.accountedResidual = new Map()
@@ -370,6 +371,22 @@ class CloudStoreService {
     const commandMessage = this.normalizePrivateCommandText(message, source)
     const normalizedCommand = this.normalizeCommandText(commandMessage)
     if (!normalizedCommand.startsWith('!')) return
+
+    // 急救必须绕过普通任务队列：它需要立即打断当前 bot 的任务。
+    if (normalizedCommand === '!急救') {
+      if (context.channel !== 'private' && !this.isPrivateSource(context.source || source)) {
+        return
+      }
+      if (!this.isAdmin(username)) {
+        this.msg(username, '你没有权限使用急救命令。')
+        return
+      }
+      this.handleEmergencyRescue(username).catch(error => {
+        console.error(`[emergency-rescue:${this.botId}] failed:`, error)
+        this.msg(username, `急救失败：${error.message}`)
+      })
+      return
+    }
     // 玩家输入记录：原样保留玩家怎么输入的（公屏/私聊渠道、原始文本），
     // 后续是受理还是被去重/繁忙拦截，也挂在同一个 command trace 上。
     const inputTrace = startTrace({
@@ -754,6 +771,40 @@ class CloudStoreService {
     if (text.startsWith('!取物品') || text.startsWith('!取')) {
       const owner = this.defaultStorageOwnerForPlayer(this.getPlayer(username))
       await this.enqueueTask(username, 'withdraw', worker => worker.handleWithdraw(username, text, owner), taskOptions)
+    }
+  }
+
+  async handleEmergencyRescue (username) {
+    if (this.emergencyRescueActive) return false
+    this.emergencyRescueActive = true
+    try {
+      const cancelledQueued = this.taskPool?.cancelQueuedForWorker(this, 'emergency rescue') || 0
+      if (cancelledQueued && this.config.debug) {
+        console.log(`[emergency-rescue:${this.botId}] cancelled queued tasks=${cancelledQueued}`)
+      }
+
+      if (this.active) {
+        this.active.cancelled = true
+        this.active.emergency = true
+      }
+      this.bot.pathfinder?.stop()
+      this.bot.clearControlStates?.()
+      if (this.bot.currentWindow) this.bot.closeWindow(this.bot.currentWindow)
+
+      const arrived = await this.teleportToPlayer(username, { ignoreCancellation: true })
+      if (!arrived) return false
+
+      const held = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
+      if (!held.length) {
+        this.msg(username, '急救完成：机器人背包为空。')
+        return true
+      }
+      const dropped = await this.dropWithdrawItemsToPlayer(username, held)
+      this.msg(username, `急救完成：已丢出${this.formatDepositSummary(dropped.length ? dropped : held)}。`)
+      return true
+    } finally {
+      this.emergencyRescueActive = false
+      this.taskPool?.dispatch()
     }
   }
 
@@ -3439,7 +3490,7 @@ class CloudStoreService {
     }
     this.bot.chat(commandTemplate.replace('{player}', username))
 
-    const ok = await this.waitForPlayerNearby(username, timeoutMs, radius)
+    const ok = await this.waitForPlayerNearby(username, timeoutMs, radius, options)
     if (ok) {
       if (this.config.debug) console.log(`[teleport] arrived near ${username}`)
       await sleep(this.config.timing.postTeleportWaitMs || 500)
@@ -3451,13 +3502,13 @@ class CloudStoreService {
     return false
   }
 
-  async waitForPlayerNearby (username, timeoutMs, radius) {
+  async waitForPlayerNearby (username, timeoutMs, radius, options = {}) {
     const startedAt = Date.now()
     const startPos = this.bot.entity?.position?.clone()
     let movedLogged = false
 
     while (Date.now() - startedAt < timeoutMs) {
-      if (this.isActiveCancelled()) return false
+      if (!options.ignoreCancellation && this.isActiveCancelled()) return false
 
       const entity = this.bot.players[username]?.entity
       const botPos = this.bot.entity?.position

@@ -36,6 +36,18 @@ class BotTaskPool {
     this.workers.delete(service)
   }
 
+  cancelQueuedForWorker (worker) {
+    const cancelled = []
+    this.queue = this.queue.filter(task => {
+      if (task.stickyWorker !== worker) return true
+      cancelled.push(task)
+      task.resolve?.(null)
+      return false
+    })
+    if (cancelled.length) this.dispatch()
+    return cancelled.length
+  }
+
   acceptIncoming (username, message, source = '') {
     if (!String(message || '').trim().startsWith('!')) return true
     const now = Date.now()
@@ -69,9 +81,9 @@ class BotTaskPool {
     // 私聊进来的业务任务绑定接收私信的机器人；该机器人掉线后退回任意空闲机器人，避免任务卡死。
     if (task.stickyWorker && this.workers.has(task.stickyWorker)) {
       const sticky = task.stickyWorker
-      return sticky.ready && !sticky.active && !sticky.recoveringFromDeath ? sticky : null
+      return sticky.ready && !sticky.active && !sticky.recoveringFromDeath && !sticky.emergencyRescueActive ? sticky : null
     }
-    return [...this.workers].find(candidate => candidate.ready && !candidate.active && !candidate.recoveringFromDeath) || null
+    return [...this.workers].find(candidate => candidate.ready && !candidate.active && !candidate.recoveringFromDeath && !candidate.emergencyRescueActive) || null
   }
 
   snapshot () {
