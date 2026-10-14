@@ -239,7 +239,9 @@ class ItemCatalog {
       ? { ...meta, metadata: this.normalizeItemMetadata(meta.metadata) }
       : meta
     const base = this.isShulkerBox(itemId) ? this.normalizeShulkerMetaForFingerprint(canonicalMeta) : canonicalMeta
-    return this.sortMetaComponentsForFingerprint(this.stripVolatileMetaForFingerprint(itemId, base))
+    const stripped = this.stripVolatileMetaForFingerprint(itemId, base)
+    if (this.isNoteBlock(itemId)) return this.canonicalNoteBlockMetaForFingerprint(stripped)
+    return this.sortMetaComponentsForFingerprint(stripped)
   }
 
   normalizeItemMetadata (metadata) {
@@ -258,6 +260,8 @@ class ItemCatalog {
     let stripped = meta
     if (this.shouldIgnoreCraftEngineNetworkData(itemId) || isShitHat) {
       stripped = this.omitObjectKeyDeep(stripped, 'craftengine:network_data')
+      stripped = this.omitObjectKeyDeep(stripped, 'craftengine:network_modifiers')
+      stripped = this.sortBlockStatePropertiesDeep(stripped)
       if (Array.isArray(stripped?.components)) {
         stripped = {
           ...stripped,
@@ -290,6 +294,64 @@ class ItemCatalog {
     return normalized === 'minecraft:string' ||
       normalized === 'minecraft:tripwire_hook' ||
       normalized === 'minecraft:note_block'
+  }
+
+  isNoteBlock (itemId) {
+    return this.normalizeItemId(itemId) === 'minecraft:note_block'
+  }
+
+  // 音符盒：CraftEngine mod 会附加波动的 craftengine:network_data /
+  // craftengine:network_modifiers 自定义数据，且 block_state 属性列表顺序
+  // 不稳定。库存中的音符盒 block_state 恒为默认值（note=0 harp false），
+  // 故指纹固定用该默认 block_state，与历史键 f17058…完全一致。
+  canonicalNoteBlockMetaForFingerprint (meta) {
+    const components = Array.isArray(meta?.components) ? meta.components : []
+    const nonBlockState = components.filter(component => component?.type !== 'block_state')
+    const blockState = components.find(component => component?.type === 'block_state')
+    const properties = Array.isArray(blockState?.data?.properties) ? blockState.data.properties : []
+    const props = Object.create(null)
+    for (const prop of properties) {
+      if (prop && typeof prop === 'object' && prop.name !== undefined) props[prop.name] = prop.value
+    }
+    // 属性顺序必须是历史 f17058 的原始顺序（powered,instrument,note），不能排序。
+    const canonicalProperties = [
+      { name: 'powered', value: this.noteBlockPropValue(props, 'powered', 'false') },
+      { name: 'instrument', value: this.noteBlockPropValue(props, 'instrument', 'harp') },
+      { name: 'note', value: this.noteBlockPropValue(props, 'note', '0') }
+    ]
+    const canonicalComponents = [...nonBlockState, {
+      data: { properties: canonicalProperties },
+      type: 'block_state'
+    }]
+    return {
+      ...meta,
+      components: canonicalComponents
+    }
+  }
+
+  noteBlockPropValue (props, name, fallback) {
+    const value = props[name]
+    const text = value === undefined || value === null ? fallback : String(value)
+    return text
+  }
+
+  // CraftEngine 服务器发来的 block_state 属性列表顺序不稳定（同一物品不同来源
+  // 顺序不同，见音符盒 e478987/f17058 两种排列）。craftengine 忽略路径内的物品
+  // 属性顺序无业务含义，统一排序使指纹稳定；注意历史指纹依赖保持原顺序的
+  // 排列（f17058…为 powered,instrument,note），因此这里排序必须产生与历史
+  // f17058 相同的序列化结果——见 note-block-canonicalization 测试。
+  sortBlockStatePropertiesDeep (value) {
+    if (Array.isArray(value)) return value.map(item => this.sortBlockStatePropertiesDeep(item))
+    if (!value || typeof value !== 'object') return value
+    const result = {}
+    for (const [key, child] of Object.entries(value)) {
+      if (key === 'properties' && Array.isArray(child) && child.every(item => item && typeof item === 'object' && !Array.isArray(item))) {
+        result[key] = [...child].sort((a, b) => this.compareFingerprintValues(a, b))
+      } else {
+        result[key] = this.sortBlockStatePropertiesDeep(child)
+      }
+    }
+    return result
   }
 
   isShitHatMeta (meta) {
