@@ -19,6 +19,7 @@ const {
   microsoftAuthRetryDelayMs
 } = require('./authCache')
 const { installFatalProtocolPacketCapture, isFatalProtocolReadError, releaseBotConnection, terminateBotTransport } = require('./botConnection')
+const { installClientTickEndPatch } = require('./tickEndPatch')
 const { logLocalError } = require('./localErrorLog')
 const { configureTraceLog } = require('./traceLog')
 
@@ -274,6 +275,7 @@ function launchBot (state) {
   const protocolPacketCapture = installFatalProtocolPacketCapture(bot, {
     directory: path.resolve(process.cwd(), 'logs')
   })
+  const uninstallTickEndPatch = installClientTickEndPatch(bot)
   let loggedIn = false
   let spawned = false
   let lastDisconnectReason = ''
@@ -437,6 +439,7 @@ function launchBot (state) {
 
   bot.on('end', () => {
     clearInterval(loginWatchdog)
+    uninstallTickEndPatch?.()
     console.log(`[login:${state.account.botName}] Bot disconnected${lastDisconnectReason ? `: ${lastDisconnectReason}` : ''}`)
     if (!releaseBotConnection(state, bot, service, taskPool, 'connection ended', { terminate: false })) return
     state.status = state.desiredEnabled ? 'offline' : (state.removeAfterStop ? 'removed' : 'disabled')
