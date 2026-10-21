@@ -1,6 +1,7 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const Warehouse = require('../src/warehouse')
+const Vec3 = require('vec3')
 const { DEFAULT_CONFIG } = require('../src/config')
 
 function createWarehouse (bot) {
@@ -121,12 +122,16 @@ test('tryWithdrawExactFrom re-takes a shortfall in the next pass', async () => {
 
 function createDropBot () {
   const slots = {}
+  const lookAtCalls = []
   const bot = {
-    players: {},
+    // 丢前瞄准需要玩家实体；默认摆在脚底坐标 (10, 64, 10)。
+    players: { Player: { entity: { position: new Vec3(10, 64, 10) } } },
     currentWindow: null,
     inventory: { items: () => Object.values(slots).filter(Boolean) },
-    clickWindow: async () => {}
+    clickWindow: async () => {},
+    lookAt: async target => { lookAtCalls.push(target) }
   }
+  bot.lookAtCalls = lookAtCalls
   return { bot, slots }
 }
 
@@ -207,4 +212,39 @@ test('dropItemsToPlayer never reports more than actually left the inventory', as
 
   assert.deepEqual(dropped, [])
   assert.equal(slots[36].count, 64)
+})
+
+test('dropItemsToPlayer aims at the player feet, not the torso', async () => {
+  const { bot, slots } = createDropBot()
+  slots[36] = { name: 'stone', count: 10, slot: 36, itemKey: 'k' }
+  const warehouse = createWarehouse(bot)
+  wireDropClicks(bot, slots)
+
+  await warehouse.dropItemsToPlayer('Player', [
+    { itemKey: 'k', itemId: 'minecraft:stone', displayName: '石头', amount: 5 }
+  ])
+
+  assert.equal(bot.lookAtCalls.length > 0, true)
+  const aimed = bot.lookAtCalls[0]
+  assert.equal(aimed.x, 10)
+  assert.equal(aimed.y, 64, '瞄准点必须是脚底坐标，不能抬高')
+  assert.equal(aimed.z, 10)
+})
+
+test('dropItemsToPlayer fails loudly instead of dropping at a stale angle', async () => {
+  const { bot, slots } = createDropBot()
+  slots[36] = { name: 'stone', count: 10, slot: 36, itemKey: 'k' }
+  const warehouse = createWarehouse(bot)
+  let clicks = 0
+  bot.clickWindow = async () => { clicks++ }
+  delete bot.players.Player
+
+  await assert.rejects(
+    warehouse.dropItemsToPlayer('Player', [
+      { itemKey: 'k', itemId: 'minecraft:stone', displayName: '石头', amount: 5 }
+    ]),
+    /找不到玩家 Player 的实体/
+  )
+  assert.equal(clicks, 0, '瞄准失败时不能丢出任何物品')
+  assert.equal(slots[36].count, 10)
 })

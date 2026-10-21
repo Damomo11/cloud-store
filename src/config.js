@@ -55,6 +55,8 @@ const DEFAULT_CONFIG = {
     quickShulkerOpenAttempts: 3,
     barrelEmptyRereadAttempts: 3,
     withdrawMaxMissingBarrels: 5,
+    withdrawMaxUnlocatedBarrels: 12,
+    unlocatedBarrelWaitMs: 5000,
     pickupSettleMs: 3500,
     pickupStableMs: 700,
     containerSettleMs: 250,
