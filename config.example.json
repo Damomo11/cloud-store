@@ -78,7 +78,9 @@
     // Independent Bot Self-Hosting Platform URL. The cloud store only checks it when the user clicks the entry.
     "botPlatformUrl": "http://127.0.0.1:8788",
     // Local HMAC key file. Copy the same key into the Bot platform's configured key file.
-    "botPlatformSsoSecretFile": "data/bot-platform-sso.key"
+    "botPlatformSsoSecretFile": "data/bot-platform-sso.key",
+    // Terminal live-log ring buffer shown in the admin panel "运行日志" tab.
+    "consoleLogLimit": 5000
   },
 
   // Storage quota and custom warehouse limits.

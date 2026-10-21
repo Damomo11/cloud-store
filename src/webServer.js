@@ -6,6 +6,7 @@ const path = require('node:path')
 const { parseLitematicData } = require('../scripts/litematic-materials')
 const { signCloudStoreToken } = require('./botPlatformSso')
 const { logLocalError } = require('./localErrorLog')
+const { snapshotConsoleLogs, pushPanelLog, isConsoleLogBufferInstalled } = require('./consoleLogBuffer')
 
 class CloudStoreWebServer {
   constructor (db, config, serviceProvider, botManagerProvider = null, subscriptions = null) {
@@ -94,6 +95,18 @@ class CloudStoreWebServer {
       if (req.method === 'GET' && url.pathname === '/api/admin/subscription/logs') return this.sendJson(res, this.apiAdminSubscriptionLogs(session, url))
       if (req.method === 'GET' && url.pathname === '/api/admin/subscription/payments') return this.sendJson(res, this.apiAdminSubscriptionPayments(session, url))
       if (req.method === 'GET' && url.pathname === '/api/admin/bots') return this.sendJson(res, this.apiAdminBots(session))
+      if (req.method === 'GET' && url.pathname === '/api/admin/console-logs') {
+        if (!this.requireAdminQuiet(session)) return this.sendJson(res, { ok: false, error: '只有管理员可以查看运行日志。' }, 403)
+        return this.sendJson(res, this.apiAdminConsoleLogs(session, url))
+      }
+      if (req.method === 'GET' && url.pathname === '/api/admin/log-files') {
+        if (!this.requireAdminQuiet(session)) return this.sendJson(res, { ok: false, error: '只有管理员可以查看日志文件。' }, 403)
+        return this.sendJson(res, this.apiAdminLogFiles(session))
+      }
+      if (req.method === 'GET' && url.pathname === '/api/admin/log-file') {
+        if (!this.requireAdminQuiet(session)) return this.sendJson(res, { ok: false, error: '只有管理员可以查看日志文件。' }, 403)
+        return this.sendJson(res, this.apiAdminLogFile(session, url))
+      }
       if (req.method === 'POST' && url.pathname === '/api/login') {
         const body = await this.readBody(req)
         return this.sendJson(res, this.apiLogin(session, body, this.clientIp(req)))
@@ -1075,6 +1088,15 @@ class CloudStoreWebServer {
     return user
   }
 
+  requireAdminQuiet (session) {
+    try {
+      this.requireAdmin(session)
+      return true
+    } catch {
+      return false
+    }
+  }
+
   requireService () {
     const service = this.serviceProvider()
     if (!service) throw new Error('机器人还没有进入服务器，请稍后再试。')
@@ -1146,6 +1168,132 @@ class CloudStoreWebServer {
     this.requireAdmin(session)
     return { ok: true, rows: this.requireSubscriptions().listUnrecognizedPaymentLogs(url.searchParams.get('limit')) }
   }
+
+  // 终端实时日志（环形缓冲，默认 5000 条滚动）。afterSeq 增量轮询。
+  apiAdminConsoleLogs (session, url) {
+    this.requireAdmin(session)
+    const afterSeq = Number.parseInt(url.searchParams.get('afterSeq'), 10)
+    const limit = Number.parseInt(url.searchParams.get('limit'), 10)
+    const snapshot = snapshotConsoleLogs({
+      afterSeq: Number.isFinite(afterSeq) ? afterSeq : 0,
+      limit: Number.isFinite(limit) ? limit : undefined
+    })
+    return {
+      ok: true,
+      ...snapshot,
+      rows: snapshot.rows.map(row => ({
+        ...row,
+        tsLabel: this.formatTimestampMs(row.ts)
+      }))
+    }
+  }
+
+  logsDirectory () {
+    return path.resolve(process.cwd(), this.config.traceLog?.directory || 'logs')
+  }
+
+  // logs 目录下的文件清单（含大小/修改时间），按修改时间倒序。
+  apiAdminLogFiles (session) {
+    this.requireAdmin(session)
+    const directory = this.logsDirectory()
+    const rows = []
+    try {
+      for (const name of fs.readdirSync(directory)) {
+        const filePath = path.join(directory, name)
+        let stat
+        try {
+          stat = fs.statSync(filePath)
+        } catch {
+          continue
+        }
+        if (!stat.isFile()) continue
+        rows.push({
+          name,
+          sizeBytes: stat.size,
+          sizeLabel: this.formatFileSize(stat.size),
+          modifiedAtMs: stat.mtimeMs,
+          modifiedAtLabel: this.formatTimestampMs(stat.mtimeMs)
+        })
+      }
+    } catch {
+      // 目录不存在或不可读时返回空清单
+    }
+    rows.sort((a, b) => b.modifiedAtMs - a.modifiedAtMs)
+    return { ok: true, directory, rows }
+  }
+
+  formatFileSize (bytes) {
+    const size = Number(bytes) || 0
+    if (size < 1024) return `${size} B`
+    if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`
+    if (size < 1024 * 1024 * 1024) return `${(size / 1024 / 1024).toFixed(1)} MB`
+    return `${(size / 1024 / 1024 / 1024).toFixed(2)} GB`
+  }
+
+  // 只允许读取 logs 目录内的常规文件；名字里不允许路径分隔符。
+  resolveLogFile (name) {
+    const fileName = String(name || '').trim()
+    if (!fileName || fileName.includes('/') || fileName.includes('\\') || fileName.includes('\0')) {
+      throw new Error('无效的日志文件名。')
+    }
+    const directory = this.logsDirectory()
+    const filePath = path.join(directory, fileName)
+    const resolved = path.resolve(filePath)
+    if (resolved !== path.resolve(directory) && !resolved.startsWith(path.resolve(directory) + path.sep)) {
+      throw new Error('只允许读取 logs 目录内的文件。')
+    }
+    let stat
+    try {
+      stat = fs.statSync(resolved)
+    } catch {
+      throw new Error(`日志文件不存在：${fileName}`)
+    }
+    if (!stat.isFile()) throw new Error('这不是一个常规文件。')
+    return { filePath: resolved, stat }
+  }
+
+  // 查看单个日志文件内容：默认读末尾 256 KB（可调 maxBytes），带 size/offset 元数据。
+  apiAdminLogFile (session, url) {
+    this.requireAdmin(session)
+    const name = String(url.searchParams.get('name') || '').trim()
+    if (!name) throw new Error('请提供日志文件名。')
+    const { filePath, stat } = this.resolveLogFile(name)
+    const maxBytesDefault = 256 * 1024
+    const maxBytesParam = Number.parseInt(url.searchParams.get('maxBytes'), 10)
+    const maxBytes = Number.isFinite(maxBytesParam) && maxBytesParam > 0 ? Math.min(maxBytesParam, 4 * 1024 * 1024) : maxBytesDefault
+    const sizeBytes = stat.size
+    const start = Math.max(0, sizeBytes - maxBytes)
+    const truncated = start > 0
+    let text = ''
+    if (sizeBytes > 0) {
+      const fd = fs.openSync(filePath, 'r')
+      try {
+        const length = sizeBytes - start
+        const buffer = Buffer.alloc(length)
+        fs.readSync(fd, buffer, 0, length, start)
+        text = buffer.toString('utf8')
+      } finally {
+        fs.closeSync(fd)
+      }
+      if (truncated) {
+        // 从文件中部截断时丢掉第一个不完整的行
+        const firstNewline = text.indexOf('\n')
+        text = firstNewline >= 0 ? text.slice(firstNewline + 1) : text
+      }
+    }
+    return {
+      ok: true,
+      name,
+      sizeBytes,
+      sizeLabel: this.formatFileSize(sizeBytes),
+      modifiedAtMs: stat.mtimeMs,
+      modifiedAtLabel: this.formatTimestampMs(stat.mtimeMs),
+      truncated,
+      startByte: start,
+      text
+    }
+  }
+
 
   apiAdminSubscriptionPayments (session, url) {
     this.requireAdmin(session)
@@ -2956,6 +3104,30 @@ const HTML = `<!doctype html>
     th { color: var(--gold); font-weight: 700; }
     .subnav { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
     .subnav button.active { background: #2a251e; color: var(--gold); border-color: #4a3921; }
+    .admin-logs-layout { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start; }
+    @media (max-width: 1100px) { .admin-logs-layout { grid-template-columns: 1fr; } }
+    .log-console {
+      margin: 12px 0 0;
+      white-space: pre-wrap;
+      word-break: break-all;
+      font: 12px/1.5 Consolas, "Courier New", monospace;
+      color: #dcd7cd;
+      background: #0f0f11;
+      border: 1px solid #2c2c33;
+      border-radius: 8px;
+      padding: 12px;
+      max-height: 58vh;
+      overflow: auto;
+    }
+    .log-line { display: block; }
+    .log-line .log-time { color: #7d7668; margin-right: 8px; }
+    .log-line.warn .log-text { color: #e0b153; }
+    .log-line.error .log-text { color: #e07a5f; }
+    .log-file-list { display: flex; flex-direction: column; gap: 6px; max-height: 46vh; overflow: auto; margin-top: 10px; }
+    .log-file-item { display: flex; gap: 10px; align-items: center; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; cursor: pointer; }
+    .log-file-item:hover { border-color: #4a3921; background: #1b1712; }
+    .log-file-item .name { flex: 1; word-break: break-all; }
+    .log-file-item.selected { border-color: var(--gold); }
     .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 14px; }
     .stat { border: 1px solid var(--line); background: #141416; border-radius: 8px; padding: 12px; }
     .stat strong { display: block; font-size: 22px; color: var(--gold); }
@@ -3482,6 +3654,7 @@ const HTML = `<!doctype html>
           <button class="primary" data-admin-tab="transactions">交易记录</button>
           <button class="primary" data-admin-tab="commands">命令记录</button>
           <button class="primary" data-admin-tab="aliases">全局别名</button>
+          <button class="primary" data-admin-tab="logs">运行日志</button>
         </div>
         <section id="adminBots" class="hidden">
           <div class="panel" style="padding:14px;margin-bottom:14px">
@@ -3609,6 +3782,35 @@ const HTML = `<!doctype html>
           </div>
           <div id="adminAliasGrid" class="panel admin-grid-panel"></div>
           <div id="adminAliasDetail" class="panel alias-detail-panel"><p class="muted">点击上方物品图标管理全局别名。</p></div>
+        </section>
+        <section id="adminLogs" class="hidden">
+          <div class="admin-logs-layout">
+            <div class="panel" style="padding:14px">
+              <h3>终端实时日志</h3>
+              <p class="muted">机器人控制台的最新输出（环形缓冲 5000 条滚动）。每 3 秒自动刷新，可暂停。</p>
+              <div class="alias-add">
+                <button id="adminLogPause" class="primary">暂停刷新</button>
+                <button id="adminLogClear" class="primary">清屏</button>
+                <span id="adminLogStatus" class="muted"></span>
+              </div>
+              <pre id="adminLogConsole" class="log-console"></pre>
+            </div>
+            <div class="panel" style="padding:14px">
+              <h3>logs 目录文件</h3>
+              <p class="muted">点击文件查看内容（默认读末尾 256KB）。</p>
+              <div id="adminLogFileList" class="log-file-list"></div>
+              <div id="adminLogViewerWrap" class="hidden">
+                <div class="alias-add" style="margin-top:12px">
+                  <strong id="adminLogFileName"></strong>
+                  <span id="adminLogFileMeta" class="muted"></span>
+                  <button id="adminLogFileClose" class="primary">关闭</button>
+                  <button id="adminLogFileRefresh" class="primary">刷新</button>
+                  <button id="adminLogFileTail" class="primary">跟踪末尾 1MB</button>
+                </div>
+                <pre id="adminLogFileView" class="log-console"></pre>
+              </div>
+            </div>
+          </div>
         </section>
       </section>
       <p id="toast" class="toast"></p>
@@ -5170,6 +5372,77 @@ const HTML = `<!doctype html>
       return { online: '在线', connecting: '连接中', logging_in: '登录中', auth_required: '等待微软登录', draining: '任务完成后下线', offline: '离线', disabled: '已停用', starting: '启动中', removing: '删除中' }[status] || status || '未知';
     }
 
+    // ===== 管理面板：终端实时日志 + logs 文件浏览 =====
+    function adminLogTimeLabel(tsLabel) {
+      return String(tsLabel || '').slice(11) || '';
+    }
+
+    function renderAdminLogRows(rows) {
+      return rows.map(row =>
+        '<span class="log-line ' + esc(row.level) + '"><span class="log-time">' + esc(adminLogTimeLabel(row.tsLabel)) + '</span><span class="log-text">' + esc(row.text) + '</span></span>'
+      ).join('');
+    }
+
+    async function loadAdminConsoleLogs(reset) {
+      if (reset) {
+        state.adminLogAfterSeq = 0;
+        state.adminLogClearedSeq = 0;
+        $('adminLogConsole').innerHTML = '';
+      }
+      const data = await api('/api/admin/console-logs', { afterSeq: state.adminLogAfterSeq || 0 });
+      state.adminLogAfterSeq = data.nextSeq || state.adminLogAfterSeq || 0;
+      const consoleEl = $('adminLogConsole');
+      if (reset && !data.rows.length) consoleEl.innerHTML = '<span class="muted">暂无日志。</span>';
+      if (data.rows.length) {
+        if (state.adminLogClearedSeq) {
+          const fresh = data.rows.filter(row => row.seq > state.adminLogClearedSeq);
+          consoleEl.innerHTML = renderAdminLogRows(fresh);
+          state.adminLogClearedSeq = 0;
+        } else {
+          consoleEl.innerHTML += renderAdminLogRows(data.rows);
+        }
+        // 只保留最近 5000 行 DOM
+        while (consoleEl.childElementCount > 5000) consoleEl.removeChild(consoleEl.firstElementChild);
+        consoleEl.scrollTop = consoleEl.scrollHeight;
+      }
+      $('adminLogStatus').textContent = data.total + ' / ' + data.limit + ' 条缓冲' + (data.rows.length ? ' · +' + data.rows.length : '');
+    }
+
+    function startAdminLogPolling() {
+      if (state.adminLogTimer) return;
+      state.adminLogPaused = false;
+      $('adminLogPause').textContent = '暂停刷新';
+      state.adminLogTimer = setInterval(() => {
+        if (state.adminLogPaused) return;
+        loadAdminConsoleLogs(false).catch(() => {});
+      }, 3000);
+    }
+
+    function stopAdminLogPolling() {
+      if (state.adminLogTimer) { clearInterval(state.adminLogTimer); state.adminLogTimer = null; }
+    }
+
+    async function loadAdminLogFiles() {
+      const data = await api('/api/admin/log-files');
+      const listEl = $('adminLogFileList');
+      state.adminLogFiles = data.rows || [];
+      listEl.innerHTML = state.adminLogFiles.length ? state.adminLogFiles.map((row, index) =>
+        '<div class="log-file-item" data-admin-log-file="' + esc(row.name) + '"><span class="name">' + esc(row.name) + '</span><span class="muted">' + esc(row.sizeLabel) + '</span><span class="muted">' + esc(row.modifiedAtLabel) + '</span></div>'
+      ).join('') : '<p class="muted">logs 目录为空。</p>';
+    }
+
+    async function openAdminLogFile(name, maxBytes) {
+      state.adminLogFileName = name;
+      const data = await api('/api/admin/log-file', { name, maxBytes: maxBytes || state.adminLogFileMaxBytes || undefined });
+      document.querySelectorAll('[data-admin-log-file]').forEach(item => item.classList.toggle('selected', item.dataset.adminLogFile === name));
+      $('adminLogViewerWrap').classList.remove('hidden');
+      $('adminLogFileName').textContent = data.name;
+      $('adminLogFileMeta').textContent = data.sizeLabel + (data.truncated ? '（已截断，仅显示末尾 ' + Math.round((data.sizeBytes - data.startByte) / 1024) + ' KB）' : '') + ' · 修改于 ' + data.modifiedAtLabel;
+      $('adminLogFileView').textContent = data.text || '（空文件）';
+      $('adminLogFileView').scrollTop = 0;
+      state.adminLogFileMaxBytes = maxBytes || state.adminLogFileMaxBytes;
+    }
+
     async function loadAdminBots() {
       const data = await api('/api/admin/bots');
       const rows = data.rows || [];
@@ -5331,6 +5604,7 @@ const HTML = `<!doctype html>
       if (state.adminTab === 'transactions') return loadAdminTransactions();
       if (state.adminTab === 'commands') return loadAdminCommands();
       if (state.adminTab === 'aliases') return loadAdminAliases();
+      if (state.adminTab === 'logs') { await loadAdminConsoleLogs(true); await loadAdminLogFiles(); }
     }
 
     function setAdminTab(tab) {
@@ -5348,9 +5622,11 @@ const HTML = `<!doctype html>
       $('adminTransactions').classList.toggle('hidden', tab !== 'transactions');
       $('adminCommands').classList.toggle('hidden', tab !== 'commands');
       $('adminAliases').classList.toggle('hidden', tab !== 'aliases');
+      $('adminLogs').classList.toggle('hidden', tab !== 'logs');
       loadAdminCurrent().catch(error => toast(error.message));
       if (state.adminBotsTimer) { clearInterval(state.adminBotsTimer); state.adminBotsTimer = null; }
       if (tab === 'bots') state.adminBotsTimer = setInterval(() => loadAdminBots().catch(() => {}), 2000);
+      if (tab !== 'logs') stopAdminLogPolling(); else startAdminLogPolling();
     }
 
     function setView(view) {
@@ -5366,6 +5642,7 @@ const HTML = `<!doctype html>
       $('warehouseAdminView').classList.toggle('hidden', view !== 'warehouseAdmin');
       $('helpView').classList.toggle('hidden', view !== 'help');
       $('adminView').classList.toggle('hidden', view !== 'admin');
+      if (view !== 'admin') stopAdminLogPolling();
       if (view === 'transactions') loadTransactions().catch(error => toast(error.message));
       if (view === 'subscriptions') loadSubscriptions().catch(error => toast(error.message));
       if (view === 'my') loadMyCurrent().catch(error => toast(error.message));
@@ -5429,6 +5706,7 @@ const HTML = `<!doctype html>
     $('txPrev').addEventListener('click', () => { if (state.txPage > 1) state.txPage--; loadTransactions().catch(error => toast(error.message)); });
     $('txNext').addEventListener('click', () => { if (state.txPage < state.txTotalPages) state.txPage++; loadTransactions().catch(error => toast(error.message)); });
     $('adminRefresh').addEventListener('click', event => {
+      if (state.view === 'admin' && state.adminTab === 'logs') return loadAdminLogFiles().catch(error => toast(error.message));
       runButtonTask(event.currentTarget, '刷新中...', '管理数据已刷新', () => loadAdminCurrent()).catch(error => toast(error.message));
     });
     $('adminBotAdd').addEventListener('click', async event => {
@@ -5473,6 +5751,32 @@ const HTML = `<!doctype html>
     $('adminCommandPrev').addEventListener('click', () => { if ((state.adminCommandPage || 1) > 1) state.adminCommandPage--; loadAdminCommands().catch(error => toast(error.message)); });
     $('adminCommandNext').addEventListener('click', () => { if ((state.adminCommandPage || 1) < (state.adminCommandTotalPages || 1)) state.adminCommandPage++; loadAdminCommands().catch(error => toast(error.message)); });
     $('adminAliasLoad').addEventListener('click', () => loadAdminAliases().catch(error => toast(error.message)));
+    $('adminLogPause').addEventListener('click', () => {
+      state.adminLogPaused = !state.adminLogPaused;
+      $('adminLogPause').textContent = state.adminLogPaused ? '恢复刷新' : '暂停刷新';
+    });
+    $('adminLogClear').addEventListener('click', () => {
+      state.adminLogClearedSeq = state.adminLogAfterSeq || 0;
+      $('adminLogConsole').innerHTML = '<span class="muted">已清屏（不影响缓冲，新日志会继续显示）。</span>';
+    });
+    $('adminLogFileClose').addEventListener('click', () => {
+      $('adminLogViewerWrap').classList.add('hidden');
+      state.adminLogFileName = '';
+      document.querySelectorAll('[data-admin-log-file]').forEach(item => item.classList.remove('selected'));
+    });
+    $('adminLogFileRefresh').addEventListener('click', () => {
+      if (state.adminLogFileName) openAdminLogFile(state.adminLogFileName).catch(error => toast(error.message));
+    });
+    $('adminLogFileTail').addEventListener('click', () => {
+      if (state.adminLogFileName) openAdminLogFile(state.adminLogFileName, 1024 * 1024).catch(error => toast(error.message));
+    });
+    document.addEventListener('click', event => {
+      const logFileItem = event.target.closest('[data-admin-log-file]');
+      if (logFileItem) {
+        state.adminLogFileMaxBytes = 256 * 1024;
+        openAdminLogFile(logFileItem.dataset.adminLogFile).catch(error => toast(error.message));
+      }
+    });
     $('adminQuotaLoad').addEventListener('click', () => loadAdminQuotas().catch(error => toast(error.message)));
     $('subscriptionRefresh').addEventListener('click', () => loadSubscriptions().catch(error => toast(error.message)));
     $('sidebarSubscription').addEventListener('click', () => setView('subscriptions'));

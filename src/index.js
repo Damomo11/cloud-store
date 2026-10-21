@@ -22,6 +22,7 @@ const { installFatalProtocolPacketCapture, isFatalProtocolReadError, releaseBotC
 const { installClientTickEndPatch } = require('./tickEndPatch')
 const { logLocalError } = require('./localErrorLog')
 const { configureTraceLog } = require('./traceLog')
+const { installConsoleLogBuffer } = require('./consoleLogBuffer')
 
 function createBot (config, onMsaCode) {
   const options = {
@@ -83,6 +84,7 @@ function isSocketDisconnectError (error) {
 }
 
 const config = loadConfig(path.resolve(process.cwd(), 'config.json'), { autoUpdate: true })
+installConsoleLogBuffer({ limit: config.web?.consoleLogLimit })
 configureTraceLog(config.traceLog)
 const db = new StoreDb(path.resolve(process.cwd(), 'data', 'cloud-store.sqlite'), config)
 const subscriptions = new SubscriptionManager(db, config)
