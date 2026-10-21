@@ -155,6 +155,17 @@
     // as missing.
     "withdrawMaxMissingBarrels": 5,
 
+    // When the ledger has stock but no barrel slot records at all, the bot opens
+    // registered barrels one by one looking for the item and refreshes each barrel's
+    // record from what it actually reads. This caps how many barrels are opened
+    // this way. 0 restores the old behavior (fail immediately without searching).
+    "withdrawMaxUnlocatedBarrels": 12,
+
+    // Per-barrel wait when searching barrels that have no slot record. The search
+    // ends the wait as soon as the container contents arrive; if nothing arrives
+    // within this time the barrel is treated as empty and the search moves on.
+    "unlocatedBarrelWaitMs": 5000,
+
     "pickupSettleMs": 3500,
     "pickupStableMs": 700,
     "containerSettleMs": 250,

@@ -532,6 +532,7 @@ class Warehouse {
     const withdrawn = []
     const missing = []
     const unlocated = []
+    let searchedUnlocatedBarrels = 0
 
     for (const allocation of allocations) {
       if (allocation.withdrawMode === 'shulker_extract') {
@@ -556,14 +557,28 @@ class Warehouse {
       }
 
       const slots = this.db.listSlotsForItemKey(allocation.itemKey)
-      const chestGroups = this.groupSlotsForWithdrawal(slots)
+      let chestGroups = this.groupSlotsForWithdrawal(slots)
       this.debug(`withdraw plan ${itemInfo.displayName || allocation.itemKey} need=${allocation.amount} chests=${chestGroups.map(group => `${group.chestId}:${group.recordedAmount}`).join(' | ') || 'none'}`)
 
-      // 账本有量但一个槽位记录都没有（物品被人工移动/记录漂移）：登记库存异常并计入 unlocated，
-      // 上层据此跳过"就地核对重试"——没有位置记录就无桶可核对，重试必然无效。
+      // 账本有量但一个槽位记录都没有（物品被人工移动/记录漂移）：登记库存异常，
+      // 但不再直接判死——按距离由近到远打开已登记木桶现场找货，
+      // 读到什么就用实测内容刷新该桶记录，凑够或搜完为止。
+      let searchBarrels = false
       if (!chestGroups.length) {
         this.reportMissingLooseRecord(allocation, itemInfo)
         unlocated.push({ ...itemInfo, amount: allocation.amount })
+        chestGroups = this.buildUnlocatedSearchGroups()
+        searchBarrels = chestGroups.length > 0
+        this.trace('plan', 'unlocated_search_start', {
+          item: itemInfo.displayName || allocation.itemKey,
+          keyTail: shortKey(allocation.itemKey),
+          need: allocation.amount,
+          candidates: chestGroups.length,
+          limit: this.unlocatedSearchLimit(),
+          decision: searchBarrels
+            ? `账本有库存但无位置记录，按距离由近到远最多打开 ${this.unlocatedSearchLimit()} 个木桶现场找货`
+            : '账本有库存但无位置记录，且没有可搜索的木桶'
+        })
       }
 
       // 链路日志：这次要取什么、账本说这些货放在哪些木桶。
@@ -588,8 +603,30 @@ class Warehouse {
       // 账实相符的桶不计数。
       let missingBarrelHops = 0
       const maxMissingBarrels = Math.max(1, Number(this.config.timing?.withdrawMaxMissingBarrels ?? 5))
+      let searchedBarrels = 0
+      let refusedBarrels = 0
+      let emptyBarrels = 0
+      let timeoutBarrels = 0
       for (const group of chestGroups) {
         if (remaining <= 0) break
+        if (searchBarrels) {
+          // 无记录搜索：额度独立于缺货换桶，按单桶 5 秒上限逐个开。
+          if (searchedBarrels >= this.unlocatedSearchLimit()) break
+          searchedBarrels++
+          searchedUnlocatedBarrels++
+          const result = await this.searchUnlocatedBarrel(group, allocation, itemInfo, remaining)
+          if (result.refused || result.empty || result.timeout) {
+            if (result.refused) refusedBarrels++
+            else if (result.empty) emptyBarrels++
+            else timeoutBarrels++
+            continue
+          }
+          if (result.moved > 0) {
+            withdrawn.push({ ...itemInfo, amount: result.moved })
+            remaining -= result.moved
+          }
+          continue
+        }
         if (missingBarrelHops >= maxMissingBarrels) {
           this.debug(`withdraw ${itemInfo.displayName || allocation.itemKey} 缺货换桶已达上限 ${missingBarrelHops}/${maxMissingBarrels}，停止继续找桶，剩余计入缺失`)
           this.trace('decision', 'barrel_hops_exhausted', {
@@ -728,6 +765,19 @@ class Warehouse {
       }
 
       if (remaining > 0) {
+        if (searchBarrels) {
+          this.trace('decision', 'unlocated_search_exhausted', {
+            item: itemInfo.displayName || allocation.itemKey,
+            keyTail: shortKey(allocation.itemKey),
+            searched: searchedBarrels,
+            limit: this.unlocatedSearchLimit(),
+            refusedCount: refusedBarrels,
+            emptyCount: emptyBarrels,
+            timeoutCount: timeoutBarrels,
+            remaining,
+            decision: `已打开 ${searchedBarrels} 个木桶仍未凑够，剩余 ${remaining} 计入缺失`
+          })
+        }
         this.trace('result', 'allocate_missing', {
           item: itemInfo.displayName || allocation.itemKey,
           keyTail: shortKey(allocation.itemKey),
@@ -741,7 +791,152 @@ class Warehouse {
     return {
       withdrawn: this.mergeItems(withdrawn),
       missing: this.mergeItems(missing),
-      unlocated: this.mergeItems(unlocated)
+      unlocated: this.mergeItems(unlocated),
+      searchedUnlocatedBarrels
+    }
+  }
+
+  // 无记录搜索的桶数上限。0 表示不搜，回到旧的"直接判定找不到位置"行为。
+  unlocatedSearchLimit () {
+    const raw = Number(this.config.timing?.withdrawMaxUnlocatedBarrels ?? 12)
+    return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 0
+  }
+
+  // 账本没有槽位记录时的候选桶：取已登记的完整木桶列表，按距离 bot /home 落点
+  // 由近到远排序，近的先搜、凑够就停。
+  buildUnlocatedSearchGroups () {
+    const limit = this.unlocatedSearchLimit()
+    if (!limit) return []
+    let chests = []
+    try {
+      chests = this.db.listChests() || []
+    } catch (error) {
+      this.debug(`list chests for unlocated search failed: ${error?.message || error}`)
+      return []
+    }
+    const origin = this.homePosition || this.bot.entity?.position
+    const distanceOf = chest => {
+      if (!origin) return 0
+      const dx = Number(chest.x) - origin.x
+      const dy = Number(chest.y) - origin.y
+      const dz = Number(chest.z) - origin.z
+      return (dx * dx) + (dy * dy) + (dz * dz)
+    }
+    return chests
+      .map(chest => ({ chest, distance: distanceOf(chest) }))
+      .sort((a, b) => a.distance - b.distance || String(a.chest.chestId).localeCompare(String(b.chest.chestId)))
+      .slice(0, limit)
+      .map(({ chest }) => ({
+        chestId: chest.chestId,
+        // 没有账本记录，不能假装是 0 个——用 null 表示"未知"，
+        // 避免下游把它当成"账本说这个桶是空的"。
+        recordedAmount: null,
+        unknown: true,
+        slots: [{ x: chest.x, y: chest.y, z: chest.z, blockName: chest.blockName }]
+      }))
+  }
+
+  // 搜一个没有槽位记录的木桶：单次尝试、最多等 unlocatedBarrelWaitMs，
+  // 容器内容一到就结束等待并继续后续动作。
+  // 返回 { refused } / { empty } / { timeout } / { moved, contents }。
+  async searchUnlocatedBarrel (group, allocation, itemInfo, remaining) {
+    const slot = group.slots[0]
+    const chest = { chestId: group.chestId, x: slot.x, y: slot.y, z: slot.z, blockName: slot.blockName }
+    const waitMs = Math.max(500, Number(this.config.timing?.unlocatedBarrelWaitMs ?? 5000))
+    const startedAt = Date.now()
+
+    this.trace('locate', 'unlocated_search_chest', {
+      item: itemInfo.displayName || allocation.itemKey,
+      chest: this.describeChest(chest),
+      chestId: chest.chestId,
+      need: remaining,
+      waitMs
+    })
+
+    const block = this.bot.blockAt(new Vec3(chest.x, chest.y, chest.z))
+    if (!block || !this.chestNames.has(block.name)) {
+      // 桶被拆掉或换成了别的方块：跳过这个坐标，继续下一个。
+      this.trace('decision', 'unlocated_search_not_barrel', {
+        chest: this.describeChest(chest),
+        actualBlock: block?.name || 'none',
+        decision: '该坐标不是可打开的木桶，跳过继续搜索'
+      })
+      return { refused: false, empty: true, timeout: false, moved: 0, notBarrel: true }
+    }
+
+    let container = null
+    try {
+      container = await this.openContainerBlock(block, waitMs)
+    } catch (error) {
+      if (error?.code === 'FATAL_PROTOCOL_READ' || this.connectionAbortController.signal.aborted) throw error
+      if (error?.openResult === 'refused') {
+        // 只收到 close_window：服务器拒绝了这次开箱，和桶里有多少东西无关，
+        // 不能当成空桶去写记录。
+        this.trace('open', 'unlocated_search_open_refused', {
+          chest: this.describeChest(chest),
+          message: error.message,
+          decision: '只收到 close_window，服务器拒绝开箱，不计空桶、不写记录，继续下一个'
+        })
+        this.closeLingeringWindow()
+        return { refused: true, empty: false, timeout: false, moved: 0 }
+      }
+      this.trace('open', 'unlocated_search_open_timeout', {
+        chest: this.describeChest(chest),
+        waitedMs: Date.now() - startedAt,
+        message: error?.message || String(error),
+        decision: '等待容器内容超时，按约定认定该木桶为空，继续下一个'
+      })
+      this.closeLingeringWindow()
+      return { refused: false, empty: false, timeout: true, moved: 0 }
+    }
+
+    if (!container) {
+      this.trace('open', 'unlocated_search_open_timeout', {
+        chest: this.describeChest(chest),
+        waitedMs: Date.now() - startedAt,
+        decision: '没有拿到容器窗口，按约定认定该木桶为空，继续下一个'
+      })
+      this.closeLingeringWindow()
+      return { refused: false, empty: false, timeout: true, moved: 0 }
+    }
+
+    try {
+      const contents = this.containerContentItems(container)
+      if (!contents.length) {
+        // 拿到了窗口但内容为空：真空桶。保留原记录，不做空读重读（省时间）。
+        this.trace('decision', 'unlocated_search_empty_barrel', {
+          chest: this.describeChest(chest),
+          decision: '木桶实测为空，保留原记录跳过'
+        })
+        return { refused: false, empty: true, timeout: false, moved: 0 }
+      }
+
+      const available = this.countContainerItem(container, allocation.itemKey)
+      const toTake = Math.min(remaining, available)
+      let moved = 0
+      if (toTake > 0) {
+        moved = await this.tryWithdrawExactFrom(container, allocation.itemKey, toTake)
+        await sleep(Math.max(0, Number(this.config.timing.containerSettleMs ?? 250)))
+        this.trace('take', 'unlocated_search_take', {
+          chest: this.describeChest(chest),
+          planned: toTake,
+          moved,
+          remaining: remaining - moved,
+          contents: this.snapshotContainerContents(container),
+          decision: `搜到目标物品 ${available} 个，本次取 ${moved} 个`
+        })
+      }
+
+      // 读到可信内容就按实测刷新该桶记录（先取后刷，写入的是取完后的真实剩余量）。
+      this.refreshChestSnapshot(chest, container)
+      this.trace('record', 'unlocated_search_refresh', {
+        chest: this.describeChest(chest),
+        contents: this.snapshotContainerContents(container),
+        decision: '已用实测内容刷新该木桶的本地槽位记录'
+      })
+      return { refused: false, empty: false, timeout: false, moved }
+    } finally {
+      this.closeContainerQuietly(container)
     }
   }
 
@@ -2416,6 +2611,9 @@ class Warehouse {
     const failure = new Error(errors.join(' ; '))
     // 全部候选方块都只是超时或空窗口（而非协议错误等）时，允许上层关窗后重试。
     failure.allOpenTimeouts = errors.every(message => message.includes('打开箱子超时') || message.includes('没有收到窗口'))
+    // 失败原因打标，供搜桶分流：refused 表示服务器只发了 close_window、
+    // 明确拒绝了这次开箱，与桶里实际有多少东西无关，不能当成空桶。
+    failure.openResult = errors.every(message => message.includes('没有收到窗口')) ? 'refused' : 'timeout'
     throw failure
   }
 
@@ -2915,11 +3113,13 @@ class Warehouse {
     return Math.max(0, before - this.inventoryCountByItemKey(itemKey))
   }
 
-  async lookAtPlayer (username, yOffset = 1.4) {
+  // 丢前瞄准默认对准玩家身体底部中心（脚底坐标）。高瞄点会让丢出方向偏上，
+  // 玩家站在台阶、半砖、船等矮位时物品落点会漂。
+  async lookAtPlayer (username, yOffset = 0) {
     const entity = this.bot.players[username]?.entity
     if (!entity) {
-      this.debug(`cannot look at player ${username}: entity not found`)
-      return
+      // 不能静默返回：调用方会按上一次视线丢出物品，等于丢歪。
+      throw new Error(`丢前瞄准失败：找不到玩家 ${username} 的实体（区块可能尚未加载）`)
     }
     const target = entity.position.offset(0, yOffset, 0)
     await this.bot.lookAt(target, true)

@@ -1358,21 +1358,24 @@ class CloudStoreService {
 
     let deliveredTotal = this.mergeItems(attempt.allDeducted)
     if (!deliveredTotal.length) {
-      // 缺失物品全部没有木桶位置记录（有账无物）：就地核对重试必然无效，
-      // 直接失败并提示管理员对账；warehouse 侧已登记库存异常供 Web 管理页展示。
+      // 缺失物品全部没有木桶位置记录（有账无物）：warehouse 已按距离逐个打开
+      // 已登记木桶现场找过并刷新了记录，这里不再做无效的就地核对重试。
+      // 残余物品不入库，留给后续任务的 flushResidual / 任务收尾统一处理。
       const unlocatedKeys = new Set((attempt.allUnlocated || []).map(item => item.itemKey))
       const missingItems = attempt.allMissing || []
       if (missingItems.length && missingItems.every(item => unlocatedKeys.has(item.itemKey))) {
+        const searchedBarrels = Number(attempt.searchedUnlocatedBarrels) || 0
         traceEvent(trace, 'decision', 'skip_retry_unlocated', {
           missing: missingItems.map(item => ({ name: item.displayName || item.itemId, amount: item.amount, keyTail: shortKey(item.itemKey) })),
-          decision: '缺失物品全部没有位置记录：跳过就地核对重试，提示管理员 !同步 对账'
+          searchedBarrels,
+          decision: '缺失物品全部没有位置记录：已现场搜桶并刷新记录，跳过就地核对重试，残余不入库'
         })
         await this.warehouse.goHome({ requireWarehouse: true })
-        const returned = await this.warehouse.depositInventoryWithoutBalance('withdraw_failed_return', `owner=${storageOwner.uuid}, actor=${username}`)
-        if (returned.leftover.length) {
-          msgActor(`机器人身上仍有未能放回仓库的物品：${this.formatItemList(returned.leftover)}`)
+        const held = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
+        if (held.length) {
+          msgActor(`机器人身上保留着 ${held.length} 种物品，将在后续任务开始前统一回仓。`)
         }
-        msgActor(`账本有库存，但仓库木桶里找不到实物位置（可能被人工移动或账实漂移）：${this.formatItemList(missingItems)}。已登记库存异常，请管理员执行 !同步 对账后再试。`)
+        msgActor(`账本有库存，但已逐个打开 ${searchedBarrels} 个木桶仍找不到实物：${this.formatItemList(missingItems)}。已登记库存异常，请管理员执行 !同步 对账后再试。`)
         this.db.clearRecoveryTask(this.botId)
         return { status: 'failed_no_location', delivered: [], missing: this.mergeItems(missingItems) }
       }
@@ -1451,6 +1454,7 @@ class CloudStoreService {
     const allDeducted = []
     const allMissing = []
     const allUnlocated = []
+    let searchedUnlocatedBarrels = 0
     let stayedWithPlayerForDeposit = false
     let cancelled = false
     let aborted = false
@@ -1485,6 +1489,7 @@ class CloudStoreService {
       })
       if (physical.missing?.length) allMissing.push(...physical.missing)
       if (physical.unlocated?.length) allUnlocated.push(...physical.unlocated)
+      searchedUnlocatedBarrels += Number(physical.searchedUnlocatedBarrels) || 0
       if (this.isActiveCancelled()) {
         cancelled = true
         break
@@ -1597,7 +1602,7 @@ class CloudStoreService {
       }
     }
 
-    return { allWithdrawn, allDeducted, allMissing, allUnlocated, stayedWithPlayerForDeposit, cancelled, aborted }
+    return { allWithdrawn, allDeducted, allMissing, allUnlocated, searchedUnlocatedBarrels, stayedWithPlayerForDeposit, cancelled, aborted }
   }
 
   async dropWithdrawItemsToPlayer (username, requestedItems) {
@@ -3493,12 +3498,30 @@ class CloudStoreService {
     const ok = await this.waitForPlayerNearby(username, timeoutMs, radius, options)
     if (ok) {
       if (this.config.debug) console.log(`[teleport] arrived near ${username}`)
-      await sleep(this.config.timing.postTeleportWaitMs || 500)
+      await this.waitForTeleportChunksReady(username, { ignoreCancellation: options.ignoreCancellation })
       return true
     }
 
     console.warn(`[teleport] /tpa ${username} timed out after ${timeoutMs}ms`)
     this.msg(username, '15秒内没有检测到你在附近，本次操作已取消；如果稍后看到这条传送请求，请不要再接受。')
+    return false
+  }
+
+  // 传送后不等区块全量加载：只要 bot 自己和目标玩家所在区块都已就绪，
+  // 就让调用方立即瞄准丢物。postTeleportWaitMs 的含义由"固定等待时长"
+  // 改为"等待上限"，超时仍继续交付（玩家已在传送检测半径内）。
+  async waitForTeleportChunksReady (username, { ignoreCancellation = false } = {}) {
+    const timeoutMs = Number(this.config.timing.postTeleportWaitMs) || 500
+    const startedAt = Date.now()
+    while (Date.now() - startedAt < timeoutMs) {
+      if (!ignoreCancellation && this.isActiveCancelled()) return false
+      const botPos = this.bot.entity?.position
+      const targetPos = this.bot.players[username]?.entity?.position
+      const botChunkReady = Boolean(botPos && this.bot.world?.getColumnAt?.(botPos))
+      const targetChunkReady = Boolean(targetPos && this.bot.world?.getColumnAt?.(targetPos))
+      if (botChunkReady && targetChunkReady) return true
+      await sleep(250)
+    }
     return false
   }
 
