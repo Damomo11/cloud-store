@@ -3315,14 +3315,17 @@ const HTML = `<!doctype html>
     @media (max-width: 1100px) { .chest-layout { grid-template-columns: 1fr; } }
     .chest-map-panel { padding: 12px; }
     .chest-map-title { font-size: 13px; color: var(--muted); margin-bottom: 8px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-    .chest-map-canvas { position: relative; width: 100%; height: 340px; background: #0f0f11; border: 1px solid #2c2c33; border-radius: 8px; overflow: hidden; cursor: crosshair; }
-    /* 3D 堆叠视图 */
-    .chest3d-canvas { position: relative; width: 100%; height: 430px; background: #0f0f11; border: 1px solid #2c2c33; border-radius: 8px; overflow: hidden; cursor: grab; touch-action: none; }
-    .chest3d-canvas:active { cursor: grabbing; }
-    .chest3d-block { position: absolute; border-radius: 4px; border: 1px solid rgba(255,255,255,.22); box-shadow: inset 0 0 10px rgba(0,0,0,.45); }
-    .chest3d-block:hover { border-color: var(--gold); }
-    .chest3d-block.selected { border-color: #fff; box-shadow: 0 0 0 2px rgba(212,175,55,.7), inset 0 0 10px rgba(0,0,0,.45); }
-    .chest3d-block[data-stacked]:not([data-topmost]) { border-style: dashed; }
+    .chest-map-canvas { position: relative; width: 100%; height: 340px; background: #0f0f11; border: 1px solid #2c2c33; border-radius: 8px; overflow: hidden; cursor: pointer; }
+    .chest-map-cell { position: absolute; border-radius: 3px; border: 1px solid rgba(255,255,255,.18); }
+    .chest-map-cell:hover { border-color: var(--gold); z-index: 3; }
+    .chest-map-cell.selected { border-color: #fff; box-shadow: 0 0 0 2px rgba(212,175,55,.65); z-index: 2; }
+    .chest-map-stack-badge {
+      position: absolute; left: 50%; top: 50%;
+      transform: translate(-50%, -50%) skewY(30deg) scaleY(1.25);
+      color: #fff; font-size: 12px; font-weight: 700;
+      text-shadow: 1px 1px 0 #000, -1px -1px 0 #000;
+      pointer-events: none; white-space: nowrap;
+    }
     .chest-list-panel { max-height: 380px; }
     .chest-list-panel table { margin: 0; }
     .chest-list-panel td, .chest-list-panel th { white-space: nowrap; }
@@ -3331,14 +3334,10 @@ const HTML = `<!doctype html>
     tr.chest-row.selected { background: #2a251e; }
     .chest-coord { font-family: Consolas, monospace; }
     .chest-detail-panel { padding: 14px; }
-    .chest-slots-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(88px, 1fr)); gap: 8px; margin-top: 10px; }
-    .chest-slot { border: 1px solid var(--line); border-radius: 8px; padding: 8px 6px; text-align: center; background: #141416; }
-    .chest-slot .slot-index { font-size: 11px; color: var(--muted); }
-    .chest-slot img { width: 32px; height: 32px; image-rendering: pixelated; }
-    .chest-slot .fallback { display: none; }
-    .chest-slot .item-name { font-size: 12px; margin-top: 4px; word-break: break-all; }
-    .chest-slot .item-amount { font-size: 13px; color: var(--gold); }
-    .chest-slot.shulker { border-color: #4a3921; background: #1b1712; }
+    .chest-slots-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(86px, 1fr)); gap: 8px; margin-top: 10px; }
+    .chest-item { width: auto; }
+    .chest-item .code { color: var(--muted); font-size: 11px; margin-top: 3px; }
+    .chest-item.chest-shulker-item { border-color: #4a3921; background: #1b1712; }
     .chest-shulker-contents { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 10px; }
     .chest-shulker-contents .shulker-entry { display: flex; gap: 8px; align-items: center; padding: 4px 0; font-size: 13px; }
     .chest-detail-head { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 6px; }
@@ -5671,243 +5670,126 @@ const HTML = `<!doctype html>
       }).join('') : '<tr><td colspan="7"><p class="muted" style="text-align:center;margin:20px 0">没有匹配的木桶。</p></td></tr>'
     }
 
-    // ===== 3D 堆叠视图 =====
-    // 木桶按真实 (x,y,z) 摆放成方块；CSS 3D 变换投影（无第三方库）。
-    // 视角：等距伪 3D（绕竖直轴旋转 yaw + 固定俯角 tilt），可拖拽旋转、滚轮缩放、
-    // 空格切层；被上层挡住的桶通过“切层”与“顶面开天窗”两种方式可见。
-    function chest3DDefaults(rows) {
-      const layers = [...new Set(rows.map(row => row.y))].sort((a, b) => a - b)
-      return {
-        layers,
-        yaw: 45,            // 绕 Y 轴旋转角（度）
-        tilt: 35,           // 俯视角（度）
-        zoom: 1,            // 缩放系数
-        // 切层模式：'' = 全部显示；数字 = 只显示该层及以下（该层顶面开天窗露出内部）
-        cutLayer: layers.length > 1 ? layers[Math.max(0, layers.length - 2)] : '',
-        minCell: 14,
-        maxCell: 44
-      }
-    }
-
+    // ===== 木桶布局示意（轻量 2.5D：斜二测平面图，无拖拽无逐帧重绘） =====
+    // 每个木桶画成一个斜方块（等距示意），Y 层错开排；同一位置上下堆叠的桶
+    // 在格子里用堆叠数标注。点击方块打开该桶的库存界面风格详情。
+    // 性能：纯 innerHTML 一次性渲染，无动画无监听循环。
     function renderAdminChestMap(data) {
       const rows = data.rows || []
       const mapWrap = document.createElement('div')
       mapWrap.innerHTML =
-        '<div class="chest-map-title"><b>3D 堆叠视图</b>' +
-        '<span class="muted">拖拽旋转 · 滚轮缩放 · 点击方块看详情</span>' +
-        '<label class="toolbar-check">切层 <select id="adminChest3DCut"></select></label>' +
-        '<button id="adminChest3DTop" class="primary" style="padding:4px 10px">正上方俯视</button>' +
-        '<button id="adminChest3DReset" class="primary" style="padding:4px 10px">复位视角</button>' +
-        '</div><div id="adminChest3DCanvas" class="chest3d-canvas"></div>' +
-        '<div id="adminChest3DHint" class="muted" style="margin-top:6px;font-size:12px"></div>'
+        '<div class="chest-map-title"><b>布局示意</b>' +
+        '<span class="muted">斜视堆叠图 · 数字=该位置叠了几个桶 · 点击看详情</span>' +
+        '<label class="toolbar-check">Y 层 <select id="adminChestMapLayer"></select></label>' +
+        '</div><div id="adminChestMapCanvas" class="chest-map-canvas"></div>' +
+        '<div id="adminChestMapHint" class="muted" style="margin-top:6px;font-size:12px"></div>'
       const canvas = $('adminChestMap')
       canvas.innerHTML = ''
       canvas.appendChild(mapWrap)
-      const canvasEl = mapWrap.querySelector('#adminChest3DCanvas')
-      const cutSelect = mapWrap.querySelector('#adminChest3DCut')
-      const hintEl = mapWrap.querySelector('#adminChest3DHint')
+      const canvasEl = mapWrap.querySelector('#adminChestMapCanvas')
+      const layerSelect = mapWrap.querySelector('#adminChestMapLayer')
+      const hintEl = mapWrap.querySelector('#adminChestMapHint')
 
       if (!rows.length) {
-        canvasEl.innerHTML = '<p class="muted" style="text-align:center;margin-top:150px">没有可显示的木桶。</p>'
+        canvasEl.innerHTML = '<p class="muted" style="text-align:center;margin-top:150px">没有匹配的木桶。</p>'
         return
       }
 
-      const view = chest3DDefaults(rows)
-      // 恢复上次的视角/切层（仅当确实存过：用 undefined 判断，避免吞掉 zoom=0 这类合法值）
-      if (state.adminChest3DYaw !== undefined) view.yaw = Number(state.adminChest3DYaw)
-      if (state.adminChest3DTilt !== undefined) view.tilt = Number(state.adminChest3DTilt)
-      if (state.adminChest3DZoom !== undefined) view.zoom = Number(state.adminChest3DZoom)
-      if (state.adminChest3DCut !== undefined) view.cutLayer = state.adminChest3DCut
-      const xs = rows.map(row => row.x), zs = rows.map(row => row.z), ys = rows.map(row => row.y)
-      const minX = Math.min(...xs), maxX = Math.max(...xs)
-      const minZ = Math.min(...zs), maxZ = Math.max(...zs)
-      const minLayer = Math.min(...ys), maxLayer = Math.max(...ys)
-      const spanX = maxX - minX + 1, spanZ = maxZ - minZ + 1
-      const spanLayers = view.layers.length || 1
-      // 画布尺寸：面板 Tab 未显示时 clientWidth/Height 为 0，用容器兜底尺寸；
-      // draw() 在每次重绘时重新读取，保证显示后再进来能算对。
-      const canvasSize = () => ({
-        w: canvasEl.clientWidth || canvasEl.parentElement?.clientWidth || 640,
-        h: canvasEl.clientHeight || 430
-      })
-
-      const stackColumns = new Map()
+      // 按位置分堆：x,z 相同的桶是一摞
+      const stacks = new Map()
       for (const row of rows) {
         const key = row.x + ',' + row.z
-        if (!stackColumns.has(key)) stackColumns.set(key, [])
-        stackColumns.get(key).push(row)
+        if (!stacks.has(key)) stacks.set(key, [])
+        stacks.get(key).push(row)
       }
-      for (const stack of stackColumns.values()) stack.sort((a, b) => a.y - b.y)
+      for (const stack of stacks.values()) stack.sort((a, b) => a.y - b.y)
+      const layers = [...new Set(rows.map(row => row.y))].sort((a, b) => a - b)
+      let currentLayer = state.adminChestMapLayer !== undefined && layers.includes(state.adminChestMapLayer)
+        ? state.adminChestMapLayer
+        : layers[layers.length - 1]
 
       const draw = () => {
-        state.adminChest3DYaw = view.yaw
-        state.adminChest3DTilt = view.tilt
-        state.adminChest3DZoom = view.zoom
-        state.adminChest3DCut = view.cutLayer
-        cutSelect.innerHTML = '<option value="">全部显示</option>' + view.layers.map(y =>
-          '<option value="' + esc(y) + '"' + (String(view.cutLayer) === String(y) ? ' selected' : '') + '>只到 Y=' + esc(y) + '（含以下）</option>').join('')
+        state.adminChestMapLayer = currentLayer
+        layerSelect.innerHTML = layers.map(y =>
+          '<option value="' + esc(y) + '"' + (y === currentLayer ? ' selected' : '') + '>Y=' + esc(y) + '</option>').join('')
+        // 该层的桶 + 每摞的堆叠信息
+        const layerRows = rows.filter(row => row.y === currentLayer)
+        const layerStacks = new Map()
+        for (const row of layerRows) {
+          const key = row.x + ',' + row.z
+          if (!layerStacks.has(key)) layerStacks.set(key, [])
+          layerStacks.get(key).push(row)
+        }
+        if (!layerRows.length) {
+          canvasEl.innerHTML = '<p class="muted" style="text-align:center;margin-top:150px">这一层没有木桶。</p>'
+          hintEl.textContent = ''
+          return
+        }
+        const xs = layerRows.map(row => row.x)
+        const zs = layerRows.map(row => row.z)
+        const minX = Math.min(...xs), maxX = Math.max(...xs)
+        const minZ = Math.min(...zs), maxZ = Math.max(...zs)
+        const spanX = maxX - minX + 1, spanZ = maxZ - minZ + 1
+        const padding = 14
+        // 等距格子：屏幕 x = (X-X0 + Z-Z0) * cellHalf, y = (Z-Z0 - (X-X0)) * cellHalf * 0.5
+        // 需要的画布宽 = (spanX + spanZ) * cellHalf，高 ≈ (spanX + spanZ) * cellHalf * 0.5 + cell
+        const availW = (canvasEl.clientWidth || 620) - padding * 2
+        const availH = (canvasEl.clientHeight || 340) - padding * 2
+        const cellHalf = Math.max(10, Math.min(30,
+          Math.min(availW / (spanX + spanZ), availH / ((spanX + spanZ) * 0.55 + 1))))
+        const cell = cellHalf * 2
+        const originX = padding + (spanZ - 1) * cellHalf + cellHalf  // 让最左的格子贴住 padding
+        const originY = padding + cellHalf * 0.5
         canvasEl.innerHTML = ''
-        let hiddenCount = 0
-        const visible = []
-        for (const row of rows) {
-          const cutted = view.cutLayer !== '' && row.y > view.cutLayer
-          if (cutted) { hiddenCount++; continue }
-          visible.push(row)
-        }
-        // 画师顺序：先画低层再画高层；同层内按屏幕深度远→近（近似 painter's algorithm：
-        // 用投影后的 depth 排序，CSS z-index 控制覆盖）
-        // cell/origin/角度在 draw 内实时计算：画布显示后尺寸会从 0 变为真实值。
-        const { w, h } = canvasSize()
-        const fit = Math.min(
-          (w - 40) / (spanX + spanZ * 0.5),
-          (h - 40) / ((spanZ * 0.8 + spanLayers * 0.9))
-        )
-        const baseCell = Math.max(view.minCell, Math.min(view.maxCell, fit))
-        const cell = baseCell * view.zoom
-        const originX = w / 2
-        const originY = h / 2
-        const yawRad = view.yaw * Math.PI / 180
-        const tiltRad = view.tilt * Math.PI / 180
-        const cosYaw = Math.cos(yawRad), sinYaw = Math.sin(yawRad)
-        const cosTilt = Math.cos(tiltRad), sinTilt = Math.sin(tiltRad)
-        const quads = []
-        for (const row of visible) {
-          const wx0 = (row.x - minX) * cell
-          const wz0 = (row.z - minZ) * cell
-          const layerIndex = view.layers.indexOf(row.y)
-          const wy = layerIndex * cell * 1.05
-          const quad = projectQuad(wx0, wz0, wy, cell, cosYaw, sinYaw, cosTilt, sinTilt, originX, originY)
-          quad.row = row
-          quads.push(quad)
-        }
-        quads.sort((a, b) => a.depth - b.depth)
-        for (const quad of quads) {
+        // 画格：先画远处（x 大 z 小），后画近处，让近处格子盖住远处，形成斜视遮挡关系
+        const sorted = layerRows.slice().sort((a, b) => (b.x - a.x) + (a.z - b.z))
+        for (const row of sorted) {
+          const stackAll = stacks.get(row.x + ',' + row.z) || []
+          const stackAbove = stackAll.filter(other => other.y > row.y).length
+          const stackTotal = stackAll.length
+          const screenX = originX + (row.x - minX) * cellHalf - (row.z - minZ) * cellHalf
+          const screenY = originY + (row.z - minZ) * cellHalf * 0.5 + (row.x - minX) * cellHalf * 0.5
           const el = document.createElement('div')
-          el.className = 'chest3d-block' + (state.adminChestId === quad.row.chestId ? ' selected' : '')
-          const fill = chestFillLevel(quad.row)
-          el.style.left = quad.minX + 'px'
-          el.style.top = quad.minY + 'px'
-          el.style.width = (quad.maxX - quad.minX) + 'px'
-          el.style.height = (quad.maxY - quad.minY) + 'px'
-          el.style.background = chestFillColor(quad.row)
-          el.style.opacity = quad.row.slotCount ? String(0.35 + fill * 0.65) : '0.35'
-          el.style.zIndex = Math.round(quad.depth)
-          const isTopmost = isStackTop(quad.row, stackColumns)
-          el.title = quad.row.chestId + ' · ' + quad.row.slotCount + ' 格 / ' + num(quad.row.totalAmount) + ' 个' +
-            (Number(quad.row.shulkerAmount || 0) > 0 ? ' · 含潜影盒' : '') +
-            (isTopmost ? '' : ' · 堆叠中（上方有桶）')
-          el.dataset.adminChest = quad.row.chestId
-          el.dataset.topmost = isTopmost ? '1' : ''
-          el.dataset.stacked = isTopmost ? '' : '1'
+          el.className = 'chest-map-cell' + (state.adminChestId === row.chestId ? ' selected' : '')
+          el.style.left = (screenX - cellHalf) + 'px'
+          el.style.top = (screenY - cellHalf * 0.5) + 'px'
+          el.style.width = cell + 'px'
+          el.style.height = cell + 'px'
+          // 等距菱形外观：用 transform 拉斜
+          el.style.transform = 'skewY(-30deg) skewX(0deg) scaleY(.8)'
+          const fill = chestFillLevel(row)
+          el.style.background = chestFillColor(row)
+          el.style.opacity = row.slotCount ? String(0.4 + fill * 0.6) : '0.4'
+          const stackNote = stackTotal > 1 ? ' · 此位置叠 ' + stackTotal + ' 桶（上方还有 ' + stackAbove + '）' : ''
+          el.title = row.chestId + ' · ' + row.slotCount + ' 格 / ' + num(row.totalAmount) + ' 个' +
+            (Number(row.shulkerAmount || 0) > 0 ? ' · 含潜影盒' : '') + stackNote
+          el.dataset.adminChest = row.chestId
+          el.dataset.stackTotal = String(stackTotal)
+          el.dataset.stackAbove = String(stackAbove)
+          // 堆叠数字直接显示在格子里
+          if (stackTotal > 1) {
+            const badge = document.createElement('span')
+            badge.className = 'chest-map-stack-badge'
+            badge.textContent = '×' + stackTotal
+            el.appendChild(badge)
+          }
           canvasEl.appendChild(el)
         }
-        // 切层天窗：顶面加一圈亮描边表示“从这里看进去”
-        hintEl.textContent = visible.length + ' 个桶可见' +
-          (hiddenCount ? '，' + hiddenCount + ' 个在切层之上被隐藏' : '') +
-          (view.cutLayer !== '' ? '（顶部开窗，可看到下方各层）' : '') +
-          ' · 视角 yaw ' + Math.round(view.yaw) + '° / tilt ' + Math.round(view.tilt) + '° / 缩放 ' + Number(view.zoom).toFixed(2)
+        hintEl.textContent = 'Y=' + currentLayer + ' 层 ' + layerRows.length + ' 个桶' +
+          (layers.length > 1 ? '（共 ' + layers.length + ' 层，共 ' + rows.length + ' 桶；切换层看各层布局）' : '') +
+          ' · 绿/黄/红=占用率'
       }
-
-      function isStackTop (row, stackColumns) {
-        const stack = stackColumns.get(row.x + ',' + row.z) || []
-        return !stack.some(other => other.y > row.y)
-      }
-
-      function projectQuad (wx, wz, wy, size, cosYaw, sinYaw, cosTilt, sinTilt, originX, originY) {
-        // 立方体 8 顶点：桶按 1×1×1 方块渲染（顶面 y+size）
-        const pts = []
-        for (const [dx, dy, dz] of [
-          [0, 0, 0], [size, 0, 0], [0, 0, size], [size, 0, size],
-          [0, size, 0], [size, size, 0], [0, size, size], [size, size, size]
-        ]) {
-          const x = wx + dx
-          const y = wy + dy
-          const z = wz + dz
-          // yaw（绕Y）：x' = x·cos - z·sin, z' = x·sin + z·cos
-          const rx = x * cosYaw - z * sinYaw
-          const rz = x * sinYaw + z * cosYaw
-          // tilt（绕X）：screenY = y·cosTilt + z·sinTilt（屏幕向下为正），depth = -y·sinTilt + z·cosTilt
-          const screenX = rx
-          const screenY = y * cosTilt + rz * sinTilt
-          const depth = rz * cosTilt - y * sinTilt
-          pts.push({ sx: originX + screenX, sy: originY + screenY, depth })
-        }
-        // 用外轮廓近似：屏幕上取 8 点的凸包包围盒 + 平均深度（正交投影下足够）
-        let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity
-        let depth = 0
-        for (const p of pts) {
-          if (p.sx < minX) minX = p.sx
-          if (p.sx > maxX) maxX = p.sx
-          if (p.sy < minY) minY = p.sy
-          if (p.sy > maxY) maxY = p.sy
-          depth += p.depth
-        }
-        return { minX, maxX, minY, maxY, depth: depth / pts.length }
-      }
-
+      layerSelect.addEventListener('change', () => {
+        currentLayer = Number(layerSelect.value)
+        draw()
+      })
       draw()
-      // 首次渲染可能发生在 Tab 刚显示、布局还没算好的瞬间（clientWidth=0）；
-      // 下一帧布局稳定后再重绘一次拿到正确尺寸。
-      requestAnimationFrame(() => draw())
-
-      // ===== 交互：拖拽旋转 / 滚轮缩放 / 切层 =====
-      let dragging = false
-      let lastX = 0, lastY = 0
-      canvasEl.addEventListener('mousedown', event => {
-        if (event.target.closest('[data-admin-chest]')) return  // 点方块走详情，不拖
-        dragging = true
-        lastX = event.clientX
-        lastY = event.clientY
-        event.preventDefault()
-      })
-      window.addEventListener('mousemove', event => {
-        if (!dragging) return
-        view.yaw = (view.yaw + (event.clientX - lastX) * 0.45 + 360) % 360
-        view.tilt = Math.max(5, Math.min(85, view.tilt - (event.clientY - lastY) * 0.3))
-        lastX = event.clientX
-        lastY = event.clientY
-        draw()
-      })
-      window.addEventListener('mouseup', () => { dragging = false })
-      canvasEl.addEventListener('wheel', event => {
-        event.preventDefault()
-        view.zoom = Math.max(0.35, Math.min(3, view.zoom * (event.deltaY < 0 ? 1.12 : 0.9)))
-        draw()
-      }, { passive: false })
-      canvasEl.addEventListener('touchstart', event => {
-        if (event.touches.length === 1) {
-          dragging = true
-          lastX = event.touches[0].clientX
-          lastY = event.touches[0].clientY
-        }
-      }, { passive: true })
-      canvasEl.addEventListener('touchmove', event => {
-        if (!dragging || event.touches.length !== 1) return
-        view.yaw = (view.yaw + (event.touches[0].clientX - lastX) * 0.45 + 360) % 360
-        view.tilt = Math.max(5, Math.min(85, view.tilt - (event.touches[0].clientY - lastY) * 0.3))
-        lastX = event.touches[0].clientX
-        lastY = event.touches[0].clientY
-        draw()
-      }, { passive: true })
-      canvasEl.addEventListener('touchend', () => { dragging = false })
-      cutSelect.addEventListener('change', () => {
-        view.cutLayer = cutSelect.value === '' ? '' : Number(cutSelect.value)
-        draw()
-      })
-      mapWrap.querySelector('#adminChest3DTop').addEventListener('click', () => {
-        view.yaw = 45
-        view.tilt = 88   // 近乎正上方，等效俯视图
-        draw()
-      })
-      mapWrap.querySelector('#adminChest3DReset').addEventListener('click', () => {
-        const fresh = chest3DDefaults(rows)
-        view.yaw = fresh.yaw
-        view.tilt = fresh.tilt
-        view.zoom = fresh.zoom
-        view.cutLayer = fresh.cutLayer
-        draw()
+      // Tab 刚显示时画布尺寸可能为 0，布局稳定后补一帧
+      requestAnimationFrame(() => {
+        if (canvasEl.clientWidth) draw()
       })
     }
+
 
     async function openAdminChest(chestId) {
       state.adminChestId = chestId
@@ -5928,18 +5810,19 @@ const HTML = `<!doctype html>
       const items = data.items || []
       const chestId = data.chestLabel
       const shulkerSlots = items.filter(item => item.isShulker)
+      // 库存界面风格：和玩家库存页一致的 .item 卡片（图标 + 右下数量角标 + 名称 + 短码）
       const slotsHtml = items.length ? items.map(item =>
-        '<div class="chest-slot' + (item.isShulker ? ' shulker' : '') + '" title="' + esc(item.displayName + ' #' + item.shortCode) + '">' +
-        '<div class="slot-index">槽 ' + esc(item.slot) + '</div>' +
-        '<img src="' + esc(iconUrl(item.itemId, 'item')) + '" alt="" loading="lazy">' +
-        '<div class="item-amount">x' + esc(item.amount) + '</div>' +
-        '<div class="item-name">' + esc(item.displayName) + '</div>' +
+        '<div class="item chest-item' + (item.isShulker ? ' chest-shulker-item' : '') + '" data-chest-item="' + esc(item.itemKey) + '" title="' +
+        esc(item.displayName + ' #' + item.shortCode + ' · 槽 ' + item.slot + (item.isShulker ? ' · 潜影盒（下方展开盒内物品）' : '')) + '">' +
+        '<div class="icon"><img src="' + esc(iconUrl(item.itemId, 'item')) + '" alt="" loading="lazy"><span class="fallback">' + esc((item.displayName || item.itemId).slice(0, 4)) + '</span><span class="count">' + esc(shortCount(item.amount)) + '</span></div>' +
+        '<div class="name">' + esc(item.displayName) + '</div>' +
+        '<div class="code">#' + esc(item.shortCode) + '</div>' +
         '</div>'
       ).join('') : '<p class="muted">（这个桶是空的）</p>'
-      const shulkerHtml = shulkerSlots.length ? '<div class="chest-shulker-contents"><h3 class="section-title">潜影盒内容（聚合）</h3>' + shulkerSlots.map(item =>
-        '<div class="shulker-box-block"><div class="shulker-entry"><img src="' + esc(iconUrl(item.itemId, 'item')) + '" alt="" style="width:24px;height:24px" loading="lazy"><strong>' + esc(item.displayName) + '</strong><span class="muted">x' + esc(item.amount) + '</span></div>' +
+      const shulkerHtml = shulkerSlots.length ? '<div class="chest-shulker-contents"><h3 class="section-title">潜影盒内容（每盒聚合）</h3>' + shulkerSlots.map(item =>
+        '<div class="shulker-box-block"><div class="shulker-entry"><img src="' + esc(iconUrl(item.itemId, 'item')) + '" alt="" style="width:24px;height:24px" loading="lazy"><strong>' + esc(item.displayName) + '</strong><span class="muted">x' + esc(item.amount) + ' · # ' + esc(item.shortCode) + '</span></div>' +
         (item.shulkerContents?.length
-          ? item.shulkerContents.map(entry => '<div class="shulker-entry"><span class="muted">·</span><img src="' + esc(iconUrl(entry.itemId, 'item')) + '" alt="" style="width:18px;height:18px" loading="lazy"><span>' + esc(entry.displayName) + '</span><span class="item-amount">x' + esc(entry.amount) + '</span><span class="muted">(' + esc(entry.slotCount) + ' 格)</span></div>').join('')
+          ? item.shulkerContents.map(entry => '<div class="shulker-entry"><span class="muted">·</span><img src="' + esc(iconUrl(entry.itemId, 'item')) + '" alt="" style="width:18px;height:18px" loading="lazy"><span>' + esc(entry.displayName) + '</span><span class="item-amount">x' + esc(shortCount(entry.amount)) + '</span><span class="muted">(' + esc(entry.slotCount) + ' 格 · # ' + esc(entry.shortCode) + ')</span></div>').join('')
           : '<div class="shulker-entry muted">（空盒）</div>') +
         '</div>'
       ).join('') + '</div>' : ''
