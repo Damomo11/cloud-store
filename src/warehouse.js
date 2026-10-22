@@ -3033,7 +3033,7 @@ class Warehouse {
     }
 
     while (true) {
-      const target = this.bot.players[username]?.entity
+      const target = this.resolvePlayerEntity(username)
       const botPos = this.bot.entity?.position
       if (!target?.position || !botPos) {
         this.debug(`repair stop ${username}: player entity unavailable`)
@@ -3116,7 +3116,7 @@ class Warehouse {
   // 丢前瞄准默认对准玩家身体底部中心（脚底坐标）。高瞄点会让丢出方向偏上，
   // 玩家站在台阶、半砖、船等矮位时物品落点会漂。
   async lookAtPlayer (username, yOffset = 0) {
-    const entity = this.bot.players[username]?.entity
+    const entity = this.resolvePlayerEntity(username)
     if (!entity) {
       // 不能静默返回：调用方会按上一次视线丢出物品，等于丢歪。
       throw new Error(`丢前瞄准失败：找不到玩家 ${username} 的实体（区块可能尚未加载）`)
@@ -3124,6 +3124,27 @@ class Warehouse {
     const target = entity.position.offset(0, yOffset, 0)
     await this.bot.lookAt(target, true)
     await sleep(100)
+  }
+
+  // bot.players[name].entity 跨维度传送后会失效；先直查，再按大小写变体，
+  // 最后扫 bot.entities 玩家实体兜底。与 service.resolvePlayerEntity 同一套语义。
+  resolvePlayerEntity (username) {
+    const name = String(username || '')
+    if (!name) return null
+    const direct = this.bot.players?.[name]
+    if (direct?.entity?.position) return direct.entity
+    const lower = name.toLowerCase()
+    const variantKey = Object.keys(this.bot.players || {}).find(key =>
+      key.toLowerCase() === lower && this.bot.players[key]?.entity?.position)
+    if (variantKey) return this.bot.players[variantKey].entity
+    const entities = this.bot.entities || {}
+    const entityValues = typeof entities.values === 'function' ? [...entities.values()] : Object.values(entities)
+    const match = entityValues.find(entity =>
+      entity?.type === 'player' &&
+      typeof entity.username === 'string' &&
+      entity.username.toLowerCase() === lower &&
+      entity.position)
+    return match || null
   }
 
   async equipItemInHand (item) {

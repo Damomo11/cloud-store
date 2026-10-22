@@ -1068,7 +1068,7 @@ class CloudStoreService {
       const deadline = Date.now() + this.config.timing.pickupWindowMs
       const shouldStopCollecting = () => {
         if (this.active?.cancelled) return true
-        const playerEntity = this.bot.players[username]?.entity
+        const playerEntity = this.resolvePlayerEntity(username).entity
         const botPosition = this.bot.entity?.position
         if (!playerEntity?.position || !botPosition) return false
         const distance = playerEntity.position.distanceTo(botPosition)
@@ -3368,6 +3368,34 @@ class CloudStoreService {
     return Boolean(this.active?.cancelled || this.active?.dead)
   }
 
+  // 解析玩家的当前实体。bot.players[name].entity 在跨维度传送后会失效
+  // （旧维度引用被清空或指向旧坐标），此时扫 bot.entities 里的玩家实体兜底。
+  // 返回 { entity, source }：source 记录命中途径，供日志区分。
+  resolvePlayerEntity (username) {
+    const name = String(username || '')
+    if (!name) return { entity: null, source: '' }
+    const direct = this.bot.players?.[name]
+    if (direct?.entity?.position) {
+      return { entity: direct.entity, source: 'players' }
+    }
+    const lower = name.toLowerCase()
+    // 大小写变体（含改名/装饰符号）：players 表里按前缀找
+    const variantKey = Object.keys(this.bot.players || {}).find(key =>
+      key.toLowerCase() === lower && this.bot.players[key]?.entity?.position)
+    if (variantKey) return { entity: this.bot.players[variantKey].entity, source: 'players-variant' }
+    // 实体表兜底：跨维度后 spawn 包已到、players 引用未重新关联时，
+    // bot.entities 里有真实玩家实体（username 与玩家名一致）。
+    const entities = this.bot.entities || {}
+    const entityValues = typeof entities.values === 'function' ? [...entities.values()] : Object.values(entities)
+    const match = entityValues.find(entity =>
+      entity?.type === 'player' &&
+      typeof entity.username === 'string' &&
+      entity.username.toLowerCase() === lower &&
+      entity.position)
+    if (match) return { entity: match, source: 'entities' }
+    return { entity: null, source: '' }
+  }
+
   getPlayer (username) {
     const uuid = this.bot.players[username]?.uuid || `name:${username}`
     this.db.upsertPlayer(uuid, username)
@@ -3530,7 +3558,12 @@ class CloudStoreService {
       return true
     }
 
-    console.warn(`[teleport] /tpa ${username} timed out after ${timeoutMs}ms`)
+    const resolved = this.resolvePlayerEntity(username)
+    const resolvedPos = resolved.entity?.position
+    const botPos = this.bot.entity?.position
+    const resolvedDistance = resolvedPos && botPos ? resolvedPos.distanceTo(botPos) : null
+    console.warn(`[teleport] /tpa ${username} timed out after ${timeoutMs}ms` +
+      ` (resolve=${resolved.source || 'none'}, distance=${resolvedDistance === null ? 'unknown' : Math.round(resolvedDistance)}, bot=${this.describePosition(botPos)})`)
     this.msg(username, '15秒内没有检测到你在附近，本次操作已取消；如果稍后看到这条传送请求，请不要再接受。')
     return false
   }
@@ -3544,7 +3577,7 @@ class CloudStoreService {
     while (Date.now() - startedAt < timeoutMs) {
       if (!ignoreCancellation && this.isActiveCancelled()) return false
       const botPos = this.bot.entity?.position
-      const targetPos = this.bot.players[username]?.entity?.position
+      const targetPos = this.resolvePlayerEntity(username).entity?.position
       const botChunkReady = Boolean(botPos && this.bot.world?.getColumnAt?.(botPos))
       const targetChunkReady = Boolean(targetPos && this.bot.world?.getColumnAt?.(targetPos))
       if (botChunkReady && targetChunkReady) return true
@@ -3553,25 +3586,75 @@ class CloudStoreService {
     return false
   }
 
+  // 等玩家出现在传送检测半径内。三条判定路径：
+  //   1. 玩家实体距离 ≤ radius —— 常规同维度传送；
+  //   2. 跨维度传送已生效（bot 自身坐标大幅跳变）后，players 引用可能失效：
+  //      此时用实体表兜底解析并重试一段时间（宽限窗口）；
+  //   3. 宽限窗结束时实体表仍无该玩家，但 bot 明确已传送到别处
+  //      （跳变 > 50 格且自身区块已就绪）——按"传送已生效但实体未知"降级放行。
+  //      放行是安全的：后续 lookAtPlayer/dropItemsToPlayer 同样用兜底解析器，
+  //      解析不到会显式报错，不会丢歪。
   async waitForPlayerNearby (username, timeoutMs, radius, options = {}) {
     const startedAt = Date.now()
     const startPos = this.bot.entity?.position?.clone()
     let movedLogged = false
+    let teleportJumped = false
+    const graceMs = 5000
+    let graceLogged = false
 
     while (Date.now() - startedAt < timeoutMs) {
       if (!options.ignoreCancellation && this.isActiveCancelled()) return false
 
-      const entity = this.bot.players[username]?.entity
       const botPos = this.bot.entity?.position
-      if (entity && botPos) {
-        const distance = entity.position.distanceTo(botPos)
-        if (distance <= radius) return true
+      const resolved = this.resolvePlayerEntity(username)
+      if (resolved.entity && botPos) {
+        const distance = resolved.entity.position.distanceTo(botPos)
+        if (distance <= radius) {
+          if (resolved.source && resolved.source !== 'players') {
+            console.log(`[teleport] near ${username} resolved via ${resolved.source}, distance=${Math.round(distance)}`)
+          }
+          return true
+        }
       }
 
       if (!movedLogged && startPos && botPos && botPos.distanceTo(startPos) > 3) {
         movedLogged = true
         if (this.config.debug) {
           console.log(`[teleport] bot position changed while waiting for ${username}: ${this.describePosition(startPos)} -> ${this.describePosition(botPos)}`)
+        }
+      }
+
+      // 传送已生效的信号：bot 自身坐标相对发出 tpa 时大幅跳变。
+      // 说明玩家已接受传送（tpa 只会把 bot 传过去），此时玩家实体
+      // 引用失效是跨维度重置的已知模式，不该死磕 8 格判定。
+      if (!teleportJumped && startPos && botPos && botPos.distanceTo(startPos) > 50) {
+        teleportJumped = true
+        console.log(`[teleport] bot jumped ${Math.round(botPos.distanceTo(startPos))} blocks while waiting for ${username}: teleport accepted, player entity may be detached (cross-dimension). Grace window ${graceMs}ms starts.`)
+      }
+      if (teleportJumped && !graceLogged) {
+        graceLogged = true
+        // 宽限窗：给 spawn/respawn 包时间到达，期间每轮继续尝试上面的实体判定
+        const graceDeadline = Math.min(Date.now() + graceMs, startedAt + timeoutMs)
+        while (Date.now() < graceDeadline) {
+          if (!options.ignoreCancellation && this.isActiveCancelled()) return false
+          const graceResolved = this.resolvePlayerEntity(username)
+          const graceBotPos = this.bot.entity?.position
+          if (graceResolved.entity && graceBotPos) {
+            const graceDistance = graceResolved.entity.position.distanceTo(graceBotPos)
+            if (graceDistance <= radius) {
+              console.log(`[teleport] near ${username} after teleport grace, distance=${Math.round(graceDistance)}, source=${graceResolved.source || 'players'}`)
+              return true
+            }
+          }
+          await sleep(250)
+        }
+        // 宽限窗结束：实体表仍找不到该玩家。bot 确实传送了（tpa 不会失败成
+        // "bot 坐标跳到别处"），此时大概率站在玩家身边只是实体未关联。
+        // 自身区块就绪即降级放行；不就绪再等到主循环超时。
+        const botReady = Boolean(this.bot.entity?.position && this.bot.world?.getColumnAt?.(this.bot.entity.position))
+        if (botReady) {
+          console.log(`[teleport] player entity for ${username} unresolved after grace window; teleport was accepted, passing through (drop will fail loudly if aim fails).`)
+          return true
         }
       }
 
