@@ -5712,36 +5712,24 @@ const HTML = `<!doctype html>
         return
       }
 
-      const view = Object.assign(chest3DDefaults(rows), {
-        yaw: state.adminChest3DYaw ?? null,
-        tilt: state.adminChest3DTilt ?? null,
-        zoom: state.adminChest3DZoom ?? null,
-        cutLayer: state.adminChest3DCut ?? null
-      })
-      if (view.yaw === null) delete view.yaw
-      if (view.tilt === null) delete view.tilt
-      if (view.zoom === null) delete view.zoom
-      if (view.cutLayer === null) delete view.cutLayer
+      const view = chest3DDefaults(rows)
+      // 恢复上次的视角/切层（仅当确实存过：用 undefined 判断，避免吞掉 zoom=0 这类合法值）
+      if (state.adminChest3DYaw !== undefined) view.yaw = Number(state.adminChest3DYaw)
+      if (state.adminChest3DTilt !== undefined) view.tilt = Number(state.adminChest3DTilt)
+      if (state.adminChest3DZoom !== undefined) view.zoom = Number(state.adminChest3DZoom)
+      if (state.adminChest3DCut !== undefined) view.cutLayer = state.adminChest3DCut
       const xs = rows.map(row => row.x), zs = rows.map(row => row.z), ys = rows.map(row => row.y)
       const minX = Math.min(...xs), maxX = Math.max(...xs)
       const minZ = Math.min(...zs), maxZ = Math.max(...zs)
       const minLayer = Math.min(...ys), maxLayer = Math.max(...ys)
       const spanX = maxX - minX + 1, spanZ = maxZ - minZ + 1
       const spanLayers = view.layers.length || 1
-      // 格子边长：画布尺寸约束下取小，保证整个堆叠都在视野内
-      const fit = Math.min(
-        (canvasEl.clientWidth - 40) / (spanX + spanZ * 0.5),
-        (canvasEl.clientHeight - 40) / ((spanZ * 0.8 + spanLayers * 0.9))
-      )
-      const baseCell = Math.max(view.minCell, Math.min(view.maxCell, fit))
-      const cell = baseCell * view.zoom
-      const originX = canvasEl.clientWidth / 2
-      const originY = canvasEl.clientHeight / 2
-      // 世界坐标 → 相机坐标：先绕 Y 轴 yaw，再绕 X 轴 tilt，最后正交投影到屏幕
-      const yawRad = view.yaw * Math.PI / 180
-      const tiltRad = view.tilt * Math.PI / 180
-      const cosYaw = Math.cos(yawRad), sinYaw = Math.sin(yawRad)
-      const cosTilt = Math.cos(tiltRad), sinTilt = Math.sin(tiltRad)
+      // 画布尺寸：面板 Tab 未显示时 clientWidth/Height 为 0，用容器兜底尺寸；
+      // draw() 在每次重绘时重新读取，保证显示后再进来能算对。
+      const canvasSize = () => ({
+        w: canvasEl.clientWidth || canvasEl.parentElement?.clientWidth || 640,
+        h: canvasEl.clientHeight || 430
+      })
 
       const stackColumns = new Map()
       for (const row of rows) {
@@ -5768,6 +5756,20 @@ const HTML = `<!doctype html>
         }
         // 画师顺序：先画低层再画高层；同层内按屏幕深度远→近（近似 painter's algorithm：
         // 用投影后的 depth 排序，CSS z-index 控制覆盖）
+        // cell/origin/角度在 draw 内实时计算：画布显示后尺寸会从 0 变为真实值。
+        const { w, h } = canvasSize()
+        const fit = Math.min(
+          (w - 40) / (spanX + spanZ * 0.5),
+          (h - 40) / ((spanZ * 0.8 + spanLayers * 0.9))
+        )
+        const baseCell = Math.max(view.minCell, Math.min(view.maxCell, fit))
+        const cell = baseCell * view.zoom
+        const originX = w / 2
+        const originY = h / 2
+        const yawRad = view.yaw * Math.PI / 180
+        const tiltRad = view.tilt * Math.PI / 180
+        const cosYaw = Math.cos(yawRad), sinYaw = Math.sin(yawRad)
+        const cosTilt = Math.cos(tiltRad), sinTilt = Math.sin(tiltRad)
         const quads = []
         for (const row of visible) {
           const wx0 = (row.x - minX) * cell
@@ -5803,7 +5805,7 @@ const HTML = `<!doctype html>
         hintEl.textContent = visible.length + ' 个桶可见' +
           (hiddenCount ? '，' + hiddenCount + ' 个在切层之上被隐藏' : '') +
           (view.cutLayer !== '' ? '（顶部开窗，可看到下方各层）' : '') +
-          ' · 视角 yaw ' + Math.round(view.yaw) + '° / tilt ' + Math.round(view.tilt) + '° / 缩放 ' + view.zoom.toFixed(2)
+          ' · 视角 yaw ' + Math.round(view.yaw) + '° / tilt ' + Math.round(view.tilt) + '° / 缩放 ' + Number(view.zoom).toFixed(2)
       }
 
       function isStackTop (row, stackColumns) {
@@ -5844,6 +5846,9 @@ const HTML = `<!doctype html>
       }
 
       draw()
+      // 首次渲染可能发生在 Tab 刚显示、布局还没算好的瞬间（clientWidth=0）；
+      // 下一帧布局稳定后再重绘一次拿到正确尺寸。
+      requestAnimationFrame(() => draw())
 
       // ===== 交互：拖拽旋转 / 滚轮缩放 / 切层 =====
       let dragging = false
