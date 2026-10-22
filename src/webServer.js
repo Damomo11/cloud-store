@@ -86,6 +86,10 @@ class CloudStoreWebServer {
       if (req.method === 'GET' && url.pathname === '/api/admin/commands') return this.sendJson(res, this.apiAdminCommands(session, url))
       if (req.method === 'GET' && url.pathname === '/api/admin/chests') return this.sendJson(res, this.apiAdminChests(session, url))
       if (req.method === 'GET' && url.pathname === '/api/admin/chest') return this.sendJson(res, this.apiAdminChest(session, url))
+      if (req.method === 'POST' && url.pathname === '/api/admin/chest/live') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, await this.apiAdminChestLive(session, body))
+      }
       if (req.method === 'GET' && url.pathname === '/api/admin/aliases') return this.sendJson(res, this.apiAdminAliases(session, url))
       if (req.method === 'GET' && url.pathname === '/api/admin/quotas') return this.sendJson(res, this.apiAdminQuotas(session, url))
       if (req.method === 'GET' && url.pathname === '/api/admin/users') return this.sendJson(res, this.apiAdminUsers(session))
@@ -1775,25 +1779,126 @@ class CloudStoreWebServer {
     }
   }
 
+  // 木桶视图列表：支持按物品名/ID/短码搜索（命中显示该桶含此物品的格数与数量）、
+  // 坐标过滤、排序，返回每桶槽位统计 + 是否含潜影盒。
   apiAdminChests (session, url) {
     this.requireAdmin(session)
-    const q = String(url.searchParams.get('q') || '').trim().toLowerCase()
+    const q = String(url.searchParams.get('q') || '').trim()
+    const sort = String(url.searchParams.get('sort') || 'coords').trim()
+    const rangeX = this.parseCoordFilter(url.searchParams.get('x'))
+    const rangeY = this.parseCoordFilter(url.searchParams.get('y'))
+    const rangeZ = this.parseCoordFilter(url.searchParams.get('z'))
     const rows = this.db.db.prepare(`
       SELECT c.chest_id AS chestId, c.x, c.y, c.z, c.block_name AS blockName,
              c.last_seen_at AS lastSeenAt,
              COUNT(cs.slot) AS slotCount,
-             COALESCE(SUM(cs.amount), 0) AS totalAmount
+             COALESCE(SUM(cs.amount), 0) AS totalAmount,
+             COALESCE(SUM(CASE WHEN i.item_id LIKE '%shulker_box' THEN cs.amount ELSE 0 END), 0) AS shulkerAmount
       FROM chests c
       LEFT JOIN chest_slots cs ON cs.chest_id = c.chest_id
+      LEFT JOIN items i ON i.item_key = cs.item_key
       GROUP BY c.chest_id
-      ORDER BY c.y, c.x, c.z
-    `).all()
-    const result = rows
-      .filter(row => !q || this.textMatches(row.chestId, q))
-      .map(row => ({ ...row, slotCount: Number(row.slotCount || 0), totalAmount: Number(row.totalAmount || 0) }))
-    return { ok: true, rows: result }
+    `).all().map(row => ({ ...row, slotCount: Number(row.slotCount || 0), totalAmount: Number(row.totalAmount || 0), shulkerAmount: Number(row.shulkerAmount || 0) }))
+      .filter(row => this.chestMatchesCoord(row, { x: rangeX, y: rangeY, z: rangeZ }))
+
+    let result = rows
+    let matches = null
+    if (q) {
+      // 搜索：物品名/ID/短码/全局别名/盒内物品名。先全局找命中的 itemKey 集合，再按桶聚合。
+      const qLower = q.toLowerCase()
+      const aliasRows = this.db.db.prepare(`
+        SELECT DISTINCT item_key AS itemKey FROM global_item_aliases WHERE alias_lower LIKE ?
+      `).all(`%${qLower}%`)
+      const aliasKeySet = new Set(aliasRows.map(row => row.itemKey))
+      const itemKeyRows = this.db.db.prepare(`
+        SELECT i.item_key AS itemKey, i.item_id AS itemId
+        FROM items i
+        WHERE i.display_name LIKE ? OR i.item_id LIKE ? OR i.item_key LIKE ?
+      `).all(`%${q}%`, `%${q}%`, `%${q}%`)
+      const keySet = new Set(itemKeyRows.map(row => row.itemKey))
+      for (const key of aliasKeySet) keySet.add(key)
+      // 短码（itemKey 末 6 位）与盒内物品名：通过 shulker_contents 聚合表反查外层盒子
+      const shulkerRows = this.db.db.prepare(`
+        SELECT shulker_item_key AS boxKey, contained_item_key AS innerKey,
+               contained_item_id AS innerId, amount
+        FROM shulker_contents
+      `).all()
+      const boxKeyByInner = new Map()
+      for (const row of shulkerRows) {
+        const innerKeyTail = String(row.innerKey || '').split('|').pop() || ''
+        const innerHit = keySet.has(row.innerKey)
+          || String(row.innerId || '').toLowerCase().includes(qLower)
+          || innerKeyTail.toLowerCase().includes(qLower)
+        if (innerHit) {
+          if (!boxKeyByInner.has(row.boxKey)) boxKeyByInner.set(row.boxKey, 0)
+        }
+      }
+      const chestSlotRows = this.db.db.prepare(`
+        SELECT chest_id AS chestId, item_key AS itemKey, amount FROM chest_slots
+      `).all()
+      const chestMatches = new Map()
+      const chestAmounts = new Map()
+      for (const slot of chestSlotRows) {
+        const keyTail = String(slot.itemKey || '').split('|').pop() || ''
+        const hit = keySet.has(slot.itemKey)
+          || keyTail.toLowerCase().includes(qLower)
+          || boxKeyByInner.has(slot.itemKey)
+        if (!hit) continue
+        chestMatches.set(slot.chestId, (chestMatches.get(slot.chestId) || 0) + 1)
+        chestAmounts.set(slot.chestId, (chestAmounts.get(slot.chestId) || 0) + Number(slot.amount || 0))
+      }
+      result = rows.filter(row => chestMatches.has(row.chestId)
+        || this.textMatches(row.chestId, q)
+        || `${row.x},${row.y},${row.z}`.includes(q))
+        .map(row => ({
+          ...row,
+          matchedSlots: chestMatches.get(row.chestId) || 0,
+          matchedAmount: chestAmounts.get(row.chestId) || 0
+        }))
+      matches = { itemKeys: keySet.size, chests: result.length }
+    }
+
+    const sorters = {
+      coords: (a, b) => a.y - b.y || a.x - b.x || a.z - b.z,
+      amount: (a, b) => b.totalAmount - a.totalAmount || a.x - b.x,
+      slots: (a, b) => b.slotCount - a.slotCount || a.x - b.x,
+      matched: (a, b) => (b.matchedAmount || 0) - (a.matchedAmount || 0) || a.x - b.x,
+      updated: (a, b) => String(b.lastSeenAt || '').localeCompare(String(a.lastSeenAt || ''))
+    }
+    result.sort(sorters[sort] || sorters.coords)
+    return {
+      ok: true,
+      rows: result,
+      matches,
+      total: rows.length,
+      now: Date.now(),
+      nowLabel: this.formatTimestampMs(Date.now())
+    }
   }
 
+  parseCoordFilter (value) {
+    const text = String(value || '').trim()
+    if (!text) return null
+    // 支持单值 "120"、范围 "120..130"、开区间 "120.." / "..130"
+    const match = text.match(/^(-?\d+)?\.\.(-?\d+)?$/)
+    if (match) {
+      const min = match[1] === undefined || match[1] === null ? -Infinity : Number(match[1])
+      const max = match[2] === undefined || match[2] === null ? Infinity : Number(match[2])
+      return { min, max }
+    }
+    if (/^-?\d+$/.test(text)) {
+      const exact = Number(text)
+      return { min: exact, max: exact }
+    }
+    throw new Error('坐标过滤格式：单值 120 或范围 120..130。')
+  }
+
+  chestMatchesCoord (row, { x, y, z }) {
+    const check = (range, value) => !range || (value >= range.min && value <= range.max)
+    return check(x, row.x) && check(y, row.y) && check(z, row.z)
+  }
+
+  // 单桶详情：槽位按 slot 排列，潜影盒展开盒内聚合内容，支持“立即重读”实时数据。
   apiAdminChest (session, url) {
     this.requireAdmin(session)
     const chestId = String(url.searchParams.get('chest') || '').trim()
@@ -1812,8 +1917,85 @@ class CloudStoreWebServer {
       WHERE cs.chest_id = ?
       ORDER BY cs.slot
     `).all(chestId)
-    return { ok: true, chest, items: rows.map(row => ({ ...this.adminItem(row), slot: row.slot, amount: Number(row.amount || 0) })) }
+    const catalog = this.db.catalog
+    const items = rows.map(row => {
+      const base = this.adminItem(row)
+      const entry = { ...base, slot: Number(row.slot), amount: Number(row.amount || 0) }
+      if (catalog?.isShulkerBox?.(row.itemId)) {
+        entry.isShulker = true
+        entry.shulkerContents = this.chestShulkerContents(base)
+      }
+      return entry
+    })
+    return {
+      ok: true,
+      chest,
+      chestLabel: `${chest.x},${chest.y},${chest.z}`,
+      items,
+      types: items.length,
+      total: items.reduce((sum, item) => sum + item.amount, 0),
+      now: Date.now(),
+      nowLabel: this.formatTimestampMs(Date.now())
+    }
   }
+
+  chestShulkerContents (item) {
+    const catalog = this.db.catalog
+    if (!catalog?.extractShulkerContents) return []
+    try {
+      return catalog.extractShulkerContents(item).map(entry => ({
+        itemId: entry.item.itemId,
+        itemKey: entry.item.itemKey,
+        displayName: entry.item.displayName || entry.item.itemId,
+        amount: entry.amount,
+        slotCount: entry.slotCount,
+        shortCode: this.db.shortCodeForItemKey(entry.item.itemKey)
+      }))
+    } catch {
+      return []
+    }
+  }
+
+  // 实时重读：让在线机器人用 !同步木桶 的同一条链路开桶刷新，结果直接回面板。
+  async apiAdminChestLive (session, body) {
+    const admin = this.requireAdmin(session)
+    const chest = String(body.chest || '').trim()
+    const [x, y, z] = chest.split(',').map(Number)
+    if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) {
+      throw new Error('格式：x,y,z。可用列表里的坐标。')
+    }
+    const service = this.requireService()
+    const detail = await service.resyncBarrelForAdmin({ x, y, z }, admin)
+    return { ok: true, message: `已重读木桶 ${chest}。`, ...this.chestDetailFromLive(detail) }
+  }
+
+  chestDetailFromLive (detail) {
+    const items = (detail.items || []).map(item => ({
+      slot: item.slot,
+      itemKey: item.itemKey,
+      itemId: item.id,
+      displayName: item.name,
+      amount: item.amount,
+      shortCode: item.keyTail,
+      shulkerContents: Array.isArray(item.shulkerContents)
+        ? item.shulkerContents.map(entry => ({
+          itemId: entry.id,
+          displayName: entry.name,
+          amount: entry.n,
+          slotCount: entry.slots,
+          shortCode: entry.key
+        }))
+        : undefined,
+      isShulker: Array.isArray(item.shulkerContents)
+    }))
+    return {
+      chestLabel: detail.chest?.describe || `${detail.chest?.x},${detail.chest?.y},${detail.chest?.z}`,
+      types: detail.types,
+      total: detail.total,
+      items
+    }
+  }
+
 
   apiAdminAliases (session, url) {
     this.requireAdmin(session)
@@ -3128,6 +3310,38 @@ const HTML = `<!doctype html>
     .log-file-item:hover { border-color: #4a3921; background: #1b1712; }
     .log-file-item .name { flex: 1; word-break: break-all; }
     .log-file-item.selected { border-color: var(--gold); }
+    /* 木桶视图 */
+    .chest-layout { display: grid; grid-template-columns: 340px 1fr; gap: 14px; align-items: start; margin-bottom: 14px; }
+    @media (max-width: 1100px) { .chest-layout { grid-template-columns: 1fr; } }
+    .chest-map-panel { padding: 12px; }
+    .chest-map-title { font-size: 13px; color: var(--muted); margin-bottom: 8px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .chest-map-canvas { position: relative; width: 100%; height: 340px; background: #0f0f11; border: 1px solid #2c2c33; border-radius: 8px; overflow: hidden; cursor: crosshair; }
+    /* 3D 堆叠视图 */
+    .chest3d-canvas { position: relative; width: 100%; height: 430px; background: #0f0f11; border: 1px solid #2c2c33; border-radius: 8px; overflow: hidden; cursor: grab; touch-action: none; }
+    .chest3d-canvas:active { cursor: grabbing; }
+    .chest3d-block { position: absolute; border-radius: 4px; border: 1px solid rgba(255,255,255,.22); box-shadow: inset 0 0 10px rgba(0,0,0,.45); }
+    .chest3d-block:hover { border-color: var(--gold); }
+    .chest3d-block.selected { border-color: #fff; box-shadow: 0 0 0 2px rgba(212,175,55,.7), inset 0 0 10px rgba(0,0,0,.45); }
+    .chest3d-block[data-stacked]:not([data-topmost]) { border-style: dashed; }
+    .chest-list-panel { max-height: 380px; }
+    .chest-list-panel table { margin: 0; }
+    .chest-list-panel td, .chest-list-panel th { white-space: nowrap; }
+    tr.chest-row { cursor: pointer; }
+    tr.chest-row:hover { background: #1b1712; }
+    tr.chest-row.selected { background: #2a251e; }
+    .chest-coord { font-family: Consolas, monospace; }
+    .chest-detail-panel { padding: 14px; }
+    .chest-slots-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(88px, 1fr)); gap: 8px; margin-top: 10px; }
+    .chest-slot { border: 1px solid var(--line); border-radius: 8px; padding: 8px 6px; text-align: center; background: #141416; }
+    .chest-slot .slot-index { font-size: 11px; color: var(--muted); }
+    .chest-slot img { width: 32px; height: 32px; image-rendering: pixelated; }
+    .chest-slot .fallback { display: none; }
+    .chest-slot .item-name { font-size: 12px; margin-top: 4px; word-break: break-all; }
+    .chest-slot .item-amount { font-size: 13px; color: var(--gold); }
+    .chest-slot.shulker { border-color: #4a3921; background: #1b1712; }
+    .chest-shulker-contents { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 10px; }
+    .chest-shulker-contents .shulker-entry { display: flex; gap: 8px; align-items: center; padding: 4px 0; font-size: 13px; }
+    .chest-detail-head { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 6px; }
     .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; margin-bottom: 14px; }
     .stat { border: 1px solid var(--line); background: #141416; border-radius: 8px; padding: 12px; }
     .stat strong { display: block; font-size: 22px; color: var(--gold); }
@@ -3749,7 +3963,23 @@ const HTML = `<!doctype html>
           </div>
         </section>
         <section id="adminChests" class="hidden">
-          <div class="empty-state panel"><div class="empty-icon">▦</div><h3>木桶视图</h3><p>此模块将在下一次专项重构中实现。本次先保留入口与布局位置。</p></div>
+          <div class="toolbar">
+            <input id="adminChestQ" placeholder="搜索物品名/ID/短码/别名（含盒内物品）或坐标">
+            <input id="adminChestX" placeholder="X 过滤，如 120 或 120..130">
+            <input id="adminChestY" placeholder="Y 过滤">
+            <input id="adminChestZ" placeholder="Z 过滤">
+            <select id="adminChestSort"><option value="coords">按坐标</option><option value="amount">按总数</option><option value="slots">按格数</option><option value="matched">按命中数</option><option value="updated">按更新时间</option></select>
+            <button id="adminChestLoad" class="primary">查询</button>
+            <button id="adminChestRefresh" class="primary">刷新</button>
+          </div>
+          <div id="adminChestStats" class="stats"></div>
+          <div class="chest-layout">
+            <div id="adminChestMap" class="panel chest-map-panel"></div>
+            <div id="adminChestListWrap" class="panel tablewrap chest-list-panel">
+              <table><thead><tr><th>坐标</th><th>方块</th><th>物品格</th><th>总数</th><th>潜影盒</th><th>最近同步</th><th></th></tr></thead><tbody id="adminChestList"></tbody></table>
+            </div>
+          </div>
+          <div id="adminChestDetail" class="panel alias-detail-panel chest-detail-panel hidden"></div>
         </section>
         <section id="adminTransactions" class="hidden">
           <div class="toolbar">
@@ -5372,6 +5602,376 @@ const HTML = `<!doctype html>
       return { online: '在线', connecting: '连接中', logging_in: '登录中', auth_required: '等待微软登录', draining: '任务完成后下线', offline: '离线', disabled: '已停用', starting: '启动中', removing: '删除中' }[status] || status || '未知';
     }
 
+    // ===== 管理面板：木桶视图 =====
+    function chestFillLevel(row) {
+      if (!row.slotCount) return 0
+      return Math.max(0.08, Math.min(1, row.slotCount / 27))
+    }
+    function chestFillColor(row) {
+      const level = chestFillLevel(row)
+      if (!row.slotCount) return '#2c2c33'
+      if (level < 0.34) return '#5a8f3c'
+      if (level < 0.67) return '#b8862b'
+      return '#c05b3c'
+    }
+
+    async function loadAdminChests() {
+      const params = { q: $('adminChestQ').value, sort: $('adminChestSort').value }
+      for (const axis of ['x', 'y', 'z']) {
+        const value = $('adminChest' + axis.toUpperCase()).value.trim()
+        if (value) params[axis] = value
+      }
+      const data = await api('/api/admin/chests', params)
+      state.adminChestRows = data.rows || []
+      renderAdminChestStats(data)
+      renderAdminChestMap(data)
+      renderAdminChestList(data)
+      if (state.adminChestId) {
+        // 刷新后保持选中态；若已不在过滤结果里则关闭详情
+        if (state.adminChestRows.some(row => row.chestId === state.adminChestId)) {
+          await openAdminChest(state.adminChestId)
+        } else {
+          closeAdminChest()
+        }
+      }
+    }
+
+    function renderAdminChestStats(data) {
+      const rows = data.rows || []
+      const totalAmount = rows.reduce((sum, row) => sum + Number(row.totalAmount || 0), 0)
+      const totalSlots = rows.reduce((sum, row) => sum + Number(row.slotCount || 0), 0)
+      const shulkerChests = rows.filter(row => Number(row.shulkerAmount || 0) > 0).length
+      renderStats('adminChestStats', {
+        '木桶数': rows.length,
+        '物品总数': num(totalAmount),
+        '已用格数': num(totalSlots),
+        '含潜影盒桶数': shulkerChests
+      })
+      const stats = $('adminChestStats')
+      if (data.matches) {
+        stats.insertAdjacentHTML('beforeend', '<div class="stat"><span class="muted">搜索命中</span><strong style="font-size:16px">' + esc(data.matches.itemKeys) + ' 种物品 / ' + esc(data.matches.chests) + ' 个桶</strong></div>')
+      }
+    }
+
+    function renderAdminChestList(data) {
+      const tbody = $('adminChestList')
+      const rows = data.rows || []
+      tbody.innerHTML = rows.length ? rows.map(row => {
+        const q = $('adminChestQ').value.trim()
+        const matched = q && row.matchedSlots !== undefined
+          ? '<span class="muted">命中 ' + esc(row.matchedSlots) + ' 格 / ' + esc(row.matchedAmount) + ' 个</span>' : ''
+        return '<tr class="chest-row' + (state.adminChestId === row.chestId ? ' selected' : '') + '" data-admin-chest="' + esc(row.chestId) + '">' +
+          '<td class="chest-coord">' + esc(row.chestId) + '</td>' +
+          '<td class="muted">' + esc(row.blockName || '') + '</td>' +
+          '<td>' + esc(row.slotCount) + '</td>' +
+          '<td>' + num(row.totalAmount) + '</td>' +
+          '<td>' + (Number(row.shulkerAmount || 0) > 0 ? num(row.shulkerAmount) + ' 个' : '<span class="muted">-</span>') + '</td>' +
+          '<td class="muted">' + esc(String(row.lastSeenAt || '').slice(0, 19).replace('T', ' ')) + '</td>' +
+          '<td>' + matched + '</td></tr>'
+      }).join('') : '<tr><td colspan="7"><p class="muted" style="text-align:center;margin:20px 0">没有匹配的木桶。</p></td></tr>'
+    }
+
+    // ===== 3D 堆叠视图 =====
+    // 木桶按真实 (x,y,z) 摆放成方块；CSS 3D 变换投影（无第三方库）。
+    // 视角：等距伪 3D（绕竖直轴旋转 yaw + 固定俯角 tilt），可拖拽旋转、滚轮缩放、
+    // 空格切层；被上层挡住的桶通过“切层”与“顶面开天窗”两种方式可见。
+    function chest3DDefaults(rows) {
+      const layers = [...new Set(rows.map(row => row.y))].sort((a, b) => a - b)
+      return {
+        layers,
+        yaw: 45,            // 绕 Y 轴旋转角（度）
+        tilt: 35,           // 俯视角（度）
+        zoom: 1,            // 缩放系数
+        // 切层模式：'' = 全部显示；数字 = 只显示该层及以下（该层顶面开天窗露出内部）
+        cutLayer: layers.length > 1 ? layers[Math.max(0, layers.length - 2)] : '',
+        minCell: 14,
+        maxCell: 44
+      }
+    }
+
+    function renderAdminChestMap(data) {
+      const rows = data.rows || []
+      const mapWrap = document.createElement('div')
+      mapWrap.innerHTML =
+        '<div class="chest-map-title"><b>3D 堆叠视图</b>' +
+        '<span class="muted">拖拽旋转 · 滚轮缩放 · 点击方块看详情</span>' +
+        '<label class="toolbar-check">切层 <select id="adminChest3DCut"></select></label>' +
+        '<button id="adminChest3DTop" class="primary" style="padding:4px 10px">正上方俯视</button>' +
+        '<button id="adminChest3DReset" class="primary" style="padding:4px 10px">复位视角</button>' +
+        '</div><div id="adminChest3DCanvas" class="chest3d-canvas"></div>' +
+        '<div id="adminChest3DHint" class="muted" style="margin-top:6px;font-size:12px"></div>'
+      const canvas = $('adminChestMap')
+      canvas.innerHTML = ''
+      canvas.appendChild(mapWrap)
+      const canvasEl = mapWrap.querySelector('#adminChest3DCanvas')
+      const cutSelect = mapWrap.querySelector('#adminChest3DCut')
+      const hintEl = mapWrap.querySelector('#adminChest3DHint')
+
+      if (!rows.length) {
+        canvasEl.innerHTML = '<p class="muted" style="text-align:center;margin-top:150px">没有可显示的木桶。</p>'
+        return
+      }
+
+      const view = Object.assign(chest3DDefaults(rows), {
+        yaw: state.adminChest3DYaw ?? null,
+        tilt: state.adminChest3DTilt ?? null,
+        zoom: state.adminChest3DZoom ?? null,
+        cutLayer: state.adminChest3DCut ?? null
+      })
+      if (view.yaw === null) delete view.yaw
+      if (view.tilt === null) delete view.tilt
+      if (view.zoom === null) delete view.zoom
+      if (view.cutLayer === null) delete view.cutLayer
+      const xs = rows.map(row => row.x), zs = rows.map(row => row.z), ys = rows.map(row => row.y)
+      const minX = Math.min(...xs), maxX = Math.max(...xs)
+      const minZ = Math.min(...zs), maxZ = Math.max(...zs)
+      const minLayer = Math.min(...ys), maxLayer = Math.max(...ys)
+      const spanX = maxX - minX + 1, spanZ = maxZ - minZ + 1
+      const spanLayers = view.layers.length || 1
+      // 格子边长：画布尺寸约束下取小，保证整个堆叠都在视野内
+      const fit = Math.min(
+        (canvasEl.clientWidth - 40) / (spanX + spanZ * 0.5),
+        (canvasEl.clientHeight - 40) / ((spanZ * 0.8 + spanLayers * 0.9))
+      )
+      const baseCell = Math.max(view.minCell, Math.min(view.maxCell, fit))
+      const cell = baseCell * view.zoom
+      const originX = canvasEl.clientWidth / 2
+      const originY = canvasEl.clientHeight / 2
+      // 世界坐标 → 相机坐标：先绕 Y 轴 yaw，再绕 X 轴 tilt，最后正交投影到屏幕
+      const yawRad = view.yaw * Math.PI / 180
+      const tiltRad = view.tilt * Math.PI / 180
+      const cosYaw = Math.cos(yawRad), sinYaw = Math.sin(yawRad)
+      const cosTilt = Math.cos(tiltRad), sinTilt = Math.sin(tiltRad)
+
+      const stackColumns = new Map()
+      for (const row of rows) {
+        const key = row.x + ',' + row.z
+        if (!stackColumns.has(key)) stackColumns.set(key, [])
+        stackColumns.get(key).push(row)
+      }
+      for (const stack of stackColumns.values()) stack.sort((a, b) => a.y - b.y)
+
+      const draw = () => {
+        state.adminChest3DYaw = view.yaw
+        state.adminChest3DTilt = view.tilt
+        state.adminChest3DZoom = view.zoom
+        state.adminChest3DCut = view.cutLayer
+        cutSelect.innerHTML = '<option value="">全部显示</option>' + view.layers.map(y =>
+          '<option value="' + esc(y) + '"' + (String(view.cutLayer) === String(y) ? ' selected' : '') + '>只到 Y=' + esc(y) + '（含以下）</option>').join('')
+        canvasEl.innerHTML = ''
+        let hiddenCount = 0
+        const visible = []
+        for (const row of rows) {
+          const cutted = view.cutLayer !== '' && row.y > view.cutLayer
+          if (cutted) { hiddenCount++; continue }
+          visible.push(row)
+        }
+        // 画师顺序：先画低层再画高层；同层内按屏幕深度远→近（近似 painter's algorithm：
+        // 用投影后的 depth 排序，CSS z-index 控制覆盖）
+        const quads = []
+        for (const row of visible) {
+          const wx0 = (row.x - minX) * cell
+          const wz0 = (row.z - minZ) * cell
+          const layerIndex = view.layers.indexOf(row.y)
+          const wy = layerIndex * cell * 1.05
+          const quad = projectQuad(wx0, wz0, wy, cell, cosYaw, sinYaw, cosTilt, sinTilt, originX, originY)
+          quad.row = row
+          quads.push(quad)
+        }
+        quads.sort((a, b) => a.depth - b.depth)
+        for (const quad of quads) {
+          const el = document.createElement('div')
+          el.className = 'chest3d-block' + (state.adminChestId === quad.row.chestId ? ' selected' : '')
+          const fill = chestFillLevel(quad.row)
+          el.style.left = quad.minX + 'px'
+          el.style.top = quad.minY + 'px'
+          el.style.width = (quad.maxX - quad.minX) + 'px'
+          el.style.height = (quad.maxY - quad.minY) + 'px'
+          el.style.background = chestFillColor(quad.row)
+          el.style.opacity = quad.row.slotCount ? String(0.35 + fill * 0.65) : '0.35'
+          el.style.zIndex = Math.round(quad.depth)
+          const isTopmost = isStackTop(quad.row, stackColumns)
+          el.title = quad.row.chestId + ' · ' + quad.row.slotCount + ' 格 / ' + num(quad.row.totalAmount) + ' 个' +
+            (Number(quad.row.shulkerAmount || 0) > 0 ? ' · 含潜影盒' : '') +
+            (isTopmost ? '' : ' · 堆叠中（上方有桶）')
+          el.dataset.adminChest = quad.row.chestId
+          el.dataset.topmost = isTopmost ? '1' : ''
+          el.dataset.stacked = isTopmost ? '' : '1'
+          canvasEl.appendChild(el)
+        }
+        // 切层天窗：顶面加一圈亮描边表示“从这里看进去”
+        hintEl.textContent = visible.length + ' 个桶可见' +
+          (hiddenCount ? '，' + hiddenCount + ' 个在切层之上被隐藏' : '') +
+          (view.cutLayer !== '' ? '（顶部开窗，可看到下方各层）' : '') +
+          ' · 视角 yaw ' + Math.round(view.yaw) + '° / tilt ' + Math.round(view.tilt) + '° / 缩放 ' + view.zoom.toFixed(2)
+      }
+
+      function isStackTop (row, stackColumns) {
+        const stack = stackColumns.get(row.x + ',' + row.z) || []
+        return !stack.some(other => other.y > row.y)
+      }
+
+      function projectQuad (wx, wz, wy, size, cosYaw, sinYaw, cosTilt, sinTilt, originX, originY) {
+        // 立方体 8 顶点：桶按 1×1×1 方块渲染（顶面 y+size）
+        const pts = []
+        for (const [dx, dy, dz] of [
+          [0, 0, 0], [size, 0, 0], [0, 0, size], [size, 0, size],
+          [0, size, 0], [size, size, 0], [0, size, size], [size, size, size]
+        ]) {
+          const x = wx + dx
+          const y = wy + dy
+          const z = wz + dz
+          // yaw（绕Y）：x' = x·cos - z·sin, z' = x·sin + z·cos
+          const rx = x * cosYaw - z * sinYaw
+          const rz = x * sinYaw + z * cosYaw
+          // tilt（绕X）：screenY = y·cosTilt + z·sinTilt（屏幕向下为正），depth = -y·sinTilt + z·cosTilt
+          const screenX = rx
+          const screenY = y * cosTilt + rz * sinTilt
+          const depth = rz * cosTilt - y * sinTilt
+          pts.push({ sx: originX + screenX, sy: originY + screenY, depth })
+        }
+        // 用外轮廓近似：屏幕上取 8 点的凸包包围盒 + 平均深度（正交投影下足够）
+        let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity
+        let depth = 0
+        for (const p of pts) {
+          if (p.sx < minX) minX = p.sx
+          if (p.sx > maxX) maxX = p.sx
+          if (p.sy < minY) minY = p.sy
+          if (p.sy > maxY) maxY = p.sy
+          depth += p.depth
+        }
+        return { minX, maxX, minY, maxY, depth: depth / pts.length }
+      }
+
+      draw()
+
+      // ===== 交互：拖拽旋转 / 滚轮缩放 / 切层 =====
+      let dragging = false
+      let lastX = 0, lastY = 0
+      canvasEl.addEventListener('mousedown', event => {
+        if (event.target.closest('[data-admin-chest]')) return  // 点方块走详情，不拖
+        dragging = true
+        lastX = event.clientX
+        lastY = event.clientY
+        event.preventDefault()
+      })
+      window.addEventListener('mousemove', event => {
+        if (!dragging) return
+        view.yaw = (view.yaw + (event.clientX - lastX) * 0.45 + 360) % 360
+        view.tilt = Math.max(5, Math.min(85, view.tilt - (event.clientY - lastY) * 0.3))
+        lastX = event.clientX
+        lastY = event.clientY
+        draw()
+      })
+      window.addEventListener('mouseup', () => { dragging = false })
+      canvasEl.addEventListener('wheel', event => {
+        event.preventDefault()
+        view.zoom = Math.max(0.35, Math.min(3, view.zoom * (event.deltaY < 0 ? 1.12 : 0.9)))
+        draw()
+      }, { passive: false })
+      canvasEl.addEventListener('touchstart', event => {
+        if (event.touches.length === 1) {
+          dragging = true
+          lastX = event.touches[0].clientX
+          lastY = event.touches[0].clientY
+        }
+      }, { passive: true })
+      canvasEl.addEventListener('touchmove', event => {
+        if (!dragging || event.touches.length !== 1) return
+        view.yaw = (view.yaw + (event.touches[0].clientX - lastX) * 0.45 + 360) % 360
+        view.tilt = Math.max(5, Math.min(85, view.tilt - (event.touches[0].clientY - lastY) * 0.3))
+        lastX = event.touches[0].clientX
+        lastY = event.touches[0].clientY
+        draw()
+      }, { passive: true })
+      canvasEl.addEventListener('touchend', () => { dragging = false })
+      cutSelect.addEventListener('change', () => {
+        view.cutLayer = cutSelect.value === '' ? '' : Number(cutSelect.value)
+        draw()
+      })
+      mapWrap.querySelector('#adminChest3DTop').addEventListener('click', () => {
+        view.yaw = 45
+        view.tilt = 88   // 近乎正上方，等效俯视图
+        draw()
+      })
+      mapWrap.querySelector('#adminChest3DReset').addEventListener('click', () => {
+        const fresh = chest3DDefaults(rows)
+        view.yaw = fresh.yaw
+        view.tilt = fresh.tilt
+        view.zoom = fresh.zoom
+        view.cutLayer = fresh.cutLayer
+        draw()
+      })
+    }
+
+    async function openAdminChest(chestId) {
+      state.adminChestId = chestId
+      document.querySelectorAll('[data-admin-chest]').forEach(el => el.classList.toggle('selected', el.dataset.adminChest === chestId))
+      const detailEl = $('adminChestDetail')
+      detailEl.classList.remove('hidden')
+      detailEl.innerHTML = '<p class="muted">加载中……</p>'
+      try {
+        const data = await api('/api/admin/chest', { chest: chestId })
+        renderAdminChestDetail(data)
+      } catch (error) {
+        detailEl.innerHTML = '<p class="muted">加载失败：' + esc(error.message) + '</p>'
+      }
+    }
+
+    function renderAdminChestDetail(data) {
+      const detailEl = $('adminChestDetail')
+      const items = data.items || []
+      const chestId = data.chestLabel
+      const shulkerSlots = items.filter(item => item.isShulker)
+      const slotsHtml = items.length ? items.map(item =>
+        '<div class="chest-slot' + (item.isShulker ? ' shulker' : '') + '" title="' + esc(item.displayName + ' #' + item.shortCode) + '">' +
+        '<div class="slot-index">槽 ' + esc(item.slot) + '</div>' +
+        '<img src="' + esc(iconUrl(item.itemId, 'item')) + '" alt="" loading="lazy">' +
+        '<div class="item-amount">x' + esc(item.amount) + '</div>' +
+        '<div class="item-name">' + esc(item.displayName) + '</div>' +
+        '</div>'
+      ).join('') : '<p class="muted">（这个桶是空的）</p>'
+      const shulkerHtml = shulkerSlots.length ? '<div class="chest-shulker-contents"><h3 class="section-title">潜影盒内容（聚合）</h3>' + shulkerSlots.map(item =>
+        '<div class="shulker-box-block"><div class="shulker-entry"><img src="' + esc(iconUrl(item.itemId, 'item')) + '" alt="" style="width:24px;height:24px" loading="lazy"><strong>' + esc(item.displayName) + '</strong><span class="muted">x' + esc(item.amount) + '</span></div>' +
+        (item.shulkerContents?.length
+          ? item.shulkerContents.map(entry => '<div class="shulker-entry"><span class="muted">·</span><img src="' + esc(iconUrl(entry.itemId, 'item')) + '" alt="" style="width:18px;height:18px" loading="lazy"><span>' + esc(entry.displayName) + '</span><span class="item-amount">x' + esc(entry.amount) + '</span><span class="muted">(' + esc(entry.slotCount) + ' 格)</span></div>').join('')
+          : '<div class="shulker-entry muted">（空盒）</div>') +
+        '</div>'
+      ).join('') + '</div>' : ''
+      detailEl.innerHTML =
+        '<div class="chest-detail-head"><strong>木桶 ' + esc(chestId) + '</strong>' +
+        '<span class="muted">' + esc(data.types) + ' 种 / ' + num(data.total) + ' 个 · 快照时间 ' + esc(data.nowLabel) + '</span>' +
+        '<span style="flex:1"></span>' +
+        '<button id="adminChestLiveBtn" class="solid">实时重读</button>' +
+        '<button id="adminChestCloseBtn" class="primary">关闭</button></div>' +
+        '<div id="adminChestLiveStatus" class="muted" style="margin-bottom:8px"></div>' +
+        '<div class="chest-slots-grid">' + slotsHtml + '</div>' + shulkerHtml
+      $('adminChestLiveBtn').addEventListener('click', () => resyncAdminChestLive(chestId))
+      $('adminChestCloseBtn').addEventListener('click', closeAdminChest)
+    }
+
+    async function resyncAdminChestLive(chestId) {
+      const statusEl = $('adminChestLiveStatus')
+      statusEl.textContent = '实时重读中：机器人正在打开这个木桶（会走到桶边开桶，可能需要几秒到十几秒）……'
+      $('adminChestLiveBtn').disabled = true
+      try {
+        const data = await post('/api/admin/chest/live', { chest: chestId })
+        statusEl.textContent = data.message + ' 快照时间：' + data.nowLabel
+        renderAdminChestDetail({ ...data, chestLabel: data.chestLabel || chestId, nowLabel: data.nowLabel })
+        // 重读会更新数据库记录，顺手刷新列表统计
+        loadAdminChests().catch(() => {})
+      } catch (error) {
+        statusEl.textContent = '实时重读失败：' + error.message
+        $('adminChestLiveBtn').disabled = false
+      }
+    }
+
+    function closeAdminChest() {
+      state.adminChestId = ''
+      $('adminChestDetail').classList.add('hidden')
+      document.querySelectorAll('[data-admin-chest]').forEach(el => el.classList.remove('selected'))
+    }
+
     // ===== 管理面板：终端实时日志 + logs 文件浏览 =====
     function adminLogTimeLabel(tsLabel) {
       return String(tsLabel || '').slice(11) || '';
@@ -5600,7 +6200,7 @@ const HTML = `<!doctype html>
       if (state.adminTab === 'inventory') return loadAdminInventory();
       if (state.adminTab === 'warehouses') return loadAdminWarehouses();
       if (state.adminTab === 'mismatches') return loadAdminMismatches();
-      if (state.adminTab === 'chests') return Promise.resolve();
+      if (state.adminTab === 'chests') return loadAdminChests();
       if (state.adminTab === 'transactions') return loadAdminTransactions();
       if (state.adminTab === 'commands') return loadAdminCommands();
       if (state.adminTab === 'aliases') return loadAdminAliases();
@@ -5727,6 +6327,22 @@ const HTML = `<!doctype html>
     $('adminInvLoad').addEventListener('click', () => loadAdminInventory({ owner: $('adminInvOwner').value }).catch(error => toast(error.message)));
     $('adminInvOwner').addEventListener('change', event => loadAdminInventory({ owner: event.currentTarget.value }).catch(error => toast(error.message)));
     $('adminMmLoad').addEventListener('click', () => loadAdminMismatches().catch(error => toast(error.message)));
+    $('adminChestLoad').addEventListener('click', () => loadAdminChests().catch(error => toast(error.message)));
+    $('adminChestRefresh').addEventListener('click', event => {
+      runButtonTask(event.currentTarget, '刷新中...', '木桶列表已刷新', () => loadAdminChests()).catch(error => toast(error.message));
+    });
+    for (const axis of ['x', 'y', 'z']) {
+      $('adminChest' + axis.toUpperCase()).addEventListener('keydown', event => {
+        if (event.key === 'Enter') loadAdminChests().catch(error => toast(error.message));
+      });
+    }
+    $('adminChestQ').addEventListener('keydown', event => {
+      if (event.key === 'Enter') loadAdminChests().catch(error => toast(error.message));
+    });
+    document.addEventListener('click', event => {
+      const chestEl = event.target.closest('[data-admin-chest]')
+      if (chestEl) openAdminChest(chestEl.dataset.adminChest)
+    })
     $('adminMmBatchResolve').addEventListener('click', () => runAdminMmBatch('extra').catch(error => toast(error.message)));
     $('adminMmBatchDeduct').addEventListener('click', () => runAdminMmBatch('missing').catch(error => toast(error.message)));
     document.querySelectorAll('[data-admin-mm-select]').forEach(button => button.addEventListener('click', () => {

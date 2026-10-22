@@ -2332,6 +2332,34 @@ class CloudStoreService {
     }, { exclusive: true })
   }
 
+  // Web 管理页“木桶视图”的实时重读：与 !同步木桶 同一条链路（开桶 → 替换槽位记录），
+  // 但不向游戏内发消息，结果直接回给面板。专用排他任务，避免与存取/全仓同步并发。
+  resyncBarrelForAdmin (coords, admin) {
+    const actor = String(admin?.username || 'web-admin')
+    return this.enqueueTask(actor, 'sync', async worker => {
+      const chestLabel = `${coords.x},${coords.y},${coords.z}`
+      const trace = startTrace({
+        bot: this.botId,
+        kind: 'barrel-debug',
+        actor,
+        source: 'web',
+        chest: chestLabel
+      })
+      this.attachWarehouseTrace(trace)
+      try {
+        const detail = await worker.warehouse.syncSingleBarrel(coords)
+        traceSummary(trace, { status: 'ok', source: 'web', chest: detail.chest?.describe || chestLabel, types: detail.types, total: detail.total })
+        return detail
+      } catch (error) {
+        traceEvent(trace, 'error', 'barrel_debug_error', { source: 'web', message: error?.message || String(error) })
+        traceSummary(trace, { status: 'failed', source: 'web', message: error?.message || String(error) })
+        throw error
+      } finally {
+        this.detachWarehouseTrace()
+      }
+    }, { exclusive: true })
+  }
+
   formatBarrelDetailLines (detail) {
     const chestLabel = detail.chest?.describe || `${detail.chest?.x},${detail.chest?.y},${detail.chest?.z}`
     const lines = [`木桶 ${chestLabel} 同步完成：${detail.types} 种物品，共 ${detail.total} 个。`]
