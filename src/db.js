@@ -2186,7 +2186,12 @@ class StoreDb {
           WHERE type = 'withdraw' AND deduction_key = ? AND player_uuid = ?
           LIMIT 1
         `).get(key, ownerUuid)
-        if (existing) continue
+        if (existing) {
+          // 撞键只应发生在同一任务的正常/恢复双路径上；跨任务撞键意味着有交付未被扣账，
+          // 不能无声跳过——留下告警便于对账（applyWithdrawDeduction 返回 applied=false）。
+          console.warn(`[withdraw-deduction] 幂等键重复，跳过扣账：key=${key} owner=${ownerUuid} username=${username}`)
+          continue
+        }
         const result = this.db.prepare(`
           INSERT INTO transactions (
             type, status, player_uuid, username, items_json, message, deduction_key, bot_id, bot_name
