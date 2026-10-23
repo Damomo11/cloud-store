@@ -1512,17 +1512,20 @@ class CloudStoreService {
         msgActor(`给 ${deliveryTarget} 的取货失败：仓库实物取出失败，请稍后再试。`)
       } else {
         // 重试后仍一无所获：缺口就地确认完毕（取到又放回的不计缺失），当场修账。
-        this.autoReconcileConfirmedMissing(storageOwner, attempt.allMissing || [], username)
+        // 背包已满导致的少取不是仓库缺货，不修账。
+        this.autoReconcileConfirmedMissing(storageOwner, (attempt.allMissing || []).filter(item => !item.inventoryFull), username)
         this.msg(username, `账本有库存，但按本地木桶记录没有取出：${this.formatItemList(plan.allocations)}。已就地核对各木桶并重试仍未取到，账本已按实物自动修正并登记异常；若持续出现，请管理员在Web管理页检查库存异常。`)
       }
       this.db.clearRecoveryTask(this.botId)
       return { status: 'failed_no_withdraw', delivered: [], missing: this.mergeItems(plan.allocations) }
     }
 
-    const missingByItem = this.groupMissingByDisplay(plan.allocations, attempt.allWithdrawn)
-    // 部分交付的缺口同样当场修账：交付部分稍后按计划扣账，缺失部分现在扣，
+    const missingByItem = this.groupMissingByDisplay(plan.allocations, attempt.allWithdrawn, attempt.allMissing)
+    // 部分交付的缺口当场修账：交付部分稍后按计划扣账，缺失部分现在扣，
     // 任务结束后账面 = 实物，不再需要管理员补 !同步。
-    const reconciledMissing = this.autoReconcileConfirmedMissing(storageOwner, attempt.allMissing || [], username)
+    // 背包已满导致的少取除外——仓库实物还在，不能扣账。
+    const reconcilableMissing = (attempt.allMissing || []).filter(item => !item.inventoryFull)
+    const reconciledMissing = this.autoReconcileConfirmedMissing(storageOwner, reconcilableMissing, username)
     traceEvent(trace, 'result', 'task_delivered', {
       delivered: deliveredTotal.map(item => ({ name: item.displayName || item.itemId, amount: item.amount, keyTail: shortKey(item.itemKey) })),
       missingNotices: missingByItem,
@@ -3034,14 +3037,22 @@ class CloudStoreService {
     }, 0)
   }
 
-  groupMissingByDisplay (planned, delivered) {
+  groupMissingByDisplay (planned, delivered, missingItems = []) {
     const plannedByKey = this.sumWithdrawCoverageByKey(planned)
     const deliveredByKey = this.sumWithdrawCoverageByKey(delivered)
+    // 背包已满导致的少取不是仓库缺货：单独提示，且不参与确认缺失自动修账
+    const inventoryFullKeys = new Set(
+      (missingItems || []).filter(item => item.inventoryFull).map(item => item.itemKey)
+    )
     const notices = []
     for (const item of planned) {
       const missing = (plannedByKey.get(this.withdrawCoverageKey(item)) || 0) - (deliveredByKey.get(this.withdrawCoverageKey(item)) || 0)
       if (missing > 0) {
-        notices.push(`${item.requestDisplayName || item.displayName || this.catalog.getDisplayName(item.itemId)} 仓库实际库存不足，少取 ${missing} 个；只扣除实际交付数量。`)
+        const name = item.requestDisplayName || item.displayName || this.catalog.getDisplayName(item.itemId)
+        const full = inventoryFullKeys.has(item.itemKey) || inventoryFullKeys.has(item.requestItemKey)
+        notices.push(full
+          ? `${name} 机器人背包已满，少取 ${missing} 个；仓库有货未扣库存，可稍后单独再取。`
+          : `${name} 仓库实际库存不足，少取 ${missing} 个；只扣除实际交付数量。`)
       }
     }
     return [...new Set(notices)]
