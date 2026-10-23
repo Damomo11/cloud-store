@@ -1063,101 +1063,52 @@ class CloudStoreService {
           return
         }
       }
-      // 收集→回仓可能往返多轮：背包捡满（或到场时就满）就提前结束本轮、回仓入库
-      // 腾出背包，再传送回玩家身边继续收集，防止玩家丢的大量物品因背包满
-      // 捡不起来、堆在地上甚至消失。仓库装不下（入库后仍有剩余）或传送不
-      // 回去时，直接按已入库结果收尾。
-      const maxInventoryFullTrips = 2
-      let inventoryFullTrips = 0
-      let earlyResult = null
-      while (!earlyResult) {
-        if (this.active) {
-          this.active.type = 'deposit'
-          this.active.phase = 'deposit_collecting'
-          this.active.targetUsername = username
-          delete this.active.depositStopReason
-          delete this.active.depositPlayerDistance
-        }
-        this.saveRecoveryTask('deposit', username, storageOwner, username, 'deposit_collecting')
-        const leaveDistance = Number(this.config.timing.depositLeaveDistance || 4)
-        this.msg(username, `开始收集物品，请在10秒内丢给我；你离开机器人超过${leaveDistance}格后会提前结束。`)
+      if (this.active) {
+        this.active.type = 'deposit'
+        this.active.phase = 'deposit_collecting'
+        this.active.targetUsername = username
+      }
+      this.saveRecoveryTask('deposit', username, storageOwner, username, 'deposit_collecting')
+      const leaveDistance = Number(this.config.timing.depositLeaveDistance || 4)
+      this.msg(username, `开始收集物品，请在10秒内丢给我；你离开机器人超过${leaveDistance}格后会提前结束。`)
 
-        const deadline = Date.now() + this.config.timing.pickupWindowMs
-        const shouldStopCollecting = () => {
-          if (this.active?.cancelled) return true
-          // 背包没有空格就提前结束本轮：满背包捡不起玩家丢的物品，
-          // 干等窗口结束只会让地上的物品堆积甚至消失。
-          if (this.bot.inventory.emptySlotCount?.() === 0) {
-            if (this.active) this.active.depositStopReason = 'inventory_full'
-            return true
-          }
-          const playerEntity = this.resolvePlayerEntity(username).entity
-          const botPosition = this.bot.entity?.position
-          if (!playerEntity?.position || !botPosition) return false
-          const distance = playerEntity.position.distanceTo(botPosition)
-          if (distance <= leaveDistance) return false
-          if (this.active) {
-            this.active.depositStopReason = 'player_left'
-            this.active.depositPlayerDistance = distance
-          }
+      const deadline = Date.now() + this.config.timing.pickupWindowMs
+      const shouldStopCollecting = () => {
+        if (this.active?.cancelled) return true
+        // 背包捡满就提前结束收集（与"玩家远离"同级的提前结束条件）：满背包
+        // 捡不起玩家丢的物品，干等窗口结束只会让地上的物品堆积甚至消失，
+        // 不如立即回去入库，玩家想继续存可以再叫一次。
+        if (this.bot.inventory.emptySlotCount?.() === 0) {
+          if (this.active) this.active.depositStopReason = 'inventory_full'
           return true
         }
-        if (this.config.debug) console.log(`[deposit] collecting for ${username}, window=${this.config.timing.pickupWindowMs}ms`)
-        await this.warehouse.collectNearbyDropsUntil(deadline, shouldStopCollecting)
-        if (this.config.debug) console.log(`[deposit] collect window ended for ${username}, cancelled=${this.active?.cancelled}, reason=${this.active?.depositStopReason || 'timeout'}`)
-        if (this.isActiveCancelled()) {
-          logCancelledSession()
-          return
+        const playerEntity = this.resolvePlayerEntity(username).entity
+        const botPosition = this.bot.entity?.position
+        if (!playerEntity?.position || !botPosition) return false
+        const distance = playerEntity.position.distanceTo(botPosition)
+        if (distance <= leaveDistance) return false
+        if (this.active) {
+          this.active.depositStopReason = 'player_left'
+          this.active.depositPlayerDistance = distance
         }
-        await this.warehouse.waitForPickupSettle()
-        const collected = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
-        traceEvent(trace, 'deposit', 'collect_done', {
-          stopReason: this.active?.depositStopReason || 'timeout',
-          held: collected.map(item => ({ name: item.displayName || item.itemId, amount: item.amount })),
-          decision: collected.length
-            ? `收集结束：收到 ${collected.reduce((sum, item) => sum + item.amount, 0)} 个物品`
-            : '收集结束：没有收到物品'
-        })
-
-        if (this.active?.depositStopReason !== 'inventory_full' || inventoryFullTrips >= maxInventoryFullTrips) break
-        inventoryFullTrips++
-        traceEvent(trace, 'decision', 'inventory_full_return', {
-          trip: inventoryFullTrips,
-          held: collected.map(item => ({ name: item.displayName || item.itemId, amount: item.amount })),
-          decision: '背包已满，提前回仓入库腾出背包，再传送回来继续收集'
-        })
-        this.msg(username, '背包已满，先回仓入库，马上回来继续收集。')
-        if (this.active) this.active.phase = 'deposit_return_home'
-        await this.warehouse.goHome({ requireWarehouse: true })
-        if (this.isActiveCancelled()) {
-          logCancelledSession()
-          return
-        }
-        if (this.active) this.active.phase = 'deposit_storing'
-        this.saveRecoveryTask('deposit', username, storageOwner, username, 'deposit_storing')
-        const flush = await this.warehouse.depositInventoryForOwner(storageOwner.uuid, storageOwner.username)
-        if (flush.deposited.length) {
-          this.msg(username, `${this.ownerActionPrefix(storageOwner)}已先存入：${this.formatDepositSummary(flush.deposited)}。`)
-        }
-        if (flush.leftover.length) {
-          // 仓库装不下剩余物品：回去也腾不出背包，直接按本次入库结果收尾。
-          traceEvent(trace, 'deposit', 'inventory_full_flush_blocked', {
-            leftover: flush.leftover.map(item => ({ name: item.displayName || item.itemId, amount: item.amount })),
-            stopReason: flush.stopReason || '',
-            decision: '入库后仍有剩余，仓库已满，不再回玩家处继续收集'
-          })
-          earlyResult = flush
-          break
-        }
-        const returned = await this.teleportToPlayer(username)
-        if (!returned) {
-          traceEvent(trace, 'delivery', 'inventory_full_return_teleport_failed', {
-            target: username,
-            decision: '腾包后没能回到玩家身边，按已入库结果收尾'
-          })
-          earlyResult = flush
-        }
+        return true
       }
+      if (this.config.debug) console.log(`[deposit] collecting for ${username}, window=${this.config.timing.pickupWindowMs}ms`)
+      await this.warehouse.collectNearbyDropsUntil(deadline, shouldStopCollecting)
+      if (this.config.debug) console.log(`[deposit] collect window ended for ${username}, cancelled=${this.active?.cancelled}, reason=${this.active?.depositStopReason || 'timeout'}`)
+      if (this.isActiveCancelled()) {
+        logCancelledSession()
+        return
+      }
+      await this.warehouse.waitForPickupSettle()
+      const collected = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
+      traceEvent(trace, 'deposit', 'collect_done', {
+        stopReason: this.active?.depositStopReason || 'timeout',
+        held: collected.map(item => ({ name: item.displayName || item.itemId, amount: item.amount })),
+        decision: collected.length
+          ? `收集结束：收到 ${collected.reduce((sum, item) => sum + item.amount, 0)} 个物品`
+          : '收集结束：没有收到物品'
+      })
 
       if (this.active) this.active.phase = 'deposit_return_home'
       await this.warehouse.goHome({ requireWarehouse: true })
@@ -1167,8 +1118,7 @@ class CloudStoreService {
       }
       if (this.active) this.active.phase = 'deposit_storing'
       this.saveRecoveryTask('deposit', username, storageOwner, username, 'deposit_storing')
-      // 中途已因仓库满/传送失败收尾时直接用当时的结果，不再重复入库。
-      const result = earlyResult || await this.warehouse.depositInventoryForOwner(storageOwner.uuid, storageOwner.username)
+      const result = await this.warehouse.depositInventoryForOwner(storageOwner.uuid, storageOwner.username)
       traceEvent(trace, 'deposit', 'deposit_flow_result', {
         deposited: (result.deposited || []).map(item => ({ name: item.displayName || item.itemId, amount: item.amount })),
         leftover: (result.leftover || []).map(item => ({ name: item.displayName || item.itemId, amount: item.amount })),
