@@ -1369,3 +1369,191 @@ test('quick shulker extraction retries opening when the server returns an empty 
   assert.equal(result.missing.length, 0)
   assert.deepEqual(operations, ['prepared', 'physical_changed', 'committed'])
 })
+
+test('a bad NBT frame after extraction is rechecked by reopening the box and completes with the real amount', async () => {
+  const target = { itemKey: 'target-key', itemId: 'minecraft:diamond', displayName: '钻石', amount: 2 }
+  const oldBoxInfo = { itemKey: 'old-box', itemId: 'minecraft:purple_shulker_box', displayName: '潜影盒' }
+  const oldBox = { slot: 36, count: 1, normalized: oldBoxInfo }
+  const newBoxInfo = { itemKey: 'new-box', itemId: oldBoxInfo.itemId, displayName: '潜影盒' }
+  const newBox = { slot: 36, count: 1, normalized: newBoxInfo }
+  let inventory = [oldBox]
+  let nbtFixed = false
+  const operations = []
+  const db = {
+    getItemByKey: key => key === target.itemKey ? target : (key === oldBoxInfo.itemKey ? oldBoxInfo : null),
+    listSlotsForItemKey: () => [{ chestId: '1,2,3', x: 1, y: 2, z: 3, blockName: 'barrel', slot: 4, amount: 1 }],
+    beginShulkerRepackRecovery: () => { operations.push('prepared') },
+    markShulkerRepackPhysicalChange: () => { operations.push('physical_changed') },
+    commitShulkerRepackRecovery: () => { operations.push('committed') },
+    clearShulkerRepackRecovery: () => {},
+    getShulkerRepackRecovery: () => null
+  }
+  const catalog = {
+    fromPrismarineItem: item => ({ ...item.normalized, amount: item.count }),
+    isShulkerBox: itemId => /_shulker_box$/.test(itemId),
+    // 关窗后盒子 NBT 一开始是坏帧（读到 0），重开盒关窗后才被服务器修正为 3
+    extractShulkerContents: box => box.itemKey === oldBoxInfo.itemKey
+      ? [{ item: target, amount: 5 }]
+      : [{ item: target, amount: nbtFixed ? 3 : 0 }]
+  }
+  const bot = { inventory: { items: () => inventory } }
+  const config = structuredClone(DEFAULT_CONFIG)
+  config.debug = false
+  config.timing.containerSettleMs = 0
+  config.timing.inventoryUpdateTimeoutMs = 100
+  const warehouse = new Warehouse(bot, db, catalog, config)
+  warehouse.takeOneShulkerFromChest = async () => oldBox
+  let opens = 0
+  warehouse.openQuickShulkerWindow = async () => {
+    opens++
+    if (opens === 1) {
+      return {
+        items: () => [{ normalized: { ...target }, slot: 0, count: 5 }],
+        close: () => { inventory = [newBox, ...inventory.filter(item => item !== oldBox)] }
+      }
+    }
+    return {
+      items: () => [{ normalized: { ...target }, slot: 0, count: 3 }],
+      close: () => { nbtFixed = true }
+    }
+  }
+  warehouse.tryWithdrawExactFrom = async (container, itemKey, amount) => {
+    if (opens === 1 && amount > 0) {
+      inventory = [...inventory, { normalized: { ...target }, slot: 20, count: amount }]
+    }
+    return amount
+  }
+  warehouse.returnShulkerToChest = async () => { inventory = [] }
+
+  const result = await warehouse.withdrawFromShulkerBoxes({
+    withdrawMode: 'shulker_extract',
+    ownerUuid: 'owner',
+    ownerUsername: 'Player',
+    itemKey: target.itemKey,
+    amount: 2,
+    sourceShulkerItemKey: oldBoxInfo.itemKey,
+    sourceBoxCount: 1
+  })
+
+  assert.equal(opens, 2, '校验失败后重开了盒子复核')
+  assert.equal(result.withdrawn[0].amount, 2)
+  assert.equal(result.missing.length, 0)
+  assert.deepEqual(operations, ['prepared', 'physical_changed', 'committed'])
+})
+
+test('extraction mismatch recovery returns the overdrawn amount back into the box', async () => {
+  const target = { itemKey: 'target-key', itemId: 'minecraft:diamond', displayName: '钻石' }
+  const boxInfo = { itemKey: 'new-box', itemId: 'minecraft:purple_shulker_box', displayName: '潜影盒' }
+  const box = { slot: 30, count: 1, normalized: boxInfo }
+  let inventory = [box, { normalized: { ...target }, slot: 20, count: 2 }]
+  let windowItems = [{ normalized: { ...target }, slot: 0, count: 0 }]
+  let depositCalls = 0
+  const bot = {
+    currentWindow: null,
+    closeWindow: () => {},
+    inventory: { items: () => inventory }
+  }
+  const catalog = {
+    fromPrismarineItem: item => ({ ...item.normalized, amount: item.count }),
+    isShulkerBox: itemId => /_shulker_box$/.test(itemId),
+    extractShulkerContents: () => [{ item: target, amount: 3 }]
+  }
+  const config = structuredClone(DEFAULT_CONFIG)
+  config.debug = false
+  config.timing.containerSettleMs = 0
+  config.timing.inventoryUpdateTimeoutMs = 100
+  const warehouse = new Warehouse(bot, {}, catalog, config)
+  warehouse.openQuickShulkerWindow = async () => ({
+    items: () => windowItems,
+    close: () => {}
+  })
+  warehouse.tryDepositInto = async () => {
+    depositCalls++
+    windowItems = [{ normalized: { ...target }, slot: 0, count: 3 }]
+    return 3
+  }
+
+  const result = await warehouse.recoverShulkerExtractionMismatch({
+    allocation: { itemKey: target.itemKey },
+    sourceKey: 'old-box',
+    sourceItem: { itemId: boxInfo.itemId },
+    available: 5,
+    planned: 2,
+    inventoryBaseline: 0
+  })
+
+  assert.equal(result.resolved, true)
+  assert.equal(result.moved, 2)
+  assert.equal(depositCalls, 1, '多取的 3 个已放回盒内')
+})
+
+test('extraction mismatch recovery reports unresolved when the box NBT still disagrees', async () => {
+  const target = { itemKey: 'target-key', itemId: 'minecraft:diamond', displayName: '钻石' }
+  const boxInfo = { itemKey: 'new-box', itemId: 'minecraft:purple_shulker_box', displayName: '潜影盒' }
+  const box = { slot: 30, count: 1, normalized: boxInfo }
+  const inventory = [box, { normalized: { ...target }, slot: 20, count: 2 }]
+  const bot = {
+    currentWindow: null,
+    closeWindow: () => {},
+    inventory: { items: () => inventory }
+  }
+  const catalog = {
+    fromPrismarineItem: item => ({ ...item.normalized, amount: item.count }),
+    isShulkerBox: itemId => /_shulker_box$/.test(itemId),
+    // 关窗后 NBT 依旧读到 0，与窗口读数 3 对不上
+    extractShulkerContents: () => [{ item: target, amount: 0 }]
+  }
+  const config = structuredClone(DEFAULT_CONFIG)
+  config.debug = false
+  config.timing.containerSettleMs = 0
+  config.timing.inventoryUpdateTimeoutMs = 100
+  const warehouse = new Warehouse(bot, {}, catalog, config)
+  warehouse.openQuickShulkerWindow = async () => ({
+    items: () => [{ normalized: { ...target }, slot: 0, count: 3 }],
+    close: () => {}
+  })
+
+  const result = await warehouse.recoverShulkerExtractionMismatch({
+    allocation: { itemKey: target.itemKey },
+    sourceKey: 'old-box',
+    sourceItem: { itemId: boxInfo.itemId },
+    available: 5,
+    planned: 2,
+    inventoryBaseline: 0
+  })
+
+  assert.equal(result.resolved, false)
+  assert.match(result.reason, /NBT 与窗口读数不一致/)
+})
+
+test('confirmed mismatch dumps the batch items into the chest and refreshes the record', async () => {
+  const target = { itemKey: 'target-key', itemId: 'minecraft:diamond', displayName: '钻石' }
+  const events = []
+  let inventory = [{ normalized: { ...target }, slot: 20, count: 64 }]
+  const bot = { inventory: { items: () => inventory } }
+  const catalog = {
+    fromPrismarineItem: item => ({ ...item.normalized, amount: item.count })
+  }
+  const config = structuredClone(DEFAULT_CONFIG)
+  config.debug = false
+  config.timing.containerSettleMs = 0
+  const warehouse = new Warehouse(bot, {}, catalog, config)
+  const container = { items: () => [] }
+  warehouse.openContainerAt = async () => { events.push('open'); return container }
+  warehouse.tryDepositInto = async () => {
+    events.push('deposit')
+    inventory = []
+    return 64
+  }
+  warehouse.closeContainerQuietly = () => { events.push('close') }
+  warehouse.refreshChestSnapshot = () => { events.push('refresh') }
+
+  await warehouse.dumpInventoryItemsToChest(
+    { chestId: '1,2,3', x: 1, y: 2, z: 3, blockName: 'barrel' },
+    { itemKey: target.itemKey },
+    'test-reason'
+  )
+
+  assert.deepEqual(events, ['open', 'deposit', 'refresh', 'close'])
+  assert.equal(inventory.length, 0, '背包中的该批物品已全部放进木桶')
+})
