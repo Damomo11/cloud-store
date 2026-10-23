@@ -26,6 +26,13 @@ class CloudStoreWebServer {
     if (this.server || this.config.web?.enabled === false) return
     const { host, port } = this.resolveListenOptions()
     this.server = http.createServer((req, res) => this.handle(req, res))
+    this.server.once('error', error => {
+      // 端口被占（EADDRINUSE）说明已有另一实例在跑（如热重载后的孤儿进程），
+      // 直接退出让外层循环/守护拉起重试，而不是带着死面板继续跑。
+      console.error(`[web] cloud store panel failed to listen on ${host}:${port}: ${error.code || error.message}`)
+      logLocalError('web-listen-error', error)
+      process.exit(1)
+    })
     this.server.listen(port, host, () => {
       const actualPort = this.server.address()?.port || port
       console.log(`[web] cloud store panel listening on ${this.publicUrl(actualPort)}`)

@@ -73,7 +73,11 @@ const DEFAULT_CONFIG = {
     teleportDetectRadius: 8,
     reconnectDelayMs: 10000,
     // !热重载 等待所有机器人空闲的最长时间；超时后直接重启，进行中的任务会在重启后自动恢复。
-    hotReloadIdleTimeoutMs: 600000
+    hotReloadIdleTimeoutMs: 600000,
+    // !热重载 退出前是否由本进程自己拉起新代码进程。默认 false：推荐在 screen 循环/
+    // systemd 等外层守护下跑，退出后由守护重新拉起，新进程留在原会话、日志可见。
+    // 只有裸跑（无任何守护、进程退出后没人重启）才需要置 true。
+    hotReloadSpawnSuccessor: false
   },
   debug: true,
   debugChat: true,

@@ -59,8 +59,8 @@ class CloudStoreService {
   }
 
   // index.js 注入热重载所需的全局收尾与退出实现：
-  // shutdownHook 在退出前执行（断开所有 bot、关订阅和 DB）；exitHook 返回 true 表示
-  // 已安排进程退出。未注入时（测试桩）热重载只跑到“通知重启”为止，不真正退出。
+  // shutdownHook 在退出前执行（断开所有 bot、关订阅和 DB）；exitHook 显式退出进程——
+  // 不依赖“事件循环自然排空”（残留 handle 会让旧进程变成断了 bot、关了 DB 的僵尸）。
   setHotReloadHooks (shutdownHook, exitHook) {
     this.hotReloadShutdownHook = typeof shutdownHook === 'function' ? shutdownHook : null
     this.hotReloadExitHook = typeof exitHook === 'function' ? exitHook : null
@@ -872,6 +872,7 @@ class CloudStoreService {
       notify: message => this.msg(username, message),
       taskPool: this.taskPool,
       idleTimeoutMs: this.config.timing?.hotReloadIdleTimeoutMs,
+      spawnSuccessor: this.config.timing?.hotReloadSpawnSuccessor === true,
       gitExec: stubs.gitExec,
       gitPull: stubs.gitPull,
       waitForIdle: stubs.waitForIdle,
@@ -883,6 +884,7 @@ class CloudStoreService {
       },
       exitProcess: async () => {
         finish()
+        // hotReloadExitHook 未注入（测试桩）时不退出，返回 false 让流程走完但进程保留。
         const exited = await this.hotReloadExitHook?.()
         return exited !== false
       }

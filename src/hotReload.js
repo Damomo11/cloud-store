@@ -121,9 +121,13 @@ function scheduleSuccessorProcess ({
 }
 
 // 完整热重载流程。notify(message) 负责把进度私聊给管理员。
-// shutdown 在退出前执行（收尾 db/订阅等）；exitProcessImplementation() 在 shutdown
-// 完成后调用，用于真正退出进程（生产传 () => process.exit(0)）。
+// shutdown 在退出前执行（收尾 db/订阅等）；exitProcess 在 shutdown 完成后调用，
+// 用于真正退出进程（生产传 () => process.exit(0)）。
 // gitPull/waitForIdle/scheduleSuccessorProcess 可注入以便测试。
+//
+// spawnSuccessor（默认 false）：是否在退出前自己拉起新代码进程。
+// 默认关闭——部署推荐在 screen 循环 / systemd 等外层守护里跑，进程退出后由守护重启，
+// 新进程留在原会话里、日志可见。只有裸跑（无任何守护）时才需要置 true。
 async function runHotReload ({
   notify,
   taskPool,
@@ -133,6 +137,7 @@ async function runHotReload ({
   pollMs,
   sleep,
   now,
+  spawnSuccessor = false,
   entryFile,
   spawnImplementation,
   shutdown,
@@ -157,13 +162,20 @@ async function runHotReload ({
     notify('等待超时：仍有任务未结束，现在直接重启（进行中的任务会在重启后自动恢复）。')
   }
 
-  const successor = startSuccessor({ entryFile, spawnImplementation })
-  notify('机器人已空闲，程序将在几秒后用新代码重启；如果几分钟后机器人没上线，请手动启动一次。')
+  // 内部拉继任者时，新进程延迟几秒启动再退旧进程，让新进程完成初始化（绑端口等），
+  // 避免热重载期间 Web 面板长时间不可用。
+  let successor = null
+  if (spawnSuccessor) {
+    successor = startSuccessor({ entryFile, spawnImplementation })
+    notify('机器人已空闲，程序将在几秒后用新代码重启；如果几分钟后机器人没上线，请手动启动一次。')
+  } else {
+    notify('机器人已空闲，程序即将退出并由外层守护用新代码重新拉起。')
+  }
 
   try {
     await shutdown?.()
   } catch (error) {
-    successor.cancel()
+    successor?.cancel()
     notify(`热重载中止：退出前收尾失败（${error.message}）。本次不重启。`)
     return { status: 'shutdown_failed', error }
   }

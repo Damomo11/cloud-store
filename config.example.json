@@ -191,7 +191,14 @@
 
     // !hot-reload (admin in-game command): max wait in ms for all bots to become
     // idle before restarting anyway. In-flight tasks auto-recover after restart.
-    "hotReloadIdleTimeoutMs": 600000
+    "hotReloadIdleTimeoutMs": 600000,
+
+    // !hot-reload: spawn the new-code process ourselves before exiting.
+    // Default false: run under a supervisor (screen loop / systemd) which
+    // restarts the process after it exits, keeping the new process inside the
+    // original session with visible logs. Only set true when running bare
+    // with no supervisor to restart the process after it exits.
+    "hotReloadSpawnSuccessor": false
   },
 
   // General debug logging.

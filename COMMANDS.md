@@ -231,13 +231,36 @@ Web 面板左侧有“库存”和“交易记录”。库存页可以点“远�
 
 1. 机器人先在本机执行 `git pull` 拉取最新代码；
 2. 然后等待所有机器人空闲（没有存取/同步任务、不在死亡恢复或急救中）；
-3. 空闲后用新代码重启程序：新进程先启动，旧进程随后退出，Web 面板会短暂中断后自动恢复。
+3. 空闲后退出旧进程，由外层守护（screen 循环 / systemd 等）用新代码重新拉起。
 
 等待期间机器人可以继续接单；管理员也可以继续正常使用。如果 10 分钟内一直有任务在跑，
 会超时并直接重启（进行中的任务会在重启后自动恢复，不会丢账）。超时时间可以在
 `config.json` 的 `timing.hotReloadIdleTimeoutMs` 中调整。
 
 `git pull` 失败（网络问题、本地有未提交改动冲突等）会私聊告知原因并中止，不会重启。
+
+### 推荐部署方式：screen 内跑循环
+
+程序设计为“退出后由外层守护重新拉起”。在 screen 会话里用循环启动：
+
+```bash
+screen -S cloud-store
+cd /path/to/cloud-store
+while true; do node src/index.js; echo "[supervisor] 程序退出，2 秒后重启"; sleep 2; done
+```
+
+这样 `!热重载` 只负责更新代码和干净退出，重启交给循环完成：
+
+- 新进程始终留在 screen 里，`screen -r` 随时可看到实时日志；
+- 程序异常崩溃也会被循环自动拉起；
+- `Ctrl+C`（SIGINT）和 `kill <pid>`（SIGTERM）都会先断开全部 bot、关闭数据库再退出，不会留脏数据。
+
+如果确实要裸跑（进程退出后没有任何东西负责重启），才把 `config.json` 的
+`timing.hotReloadSpawnSuccessor` 设为 `true`：热重载会在退出前自己拉起新代码进程
+（新进程脱离 screen，日志不可见）。默认 `false`。
+
+注意：Web 面板端口被占说明已有另一个实例在跑，此时进程会记录错误后直接退出（exit 1）。
+发现机器人和面板异常时先用 `ps -ef | grep "node src/index.js"` 确认只有一个实例。
 
 ### 同步仓库
 

@@ -60,7 +60,7 @@ function stubHotReloadDeps (fixture, { gitPullError } = {}) {
   return calls
 }
 
-test('admin !热重载 runs pull, waits for idle, then restarts', async () => {
+test('admin !热重载 runs pull, waits for idle, then exits for the external supervisor', async () => {
   const fixture = createService()
   const calls = stubHotReloadDeps(fixture)
   const shutdownCalls = []
@@ -71,11 +71,23 @@ test('admin !热重载 runs pull, waits for idle, then restarts', async () => {
 
   assert.equal(result.status, 'restarting')
   assert.equal(calls.gitExec?.[0] !== undefined, true, 'git pull executed')
-  assert.equal(calls.successorStarted, true, 'successor process scheduled')
+  // 默认（无外层守护拉起配置）不自己拉继任进程，退出交给外层循环/守护。
+  assert.equal(calls.successorStarted, false, 'successor NOT spawned by default')
   assert.equal(shutdownCalls.length, 1, 'shutdown hook called once')
   assert.equal(exitCalls.length, 1, 'exit hook called once')
   assert.ok(fixture.sent[0].includes('开始热重载'), 'flow start notified')
   assert.ok(fixture.sent.some(text => text.includes('机器人已空闲')), 'idle restart notified')
+})
+
+test('hotReloadSpawnSuccessor=true spawns the successor process itself', async () => {
+  const fixture = createService()
+  const calls = stubHotReloadDeps(fixture)
+  fixture.service.config.timing.hotReloadSpawnSuccessor = true
+  fixture.service.setHotReloadHooks(() => {}, async () => true)
+
+  const result = await fixture.service.handleHotReload('Admin')
+  assert.equal(result.status, 'restarting')
+  assert.equal(calls.successorStarted, true, 'successor spawned when enabled')
 })
 
 test('!热重载 dispatch through handleIncoming requires admin', async () => {

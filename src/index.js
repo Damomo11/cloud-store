@@ -286,7 +286,12 @@ function launchBot (state) {
   const warehouse = new Warehouse(bot, db, catalog, launchConfig, taskPool.warehouseMutex, taskPool.warehouseState)
   const service = new CloudStoreService(bot, db, catalog, warehouse, launchConfig, taskPool, subscriptions)
   service.setWebAuth(webServer)
-  service.setHotReloadHooks(shutdownForHotReload, () => true)
+  // 热重载收尾钩子：断开全部 bot 并关资源后显式退出（exit 0），
+  // 由外层守护（screen 循环/systemd）或 spawnSuccessor 拉起的新进程接替。
+  service.setHotReloadHooks(shutdownForHotReload, () => {
+    process.exit(0)
+    return true
+  })
   setupRegistryExport(bot, catalog, db)
 
   const loginWatchdog = setInterval(() => {
@@ -598,8 +603,8 @@ process.on('unhandledRejection', (reason) => {
   logLocalError('unhandled-rejection', reason)
 })
 
-// !热重载 的全局收尾：断开全部 bot（不再重连）、关闭订阅和 DB。
-// 新代码进程已由 hotReload.js 拉起，这里只负责让旧进程干净退出。
+// !热重载 / SIGINT / SIGTERM 共用的全局收尾：断开全部 bot（不再重连）、关闭 Web 端口、
+// 订阅和 DB。退出后由外层守护（screen 循环/systemd）或 spawnSuccessor 拉起的新进程接替。
 function shutdownForHotReload () {
   if (shuttingDown) return
   shuttingDown = true
@@ -607,7 +612,7 @@ function shutdownForHotReload () {
     if (state.reconnectTimer) clearTimeout(state.reconnectTimer)
     state.reconnectTimer = null
     state.desiredEnabled = false
-    try { state.bot?.quit('hot reload restart') } catch {}
+    try { state.bot?.quit('shutdown') } catch {}
   }
   try { webServer.server?.close?.() } catch {}
   subscriptions.close()
@@ -615,6 +620,13 @@ function shutdownForHotReload () {
 }
 
 process.on('SIGINT', () => {
+  shutdownForHotReload()
+  process.exit(0)
+})
+
+process.on('SIGTERM', () => {
+  // 外层守护（screen 循环/systemd 重启、运维手动 stop）统一走这条收尾：
+  // 断开全部 bot、关订阅和 DB，再退出；未收尾直接 kill 会留下 WAL 未合并、bot 未 quit。
   shutdownForHotReload()
   process.exit(0)
 })
