@@ -2277,7 +2277,7 @@ class CloudStoreService {
     return [coordinator, ...picked]
   }
 
-  async syncWarehouseWithTeam (coordinator, radius, trace) {
+  async syncWarehouseWithTeam (coordinator, radius, trace, options = {}) {
     const blocks = await coordinator.warehouse.prepareSyncBlocks(radius)
     const participants = this.collectSyncParticipants(coordinator)
     // 桶数不足就不分区（<=1 个桶并行没有意义）。
@@ -2286,7 +2286,7 @@ class CloudStoreService {
 
     if (workerCount === 1) {
       const scan = await coordinator.warehouse.scanBarrelBlocks(blocks, radius)
-      const result = await coordinator.warehouse.withWarehouseLock(() => coordinator.warehouse.applyWarehouseScan(scan, radius))
+      const result = await coordinator.warehouse.withWarehouseLock(() => coordinator.warehouse.applyWarehouseScan(scan, radius, options))
       return { ...result, botCount: 1 }
     }
 
@@ -2315,7 +2315,7 @@ class CloudStoreService {
         snapshots: scans.flatMap(scan => scan.snapshots),
         actualItems: scans.flatMap(scan => scan.actualItems)
       }
-      const result = await coordinator.warehouse.withWarehouseLock(() => coordinator.warehouse.applyWarehouseScan(merged, radius))
+      const result = await coordinator.warehouse.withWarehouseLock(() => coordinator.warehouse.applyWarehouseScan(merged, radius, options))
       return { ...result, botCount: workerCount }
     } finally {
       for (const service of borrowed) {
@@ -2332,17 +2332,21 @@ class CloudStoreService {
 
     await this.enqueueTask(username, 'sync', async worker => {
       const parts = text.split(/\s+/).filter(Boolean)
+      // "强制" 用于确属拆除木桶后的缩量重扫，跳过缩量守卫（守卫默认开启，
+      // 防止小半径同步误删半径外的桶记录并对账抽干 momo）。
+      const force = parts.slice(1).some(part => part === '强制' || part.toLowerCase() === 'force')
+      const numericArg = parts.slice(1).find(part => /^-?\d+$/.test(part))
       const radius = clampInt(
-        parts[1],
+        numericArg,
         this.config.warehouse.defaultSyncRadius,
         1,
         this.config.warehouse.maxSyncRadius
       )
       const trace = startTrace({ bot: this.botId, kind: 'sync', actor: username, radius })
       this.attachWarehouseTrace(trace)
-      this.msg(username, `开始同步仓库，半径 ${radius}。`)
+      this.msg(username, `开始同步仓库，半径 ${radius}${force ? '（强制，跳过缩量守卫）' : ''}。`)
       try {
-        const result = await this.syncWarehouseWithTeam(worker, radius, trace)
+        const result = await this.syncWarehouseWithTeam(worker, radius, trace, { allowShrink: force })
         const addedAmount = this.totalAmount(result.addedToMomo)
         const unresolvedAmount = this.totalAmount(result.unresolved)
         const failureText = result.failures.length ? `，失败${result.failures.length}` : ''

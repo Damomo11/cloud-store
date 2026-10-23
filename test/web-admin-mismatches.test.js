@@ -121,7 +121,7 @@ function makeItem (key, itemId, displayName) {
   return { itemKey: key, itemId, displayName, nbtJson: '', metaJson: '' }
 }
 
-test('batch deduct resolves many missing mismatches and reports per-item failures', () => {
+test('batch deduct closes balance-empty missing rows instead of failing them', () => {
   const fixture = createFixture()
   const okItem = makeItem('missing-diamond-key', 'minecraft:diamond', '钻石')
   const brokeItem = makeItem('missing-iron-key', 'minecraft:iron_ingot', '铁锭')
@@ -136,15 +136,16 @@ test('batch deduct resolves many missing mismatches and reports per-item failure
     const result = fixture.server.apiAdminMismatchBatchDeduct({}, { ids: open.map(row => row.id) })
 
     assert.equal(result.ok, true)
-    assert.equal(result.results.length, 2)
-    assert.deepEqual(result.results.map(row => row.ok), [true, false])
-    assert.match(result.message, /成功 1 条，失败 1 条/)
+    assert.deepEqual(result.results.map(row => row.ok), [true, true], '账面为空的记录不再失败，而是关闭留痕')
+    assert.match(result.message, /成功 2 条/)
     assert.equal(fixture.db.getBalance(ownerUuid, okItem.itemKey), 3)
     assert.equal(fixture.db.getBalance(ownerUuid, brokeItem.itemKey), 0)
     assert.equal(
       fixture.db.db.prepare("SELECT COUNT(*) AS count FROM inventory_mismatches WHERE status = 'resolved'").get().count,
-      1
+      2
     )
+    const closedRow = fixture.db.db.prepare('SELECT note FROM inventory_mismatches WHERE id = ?').get(open[1].id)
+    assert.match(closedRow.note, /账面已无可扣除数量/)
   } finally {
     fixture.close()
   }

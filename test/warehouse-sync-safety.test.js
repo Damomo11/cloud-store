@@ -4,7 +4,7 @@ const assert = require('node:assert/strict')
 const Warehouse = require('../src/warehouse')
 const { DEFAULT_CONFIG } = require('../src/config')
 
-function createWarehouse (blocks) {
+function createWarehouse (blocks, registeredChests = 1) {
   const calls = {
     clear: 0,
     reconcile: 0,
@@ -13,7 +13,7 @@ function createWarehouse (blocks) {
     openCalls: []
   }
   const db = {
-    listChests: () => [{ chestId: 'old' }],
+    listChests: () => Array.from({ length: registeredChests }, (_, index) => ({ chestId: `old-${index}` })),
     clearChests: () => { calls.clear++ },
     upsertChest: () => {},
     replaceChestSlots: (chestId, slots) => { calls.replacedSlots.push({ chestId, slots }) },
@@ -114,4 +114,31 @@ test('warehouse sync keeps old inventory when the mutation rescan fails', async 
   await assert.rejects(() => warehouse.syncWarehouse(16), /simulated rescan failure/)
   assert.equal(calls.clear, 0)
   assert.equal(calls.reconcile, 0)
+})
+
+test('warehouse sync refuses a scan that shrinks registered chests and keeps old records', async () => {
+  // 已登记 3 个桶，但本次半径只扫到 1 个：疑似半径过小。
+  const blocks = [
+    { chest: { chestId: 'one', x: 1, y: 2, z: 3, blockName: 'barrel' } }
+  ]
+  const { warehouse, calls } = createWarehouse(blocks, 3)
+  warehouse.openContainerAt = async () => ({ items: [], close: () => {} })
+
+  await assert.rejects(() => warehouse.syncWarehouse(4), /同步中止：本次扫描到 1 个木桶，少于已登记的 3 个/)
+  assert.equal(calls.clear, 0, '没有清库，旧记录原样保留')
+  assert.equal(calls.reconcile, 0, '没有对账，不会制造假缺失')
+})
+
+test('warehouse sync allows intentional shrink with allowShrink option', async () => {
+  const blocks = [
+    { chest: { chestId: 'one', x: 1, y: 2, z: 3, blockName: 'barrel' } }
+  ]
+  const { warehouse, calls } = createWarehouse(blocks, 3)
+  warehouse.openContainerAt = async () => ({ items: [], close: () => {} })
+
+  const result = await warehouse.syncWarehouse(4, { allowShrink: true })
+
+  assert.equal(calls.clear, 1, '强制模式允许用较小的扫描结果重写登记清单')
+  assert.equal(calls.reconcile, 1)
+  assert.equal(result.chestCount, 1)
 })

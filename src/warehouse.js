@@ -2051,11 +2051,11 @@ class Warehouse {
     })
   }
 
-  async syncWarehouse (radius) {
+  async syncWarehouse (radius, options = {}) {
     // 阶段一：不持仓库锁扫描，业务存取照常进行；
     // 阶段二：短暂持锁，重读扫描期间被业务改动过的木桶后换入新库存并对账。
     const scan = await this.scanWarehouseContainers(radius)
-    return this.withWarehouseLock(() => this.applyWarehouseScan(scan, radius))
+    return this.withWarehouseLock(() => this.applyWarehouseScan(scan, radius, options))
   }
 
   async scanWarehouseContainers (radius) {
@@ -2145,9 +2145,19 @@ class Warehouse {
     return this.scanBarrelBlocks(blocks, radius)
   }
 
-  async applyWarehouseScan (scan, radius) {
+  async applyWarehouseScan (scan, radius, options = {}) {
     const { blocks, snapshots } = scan
     this.assertConnectionHealthy()
+
+    // 缩量守卫：扫描结果比已登记木桶还少，基本是半径没罩住整个仓库。
+    // 此时清库重写会把半径外的桶记录删掉，对账随即制造假缺失并抽干 momo，
+    // 因此宁可中止保留旧记录；确属拆除木桶的场景用 !同步 <半径> 强制 通过。
+    if (!options.allowShrink) {
+      const registeredChestCount = this.db.listChests().length
+      if (blocks.length < registeredChestCount) {
+        throw new Error(`同步中止：本次扫描到 ${blocks.length} 个木桶，少于已登记的 ${registeredChestCount} 个（疑似半径过小）。已保留旧记录。请用覆盖整个仓库的半径重试；若确实拆除了木桶，请使用 !同步 <半径> 强制 重扫登记清单。`)
+      }
+    }
 
     // 重读同步扫描期间被业务存取改动过的木桶，避免用过期快照覆盖业务变更。
     // 任一重读失败都直接抛错：此时还没有写入任何新记录，旧库存原样保留。
