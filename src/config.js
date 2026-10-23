@@ -95,6 +95,9 @@ const DEFAULT_CONFIG = {
     pickupRadius: 2,
     homeSkipRadius: 8,
     maxSyncRadius: 64,
+    // !同步 的并行 bot 上限：0 = 不限（全部空闲 bot 参与分区扫描）。
+    // 只影响扫描阶段；落账（重读+换记录+对账）仍由协调 bot 持仓库锁一次完成。
+    maxParallelSyncBots: 0,
     maxEmptyDepositAttempts: 3,
     cylinder: {
       axis: 'x',

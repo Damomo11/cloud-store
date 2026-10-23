@@ -2059,6 +2059,13 @@ class Warehouse {
   }
 
   async scanWarehouseContainers (radius) {
+    const blocks = await this.prepareSyncBlocks(radius)
+    return this.scanBarrelBlocks(blocks, radius)
+  }
+
+  // 全仓同步准备阶段：回仓并枚举半径内全部容器。并行同步时只由协调 bot
+  // 执行一次，参与并行的各 bot 共用同一份木桶清单做分区，保证并集=全集。
+  async prepareSyncBlocks (radius) {
     this.debug(`sync start radius=${radius}`)
     this.trace('sync', 'sync_start', {
       radius,
@@ -2072,7 +2079,12 @@ class Warehouse {
       count: blocks.length,
       blocks: blocks.map(block => this.describeBlock(block))
     })
+    return blocks
+  }
 
+  // 逐桶打开读取给定清单（单 bot 同步时是全部，并行时是其中一个分区）。
+  // 任一木桶读取失败都抛错：此时还没写入任何记录，旧库存原样保留。
+  async scanBarrelBlocks (blocks, radius) {
     const actualItems = []
     const snapshots = []
     const failures = []
@@ -2124,6 +2136,13 @@ class Warehouse {
     }
 
     return { radius, blocks, snapshots, actualItems }
+  }
+
+  // 并行参与者：回仓就位后扫描分配到的分区。与协调 bot 共用同一份
+  // warehouseState（revision / chestRevisions），快照语义不变。
+  async scanSyncPartition (radius, blocks) {
+    await this.goHome({ requireWarehouse: this.db.listChests().length > 0 })
+    return this.scanBarrelBlocks(blocks, radius)
   }
 
   async applyWarehouseScan (scan, radius) {

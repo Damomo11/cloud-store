@@ -2250,6 +2250,80 @@ class CloudStoreService {
     return removals
   }
 
+  // ── 多 bot 并行全仓同步 ──────────────────────────────────────────────
+  // 硬约束：对账（applyWarehouseScan）必须一次性拿到全仓快照，否则会出现
+  // "账 > 实物"的假缺口。因此并行只发生在扫描阶段：各 bot 分区扫完后，
+  // 由协调 bot 持仓库锁统一重读变更桶、换记录、对账。
+
+  // 按既有扫描顺序切空间连续条带（findContainerBlocks 按距离排序，连续段
+  // = 同心环带），减少并行 bot 互相穿越挡路；并集=全集、互不重叠。
+  splitBlocksForParallelSync (workerCount, blocks) {
+    const strips = Array.from({ length: workerCount }, () => [])
+    blocks.forEach((block, index) => {
+      strips[Math.min(workerCount - 1, Math.floor((index * workerCount) / blocks.length))].push(block)
+    })
+    return strips
+  }
+
+  // 收集并行参与者：协调 bot + 其他空闲健康 bot（跳过正在跑任务、
+  // 死亡恢复中、紧急救援中的），maxParallelSyncBots 可限制并行上限。
+  collectSyncParticipants (coordinator) {
+    if (!this.taskPool) return [coordinator]
+    const cap = Number(this.config.warehouse.maxParallelSyncBots || 0)
+    const idle = [...this.taskPool.workers].filter(candidate =>
+      candidate !== coordinator &&
+      candidate.ready && !candidate.active && !candidate.recoveringFromDeath && !candidate.emergencyRescueActive)
+    const picked = cap > 0 ? idle.slice(0, cap - 1) : idle
+    return [coordinator, ...picked]
+  }
+
+  async syncWarehouseWithTeam (coordinator, radius, trace) {
+    const blocks = await coordinator.warehouse.prepareSyncBlocks(radius)
+    const participants = this.collectSyncParticipants(coordinator)
+    // 桶数不足就不分区（<=1 个桶并行没有意义）。
+    const workerCount = blocks.length > 1 ? Math.min(participants.length, blocks.length) : 1
+    const team = participants.slice(0, workerCount)
+
+    if (workerCount === 1) {
+      const scan = await coordinator.warehouse.scanBarrelBlocks(blocks, radius)
+      const result = await coordinator.warehouse.withWarehouseLock(() => coordinator.warehouse.applyWarehouseScan(scan, radius))
+      return { ...result, botCount: 1 }
+    }
+
+    const strips = this.splitBlocksForParallelSync(workerCount, blocks)
+    traceEvent(trace, 'sync', 'sync_partition_plan', {
+      botCount: workerCount,
+      partitionSizes: strips.map(strip => strip.length),
+      decision: `分区并行扫描：${team.map(service => service.botId).join(' + ')}`
+    })
+
+    // 借用的 bot 挂上任务标记：快照如实显示"同步中"，任务池派发双保险。
+    const borrowed = team.slice(1)
+    for (const service of borrowed) {
+      service.active = { type: 'sync', name: 'sync', username: 'admin', exclusive: false, borrowedBySync: coordinator.botId }
+    }
+
+    try {
+      // 等所有分区全部落地再合并：任一分区失败整体中止，旧记录原样保留。
+      const settled = await Promise.allSettled(strips.map((strip, index) => team[index].warehouse.scanSyncPartition(radius, strip)))
+      const failure = settled.find(outcome => outcome.status === 'rejected')
+      if (failure) throw failure.reason
+      const scans = settled.map(outcome => outcome.value)
+      const merged = {
+        radius,
+        blocks,
+        snapshots: scans.flatMap(scan => scan.snapshots),
+        actualItems: scans.flatMap(scan => scan.actualItems)
+      }
+      const result = await coordinator.warehouse.withWarehouseLock(() => coordinator.warehouse.applyWarehouseScan(merged, radius))
+      return { ...result, botCount: workerCount }
+    } finally {
+      for (const service of borrowed) {
+        if (service.active?.borrowedBySync === coordinator.botId) service.active = null
+      }
+    }
+  }
+
   async handleSync (username, text) {
     if (!this.isAdmin(username)) {
       this.msg(username, '你没有权限同步仓库。')
@@ -2268,16 +2342,18 @@ class CloudStoreService {
       this.attachWarehouseTrace(trace)
       this.msg(username, `开始同步仓库，半径 ${radius}。`)
       try {
-        const result = await worker.warehouse.syncWarehouse(radius)
+        const result = await this.syncWarehouseWithTeam(worker, radius, trace)
         const addedAmount = this.totalAmount(result.addedToMomo)
         const unresolvedAmount = this.totalAmount(result.unresolved)
         const failureText = result.failures.length ? `，失败${result.failures.length}` : ''
-        this.msg(username, `同步完成：木桶${result.chestCount}，打开${result.openedChestCount}，重读${result.rescanCount || 0}${failureText}，多余${addedAmount}/${this.itemTypeCount(result.addedToMomo)}种，缺失${unresolvedAmount}/${this.itemTypeCount(result.unresolved)}种。详情见Web管理页。`)
+        const parallelText = result.botCount > 1 ? `，${result.botCount}台并行` : ''
+        this.msg(username, `同步完成：木桶${result.chestCount}，打开${result.openedChestCount}，重读${result.rescanCount || 0}${failureText}${parallelText}，多余${addedAmount}/${this.itemTypeCount(result.addedToMomo)}种，缺失${unresolvedAmount}/${this.itemTypeCount(result.unresolved)}种。详情见Web管理页。`)
         traceSummary(trace, {
           status: 'ok',
           chests: result.chestCount,
           opened: result.openedChestCount,
           rescan: result.rescanCount || 0,
+          bots: result.botCount,
           addedTotal: addedAmount,
           unresolvedTotal: unresolvedAmount
         })
