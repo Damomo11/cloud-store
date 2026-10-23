@@ -71,7 +71,9 @@ const DEFAULT_CONFIG = {
     commandDedupeMs: 1500,
     teleportRequestTimeoutMs: 15000,
     teleportDetectRadius: 8,
-    reconnectDelayMs: 10000
+    reconnectDelayMs: 10000,
+    // !热重载 等待所有机器人空闲的最长时间；超时后直接重启，进行中的任务会在重启后自动恢复。
+    hotReloadIdleTimeoutMs: 600000
   },
   debug: true,
   debugChat: true,

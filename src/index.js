@@ -286,6 +286,7 @@ function launchBot (state) {
   const warehouse = new Warehouse(bot, db, catalog, launchConfig, taskPool.warehouseMutex, taskPool.warehouseState)
   const service = new CloudStoreService(bot, db, catalog, warehouse, launchConfig, taskPool, subscriptions)
   service.setWebAuth(webServer)
+  service.setHotReloadHooks(shutdownForHotReload, () => true)
   setupRegistryExport(bot, catalog, db)
 
   const loginWatchdog = setInterval(() => {
@@ -597,13 +598,23 @@ process.on('unhandledRejection', (reason) => {
   logLocalError('unhandled-rejection', reason)
 })
 
-process.on('SIGINT', () => {
+// !热重载 的全局收尾：断开全部 bot（不再重连）、关闭订阅和 DB。
+// 新代码进程已由 hotReload.js 拉起，这里只负责让旧进程干净退出。
+function shutdownForHotReload () {
+  if (shuttingDown) return
   shuttingDown = true
   for (const state of states.values()) {
     if (state.reconnectTimer) clearTimeout(state.reconnectTimer)
-    state.bot?.quit('shutdown')
+    state.reconnectTimer = null
+    state.desiredEnabled = false
+    try { state.bot?.quit('hot reload restart') } catch {}
   }
+  try { webServer.server?.close?.() } catch {}
   subscriptions.close()
   db.close()
+}
+
+process.on('SIGINT', () => {
+  shutdownForHotReload()
   process.exit(0)
 })

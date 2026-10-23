@@ -1,5 +1,6 @@
 const { clampInt, sleep, sumBy } = require('./utils')
 const { startTrace, traceEvent, traceSummary, traceStandalone, shortKey } = require('./traceLog')
+const { runHotReload } = require('./hotReload')
 
 const REPAIR_BOTTLE_ITEM_ID = 'minecraft:experience_bottle'
 const REPAIR_BOTTLE_AMOUNT = 64
@@ -24,6 +25,12 @@ class CloudStoreService {
     this.seenMessages = new Map()
     this.webAuth = null
     this.accountedResidual = new Map()
+    this.hotReloadRunning = false
+    // index.js 注入：重启前的全局收尾（断开所有 bot、关订阅/DB）与进程退出。
+    this.hotReloadShutdownHook = null
+    this.hotReloadExitHook = null
+    // 测试注入口：runHotReload 的内部步骤桩（gitPull/waitForIdle/scheduleSuccessorProcess）。
+    this.hotReloadStubs = null
   }
 
   invalidateConnection (reason = 'connection invalidated') {
@@ -42,6 +49,14 @@ class CloudStoreService {
 
   setWebAuth (webAuth) {
     this.webAuth = webAuth
+  }
+
+  // index.js 注入热重载所需的全局收尾与退出实现：
+  // shutdownHook 在退出前执行（断开所有 bot、关订阅和 DB）；exitHook 返回 true 表示
+  // 已安排进程退出。未注入时（测试桩）热重载只跑到“通知重启”为止，不真正退出。
+  setHotReloadHooks (shutdownHook, exitHook) {
+    this.hotReloadShutdownHook = typeof shutdownHook === 'function' ? shutdownHook : null
+    this.hotReloadExitHook = typeof exitHook === 'function' ? exitHook : null
   }
 
   start () {
@@ -384,6 +399,19 @@ class CloudStoreService {
       this.handleEmergencyRescue(username).catch(error => {
         console.error(`[emergency-rescue:${this.botId}] failed:`, error)
         this.msg(username, `急救失败：${error.message}`)
+      })
+      return
+    }
+    // 热重载同样绕过任务队列：管理员命令不占用 bot，流程会在后台等所有 bot 空闲。
+    // 且各个 bot 都能受理（多 bot 在线时每只都会收到，第一只标记后其余直接跳过）。
+    if (normalizedCommand === '!热重载') {
+      if (!this.isAdmin(username)) {
+        this.msg(username, '你没有权限使用热重载命令。')
+        return
+      }
+      this.handleHotReload(username).catch(error => {
+        console.error(`[hot-reload:${this.botId}] failed:`, error)
+        this.msg(username, `热重载失败：${error.message}`)
       })
       return
     }
@@ -746,6 +774,17 @@ class CloudStoreService {
       return
     }
 
+    if (text === '!热重载') {
+      // handleIncoming 已在更早处拦下 !热重载 并做了权限校验；
+      // 这里只是兜底（如测试直接调 handleChat），不再重复校验权限。
+      if (!this.isAdmin(username)) {
+        this.msg(username, '你没有权限使用热重载命令。')
+        return
+      }
+      await this.handleHotReload(username)
+      return
+    }
+
     if (/^!修装备(?:\s|$)?/.test(text)) {
       await this.handleRepairCommand(username, text, taskOptions)
       return
@@ -806,6 +845,49 @@ class CloudStoreService {
       this.emergencyRescueActive = false
       this.taskPool?.dispatch()
     }
+  }
+
+  // 管理员命令 !热重载：git pull 更新代码 → 等所有 bot 空闲 → 拉起新代码进程并退出旧进程。
+  // 不占任务队列：流程在后台等待，管理员下达后可以继续干别的；重启前会把进度私聊给管理员。
+  // 管理员命令 !热重载：git pull 更新代码 → 等所有 bot 空闲 → 拉起新代码进程并退出旧进程。
+  // 不占任务队列：流程在后台等待，管理员下达后可以继续干别的；重启前会把进度私聊给管理员。
+  // 重启通过“新进程先启动、旧进程再退出”实现，不依赖 pm2/systemd 等外部守护；
+  // 多 bot 在线时每只都能受理该命令，但 hotReloadRunning 标志保证只有一个流程在跑。
+  handleHotReload (username) {
+    if (this.hotReloadRunning) {
+      this.msg(username, '热重载已在进行中，请等待完成。')
+      return Promise.resolve({ status: 'already_running' })
+    }
+    this.hotReloadRunning = true
+    const finish = () => { this.hotReloadRunning = false }
+    const stubs = this.hotReloadStubs || {}
+    return runHotReload({
+      notify: message => this.msg(username, message),
+      taskPool: this.taskPool,
+      idleTimeoutMs: this.config.timing?.hotReloadIdleTimeoutMs,
+      gitExec: stubs.gitExec,
+      gitPull: stubs.gitPull,
+      waitForIdle: stubs.waitForIdle,
+      scheduleSuccessorProcess: stubs.scheduleSuccessorProcess,
+      shutdown: () => {
+        // 让本 bot 手头任务尽快收尾：标记取消并断开连接（其他 bot 由 index.js 的收尾钩子处理）。
+        this.invalidateConnection('hot reload restart')
+        this.hotReloadShutdownHook?.()
+      },
+      exitProcess: async () => {
+        finish()
+        const exited = await this.hotReloadExitHook?.()
+        return exited !== false
+      }
+    })
+      .then(result => {
+        if (result?.status !== 'restarting') finish()
+        return result
+      })
+      .catch(error => {
+        finish()
+        throw error
+      })
   }
 
   async runExclusive (username, type, fn, extra = {}) {
@@ -3759,9 +3841,12 @@ class CloudStoreService {
       '同步木桶',
       '同步仓库',
       '同步',
+      '急救',
+      '热重载',
       '存物品',
       '存取',
       '取存',
+      '热重载',
       '存',
       '取物品',
       '取'

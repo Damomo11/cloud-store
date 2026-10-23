@@ -187,7 +187,11 @@
     "commandDedupeMs": 1500,
     "teleportRequestTimeoutMs": 15000,
     "teleportDetectRadius": 8,
-    "reconnectDelayMs": 10000
+    "reconnectDelayMs": 10000,
+
+    // !hot-reload (admin in-game command): max wait in ms for all bots to become
+    // idle before restarting anyway. In-flight tasks auto-recover after restart.
+    "hotReloadIdleTimeoutMs": 600000
   },
 
   // General debug logging.
