@@ -2197,7 +2197,22 @@ class CloudStoreWebServer {
     const item = this.db.getItemByKey(row.itemKey) || this.db.rowToItem(row)
     const current = this.db.getBalance(row.ownerUuid, row.itemKey)
     const amount = Math.min(current, Number(row.amount || 0))
-    if (amount <= 0) throw new Error(`${this.db.ownerLabel(row.ownerUuid)} 没有可扣除的 ${row.displayName || row.itemId}。`)
+    if (amount <= 0) {
+      // 账面已无可扣除数量：常见于同步对账时已自动扣过。这里不再报错卡死，
+      // 只关闭留痕，避免这条异常永远无法处理。
+      const closeNote = 'Web关闭留痕：账面已无可扣除数量'
+      this.db.db.prepare(`
+        UPDATE inventory_mismatches
+        SET status = 'resolved',
+            resolved_at = CURRENT_TIMESTAMP,
+            note = CASE
+              WHEN note = '' THEN ?
+              ELSE note || '；' || ?
+            END
+        WHERE id = ?
+      `).run(closeNote, closeNote, id)
+      return `账面已无可扣除的 ${row.displayName || row.itemId}（可能同步时已自动扣除），异常留痕已关闭。`
+    }
 
     const changed = [{ ...item, amount }]
     this.db.transaction(() => {

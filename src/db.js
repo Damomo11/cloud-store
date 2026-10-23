@@ -3140,13 +3140,43 @@ class StoreDb {
             const missingItem = this.rowToItem(item)
             unresolved.push({ ...missingItem, amount: unresolvedAmount })
             for (const allocation of this.allocateMissingOwners(key, unresolvedAmount)) {
+              if (!allocation.ownerUuid) {
+                // 完全无法归属到任何账面持有者：只留痕，不动账。
+                this.addInventoryMismatch(
+                  'missing',
+                  allocation.ownerUuid,
+                  allocation.username,
+                  missingItem,
+                  allocation.amount,
+                  '同步发现仓库实物少于账本；无法归属到任何账面持有者，未自动扣除。'
+                )
+                continue
+              }
+              // 同步即扣：按归属估算直接扣减 owner 账面余额，让 Web 库存与实物
+              // 一致，不再出现"登记了异常但库存数字一直虚高"。扣减按当前余额
+              // 钳制，防止异常数据把整个对账事务顶回滚；异常仍登记留痕。
+              const balance = this.getBalance(allocation.ownerUuid, key)
+              const deducted = Math.min(balance, allocation.amount)
+              if (deducted > 0) {
+                this.adjustBalance(allocation.ownerUuid, key, -deducted)
+                this.addTransaction(
+                  'sync_deduct',
+                  'ok',
+                  allocation.ownerUuid,
+                  allocation.username,
+                  [{ ...missingItem, amount: deducted }],
+                  `sync=missing; deduct=${deducted}; requested=${allocation.amount}`
+                )
+              }
               this.addInventoryMismatch(
                 'missing',
                 allocation.ownerUuid,
                 allocation.username,
                 missingItem,
                 allocation.amount,
-                '同步发现仓库实物少于账本；归属为按账本库存估算，不会自动扣除。'
+                deducted <= 0
+                  ? '同步发现仓库实物少于账本，账面已无可扣除数量；留痕待管理员复核。'
+                  : `同步发现仓库实物少于账本，已自动扣除账面 x${deducted}${deducted < allocation.amount ? `（请求扣 ${allocation.amount}，账面仅剩 ${deducted}）` : ''}；留痕待管理员复核。`
               )
             }
           }
