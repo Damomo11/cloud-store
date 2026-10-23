@@ -1201,7 +1201,9 @@ class Warehouse {
                 decision: '已写入重打包恢复记录（防断线丢账），开始从盒内取物'
               })
             }
-            const moved = await this.tryWithdrawExactFrom(quickWindow, allocation.itemKey, toTake)
+            // 拆盒前的背包基线：恢复复核时用来判断目标物品是否真的进了背包
+            const inventoryBaseline = this.inventoryCountByItemKey(allocation.itemKey)
+            let moved = await this.tryWithdrawExactFrom(quickWindow, allocation.itemKey, toTake)
             this.debug(`shulker extract open source=${sourceKey} available=${available} moved=${moved} remaining=${remaining}`)
             this.trace('take', 'shulker_take_result', {
               sourceBox: { key: sourceKey, keyTail: shortKey(sourceKey) },
@@ -1244,14 +1246,38 @@ class Warehouse {
               allocation.itemKey,
               Math.max(0, Number(available) - Number(moved))
             )
-            const newBox = this.catalog.fromPrismarineItem(boxToReturn)
+            let newBox = this.catalog.fromPrismarineItem(boxToReturn)
             this.trace('result', 'shulker_box_after', {
               oldBox: { key: sourceKey, keyTail: shortKey(sourceKey) },
               newBox: { key: newBox.itemKey, keyTail: shortKey(newBox.itemKey), name: newBox.displayName || newBox.itemId },
               contents: this.snapshotShulkerContents(newBox),
               decision: `取完后盒子内容已变化（新短码 ${shortKey(newBox.itemKey)}），按 NBT 校验剩余数量`
             })
-            this.verifyShulkerExtraction(newBox, allocation.itemKey, available, moved)
+            try {
+              this.verifyShulkerExtraction(newBox, allocation.itemKey, available, moved)
+            } catch (verifyError) {
+              // NBT 校验失败不代表实物一定出错：关所有容器、重开该盒、按窗口实物
+              // 复核盒内数量与背包到手量，能对账就按复核结果继续，救不回来才报错。
+              const recovery = await this.recoverShulkerExtractionMismatch({
+                chest,
+                allocation,
+                targetItem,
+                sourceKey,
+                sourceItem,
+                available,
+                planned: toTake,
+                moved,
+                inventoryBaseline
+              })
+              if (!recovery.resolved) {
+                // 确定异常：把背包中的该批物品放进木桶空槽位并刷新桶记录（库存与 Web 同步）
+                await this.dumpInventoryItemsToChest(chest, allocation, recovery.reason)
+                throw verifyError
+              }
+              moved = recovery.moved
+              boxToReturn = recovery.boxToReturn
+              newBox = recovery.newBox
+            }
 
             this.db.markShulkerRepackPhysicalChange(
               this.botId,
@@ -1646,6 +1672,162 @@ class Warehouse {
     })
     await this.bot.clickWindow(emptySlot, 0, 0)
     await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
+  }
+
+  // 快捷开盒取物后的 NBT 校验失败，先别急着报错：关闭所有容器，重新打开该盒，
+  // 以服务器窗口实物复核盒内数量，并对照拆盒前的背包基线核对到手量；
+  // 取多了放回盒内、取少了补取，复核闭合后按真实数量继续；仍对不上账才算确定异常。
+  async recoverShulkerExtractionMismatch ({ allocation, sourceKey, sourceItem, available, planned, inventoryBaseline }) {
+    const settleMs = Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250))
+    this.trace('decision', 'shulker_verify_mismatch_recover', {
+      sourceBox: { key: sourceKey, keyTail: shortKey(sourceKey) },
+      available,
+      planned,
+      decision: '盒内容 NBT 校验失败：关闭所有容器后重新打开该盒，按窗口实物复核'
+    })
+    try {
+      // 1. 关闭所有容器
+      if (this.bot.currentWindow) {
+        this.bot.closeWindow(this.bot.currentWindow)
+        await sleep(settleMs)
+      }
+      // 2. 找到背包里的盒子（内容可能已变化）并重新打开
+      let boxItem = this.findInventoryShulker(sourceItem.itemId, sourceKey)
+      if (!boxItem) return { resolved: false, reason: '背包中找不到该潜影盒，无法复核' }
+      const boxKey = this.catalog.fromPrismarineItem(boxItem).itemKey
+      const window = await this.openQuickShulkerWindow(boxKey)
+      try {
+        await sleep(settleMs)
+        // 3. 读盒内目标物品：实际取出 = 原有 - 盒内剩余
+        const windowAmount = this.countContainerItem(window, allocation.itemKey)
+        const actualMoved = Number(available) - windowAmount
+        this.trace('open', 'shulker_recheck_window', {
+          sourceBox: { key: boxKey, keyTail: shortKey(boxKey) },
+          windowAmount,
+          available,
+          actualMoved,
+          planned,
+          decision: `重开盒复核：盒内剩 ${windowAmount}，实际取出 ${actualMoved}，本轮计划 ${planned}`
+        })
+        if (!(actualMoved >= 0 && actualMoved <= available)) {
+          return { resolved: false, reason: `重开盒后数量对不上：盒内剩 ${windowAmount}，原记录 ${available}` }
+        }
+        // 4. 取多了：把多出的放回盒内（整格放回，最终以重读为准）
+        if (actualMoved > planned) {
+          const returnedBack = await this.returnItemsIntoContainer(window, allocation.itemKey, actualMoved - planned)
+          this.trace('return', 'shulker_recheck_return_extra', {
+            giveBack: actualMoved - planned,
+            returnedBack,
+            decision: `实际取出 ${actualMoved} 超过计划 ${planned}，已把多出的 ${returnedBack} 个放回盒内`
+          })
+        }
+        // 5. 背包没到手：从盒内补取差额
+        const expectedHold = inventoryBaseline + Math.min(actualMoved, planned)
+        const holdNow = this.inventoryCountByItemKey(allocation.itemKey)
+        if (holdNow < expectedHold) {
+          const shortfall = expectedHold - holdNow
+          const windowLeft = this.countContainerItem(window, allocation.itemKey)
+          const topUp = Math.min(shortfall, windowLeft)
+          if (topUp > 0) {
+            const topped = await this.tryWithdrawExactFrom(window, allocation.itemKey, topUp)
+            this.trace('take', 'shulker_recheck_topup', {
+              shortfall,
+              topUp,
+              topped,
+              decision: `背包到手量不足（差 ${shortfall}），已从盒内补取 ${topped} 个`
+            })
+          }
+        }
+        // 6. 最终对账：盒内剩余、实际取出、背包到手量必须闭合
+        const finalWindowAmount = this.countContainerItem(window, allocation.itemKey)
+        const finalMoved = Number(available) - finalWindowAmount
+        const finalHold = this.inventoryCountByItemKey(allocation.itemKey)
+        this.trace('result', 'shulker_recheck_final', {
+          sourceBox: { key: boxKey, keyTail: shortKey(boxKey) },
+          finalWindowAmount,
+          finalMoved,
+          finalHold,
+          inventoryBaseline,
+          planned,
+          decision: `复核结束：盒内剩 ${finalWindowAmount}，实际取出 ${finalMoved}，背包 ${inventoryBaseline} → ${finalHold}`
+        })
+        if (!(finalMoved >= 0 && finalMoved <= available && finalMoved <= planned &&
+              finalHold >= inventoryBaseline + finalMoved)) {
+          return { resolved: false, reason: `复核后仍对不上账：盒内剩 ${finalWindowAmount}，背包 ${finalHold}（基线 ${inventoryBaseline}）` }
+        }
+        // 7. 关窗后重读盒子 NBT，与窗口读数一致才认可
+        window.close()
+        await sleep(settleMs)
+        boxItem = this.findInventoryShulker(sourceItem.itemId, sourceKey)
+        if (!boxItem) return { resolved: false, reason: '复核后背包中找不到该潜影盒' }
+        const newBox = this.catalog.fromPrismarineItem(boxItem)
+        const nbtAmount = this.catalog.extractShulkerContents(newBox)
+          .filter(entry => entry.item.itemKey === allocation.itemKey)
+          .reduce((sum, entry) => sum + Number(entry.amount || 0), 0)
+        if (nbtAmount !== finalWindowAmount) {
+          return { resolved: false, reason: `复核后盒子 NBT 与窗口读数不一致：NBT ${nbtAmount}，窗口 ${finalWindowAmount}` }
+        }
+        this.trace('result', 'shulker_recheck_resolved', {
+          sourceBox: { key: boxKey, keyTail: shortKey(boxKey) },
+          newBox: { key: newBox.itemKey, keyTail: shortKey(newBox.itemKey) },
+          moved: finalMoved,
+          decision: `复核闭合：本轮实际取出 ${finalMoved} 个，按复核结果继续放回与记账`
+        })
+        return { resolved: true, moved: finalMoved, boxToReturn: boxItem, newBox }
+      } finally {
+        try { window.close() } catch {}
+        await sleep(settleMs)
+      }
+    } catch (error) {
+      return { resolved: false, reason: `复核流程出错：${error?.message || error}` }
+    }
+  }
+
+  // 把背包内指定物品放进容器（整格 shift 放入），最多放 maxAmount 个，返回实际放入数
+  async returnItemsIntoContainer (container, itemKey, maxAmount) {
+    let remaining = Math.max(0, Number(maxAmount || 0))
+    let returned = 0
+    while (remaining > 0) {
+      const item = this.bot.inventory.items()
+        .find(entry => this.catalog.fromPrismarineItem(entry).itemKey === itemKey)
+      if (!item) break
+      const movedNow = await this.tryDepositInto(container, item)
+      if (movedNow <= 0) break
+      returned += movedNow
+      remaining -= movedNow
+      await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
+    }
+    return returned
+  }
+
+  // 确定异常后的兜底：把背包中的该批目标物品放进木桶空槽位，并刷新桶记录，
+  // 让库存记录（含 Web 展示）与实物同步，物品不再滞留在 bot 身上。
+  async dumpInventoryItemsToChest (chest, allocation, reason = '') {
+    try {
+      const settleMs = Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250))
+      const container = await this.openContainerAt(chest)
+      try {
+        const dumped = await this.returnItemsIntoContainer(container, allocation.itemKey, Infinity)
+        await sleep(settleMs)
+        this.refreshChestSnapshot(chest, container)
+        this.trace('return', 'shulker_mismatch_dump_to_chest', {
+          chest: this.describeChest(chest),
+          item: { key: allocation.itemKey, keyTail: shortKey(allocation.itemKey), dumped },
+          reason,
+          decision: `确认异常：背包中该物品 ${dumped} 个已放进木桶空槽位并刷新库存记录（Web 同步）`
+        })
+        if (dumped > 0) this.debug(`shulker mismatch dumped ${dumped} ${allocation.itemKey} into chest ${chest.chestId}`)
+      } finally {
+        this.closeContainerQuietly(container)
+        await sleep(settleMs)
+      }
+    } catch (error) {
+      console.warn(`[shulker-recover] 异常物品回存木桶失败：${error?.message || error}`)
+      this.trace('error', 'shulker_mismatch_dump_failed', {
+        chest: chest?.chestId,
+        reason: error?.message || String(error)
+      })
+    }
   }
 
   resolvePreparedShulkerRepackFromItem (recovery, item) {
