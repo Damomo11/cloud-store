@@ -653,6 +653,9 @@ class Warehouse {
           decision: `定位到木桶 ${this.describeChest(chest)}（账本 ${group.recordedAmount} 个），走去打开`
         })
         let container = await this.openContainerAt(chest)
+        // 开窗前的该桶 revision：读窗期间若被其他流程改写（如紧急救援直写库存），
+        // 多出部分可能是在途物品，跳过自动入账留给 !同步，避免双重记账。
+        const revisionBeforeOpen = this.warehouseState?.chestRevisions?.get(chestId) || 0
         try {
           // 木桶整个读出来一个物品都没有，多半是服务器卡顿返回了空窗口，而不是真实缺货：
           // 关窗重开重读确认；重读仍为空就保留原记录并跳过该木桶，与真实缺货区分开。
@@ -736,6 +739,27 @@ class Warehouse {
               max: maxMissingBarrels,
               decision: `实物(${available})比账本(${group.recordedAmount})少，已刷新该桶记录，换下一个木桶`
             })
+          } else if (available > group.recordedAmount) {
+            // 实物比记录多：多出部分归属未知（人工放入/历史漂移），当场按 !同步 的
+            // extra 语义划入 momo 并登记异常，供管理员在 Web 页转移给正确归属——
+            // 取货任务结束时账本即与实物一致，不必等管理员手动 !同步。
+            const extra = available - group.recordedAmount
+            const revisionNow = this.warehouseState?.chestRevisions?.get(chestId) || 0
+            if (revisionNow !== revisionBeforeOpen) {
+              this.trace('decision', 'barrel_extra_skip', {
+                chest: this.describeChest(chest),
+                extra,
+                decision: '读窗期间该木桶被其他流程改动，多出部分可能是在途物品：跳过自动入账，留给 !同步 对账'
+              })
+            } else if (typeof this.db.creditExtraToMomo === 'function') {
+              const credited = this.db.creditExtraToMomo(itemInfo, extra, `withdraw_barrel_extra; chest=${chestId}`)
+              this.trace('record', 'barrel_extra_credited', {
+                chest: this.describeChest(chest),
+                extra,
+                credited,
+                decision: `实物比记录多 ${extra} 个，已划入 momo 并登记异常留痕`
+              })
+            }
           }
         } catch (error) {
           if (error?.uncertainTransfer) {
@@ -2051,14 +2075,21 @@ class Warehouse {
     })
   }
 
-  async syncWarehouse (radius) {
+  async syncWarehouse (radius, options = {}) {
     // 阶段一：不持仓库锁扫描，业务存取照常进行；
     // 阶段二：短暂持锁，重读扫描期间被业务改动过的木桶后换入新库存并对账。
     const scan = await this.scanWarehouseContainers(radius)
-    return this.withWarehouseLock(() => this.applyWarehouseScan(scan, radius))
+    return this.withWarehouseLock(() => this.applyWarehouseScan(scan, radius, options))
   }
 
   async scanWarehouseContainers (radius) {
+    const blocks = await this.prepareSyncBlocks(radius)
+    return this.scanBarrelBlocks(blocks, radius)
+  }
+
+  // 全仓同步准备阶段：回仓并枚举半径内全部容器。并行同步时只由协调 bot
+  // 执行一次，参与并行的各 bot 共用同一份木桶清单做分区，保证并集=全集。
+  async prepareSyncBlocks (radius) {
     this.debug(`sync start radius=${radius}`)
     this.trace('sync', 'sync_start', {
       radius,
@@ -2072,7 +2103,12 @@ class Warehouse {
       count: blocks.length,
       blocks: blocks.map(block => this.describeBlock(block))
     })
+    return blocks
+  }
 
+  // 逐桶打开读取给定清单（单 bot 同步时是全部，并行时是其中一个分区）。
+  // 任一木桶读取失败都抛错：此时还没写入任何记录，旧库存原样保留。
+  async scanBarrelBlocks (blocks, radius) {
     const actualItems = []
     const snapshots = []
     const failures = []
@@ -2126,9 +2162,26 @@ class Warehouse {
     return { radius, blocks, snapshots, actualItems }
   }
 
-  async applyWarehouseScan (scan, radius) {
+  // 并行参与者：回仓就位后扫描分配到的分区。与协调 bot 共用同一份
+  // warehouseState（revision / chestRevisions），快照语义不变。
+  async scanSyncPartition (radius, blocks) {
+    await this.goHome({ requireWarehouse: this.db.listChests().length > 0 })
+    return this.scanBarrelBlocks(blocks, radius)
+  }
+
+  async applyWarehouseScan (scan, radius, options = {}) {
     const { blocks, snapshots } = scan
     this.assertConnectionHealthy()
+
+    // 缩量守卫：扫描结果比已登记木桶还少，基本是半径没罩住整个仓库。
+    // 此时清库重写会把半径外的桶记录删掉，对账随即制造假缺失并抽干 momo，
+    // 因此宁可中止保留旧记录；确属拆除木桶的场景用 !同步 <半径> 强制 通过。
+    if (!options.allowShrink) {
+      const registeredChestCount = this.db.listChests().length
+      if (blocks.length < registeredChestCount) {
+        throw new Error(`同步中止：本次扫描到 ${blocks.length} 个木桶，少于已登记的 ${registeredChestCount} 个（疑似半径过小）。已保留旧记录。请用覆盖整个仓库的半径重试；若确实拆除了木桶，请使用 !同步 <半径> 强制 重扫登记清单。`)
+      }
+    }
 
     // 重读同步扫描期间被业务存取改动过的木桶，避免用过期快照覆盖业务变更。
     // 任一重读失败都直接抛错：此时还没有写入任何新记录，旧库存原样保留。

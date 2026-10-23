@@ -2186,7 +2186,12 @@ class StoreDb {
           WHERE type = 'withdraw' AND deduction_key = ? AND player_uuid = ?
           LIMIT 1
         `).get(key, ownerUuid)
-        if (existing) continue
+        if (existing) {
+          // 撞键只应发生在同一任务的正常/恢复双路径上；跨任务撞键意味着有交付未被扣账，
+          // 不能无声跳过——留下告警便于对账（applyWithdrawDeduction 返回 applied=false）。
+          console.warn(`[withdraw-deduction] 幂等键重复，跳过扣账：key=${key} owner=${ownerUuid} username=${username}`)
+          continue
+        }
         const result = this.db.prepare(`
           INSERT INTO transactions (
             type, status, player_uuid, username, items_json, message, deduction_key, bot_id, bot_name
@@ -2209,11 +2214,92 @@ class StoreDb {
             throw new Error(`扣账物品记录不完整：${item.itemKey}`)
           }
           this.upsertItem(complete)
-          this.adjustBalance(ownerUuid, item.itemKey, -Number(item.amount || 0))
+          // 扣减按当前余额钳制：极端场景（如 Web 管理扣减与任务预留撞车）下
+          // 账面可能不足以覆盖交付。物品已经交付给玩家，回滚整个扣账事务只会
+          // 让"有交付无扣账"无迹可查——按现有余额扣减，缺额登记异常留痕。
+          const amount = Number(item.amount || 0)
+          const balance = this.getBalance(ownerUuid, item.itemKey)
+          const deducted = Math.min(balance, amount)
+          if (deducted < amount) {
+            console.warn(`[withdraw-deduction] 账面余额不足：owner=${ownerUuid} item=${item.itemKey} 需扣=${amount} 实有=${balance}`)
+            this.addInventoryMismatch(
+              'missing',
+              ownerUuid,
+              username,
+              complete,
+              amount - deducted,
+              `取货扣账时账面余额不足：需扣 ${amount}，实有 ${balance}，已按 ${deducted} 扣减；缺额留痕待管理员复核。`
+            )
+          }
+          if (deducted > 0) this.adjustBalance(ownerUuid, item.itemKey, -deducted)
         }
       }
       return { applied }
     })
+  }
+
+  // 取货任务确认的缺失（现场搜桶/换桶重试后仍未取到的部分）当场修账：
+  // 归属精确到该任务的 owner，比 !同步 的按比例估算更可靠。扣减按余额钳制，
+  // 写 sync_deduct 流水与 missing 异常留痕（同 owner+item 已有 open 异常时不重复登记）。
+  deductConfirmedMissing (ownerUuid, username, items, notePrefix = '取货时确认缺失') {
+    if (!ownerUuid || !Array.isArray(items) || !items.length) return []
+    const results = []
+    this.db.transaction(() => {
+      for (const item of items) {
+        const amount = Number(item.amount || 0)
+        if (amount <= 0) continue
+        const stored = this.getItemByKey(item.itemKey)
+        const complete = { ...stored, ...item }
+        if (!complete.itemId || !complete.displayName) continue
+        const balance = this.getBalance(ownerUuid, item.itemKey)
+        const deducted = Math.min(balance, amount)
+        if (deducted > 0) {
+          this.adjustBalance(ownerUuid, item.itemKey, -deducted)
+          this.addTransaction(
+            'sync_deduct',
+            'ok',
+            ownerUuid,
+            username,
+            [{ ...complete, amount: deducted }],
+            `${notePrefix}; requested=${amount}; deducted=${deducted}`
+          )
+        }
+        if (typeof this.hasOpenInventoryMismatch !== 'function' ||
+            !this.hasOpenInventoryMismatch(ownerUuid, item.itemKey)) {
+          this.addInventoryMismatch(
+            'missing',
+            ownerUuid,
+            username,
+            complete,
+            amount,
+            `${notePrefix}：账面需修正 ${amount}，已自动扣除 ${deducted}${deducted < amount ? `（账面仅剩 ${deducted}）` : ''}；账本已与实物同步，留痕待管理员复核。`
+          )
+        }
+        results.push({ itemKey: item.itemKey, requested: amount, deducted })
+      }
+    })()
+    return results
+  }
+
+  // 取货时发现目标木桶实物多于记录：多出部分归属未知，与 !同步 的 extra 语义
+  // 一致——划入 momo 并登记 extra 异常，供管理员在 Web 页转移给正确归属。
+  creditExtraToMomo (item, amount, note = '') {
+    const extra = Number(amount || 0)
+    if (extra <= 0 || !item?.itemKey) return null
+    return this.db.transaction(() => {
+      this.upsertItem(item)
+      this.adjustBalance(this.momoOwner, item.itemKey, extra)
+      this.addTransaction('sync', 'ok', this.momoOwner, 'momo', [{ ...item, amount: extra }], note || `barrel_extra; key=${item.itemKey}; amount=${extra}`)
+      this.addInventoryMismatch(
+        'extra',
+        this.momoOwner,
+        'momo',
+        item,
+        extra,
+        `取货时发现目标木桶实物比记录多 ${extra} 个，已划入 momo；请在 Web 管理页库存异常中转移给正确归属。`
+      )
+      return { itemKey: item.itemKey, amount: extra }
+    })()
   }
 
   addTransaction (type, status, playerUuid, username, items, message = '') {
@@ -2501,7 +2587,9 @@ class StoreDb {
     const rows = this.db.prepare(`
       SELECT b.owner_uuid AS ownerUuid, i.item_key AS itemKey, i.item_id AS itemId,
              i.display_name AS displayName, i.nbt_json AS nbtJson,
-             i.meta_json AS metaJson, b.amount
+             i.meta_json AS metaJson, b.amount,
+             COALESCE((SELECT SUM(r.amount) FROM inventory_reservations r
+                       WHERE r.owner_uuid = b.owner_uuid AND r.item_key = b.item_key), 0) AS reserved
       FROM balances b
       JOIN items i ON i.item_key = b.item_key
       WHERE b.owner_uuid = ? AND b.amount > 0
@@ -2515,12 +2603,16 @@ class StoreDb {
     const personalDisplayNames = this.getPlayerItemDisplayNames(viewerUuid, [...rows.map(row => row.itemKey), ...contentKeys])
     const globalAliases = this.getGlobalAliasesForItems([...rows.map(row => row.itemKey), ...contentKeys], viewerUuid)
     const totalAmount = rows.reduce((sum, row) => sum + row.amount, 0)
+    // 预留中：任务已挂起但账还没扣的数量。页面要展示"可取"口径，
+    // 避免任务进行中数字虚高、玩家再下单被"库存已被其他任务占用"打回。
+    const reservedAmount = rows.reduce((sum, row) => sum + Math.min(row.reserved, row.amount), 0)
 
     return {
       ownerUuid,
       ownerLabel: this.ownerLabel(ownerUuid),
       stats: {
         totalAmount,
+        reservedAmount,
         itemTypes: rows.length
       },
       items: rows.map(row => {
@@ -2551,6 +2643,8 @@ class StoreDb {
           personalDisplayName,
           displayName: personalDisplayName || row.displayName,
           amount: row.amount,
+          reserved: Math.min(row.reserved, row.amount),
+          available: Math.max(0, row.amount - row.reserved),
           shortCode: this.shortCodeForItemKey(row.itemKey),
           shulkerContents: contents
         }
@@ -3110,13 +3204,43 @@ class StoreDb {
             const missingItem = this.rowToItem(item)
             unresolved.push({ ...missingItem, amount: unresolvedAmount })
             for (const allocation of this.allocateMissingOwners(key, unresolvedAmount)) {
+              if (!allocation.ownerUuid) {
+                // 完全无法归属到任何账面持有者：只留痕，不动账。
+                this.addInventoryMismatch(
+                  'missing',
+                  allocation.ownerUuid,
+                  allocation.username,
+                  missingItem,
+                  allocation.amount,
+                  '同步发现仓库实物少于账本；无法归属到任何账面持有者，未自动扣除。'
+                )
+                continue
+              }
+              // 同步即扣：按归属估算直接扣减 owner 账面余额，让 Web 库存与实物
+              // 一致，不再出现"登记了异常但库存数字一直虚高"。扣减按当前余额
+              // 钳制，防止异常数据把整个对账事务顶回滚；异常仍登记留痕。
+              const balance = this.getBalance(allocation.ownerUuid, key)
+              const deducted = Math.min(balance, allocation.amount)
+              if (deducted > 0) {
+                this.adjustBalance(allocation.ownerUuid, key, -deducted)
+                this.addTransaction(
+                  'sync_deduct',
+                  'ok',
+                  allocation.ownerUuid,
+                  allocation.username,
+                  [{ ...missingItem, amount: deducted }],
+                  `sync=missing; deduct=${deducted}; requested=${allocation.amount}`
+                )
+              }
               this.addInventoryMismatch(
                 'missing',
                 allocation.ownerUuid,
                 allocation.username,
                 missingItem,
                 allocation.amount,
-                '同步发现仓库实物少于账本；归属为按账本库存估算，不会自动扣除。'
+                deducted <= 0
+                  ? '同步发现仓库实物少于账本，账面已无可扣除数量；留痕待管理员复核。'
+                  : `同步发现仓库实物少于账本，已自动扣除账面 x${deducted}${deducted < allocation.amount ? `（请求扣 ${allocation.amount}，账面仅剩 ${deducted}）` : ''}；留痕待管理员复核。`
               )
             }
           }

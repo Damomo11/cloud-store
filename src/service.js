@@ -7,6 +7,13 @@ const REPAIR_BOTTLE_AMOUNT = 64
 const REPAIR_MAX_DISTANCE = 4
 const WHOLE_SHULKER_WITHDRAW_THRESHOLD = 1728
 
+// 扣账幂等键的进程级盐。任务序号（taskPool.sequence）是内存自增、进程重启后归零，
+// 幂等键若只由 botId+taskId+批次号组成，重启后会与重启前的任务撞键：
+// applyWithdrawDeduction 会把新交付误判成“已扣过”而静默跳过扣账，
+// 造成物品已交付、账本不扣、Web 库存虚高（后续取货只能走无记录搜桶并报缺货）。
+// 盐在进程生命周期内保持稳定：同进程内同批次键不变（就地重试/崩溃恢复防双扣语义不变），跨进程必然不同。
+const DEDUCTION_KEY_SALT = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
+
 class CloudStoreService {
   constructor (bot, db, catalog, warehouse, config, taskPool = null, subscriptions = null) {
     this.bot = bot
@@ -1150,6 +1157,13 @@ class CloudStoreService {
       const deadline = Date.now() + this.config.timing.pickupWindowMs
       const shouldStopCollecting = () => {
         if (this.active?.cancelled) return true
+        // 背包捡满就提前结束收集（与"玩家远离"同级的提前结束条件）：满背包
+        // 捡不起玩家丢的物品，干等窗口结束只会让地上的物品堆积甚至消失，
+        // 不如立即回去入库，玩家想继续存可以再叫一次。
+        if (this.bot.inventory.emptySlotCount?.() === 0) {
+          if (this.active) this.active.depositStopReason = 'inventory_full'
+          return true
+        }
         const playerEntity = this.resolvePlayerEntity(username).entity
         const botPosition = this.bot.entity?.position
         if (!playerEntity?.position || !botPosition) return false
@@ -1457,7 +1471,9 @@ class CloudStoreService {
         if (held.length) {
           msgActor(`机器人身上保留着 ${held.length} 种物品，将在后续任务开始前统一回仓。`)
         }
-        msgActor(`账本有库存，但已逐个打开 ${searchedBarrels} 个木桶仍找不到实物：${this.formatItemList(missingItems)}。已登记库存异常，请管理员执行 !同步 对账后再试。`)
+        // 缺口已现场确认：当场修账（扣 owner 余额 + 留痕），Web 库存立即与实物一致。
+        this.autoReconcileConfirmedMissing(storageOwner, missingItems, username)
+        msgActor(`账本有库存，但已逐个打开 ${searchedBarrels} 个木桶仍找不到实物：${this.formatItemList(missingItems)}。已自动同步账本并登记库存异常，管理员可在Web管理页复核。`)
         this.db.clearRecoveryTask(this.botId)
         return { status: 'failed_no_location', delivered: [], missing: this.mergeItems(missingItems) }
       }
@@ -1493,20 +1509,27 @@ class CloudStoreService {
         msgTarget(`${username} 给你的取货失败：仓库实物取出失败，请稍后再试。`)
         msgActor(`给 ${deliveryTarget} 的取货失败：仓库实物取出失败，请稍后再试。`)
       } else {
-        this.msg(username, `账本有库存，但按本地木桶记录没有取出：${this.formatItemList(plan.allocations)}。已就地核对各木桶并重试仍未取到，请稍后再试；若持续出现，请管理员在Web管理页检查库存异常。`)
+        // 重试后仍一无所获：缺口就地确认完毕（取到又放回的不计缺失），当场修账。
+        this.autoReconcileConfirmedMissing(storageOwner, attempt.allMissing || [], username)
+        this.msg(username, `账本有库存，但按本地木桶记录没有取出：${this.formatItemList(plan.allocations)}。已就地核对各木桶并重试仍未取到，账本已按实物自动修正并登记异常；若持续出现，请管理员在Web管理页检查库存异常。`)
       }
       this.db.clearRecoveryTask(this.botId)
       return { status: 'failed_no_withdraw', delivered: [], missing: this.mergeItems(plan.allocations) }
     }
 
     const missingByItem = this.groupMissingByDisplay(plan.allocations, attempt.allWithdrawn)
+    // 部分交付的缺口同样当场修账：交付部分稍后按计划扣账，缺失部分现在扣，
+    // 任务结束后账面 = 实物，不再需要管理员补 !同步。
+    const reconciledMissing = this.autoReconcileConfirmedMissing(storageOwner, attempt.allMissing || [], username)
     traceEvent(trace, 'result', 'task_delivered', {
       delivered: deliveredTotal.map(item => ({ name: item.displayName || item.itemId, amount: item.amount, keyTail: shortKey(item.itemKey) })),
       missingNotices: missingByItem,
+      reconciledMissing,
       decision: '实物已交付，交付部分已按计划扣账'
     })
     if (!deliveryToOther) {
       for (const notice of missingByItem) this.msg(username, notice)
+      if (reconciledMissing.length) this.msg(username, '缺失部分已自动同步账本并登记库存异常，管理员可在Web管理页复核。')
     }
 
     if (deliveryToOther) {
@@ -1531,6 +1554,25 @@ class CloudStoreService {
     return { status: 'delivered', delivered: deliveredTotal, missing: attempt.allMissing || [] }
   }
 
+  // 取货任务收尾：把确认取不到的缺口当场修账（扣 owner 余额 + sync_deduct 流水 +
+  // missing 异常留痕）。归属精确到本任务 owner，比 !同步 的按比例估算更可靠；
+  // 失败只告警不阻断任务收尾。
+  autoReconcileConfirmedMissing (storageOwner, missingItems, username) {
+    if (!missingItems?.length) return []
+    try {
+      if (typeof this.db.deductConfirmedMissing !== 'function') return []
+      return this.db.deductConfirmedMissing(
+        storageOwner.uuid,
+        storageOwner.username || username || '',
+        missingItems,
+        '取货时确认缺失'
+      )
+    } catch (error) {
+      console.warn(`[withdraw-auto-reconcile] 确认缺失自动修账失败：${error?.message || error}`)
+      return []
+    }
+  }
+
   async runWithdrawBatches ({ username, storageOwner, deliveryTarget, deliveryToOther, deliveryMode, batches, continueWithDeposit, msgActor, msgTarget, trace }) {
     const allWithdrawn = []
     const allDeducted = []
@@ -1542,7 +1584,8 @@ class CloudStoreService {
     let aborted = false
     for (let index = 0; index < batches.length; index++) {
       const batch = batches[index]
-      const batchId = `withdraw:${this.botId}:${this.active?.taskId || 'legacy'}:${index + 1}`
+      // 幂等键必须带进程盐：任务序号重启归零，裸拼会在重启后与旧任务撞键导致静默跳过扣账。
+      const batchId = `withdraw:${this.botId}:${this.active?.taskId || 'legacy'}:${index + 1}:${DEDUCTION_KEY_SALT}`
       this.setWithdrawBatchProgress(index + 1, batches.length, 'withdraw_from_chests')
       this.saveRecoveryTask('withdraw', username, storageOwner, deliveryTarget, 'withdraw_from_chests', [], batchId)
       traceEvent(trace, 'batch', 'batch_start', {
@@ -2317,6 +2360,80 @@ class CloudStoreService {
     return removals
   }
 
+  // ── 多 bot 并行全仓同步 ──────────────────────────────────────────────
+  // 硬约束：对账（applyWarehouseScan）必须一次性拿到全仓快照，否则会出现
+  // "账 > 实物"的假缺口。因此并行只发生在扫描阶段：各 bot 分区扫完后，
+  // 由协调 bot 持仓库锁统一重读变更桶、换记录、对账。
+
+  // 按既有扫描顺序切空间连续条带（findContainerBlocks 按距离排序，连续段
+  // = 同心环带），减少并行 bot 互相穿越挡路；并集=全集、互不重叠。
+  splitBlocksForParallelSync (workerCount, blocks) {
+    const strips = Array.from({ length: workerCount }, () => [])
+    blocks.forEach((block, index) => {
+      strips[Math.min(workerCount - 1, Math.floor((index * workerCount) / blocks.length))].push(block)
+    })
+    return strips
+  }
+
+  // 收集并行参与者：协调 bot + 其他空闲健康 bot（跳过正在跑任务、
+  // 死亡恢复中、紧急救援中的），maxParallelSyncBots 可限制并行上限。
+  collectSyncParticipants (coordinator) {
+    if (!this.taskPool) return [coordinator]
+    const cap = Number(this.config.warehouse.maxParallelSyncBots || 0)
+    const idle = [...this.taskPool.workers].filter(candidate =>
+      candidate !== coordinator &&
+      candidate.ready && !candidate.active && !candidate.recoveringFromDeath && !candidate.emergencyRescueActive)
+    const picked = cap > 0 ? idle.slice(0, cap - 1) : idle
+    return [coordinator, ...picked]
+  }
+
+  async syncWarehouseWithTeam (coordinator, radius, trace, options = {}) {
+    const blocks = await coordinator.warehouse.prepareSyncBlocks(radius)
+    const participants = this.collectSyncParticipants(coordinator)
+    // 桶数不足就不分区（<=1 个桶并行没有意义）。
+    const workerCount = blocks.length > 1 ? Math.min(participants.length, blocks.length) : 1
+    const team = participants.slice(0, workerCount)
+
+    if (workerCount === 1) {
+      const scan = await coordinator.warehouse.scanBarrelBlocks(blocks, radius)
+      const result = await coordinator.warehouse.withWarehouseLock(() => coordinator.warehouse.applyWarehouseScan(scan, radius, options))
+      return { ...result, botCount: 1 }
+    }
+
+    const strips = this.splitBlocksForParallelSync(workerCount, blocks)
+    traceEvent(trace, 'sync', 'sync_partition_plan', {
+      botCount: workerCount,
+      partitionSizes: strips.map(strip => strip.length),
+      decision: `分区并行扫描：${team.map(service => service.botId).join(' + ')}`
+    })
+
+    // 借用的 bot 挂上任务标记：快照如实显示"同步中"，任务池派发双保险。
+    const borrowed = team.slice(1)
+    for (const service of borrowed) {
+      service.active = { type: 'sync', name: 'sync', username: 'admin', exclusive: false, borrowedBySync: coordinator.botId }
+    }
+
+    try {
+      // 等所有分区全部落地再合并：任一分区失败整体中止，旧记录原样保留。
+      const settled = await Promise.allSettled(strips.map((strip, index) => team[index].warehouse.scanSyncPartition(radius, strip)))
+      const failure = settled.find(outcome => outcome.status === 'rejected')
+      if (failure) throw failure.reason
+      const scans = settled.map(outcome => outcome.value)
+      const merged = {
+        radius,
+        blocks,
+        snapshots: scans.flatMap(scan => scan.snapshots),
+        actualItems: scans.flatMap(scan => scan.actualItems)
+      }
+      const result = await coordinator.warehouse.withWarehouseLock(() => coordinator.warehouse.applyWarehouseScan(merged, radius, options))
+      return { ...result, botCount: workerCount }
+    } finally {
+      for (const service of borrowed) {
+        if (service.active?.borrowedBySync === coordinator.botId) service.active = null
+      }
+    }
+  }
+
   async handleSync (username, text) {
     if (!this.isAdmin(username)) {
       this.msg(username, '你没有权限同步仓库。')
@@ -2325,26 +2442,32 @@ class CloudStoreService {
 
     await this.enqueueTask(username, 'sync', async worker => {
       const parts = text.split(/\s+/).filter(Boolean)
+      // "强制" 用于确属拆除木桶后的缩量重扫，跳过缩量守卫（守卫默认开启，
+      // 防止小半径同步误删半径外的桶记录并对账抽干 momo）。
+      const force = parts.slice(1).some(part => part === '强制' || part.toLowerCase() === 'force')
+      const numericArg = parts.slice(1).find(part => /^-?\d+$/.test(part))
       const radius = clampInt(
-        parts[1],
+        numericArg,
         this.config.warehouse.defaultSyncRadius,
         1,
         this.config.warehouse.maxSyncRadius
       )
       const trace = startTrace({ bot: this.botId, kind: 'sync', actor: username, radius })
       this.attachWarehouseTrace(trace)
-      this.msg(username, `开始同步仓库，半径 ${radius}。`)
+      this.msg(username, `开始同步仓库，半径 ${radius}${force ? '（强制，跳过缩量守卫）' : ''}。`)
       try {
-        const result = await worker.warehouse.syncWarehouse(radius)
+        const result = await this.syncWarehouseWithTeam(worker, radius, trace, { allowShrink: force })
         const addedAmount = this.totalAmount(result.addedToMomo)
         const unresolvedAmount = this.totalAmount(result.unresolved)
         const failureText = result.failures.length ? `，失败${result.failures.length}` : ''
-        this.msg(username, `同步完成：木桶${result.chestCount}，打开${result.openedChestCount}，重读${result.rescanCount || 0}${failureText}，多余${addedAmount}/${this.itemTypeCount(result.addedToMomo)}种，缺失${unresolvedAmount}/${this.itemTypeCount(result.unresolved)}种。详情见Web管理页。`)
+        const parallelText = result.botCount > 1 ? `，${result.botCount}台并行` : ''
+        this.msg(username, `同步完成：木桶${result.chestCount}，打开${result.openedChestCount}，重读${result.rescanCount || 0}${failureText}${parallelText}，多余${addedAmount}/${this.itemTypeCount(result.addedToMomo)}种，缺失${unresolvedAmount}/${this.itemTypeCount(result.unresolved)}种。详情见Web管理页。`)
         traceSummary(trace, {
           status: 'ok',
           chests: result.chestCount,
           opened: result.openedChestCount,
           rescan: result.rescanCount || 0,
+          bots: result.botCount,
           addedTotal: addedAmount,
           unresolvedTotal: unresolvedAmount
         })
