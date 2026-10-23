@@ -1095,10 +1095,9 @@ class Warehouse {
           let returned = false
           let repackState = ''
           try {
-            await this.equipItemInHand(sourceBox)
-            this.trace('open', 'shulker_equip', {
+            this.trace('open', 'shulker_click_open', {
               sourceBox: { key: sourceKey, keyTail: shortKey(sourceKey), slot: sourceBox.slot },
-              decision: '已把源盒拿在主手，对空气右键快捷开盒'
+              decision: '源盒留在背包格，光标为空右键点击盒子快捷开盒'
             })
             // 服务器偶尔会在快捷开盒后返回空窗口（数量 0），与盒内应有物品对不上；
             // 关窗重开最多 quickShulkerOpenAttempts 次，仍为 0 才跳过该盒。
@@ -1544,6 +1543,13 @@ class Warehouse {
     return 0
   }
 
+  findAnyInventoryShulker () {
+    return this.bot.inventory.items().find(item => {
+      const normalized = this.catalog.fromPrismarineItem(item)
+      return this.catalog.isShulkerBox(normalized.itemId)
+    }) || null
+  }
+
   findInventoryShulker (itemId, preferredItemKey = '') {
     const candidates = this.bot.inventory.items().filter(item => {
       const normalized = this.catalog.fromPrismarineItem(item)
@@ -1585,50 +1591,26 @@ class Warehouse {
     }
   }
 
-  async aimAtAir (maxDistance = 6) {
-    const startYaw = Number(this.bot.entity?.yaw || 0)
-    const candidates = []
-    const seen = new Set()
-    const addCandidate = (yaw, pitch) => {
-      const normalizedYaw = Math.atan2(Math.sin(yaw), Math.cos(yaw))
-      const key = `${normalizedYaw.toFixed(6)},${pitch.toFixed(6)}`
-      if (seen.has(key)) return
-      seen.add(key)
-      candidates.push({ yaw: normalizedYaw, pitch })
-    }
-
-    // A 1x2 warehouse tunnel has floor and ceiling blocks close to the bot, so
-    // horizontal cardinal directions must be checked before looking up or down.
-    for (const yaw of [0, Math.PI / 2, Math.PI, -Math.PI / 2]) addCandidate(yaw, 0)
-    for (const offset of [0, Math.PI / 2, Math.PI, -Math.PI / 2]) addCandidate(startYaw + offset, 0)
-    addCandidate(startYaw, Math.PI / 2)
-    for (const offset of [Math.PI / 2, Math.PI, -Math.PI / 2]) addCandidate(startYaw + offset, Math.PI / 3)
-
-    for (const candidate of candidates) {
-      await this.bot.look(candidate.yaw, candidate.pitch, true)
-      await sleep(100)
-      const block = this.bot.blockAtCursor(maxDistance)
-      if (!block) {
-        this.debug(`air target confirmed yaw=${candidate.yaw.toFixed(3)} pitch=${candidate.pitch.toFixed(3)} distance=${maxDistance}`)
-        return
-      }
-      this.debug(`air target blocked yaw=${candidate.yaw.toFixed(3)} pitch=${candidate.pitch.toFixed(3)} by ${this.describeBlock(block)}`)
-    }
-    throw new Error(`无法找到前方 ${maxDistance} 格内没有方块的方向，已取消快捷打开潜影盒。`)
-  }
-
+  // 快捷开盒手势：光标为空时右键点击背包内的潜影盒（与玩家在物品栏 GUI 里
+  // 空手右键盒子相同），由服务器的快捷开盒插件打开盒子窗口；
+  // 关闭用 window.close()（即按 E/ESC 的关闭容器包）。
   async openQuickShulkerWindow (expectedItemKey = '') {
     if (this.bot.currentWindow) {
       this.bot.closeWindow(this.bot.currentWindow)
       await sleep(150)
     }
-    this.assertHeldShulker(expectedItemKey)
-    await this.aimAtAir(6)
+    const box = (expectedItemKey && this.findInventoryItemByKey(expectedItemKey)) ||
+      this.findAnyInventoryShulker()
+    if (!box) throw new Error('背包中找不到可快捷打开的潜影盒。')
+    await this.clearCursorBeforeClick()
+    const normalized = this.catalog.fromPrismarineItem(box)
+    this.debug(`quick shulker click ${normalized.displayName || normalized.itemId} key=${normalized.itemKey.slice(-6)} slot=${box.slot}`)
 
     const timeoutMs = Math.max(500, Number(this.config.timing?.openContainerTimeoutMs || 8000))
     for (let attempt = 1; attempt <= 2; attempt++) {
       const windowPromise = this.waitForWindowOpen(timeoutMs)
-      this.bot.activateItem(false)
+      // 空光标右键背包格：普通点击 mode 0 + 右键 button 1
+      await this.bot.clickWindow(box.slot, 1, 0)
       const window = await windowPromise
       if (window) {
         if (!this.isQuickShulkerWindow(window)) {
@@ -1637,9 +1619,33 @@ class Warehouse {
         }
         return window
       }
+      // 手势没被服务器识别时，右键会把盒子拿到光标上；点回原格放回后重试
+      if (this.bot.inventory?.selectedItem) {
+        this.trace('decision', 'shulker_click_no_window_return_box', {
+          sourceBox: { key: normalized.itemKey, keyTail: shortKey(normalized.itemKey), slot: box.slot },
+          attempt,
+          decision: '右键后没有收到潜影盒窗口，盒子可能停在光标上，先放回原格再重试'
+        })
+        await this.bot.clickWindow(box.slot, 0, 0)
+        await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
+      }
       if (attempt < 2) await sleep(250)
     }
-    throw new Error('拿着潜影盒对空气右键后，没有收到潜影盒窗口。')
+    throw new Error('在背包内右键潜影盒后，没有收到潜影盒窗口。')
+  }
+
+  async clearCursorBeforeClick () {
+    const cursor = this.bot.inventory?.selectedItem
+    if (!cursor) return
+    const slots = this.bot.inventory.slots || []
+    const emptySlot = slots.findIndex((item, slot) => slot >= 9 && slot < 45 && !item)
+    if (emptySlot < 0) throw new Error('光标上残留物品且背包没有空位，无法快捷打开潜影盒。')
+    this.trace('decision', 'shulker_click_cursor_clear', {
+      cursorItem: { name: cursor.name || cursor.itemId || 'unknown', slot: emptySlot },
+      decision: '点击盒子前光标不为空，先把光标物品放回背包空格'
+    })
+    await this.bot.clickWindow(emptySlot, 0, 0)
+    await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
   }
 
   resolvePreparedShulkerRepackFromItem (recovery, item) {
@@ -1733,20 +1739,6 @@ class Warehouse {
     if (unchanged.length) return this.resolvePreparedShulkerRepackFromItem(recovery, unchanged[0])
     console.warn(`[shulker-repack-recovery] prepared record is still pending; matching box is not currently in inventory, keeping the record and continuing bot tasks: bot=${this.botId} old=${recovery.oldBoxItemKey}`)
     return null
-  }
-
-  assertHeldShulker (expectedItemKey = '') {
-    const held = this.bot.heldItem
-    if (!held) throw new Error('快捷打开潜影盒前主手为空。')
-    const normalized = this.catalog.fromPrismarineItem(held)
-    if (!this.catalog.isShulkerBox(normalized.itemId)) {
-      throw new Error(`快捷打开潜影盒前主手物品不是潜影盒：${normalized.displayName || normalized.itemId}`)
-    }
-    if (expectedItemKey && normalized.itemKey !== expectedItemKey) {
-      throw new Error(`快捷打开潜影盒前主手拿错物品：期望 ${expectedItemKey.slice(-6)}，实际 ${normalized.itemKey.slice(-6)}`)
-    }
-    this.debug(`quick shulker held ${normalized.displayName || normalized.itemId} key=${normalized.itemKey.slice(-6)} slot=${held.slot}`)
-    return held
   }
 
   waitForWindowOpen (timeoutMs) {

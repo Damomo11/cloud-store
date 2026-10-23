@@ -437,18 +437,16 @@ test('disconnect recovery stores held items before committing the pending shulke
   assert.equal(pending, null)
 })
 
-test('quick shulker opening aims at air and sends activateItem without block interaction', async () => {
+test('quick shulker opening right-clicks the box inside the inventory with an empty cursor', async () => {
   const bot = new EventEmitter()
+  const box = { name: 'purple_shulker_box', slot: 30, count: 1 }
+  const clicks = []
   let activateCalls = 0
-  let blockOpenCalls = 0
-  bot.entity = { yaw: 0, pitch: 0 }
   bot.currentWindow = null
-  bot.heldItem = { name: 'purple_shulker_box', slot: 36, count: 1 }
-  bot.look = async () => {}
-  bot.blockAtCursor = () => null
-  bot.activateItem = offHand => {
-    assert.equal(offHand, false)
-    activateCalls++
+  bot.inventory = { items: () => [box], selectedItem: null }
+  bot.activateItem = () => { activateCalls++ }
+  bot.clickWindow = async (slot, button, mode) => {
+    clicks.push({ slot, button, mode })
     setImmediate(() => bot.emit('windowOpen', {
       type: 'minecraft:shulker_box',
       inventoryStart: 27,
@@ -456,7 +454,6 @@ test('quick shulker opening aims at air and sends activateItem without block int
       close: () => {}
     }))
   }
-  bot.openContainer = () => { blockOpenCalls++ }
   const config = structuredClone(DEFAULT_CONFIG)
   config.debug = false
   config.timing.openContainerTimeoutMs = 200
@@ -469,8 +466,8 @@ test('quick shulker opening aims at air and sends activateItem without block int
   const window = await warehouse.openQuickShulkerWindow('box-key')
 
   assert.equal(window.inventoryStart, 27)
-  assert.equal(activateCalls, 1)
-  assert.equal(blockOpenCalls, 0)
+  assert.deepEqual(clicks, [{ slot: 30, button: 1, mode: 0 }], '空光标右键点击背包内的盒子')
+  assert.equal(activateCalls, 0, '不再对手持物品使用右键手势')
 })
 
 test('taking a shulker waits for the delayed inventory update after the barrel closes', async () => {
@@ -501,15 +498,64 @@ test('taking a shulker waits for the delayed inventory update after the barrel c
   assert.equal(taken, box)
 })
 
-test('quick shulker opening refuses to activate an empty main hand', async () => {
+test('quick shulker opening refuses when the inventory has no shulker box', async () => {
   const bot = new EventEmitter()
   bot.currentWindow = null
-  bot.heldItem = null
+  bot.inventory = { items: () => [], selectedItem: null }
   const config = structuredClone(DEFAULT_CONFIG)
   config.debug = false
   const warehouse = new Warehouse(bot, {}, {}, config)
 
-  await assert.rejects(warehouse.openQuickShulkerWindow(), /主手为空/)
+  await assert.rejects(warehouse.openQuickShulkerWindow(), /背包中找不到/)
+})
+
+test('quick shulker opening returns the cursor box and retries when no window opens', async () => {
+  const bot = new EventEmitter()
+  const box = { name: 'purple_shulker_box', slot: 30, count: 1 }
+  const clicks = []
+  let boxOnCursor = null
+  bot.currentWindow = null
+  bot.inventory = {
+    items: () => [box],
+    get selectedItem () { return boxOnCursor },
+    slots: new Array(46).fill(null)
+  }
+  bot.clickWindow = async (slot, button, mode) => {
+    clicks.push({ slot, button, mode })
+    if (button === 0) {
+      // 放回光标物品后服务器同步清空光标
+      boxOnCursor = null
+      return
+    }
+    // 手势没被识别时，服务器把盒子拿到光标上；第二次右键才开窗
+    boxOnCursor = box
+    if (clicks.filter(click => click.button === 1).length >= 2) {
+      setImmediate(() => bot.emit('windowOpen', {
+        type: 'minecraft:shulker_box',
+        inventoryStart: 27,
+        slots: new Array(63),
+        close: () => {}
+      }))
+    }
+  }
+  const config = structuredClone(DEFAULT_CONFIG)
+  config.debug = false
+  config.timing.openContainerTimeoutMs = 150
+  config.timing.containerSettleMs = 0
+  const catalog = {
+    fromPrismarineItem: () => ({ itemKey: 'box-key', itemId: 'minecraft:purple_shulker_box', displayName: '紫色潜影盒' }),
+    isShulkerBox: itemId => /_shulker_box$/.test(itemId)
+  }
+  const warehouse = new Warehouse(bot, {}, catalog, config)
+
+  const window = await warehouse.openQuickShulkerWindow('box-key')
+
+  assert.equal(window.inventoryStart, 27)
+  assert.deepEqual(clicks, [
+    { slot: 30, button: 1, mode: 0 },
+    { slot: 30, button: 0, mode: 0 },
+    { slot: 30, button: 1, mode: 0 }
+  ], '第一次右键没开窗：放回光标盒子后重试成功')
 })
 
 test('quick shulker extraction waits for delayed window contents', async () => {
@@ -691,33 +737,6 @@ test('shulker storage strips nested bee container components', () => {
   assert.equal(storedEntry.addedComponentCount, 0)
   assert.equal(storedEntry.removedComponentCount, 0)
   assert.equal(normalized.metaJson.includes('VV|original_hashes'), false)
-})
-
-test('air aiming finds a horizontal cardinal opening inside a 1x2 barrel tunnel', async () => {
-  const looks = []
-  const bot = {
-    entity: { yaw: 0.37, pitch: 0 },
-    look: async (yaw, pitch) => {
-      bot.entity.yaw = yaw
-      bot.entity.pitch = pitch
-      looks.push({ yaw, pitch })
-    },
-    blockAtCursor: () => {
-      const eastOrWest = Math.abs(Math.abs(bot.entity.yaw) - (Math.PI / 2)) < 0.001
-      return bot.entity.pitch === 0 && eastOrWest
-        ? null
-        : { name: bot.entity.pitch === 0 ? 'barrel' : 'quartz_block', position: { x: 0, y: 0, z: 0 } }
-    }
-  }
-  const config = structuredClone(DEFAULT_CONFIG)
-  config.debug = false
-  const warehouse = new Warehouse(bot, {}, {}, config)
-
-  await warehouse.aimAtAir(6)
-
-  assert.equal(looks.at(-1).pitch, 0)
-  assert.ok(Math.abs(Math.abs(looks.at(-1).yaw) - (Math.PI / 2)) < 0.001)
-  assert.ok(looks.every(look => look.pitch === 0), 'horizontal opening should be found before vertical fallback')
 })
 
 test('shulker return accepts a delayed inventory update without clicking twice', async () => {
