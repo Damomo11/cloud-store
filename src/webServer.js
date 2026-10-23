@@ -3594,7 +3594,7 @@ const HTML = `<!doctype html>
       </div>
     </aside>
     <main>
-      <div id="inventoryHero" class="hero">欢迎回来，<strong id="heroName">-</strong>。 共 <strong id="heroTypes">0</strong> 种物品，<strong id="heroAmount">0</strong> 件。 <span id="inventoryQuota" class="quota-inline">仓库额度 0/0格</span></div>
+      <div id="inventoryHero" class="hero">欢迎回来，<strong id="heroName">-</strong>。 共 <strong id="heroTypes">0</strong> 种物品，<strong id="heroAmount">0</strong> 件。 <span id="heroReserved" class="quota-inline"></span><span id="inventoryQuota" class="quota-inline">仓库额度 0/0格</span></div>
       <section id="inventoryView">
         <div class="toolbar">
           <div class="title">远程存储 <span id="loaded" class="muted">0/0 种已加载</span></div>
@@ -4560,6 +4560,9 @@ const HTML = `<!doctype html>
       state.selected.clear();
       renderLitematicPlan(null);
       updateInventoryHeroStats();
+      // 任务占用中的数量（预留已挂起、账还没扣）：提示玩家这部分暂时不可取。
+      const reservedAmount = Number(data.stats?.reservedAmount || 0);
+      $('heroReserved').textContent = reservedAmount > 0 ? '任务占用中 ' + num(reservedAmount) + ' 件' : '';
       $('inventoryQuota').textContent = '仓库额度 ' + num(data.quota?.usedSlots || 0) + '/' + num(data.quota?.quotaSlots || 0) + '格';
       renderSelected();
       renderInventory();
@@ -5015,8 +5018,9 @@ const HTML = `<!doctype html>
         const selected = state.selected.has(item.itemKey) ? ' selected' : '';
         const aliasTitle = item.personalAliases?.length ? '个人别名：' + item.personalAliases.join('、') : (item.adminDisplayName && item.adminDisplayName !== item.displayName ? '默认名：' + item.adminDisplayName : '');
         const boxedBadge = !state.shulkerBoxView && Number(item.boxedAmount || 0) > 0 ? '<span class="boxed-badge">盒</span>' : '';
+        const reservedBadge = Number(item.reserved || 0) > 0 ? '<span class="boxed-badge" title="任务占用中 ' + esc(num(item.reserved)) + '，可取 ' + esc(num(item.available)) + '">占' + esc(shortCount(item.reserved)) + '</span>' : '';
         return '<div class="item' + selected + '" data-key="' + esc(item.itemKey) + '">' +
-          '<div class="icon"><img data-key="' + esc(item.itemKey) + '" alt="" loading="lazy" decoding="async"><span class="fallback">' + esc((item.displayName || item.itemId).slice(0, 4)) + '</span><span class="count">' + esc(shortCount(item.amount)) + '</span>' + boxedBadge + '</div>' +
+          '<div class="icon"><img data-key="' + esc(item.itemKey) + '" alt="" loading="lazy" decoding="async"><span class="fallback">' + esc((item.displayName || item.itemId).slice(0, 4)) + '</span><span class="count">' + esc(shortCount(item.amount)) + '</span>' + boxedBadge + reservedBadge + '</div>' +
           '<div class="name" title="' + esc(aliasTitle) + '">' + esc(item.displayName || item.itemId) + '</div>' +
           '</div>';
       }).join('') + '</div>';
