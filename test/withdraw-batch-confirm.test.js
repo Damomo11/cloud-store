@@ -9,7 +9,7 @@ function createWarehouse (bot) {
   config.timing.containerSettleMs = 0
   config.timing.containerClickIntervalMs = 0
   config.timing.dropIntervalMs = 0
-  const catalog = { fromPrismarineItem: item => item }
+  const catalog = { fromPrismarineItem: item => item, getStackSize: () => 64 }
   return new Warehouse(bot, {}, catalog, config)
 }
 

@@ -524,6 +524,65 @@ class Warehouse {
     return null
   }
 
+  // 窗口背包区里同类型的未满堆：找能整份收下 amount 个的堆（余量最大者优先）。
+  // 左键把光标上的同类型物品点上去、右键逐个放上去，服务器都按合并处理。
+  windowMergeSlotForItem (window, itemKey, amount) {
+    if (!Number.isFinite(amount) || amount <= 0) return null
+    let bestSlot = null
+    let bestFree = 0
+    for (let slot = window.inventoryStart; slot < window.inventoryEnd; slot++) {
+      const item = window.slots[slot]
+      if (!item) continue
+      const normalized = this.catalog.fromPrismarineItem(item)
+      if (normalized.itemKey !== itemKey) continue
+      const stackSize = item.stackSize || this.catalog.getStackSize(`minecraft:${item.name}`)
+      const free = Math.max(0, stackSize - Number(item.count || 0))
+      if (free >= amount && free > bestFree) {
+        bestSlot = slot
+        bestFree = free
+      }
+    }
+    return bestSlot
+  }
+
+  // 取物落点：优先并入背包里同类型未满堆，并不下整份再占空格。
+  // 桶里的库存常是 39/38/29 这种碎片堆，不并堆的话每取一个碎片就多占一格，
+  // 实际占格会远超分批预算的 ceil(数量/堆叠上限)，把背包提前撑满。
+  withdrawDestinationSlot (window, sourceItem, amount) {
+    const normalized = this.catalog.fromPrismarineItem(sourceItem)
+    const mergeSlot = this.windowMergeSlotForItem(window, normalized.itemKey, amount)
+    if (mergeSlot !== null) return mergeSlot
+    return this.firstEmptyWindowInventorySlot(window)
+  }
+
+  emptyInventorySlotCount () {
+    const slots = this.bot.inventory?.slots
+    if (!Array.isArray(slots)) return 0
+    let count = 0
+    for (let slot = 9; slot < 45; slot++) {
+      if (!slots[slot]) count++
+    }
+    return count
+  }
+
+  // 背包对某物品的剩余可收容量：空格 × 堆叠上限 + 同类型未满堆余量。
+  // 取物并堆后这就是"还能再取多少个"的真实上限。无法观测背包槽位（测试桩等）
+  // 时返回 Infinity，调用方按"还有容量"处理。
+  inventoryFreeCapacityForItem (itemKey) {
+    const slots = this.bot.inventory?.slots
+    if (!Array.isArray(slots)) return Number.POSITIVE_INFINITY
+    const itemId = String(itemKey || '').split('|')[0]
+    const stackSize = Math.max(1, Number(this.catalog.getStackSize(itemId) || 64))
+    let free = this.emptyInventorySlotCount() * stackSize
+    for (const item of this.bot.inventory.items()) {
+      const normalized = this.catalog.fromPrismarineItem(item)
+      if (normalized.itemKey !== itemKey) continue
+      const size = Number(item.stackSize) > 0 ? Number(item.stackSize) : stackSize
+      free += Math.max(0, size - Number(item.count || 0))
+    }
+    return free
+  }
+
   async withdrawAllocations (allocations) {
     return this.withWarehouseLock(() => this.withdrawAllocationsLocked(allocations))
   }
@@ -543,6 +602,9 @@ class Warehouse {
       }
 
       let remaining = allocation.amount
+      // 背包对该物品装不下时（空格与同类型半堆余量都为 0），剩余数量按"背包已满"
+      // 计入缺失——这不是仓库缺货，不参与确认缺失自动修账。
+      let inventoryFull = false
       const itemInfo = this.db.getItemByKey(allocation.itemKey)
       if (!itemInfo) {
         this.trace('plan', 'allocate_item_unknown', {
@@ -609,6 +671,19 @@ class Warehouse {
       let timeoutBarrels = 0
       for (const group of chestGroups) {
         if (remaining <= 0) break
+        // 容量兜底：并堆后背包对该物品已经装不下时，不再白跑木桶（每桶都会
+        // 因"没有空槽"空手而归），直接按背包已满结算剩余数量。
+        if (this.inventoryFreeCapacityForItem(allocation.itemKey) <= 0) {
+          inventoryFull = true
+          this.debug(`withdraw ${itemInfo.displayName || allocation.itemKey} 背包已满（无空格且无可并半堆），停止取该物品 remaining=${remaining}`)
+          this.trace('decision', 'withdraw_inventory_full', {
+            item: itemInfo.displayName || allocation.itemKey,
+            keyTail: shortKey(allocation.itemKey),
+            remaining,
+            decision: `背包已满且无同类型可并堆位，停止取该物品，剩余 ${remaining} 个按背包已满计入缺失`
+          })
+          break
+        }
         if (searchBarrels) {
           // 无记录搜索：额度独立于缺货换桶，按单桶 5 秒上限逐个开。
           if (searchedBarrels >= this.unlocatedSearchLimit()) break
@@ -806,9 +881,12 @@ class Warehouse {
           item: itemInfo.displayName || allocation.itemKey,
           keyTail: shortKey(allocation.itemKey),
           missing: remaining,
-          decision: `该物品最终还有 ${remaining} 个没有取到，计入缺失`
+          inventoryFull,
+          decision: inventoryFull
+            ? `背包已满，该物品还有 ${remaining} 个装不下，按背包已满计入缺失（不修账）`
+            : `该物品最终还有 ${remaining} 个没有取到，计入缺失`
         })
-        missing.push({ ...itemInfo, amount: remaining })
+        missing.push({ ...itemInfo, amount: remaining, ...(inventoryFull ? { inventoryFull: true } : {}) })
       }
     }
 
@@ -1023,6 +1101,8 @@ class Warehouse {
     let remaining = Number(allocation.amount || 0)
     let boxesRemaining = Math.max(0, Number(allocation.sourceBoxCount || 0))
     const withdrawn = []
+    // 背包装不下目标物品或放不下源盒时停止拆盒，剩余按"背包已满"计入缺失（不修账）
+    let inventoryFull = false
 
     this.trace('plan', 'shulker_extract_start', {
       item: targetItem.displayName || allocation.itemKey,
@@ -1063,10 +1143,26 @@ class Warehouse {
 
       for (const group of chestGroups) {
         if (remaining <= 0 || boxesRemaining <= 0) break
+        if (inventoryFull) break
         const slot = group.slots[0]
         const chest = { chestId: group.chestId, x: slot.x, y: slot.y, z: slot.z, blockName: slot.blockName }
 
         while (remaining > 0 && boxesRemaining > 0) {
+          // 容量兜底：目标物品装不下、或没有格子放源盒（潜影盒带指纹基本不可并堆）
+          // 时停止拆盒——继续拿盒只会以"取潜影盒失败，实际取出 0 个"整单报错。
+          if (this.inventoryFreeCapacityForItem(allocation.itemKey) <= 0 ||
+              this.inventoryFreeCapacityForItem(sourceKey) < 1) {
+            inventoryFull = true
+            this.debug(`shulker extract ${targetItem.displayName || allocation.itemKey} 背包已满，停止拆盒 remaining=${remaining}`)
+            this.trace('decision', 'shulker_extract_inventory_full', {
+              item: targetItem.displayName || allocation.itemKey,
+              keyTail: shortKey(allocation.itemKey),
+              sourceBox: { key: sourceKey, keyTail: shortKey(sourceKey) },
+              remaining,
+              decision: `背包已满（目标物品或源盒都放不下），停止拆盒，剩余 ${remaining} 个按背包已满计入缺失`
+            })
+            break
+          }
           const sourceBox = await this.takeOneShulkerFromChest(chest, sourceKey, group.slots.map(row => row.slot))
           if (!sourceBox) {
             this.trace('decision', 'shulker_take_box_none', {
@@ -1376,6 +1472,7 @@ class Warehouse {
       })
       for (const row of fallbackRows) {
         if (remaining <= 0) break
+        if (inventoryFull) break
         const fallbackKey = String(row.shulkerItemKey || '')
         if (!fallbackKey || fallbackKey === sourceKey) continue
         if (!this.db.listSlotsForItemKey(fallbackKey).length) continue
@@ -1402,14 +1499,19 @@ class Warehouse {
       item: targetItem.displayName || allocation.itemKey,
       withdrawn: withdrawn.reduce((sum, item) => sum + Number(item.amount || 0), 0),
       missing: Math.max(0, remaining),
+      inventoryFull,
       decision: remaining > 0
-        ? `盒装取货结束，仍有 ${remaining} 个没取到`
+        ? (inventoryFull
+            ? `背包已满，仍有 ${remaining} 个装不下，按背包已满计入缺失（不修账）`
+            : `盒装取货结束，仍有 ${remaining} 个没取到`)
         : '盒装取货结束，数量已取够'
     })
 
     return {
       withdrawn: this.mergeItems(withdrawn),
-      missing: remaining > 0 ? [{ ...targetItem, amount: remaining }] : []
+      missing: remaining > 0
+        ? [{ ...targetItem, amount: remaining, ...(inventoryFull ? { inventoryFull: true } : {}) }]
+        : []
     }
   }
 
@@ -1473,13 +1575,20 @@ class Warehouse {
     }
 
     if (moved !== 1) {
+      // 背包满时给直白的原因，而不是"实际取出 0 个"这种费解的报错
+      const inventoryFull = this.inventoryFreeCapacityForItem(itemKey) < 1
       this.trace('error', 'shulker_take_box_failed', {
         chest: this.describeChest(chest),
         sourceBox: { key: itemKey, keyTail: shortKey(itemKey) },
         moved,
-        decision: '取盒点击未确认成功'
+        inventoryFull,
+        decision: inventoryFull
+          ? '背包已满且无同 key 可并堆位，放不下潜影盒'
+          : '取盒点击未确认成功'
       })
-      throw new Error(`从 ${this.describeChest(chest)} 取潜影盒失败，实际取出 ${moved} 个。`)
+      throw new Error(inventoryFull
+        ? `机器人背包已满，没有空槽从 ${this.describeChest(chest)} 取潜影盒。`
+        : `从 ${this.describeChest(chest)} 取潜影盒失败，实际取出 ${moved} 个。`)
     }
     const item = await this.waitForInventoryItemByKey(itemKey)
     if (!item) {
@@ -2156,7 +2265,10 @@ class Warehouse {
 
   async ensureWindowCursorCleared (container) {
     if (!container.selectedItem) return true
-    const destSlot = this.firstEmptyWindowInventorySlot(container)
+    // 光标物品优先并回同类型未满堆（整份收得下才点），其次找空格
+    const cursor = this.catalog.fromPrismarineItem(container.selectedItem)
+    let destSlot = this.windowMergeSlotForItem(container, cursor.itemKey, Number(container.selectedItem.count || 0))
+    if (destSlot === null) destSlot = this.firstEmptyWindowInventorySlot(container)
     if (destSlot === null) return false
     try {
       await this.bot.clickWindow(destSlot, 0, 0)
@@ -2190,7 +2302,10 @@ class Warehouse {
   }
 
   async moveContainerSlotToInventory (container, sourceSlot) {
-    const destSlot = this.firstEmptyWindowInventorySlot(container)
+    const sourceItem = container.slots[sourceSlot]
+    if (!sourceItem) throw new Error(`容器槽位 ${sourceSlot} 上没有物品，无法取物`)
+    // 整堆搬运优先并入背包里同类型未满堆（余量收得下整份时左键点上去即全部合并）
+    const destSlot = this.withdrawDestinationSlot(container, sourceItem, Number(sourceItem.count || 0))
     if (destSlot === null) throw new Error('机器人背包没有空槽，无法取物')
 
     await this.bot.clickWindow(sourceSlot, 0, 0)
@@ -2199,7 +2314,10 @@ class Warehouse {
   }
 
   async movePartialContainerSlotToInventory (container, sourceSlot, count) {
-    const destSlot = this.firstEmptyWindowInventorySlot(container)
+    const sourceItem = container.slots[sourceSlot]
+    if (!sourceItem) throw new Error(`容器槽位 ${sourceSlot} 上没有物品，无法拆分取物`)
+    // 右键逐个放入同类型半堆同样是合并语义：优先并堆，没有能整份收下的半堆再开新格
+    const destSlot = this.withdrawDestinationSlot(container, sourceItem, count)
     if (destSlot === null) throw new Error('机器人背包没有空槽，无法拆分取物')
     const intervalMs = Math.max(0, Number(this.config.timing?.containerClickIntervalMs ?? 50))
 
