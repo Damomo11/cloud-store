@@ -6,6 +6,13 @@ const REPAIR_BOTTLE_AMOUNT = 64
 const REPAIR_MAX_DISTANCE = 4
 const WHOLE_SHULKER_WITHDRAW_THRESHOLD = 1728
 
+// 扣账幂等键的进程级盐。任务序号（taskPool.sequence）是内存自增、进程重启后归零，
+// 幂等键若只由 botId+taskId+批次号组成，重启后会与重启前的任务撞键：
+// applyWithdrawDeduction 会把新交付误判成“已扣过”而静默跳过扣账，
+// 造成物品已交付、账本不扣、Web 库存虚高（后续取货只能走无记录搜桶并报缺货）。
+// 盐在进程生命周期内保持稳定：同进程内同批次键不变（就地重试/崩溃恢复防双扣语义不变），跨进程必然不同。
+const DEDUCTION_KEY_SALT = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
+
 class CloudStoreService {
   constructor (bot, db, catalog, warehouse, config, taskPool = null, subscriptions = null) {
     this.bot = bot
@@ -1460,7 +1467,8 @@ class CloudStoreService {
     let aborted = false
     for (let index = 0; index < batches.length; index++) {
       const batch = batches[index]
-      const batchId = `withdraw:${this.botId}:${this.active?.taskId || 'legacy'}:${index + 1}`
+      // 幂等键必须带进程盐：任务序号重启归零，裸拼会在重启后与旧任务撞键导致静默跳过扣账。
+      const batchId = `withdraw:${this.botId}:${this.active?.taskId || 'legacy'}:${index + 1}:${DEDUCTION_KEY_SALT}`
       this.setWithdrawBatchProgress(index + 1, batches.length, 'withdraw_from_chests')
       this.saveRecoveryTask('withdraw', username, storageOwner, deliveryTarget, 'withdraw_from_chests', [], batchId)
       traceEvent(trace, 'batch', 'batch_start', {
