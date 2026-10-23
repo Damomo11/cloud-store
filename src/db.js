@@ -2238,6 +2238,70 @@ class StoreDb {
     })
   }
 
+  // 取货任务确认的缺失（现场搜桶/换桶重试后仍未取到的部分）当场修账：
+  // 归属精确到该任务的 owner，比 !同步 的按比例估算更可靠。扣减按余额钳制，
+  // 写 sync_deduct 流水与 missing 异常留痕（同 owner+item 已有 open 异常时不重复登记）。
+  deductConfirmedMissing (ownerUuid, username, items, notePrefix = '取货时确认缺失') {
+    if (!ownerUuid || !Array.isArray(items) || !items.length) return []
+    const results = []
+    this.db.transaction(() => {
+      for (const item of items) {
+        const amount = Number(item.amount || 0)
+        if (amount <= 0) continue
+        const stored = this.getItemByKey(item.itemKey)
+        const complete = { ...stored, ...item }
+        if (!complete.itemId || !complete.displayName) continue
+        const balance = this.getBalance(ownerUuid, item.itemKey)
+        const deducted = Math.min(balance, amount)
+        if (deducted > 0) {
+          this.adjustBalance(ownerUuid, item.itemKey, -deducted)
+          this.addTransaction(
+            'sync_deduct',
+            'ok',
+            ownerUuid,
+            username,
+            [{ ...complete, amount: deducted }],
+            `${notePrefix}; requested=${amount}; deducted=${deducted}`
+          )
+        }
+        if (typeof this.hasOpenInventoryMismatch !== 'function' ||
+            !this.hasOpenInventoryMismatch(ownerUuid, item.itemKey)) {
+          this.addInventoryMismatch(
+            'missing',
+            ownerUuid,
+            username,
+            complete,
+            amount,
+            `${notePrefix}：账面需修正 ${amount}，已自动扣除 ${deducted}${deducted < amount ? `（账面仅剩 ${deducted}）` : ''}；账本已与实物同步，留痕待管理员复核。`
+          )
+        }
+        results.push({ itemKey: item.itemKey, requested: amount, deducted })
+      }
+    })()
+    return results
+  }
+
+  // 取货时发现目标木桶实物多于记录：多出部分归属未知，与 !同步 的 extra 语义
+  // 一致——划入 momo 并登记 extra 异常，供管理员在 Web 页转移给正确归属。
+  creditExtraToMomo (item, amount, note = '') {
+    const extra = Number(amount || 0)
+    if (extra <= 0 || !item?.itemKey) return null
+    return this.db.transaction(() => {
+      this.upsertItem(item)
+      this.adjustBalance(this.momoOwner, item.itemKey, extra)
+      this.addTransaction('sync', 'ok', this.momoOwner, 'momo', [{ ...item, amount: extra }], note || `barrel_extra; key=${item.itemKey}; amount=${extra}`)
+      this.addInventoryMismatch(
+        'extra',
+        this.momoOwner,
+        'momo',
+        item,
+        extra,
+        `取货时发现目标木桶实物比记录多 ${extra} 个，已划入 momo；请在 Web 管理页库存异常中转移给正确归属。`
+      )
+      return { itemKey: item.itemKey, amount: extra }
+    })()
+  }
+
   addTransaction (type, status, playerUuid, username, items, message = '') {
     const context = this.transactionContext.getStore() || {}
     this.db.prepare(`

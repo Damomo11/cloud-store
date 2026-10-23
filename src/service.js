@@ -1389,7 +1389,9 @@ class CloudStoreService {
         if (held.length) {
           msgActor(`机器人身上保留着 ${held.length} 种物品，将在后续任务开始前统一回仓。`)
         }
-        msgActor(`账本有库存，但已逐个打开 ${searchedBarrels} 个木桶仍找不到实物：${this.formatItemList(missingItems)}。已登记库存异常，请管理员执行 !同步 对账后再试。`)
+        // 缺口已现场确认：当场修账（扣 owner 余额 + 留痕），Web 库存立即与实物一致。
+        this.autoReconcileConfirmedMissing(storageOwner, missingItems, username)
+        msgActor(`账本有库存，但已逐个打开 ${searchedBarrels} 个木桶仍找不到实物：${this.formatItemList(missingItems)}。已自动同步账本并登记库存异常，管理员可在Web管理页复核。`)
         this.db.clearRecoveryTask(this.botId)
         return { status: 'failed_no_location', delivered: [], missing: this.mergeItems(missingItems) }
       }
@@ -1425,20 +1427,27 @@ class CloudStoreService {
         msgTarget(`${username} 给你的取货失败：仓库实物取出失败，请稍后再试。`)
         msgActor(`给 ${deliveryTarget} 的取货失败：仓库实物取出失败，请稍后再试。`)
       } else {
-        this.msg(username, `账本有库存，但按本地木桶记录没有取出：${this.formatItemList(plan.allocations)}。已就地核对各木桶并重试仍未取到，请稍后再试；若持续出现，请管理员在Web管理页检查库存异常。`)
+        // 重试后仍一无所获：缺口就地确认完毕（取到又放回的不计缺失），当场修账。
+        this.autoReconcileConfirmedMissing(storageOwner, attempt.allMissing || [], username)
+        this.msg(username, `账本有库存，但按本地木桶记录没有取出：${this.formatItemList(plan.allocations)}。已就地核对各木桶并重试仍未取到，账本已按实物自动修正并登记异常；若持续出现，请管理员在Web管理页检查库存异常。`)
       }
       this.db.clearRecoveryTask(this.botId)
       return { status: 'failed_no_withdraw', delivered: [], missing: this.mergeItems(plan.allocations) }
     }
 
     const missingByItem = this.groupMissingByDisplay(plan.allocations, attempt.allWithdrawn)
+    // 部分交付的缺口同样当场修账：交付部分稍后按计划扣账，缺失部分现在扣，
+    // 任务结束后账面 = 实物，不再需要管理员补 !同步。
+    const reconciledMissing = this.autoReconcileConfirmedMissing(storageOwner, attempt.allMissing || [], username)
     traceEvent(trace, 'result', 'task_delivered', {
       delivered: deliveredTotal.map(item => ({ name: item.displayName || item.itemId, amount: item.amount, keyTail: shortKey(item.itemKey) })),
       missingNotices: missingByItem,
+      reconciledMissing,
       decision: '实物已交付，交付部分已按计划扣账'
     })
     if (!deliveryToOther) {
       for (const notice of missingByItem) this.msg(username, notice)
+      if (reconciledMissing.length) this.msg(username, '缺失部分已自动同步账本并登记库存异常，管理员可在Web管理页复核。')
     }
 
     if (deliveryToOther) {
@@ -1461,6 +1470,25 @@ class CloudStoreService {
     }
     this.db.clearRecoveryTask(this.botId)
     return { status: 'delivered', delivered: deliveredTotal, missing: attempt.allMissing || [] }
+  }
+
+  // 取货任务收尾：把确认取不到的缺口当场修账（扣 owner 余额 + sync_deduct 流水 +
+  // missing 异常留痕）。归属精确到本任务 owner，比 !同步 的按比例估算更可靠；
+  // 失败只告警不阻断任务收尾。
+  autoReconcileConfirmedMissing (storageOwner, missingItems, username) {
+    if (!missingItems?.length) return []
+    try {
+      if (typeof this.db.deductConfirmedMissing !== 'function') return []
+      return this.db.deductConfirmedMissing(
+        storageOwner.uuid,
+        storageOwner.username || username || '',
+        missingItems,
+        '取货时确认缺失'
+      )
+    } catch (error) {
+      console.warn(`[withdraw-auto-reconcile] 确认缺失自动修账失败：${error?.message || error}`)
+      return []
+    }
   }
 
   async runWithdrawBatches ({ username, storageOwner, deliveryTarget, deliveryToOther, deliveryMode, batches, continueWithDeposit, msgActor, msgTarget, trace }) {

@@ -653,6 +653,9 @@ class Warehouse {
           decision: `定位到木桶 ${this.describeChest(chest)}（账本 ${group.recordedAmount} 个），走去打开`
         })
         let container = await this.openContainerAt(chest)
+        // 开窗前的该桶 revision：读窗期间若被其他流程改写（如紧急救援直写库存），
+        // 多出部分可能是在途物品，跳过自动入账留给 !同步，避免双重记账。
+        const revisionBeforeOpen = this.warehouseState?.chestRevisions?.get(chestId) || 0
         try {
           // 木桶整个读出来一个物品都没有，多半是服务器卡顿返回了空窗口，而不是真实缺货：
           // 关窗重开重读确认；重读仍为空就保留原记录并跳过该木桶，与真实缺货区分开。
@@ -736,6 +739,27 @@ class Warehouse {
               max: maxMissingBarrels,
               decision: `实物(${available})比账本(${group.recordedAmount})少，已刷新该桶记录，换下一个木桶`
             })
+          } else if (available > group.recordedAmount) {
+            // 实物比记录多：多出部分归属未知（人工放入/历史漂移），当场按 !同步 的
+            // extra 语义划入 momo 并登记异常，供管理员在 Web 页转移给正确归属——
+            // 取货任务结束时账本即与实物一致，不必等管理员手动 !同步。
+            const extra = available - group.recordedAmount
+            const revisionNow = this.warehouseState?.chestRevisions?.get(chestId) || 0
+            if (revisionNow !== revisionBeforeOpen) {
+              this.trace('decision', 'barrel_extra_skip', {
+                chest: this.describeChest(chest),
+                extra,
+                decision: '读窗期间该木桶被其他流程改动，多出部分可能是在途物品：跳过自动入账，留给 !同步 对账'
+              })
+            } else if (typeof this.db.creditExtraToMomo === 'function') {
+              const credited = this.db.creditExtraToMomo(itemInfo, extra, `withdraw_barrel_extra; chest=${chestId}`)
+              this.trace('record', 'barrel_extra_credited', {
+                chest: this.describeChest(chest),
+                extra,
+                credited,
+                decision: `实物比记录多 ${extra} 个，已划入 momo 并登记异常留痕`
+              })
+            }
           }
         } catch (error) {
           if (error?.uncertainTransfer) {
