@@ -3317,10 +3317,14 @@ class Warehouse {
       let plannedThisRound = 0
       for (const entry of pending) {
         let remaining = entry.amount
+        // 同一轮里丢过的槽位不再重复点：背包槽位要等服务器同步才刷新，
+        // 重复点同一堆只有第一次生效，计划量会被虚耗，导致少丢。
+        // 个别点击没生效的堆，靠下一轮 pending 对账补丢。
+        const droppedSlots = new Set()
         while (remaining > 0) {
           const item = this.bot.inventory.items().find(slot => {
             const normalized = this.catalog.fromPrismarineItem(slot)
-            return normalized.itemKey === entry.request.itemKey
+            return normalized.itemKey === entry.request.itemKey && !droppedSlots.has(slot.slot)
           })
           if (!item) break
           const normalized = this.catalog.fromPrismarineItem(item)
@@ -3328,6 +3332,7 @@ class Warehouse {
           const startedAt = Date.now()
           this.debug(`drop batch ${normalized.displayName} x${amount} slot=${item.slot} round=${round + 1}/${maxRounds}`)
           await this.dropSlotAmountFast(item, amount)
+          droppedSlots.add(item.slot)
           remaining -= amount
           plannedThisRound += amount
           await this.waitDropCooldown(startedAt)
