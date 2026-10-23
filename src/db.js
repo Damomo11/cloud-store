@@ -2214,7 +2214,24 @@ class StoreDb {
             throw new Error(`扣账物品记录不完整：${item.itemKey}`)
           }
           this.upsertItem(complete)
-          this.adjustBalance(ownerUuid, item.itemKey, -Number(item.amount || 0))
+          // 扣减按当前余额钳制：极端场景（如 Web 管理扣减与任务预留撞车）下
+          // 账面可能不足以覆盖交付。物品已经交付给玩家，回滚整个扣账事务只会
+          // 让"有交付无扣账"无迹可查——按现有余额扣减，缺额登记异常留痕。
+          const amount = Number(item.amount || 0)
+          const balance = this.getBalance(ownerUuid, item.itemKey)
+          const deducted = Math.min(balance, amount)
+          if (deducted < amount) {
+            console.warn(`[withdraw-deduction] 账面余额不足：owner=${ownerUuid} item=${item.itemKey} 需扣=${amount} 实有=${balance}`)
+            this.addInventoryMismatch(
+              'missing',
+              ownerUuid,
+              username,
+              complete,
+              amount - deducted,
+              `取货扣账时账面余额不足：需扣 ${amount}，实有 ${balance}，已按 ${deducted} 扣减；缺额留痕待管理员复核。`
+            )
+          }
+          if (deducted > 0) this.adjustBalance(ownerUuid, item.itemKey, -deducted)
         }
       }
       return { applied }
@@ -2506,7 +2523,9 @@ class StoreDb {
     const rows = this.db.prepare(`
       SELECT b.owner_uuid AS ownerUuid, i.item_key AS itemKey, i.item_id AS itemId,
              i.display_name AS displayName, i.nbt_json AS nbtJson,
-             i.meta_json AS metaJson, b.amount
+             i.meta_json AS metaJson, b.amount,
+             COALESCE((SELECT SUM(r.amount) FROM inventory_reservations r
+                       WHERE r.owner_uuid = b.owner_uuid AND r.item_key = b.item_key), 0) AS reserved
       FROM balances b
       JOIN items i ON i.item_key = b.item_key
       WHERE b.owner_uuid = ? AND b.amount > 0
@@ -2520,12 +2539,16 @@ class StoreDb {
     const personalDisplayNames = this.getPlayerItemDisplayNames(viewerUuid, [...rows.map(row => row.itemKey), ...contentKeys])
     const globalAliases = this.getGlobalAliasesForItems([...rows.map(row => row.itemKey), ...contentKeys], viewerUuid)
     const totalAmount = rows.reduce((sum, row) => sum + row.amount, 0)
+    // 预留中：任务已挂起但账还没扣的数量。页面要展示"可取"口径，
+    // 避免任务进行中数字虚高、玩家再下单被"库存已被其他任务占用"打回。
+    const reservedAmount = rows.reduce((sum, row) => sum + Math.min(row.reserved, row.amount), 0)
 
     return {
       ownerUuid,
       ownerLabel: this.ownerLabel(ownerUuid),
       stats: {
         totalAmount,
+        reservedAmount,
         itemTypes: rows.length
       },
       items: rows.map(row => {
@@ -2556,6 +2579,8 @@ class StoreDb {
           personalDisplayName,
           displayName: personalDisplayName || row.displayName,
           amount: row.amount,
+          reserved: Math.min(row.reserved, row.amount),
+          available: Math.max(0, row.amount - row.reserved),
           shortCode: this.shortCodeForItemKey(row.itemKey),
           shulkerContents: contents
         }
