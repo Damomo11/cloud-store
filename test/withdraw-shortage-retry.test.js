@@ -21,6 +21,7 @@ function createFixture (withdrawAmounts, options = {}) {
   let withdrawCalls = 0
   let teleportCalls = 0
   const depositCalls = []
+  const deductMissingCalls = []
   const syncCalls = []
   const dropRequests = []
   const balanceChanges = []
@@ -49,7 +50,11 @@ function createFixture (withdrawAmounts, options = {}) {
       : null,
     upsertItem: () => {},
     adjustBalance: (ownerUuid, itemKey, amount) => balanceChanges.push({ ownerUuid, itemKey, amount }),
-    addTransaction: () => {}
+    addTransaction: () => {},
+    deductConfirmedMissing: (ownerUuid, username, items, note) => {
+      deductMissingCalls.push({ ownerUuid, username, items, note })
+      return items.map(entry => ({ itemKey: entry.itemKey, requested: entry.amount, deducted: entry.amount }))
+    }
   }
   const catalog = {
     aggregatePrismarineItems: items => items.map(entry => ({
@@ -74,6 +79,9 @@ function createFixture (withdrawAmounts, options = {}) {
           unlocated: [{ ...item, amount: 10 }],
           searchedUnlocatedBarrels: options.searchedBarrels ?? 0
         }
+      }
+      if (options.missingOnZero && amount === 0) {
+        return { withdrawn: [], missing: [{ ...item, amount: 10 }], unlocated: [] }
       }
       return { withdrawn: amount > 0 ? [{ ...item, amount }] : [], missing: [] }
     },
@@ -121,6 +129,7 @@ function createFixture (withdrawAmounts, options = {}) {
     dropRequests,
     balanceChanges,
     syncCalls,
+    deductMissingCalls,
     sent,
     getWithdrawCalls: () => withdrawCalls,
     getTeleportCalls: () => teleportCalls
@@ -162,9 +171,23 @@ test('retry after barrel recheck still failing reports shortage for later retry'
   const finalMessage = fixture.sent.find(message => message.includes('账本有库存，但按本地木桶记录没有取出'))
   assert.ok(finalMessage)
   assert.ok(finalMessage.includes('已就地核对各木桶并重试仍未取到'))
-  assert.ok(finalMessage.includes('请稍后再试'))
+  assert.ok(finalMessage.includes('账本已按实物自动修正并登记异常'))
   assert.ok(!finalMessage.includes('请管理员执行 !同步'))
   assert.deepEqual(fixture.balanceChanges, [])
+  assert.deepEqual(fixture.deductMissingCalls, [], '该场景桩未产生 missing，不应触发自动修账')
+})
+
+test('confirmed shortage after the recheck retry is auto-reconciled on the spot', async () => {
+  const fixture = createFixture([0, 0], { missingOnZero: true })
+
+  await fixture.service.handleWithdraw('Alice', '', owner, request)
+
+  assert.equal(fixture.getWithdrawCalls(), 2)
+  assert.equal(fixture.deductMissingCalls.length, 1, '任务收尾自动修账一次')
+  const call = fixture.deductMissingCalls[0]
+  assert.equal(call.ownerUuid, 'vault-1')
+  assert.deepEqual(call.items.map(entry => entry.amount), [10])
+  assert.ok(fixture.sent.some(message => message.includes('账本已按实物自动修正并登记异常')))
 })
 
 test('items that cannot be returned to chests skip the retry', async () => {
@@ -197,8 +220,10 @@ test('fully unlocated missing searches barrels, skips the recheck retry and leav
   const finalMessage = fixture.sent.find(message => message.includes('已逐个打开'))
   assert.ok(finalMessage, 'the player is told how many barrels were searched')
   assert.ok(finalMessage.includes('5 个木桶'))
-  assert.ok(finalMessage.includes('!同步'))
+  assert.ok(finalMessage.includes('已自动同步账本'), '缺口当场修账，不再要求管理员 !同步')
   assert.deepEqual(fixture.balanceChanges, [], 'nothing is deducted')
+  assert.equal(fixture.deductMissingCalls.length, 1, 'unlocated 缺口确认后自动修账')
+  assert.deepEqual(fixture.deductMissingCalls[0].items.map(entry => entry.amount), [10])
 })
 
 function fixtureItem () {
