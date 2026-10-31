@@ -35,6 +35,7 @@ function createFixture (withdrawAmounts) {
   }
   const db = {
     upsertPlayer: () => {},
+    canonicalPlayerUuid: uuid => uuid,
     currentCommandLogId: () => 1,
     addCommandReply: () => {},
     runWithCommandContext: (commandLogId, fn) => fn(),

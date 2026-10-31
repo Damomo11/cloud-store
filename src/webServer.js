@@ -225,6 +225,10 @@ class CloudStoreWebServer {
         const body = await this.readBody(req)
         return this.sendJson(res, this.apiAdminDeleteOrganizationWarehouse(session, body))
       }
+      if (req.method === 'POST' && url.pathname === '/api/admin/identity/merge') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiAdminIdentityMerge(session, body))
+      }
       if (req.method === 'POST' && url.pathname === '/api/admin/transfer') {
         const body = await this.readBody(req)
         return this.sendJson(res, this.apiAdminTransfer(session, body))
@@ -1171,7 +1175,21 @@ class CloudStoreWebServer {
       settings: subscriptions.getSettings(),
       plans: subscriptions.listPlans(),
       time: subscriptions.networkTime.status(),
-      identityConflicts: subscriptions.listIdentityConflicts()
+      identityConflicts: subscriptions.listIdentityConflicts(),
+      playerIdentityConflicts: this.db.listPlayerIdentityConflicts()
+    }
+  }
+
+  apiAdminIdentityMerge (session, body) {
+    const admin = this.requireAdmin(session)
+    const primaryUuid = String(body.primaryUuid || '').trim()
+    const secondaryUuid = String(body.secondaryUuid || '').trim()
+    if (!primaryUuid || !secondaryUuid) throw new Error('请选择要合并的两个 UUID（保留号 + 合并号）。')
+    const result = this.db.mergePlayerIdentities(primaryUuid, secondaryUuid, admin.username)
+    return {
+      ok: true,
+      message: `已把 ${result.username} 的 ${result.secondary} 合并进主号 ${result.primary}：并入 ${result.mergedTypes} 种、共 ${result.mergedAmount} 个物品。`,
+      result
     }
   }
 
@@ -3928,6 +3946,7 @@ const HTML = `<!doctype html>
           <div class="pager"><button id="adminPaymentPrev">上一页</button><span id="adminPaymentPage" class="muted"></span><button id="adminPaymentNext">下一页</button></div>
           <h3 class="section-title">未识别到账日志</h3><div id="adminPaymentLogs" class="panel tablewrap"></div>
           <h3 class="section-title">用户名合并异常</h3><div id="adminIdentityConflicts" class="panel tablewrap"></div>
+          <h3 class="section-title">玩家双 UUID 冲突（同一玩家两个正版身份，库存分裂）</h3><div id="adminPlayerIdentityConflicts" class="panel tablewrap"></div>
         </section>
         <section id="adminInventory">
           <div class="toolbar">
@@ -6056,6 +6075,11 @@ const HTML = `<!doctype html>
         ? '网络时间：' + dateTime(data.time.now) + ' · 来源 ' + data.time.source + ' · 偏差 ' + data.time.offsetMs + 'ms · 上次同步 ' + dateTime(data.time.lastSyncedAt)
         : '网络时间未同步：' + (data.time?.lastError || '等待同步');
       renderTable('adminIdentityConflicts', ['时间', '用户名', '临时账户', '冲突 UUID'], (data.identityConflicts || []).map(row => '<tr><td>' + esc(dateTime(row.createdAtMs)) + '</td><td>' + esc(row.username) + '</td><td>' + esc(row.ghostUuid) + '</td><td class="wrap">' + esc(row.realUuid) + '</td></tr>'), '没有用户名合并异常。');
+      const conflicts = data.playerIdentityConflicts || [];
+      state.adminPlayerIdentityConflicts = new Map(conflicts.map(row => [String(row.id), row]));
+      $('adminPlayerIdentityConflicts').innerHTML = conflicts.length ? '<table><thead><tr><th>时间</th><th>玩家</th><th>冲突 UUID</th><th>操作</th></tr></thead><tbody>' + conflicts.map(row => {
+        return '<tr><td>' + esc(dateTime(row.createdAtMs)) + '</td><td>' + esc(row.username) + '</td><td class="wrap">' + esc((row.uuids || []).join(' ')) + '</td><td><select data-pid-keep><option value="">选择要保留的主号</option>' + (row.uuids || []).map(uuid => '<option value="' + esc(uuid) + '">' + esc(uuid) + '</option>').join('') + '</select><button class="primary" data-pid-merge="' + esc(row.id) + '">合并到此号</button></td></tr>';
+      }).join('') + '</tbody></table>' : '<p class="muted">没有双 UUID 冲突。</p>';
       const logs = await api('/api/admin/subscription/logs');
       renderTable('adminPaymentLogs', ['时间', 'Bot', '完整消息'], (logs.rows || []).map(row => '<tr><td>' + esc(dateTime(row.createdAtMs)) + '</td><td>' + esc(row.botName) + '</td><td class="wrap">' + esc(row.message) + '</td></tr>'), '没有未识别到账日志。');
       await loadAdminPaymentRecords();
@@ -6387,6 +6411,7 @@ const HTML = `<!doctype html>
       const adminPickRemove = event.target.closest('[data-admin-pick-remove]');
       const adminPickClear = event.target.closest('[data-admin-pick-clear]');
       const mmDeduct = event.target.closest('[data-admin-mm-deduct]');
+      const pidMerge = event.target.closest('[data-pid-merge]');
       const mmResolve = event.target.closest('[data-admin-mm-resolve]');
       const mmComponents = event.target.closest('[data-admin-mm-components]');
       const aliasSave = event.target.closest('[data-admin-alias-save]');
@@ -6545,6 +6570,17 @@ const HTML = `<!doctype html>
           const row = state.adminMismatchRows.get('mm-' + mmComponents.dataset.adminMmComponents);
           if (!row) throw new Error('找不到这条异常记录。');
           openNbtModal(row);
+        } else if (pidMerge) {
+          const row = pidMerge.closest('tr');
+          const primaryUuid = row.querySelector('[data-pid-keep]').value;
+          if (!primaryUuid) throw new Error('请先选择要保留的主号 UUID。');
+          const conflict = state.adminPlayerIdentityConflicts?.get(String(pidMerge.dataset.pidMerge));
+          const secondaryUuid = (conflict?.uuids || []).find(uuid => uuid !== primaryUuid);
+          if (!secondaryUuid) throw new Error('冲突记录里找不到要合并的另一个 UUID。');
+          if (!confirm('确认把 ' + secondaryUuid + ' 的库存和身份全部合并进 ' + primaryUuid + ' 吗？此操作会把被合并号的账本、成员身份、登录密码都归到主号名下，且不可撤销。')) return;
+          const data = await post('/api/admin/identity/merge', { primaryUuid, secondaryUuid });
+          toast(data.message);
+          await loadAdminSubscriptionConfig();
         } else if (mmDeduct) {
           const ok = confirm('确认清除这条缺失物品对应的账本库存吗？');
           if (!ok) return;

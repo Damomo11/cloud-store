@@ -8,6 +8,7 @@ function createFixture () {
   const db = {
     isAdmin: () => true,
     upsertPlayer: () => {},
+    canonicalPlayerUuid: uuid => uuid,
     createCommandLog: () => 1,
     runWithCommandContext: async (id, fn) => fn(),
     runWithBotContext: async (context, fn) => fn(),

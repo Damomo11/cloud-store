@@ -8,6 +8,7 @@ function createFixture () {
   const sent = []
   const db = {
     upsertPlayer: () => {},
+    canonicalPlayerUuid: uuid => uuid,
     getEffectiveDefaultOwnerUuid: uuid => uuid,
     hasPersonalWarehouse: () => true,
     currentCommandLogId: () => 1,

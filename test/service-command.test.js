@@ -10,6 +10,7 @@ function createService ({ admin = true } = {}) {
   const db = {
     isAdmin: () => admin,
     upsertPlayer: () => {},
+    canonicalPlayerUuid: uuid => uuid,
     createCommandLog: entry => {
       commandLogs.push(entry)
       return commandLogs.length

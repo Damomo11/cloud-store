@@ -3615,7 +3615,8 @@ class CloudStoreService {
   }
 
   getPlayer (username) {
-    const uuid = this.bot.players[username]?.uuid || `name:${username}`
+    const rawUuid = this.bot.players[username]?.uuid || `name:${username}`
+    const uuid = this.db.canonicalPlayerUuid(rawUuid)
     this.db.upsertPlayer(uuid, username)
     return { uuid, username }
   }
@@ -3624,15 +3625,16 @@ class CloudStoreService {
     const onlineName = Object.keys(this.bot.players).find(name => name.toLowerCase() === username.toLowerCase())
     const online = onlineName ? this.bot.players[onlineName] : null
     if (online?.uuid) {
-      this.db.upsertPlayer(online.uuid, onlineName)
-      return { uuid: online.uuid, username: onlineName }
+      const uuid = this.db.canonicalPlayerUuid(online.uuid)
+      this.db.upsertPlayer(uuid, onlineName)
+      return { uuid, username: onlineName }
     }
 
     const known = this.db.getPlayerByUsername(username)
     if (known) return known
 
     const fallback = { uuid: `name:${username}`, username }
-    this.db.upsertPlayer(fallback.uuid, username)
+    this.db.upsertPlayer(fallback.uuid, fallback.username)
     return fallback
   }
 

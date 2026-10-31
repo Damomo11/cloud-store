@@ -1398,6 +1398,7 @@ class StoreDb {
       `).run(cleanUuid, cleanUsername)
 
       this.migrateGhostPlayerIdentity(cleanUuid, cleanUsername)
+      this.flagConflictingRealIdentities(cleanUuid, cleanUsername)
 
       this.db.prepare(`
         UPDATE admin_users
@@ -1405,6 +1406,223 @@ class StoreDb {
         WHERE username_lower = ?
       `).run(cleanUuid, cleanUsername.toLowerCase())
       this.db.prepare('UPDATE personal_warehouses SET username = ? WHERE owner_uuid = ?').run(cleanUsername, cleanUuid)
+    })
+  }
+
+  // 玩家当前上报的 UUID 若已被管理员合并进另一主 UUID（双号冲突处理），
+  // 后续存取一律改挂主号。合并后 secondary 的 players 行已删，按用户名找到主号。
+  canonicalPlayerUuid (uuid) {
+    const cleanUuid = String(uuid || '').trim()
+    if (!cleanUuid || cleanUuid.startsWith('name:') || cleanUuid.startsWith('vault:')) return cleanUuid
+    const exists = this.db.prepare('SELECT 1 FROM players WHERE uuid = ? LIMIT 1').get(cleanUuid)
+    if (exists) return cleanUuid
+    // 未见过的 UUID：可能是双号冲突场景下 secondary 已被合并删除，也可能只是新玩家。
+    // 只有当该 UUID 的用户名已存在主号且没有任何待处理冲突时才复用，避免误绑。
+    const username = this.db.prepare(`
+      SELECT username FROM players WHERE uuid = ? LIMIT 1
+    `).get(cleanUuid)?.username
+    if (!username) {
+      // players 行已被合并删除：直接查“merged”审计记录找主号。
+      const merged = this.db.prepare(`
+        SELECT real_uuid AS primaryUuid FROM wallet_identity_conflicts
+        WHERE status = 'merged' AND ghost_uuid = ?
+        ORDER BY id DESC LIMIT 1
+      `).get(cleanUuid)
+      return merged?.primaryUuid || cleanUuid
+    }
+    const conflict = this.db.prepare(`
+      SELECT 1 FROM wallet_identity_conflicts
+      WHERE status = 'open' AND real_uuid LIKE '%,%' AND lower(username) = lower(?)
+      LIMIT 1
+    `).get(username)
+    if (conflict) return cleanUuid
+    const known = this.db.prepare(`
+      SELECT uuid FROM players
+      WHERE uuid NOT LIKE 'name:%' AND lower(username) = lower(?)
+      ORDER BY last_seen_at DESC LIMIT 1
+    `).get(username)
+    return known?.uuid && known.uuid !== cleanUuid ? known.uuid : cleanUuid
+  }
+
+  // 同一用户名出现多个真实 UUID（正版改离线/皮肤站换 UUID 等场景）时，
+  // 系统没有能力自动判断哪个是本人主号，不能擅自合并账本；
+  // 这里只登记冲突（复用 wallet_identity_conflicts 表，留管理员在 Web 页处理）。
+  flagConflictingRealIdentities (uuid, username) {
+    if (uuid.startsWith('name:')) return false
+    const others = this.db.prepare(`
+      SELECT uuid FROM players
+      WHERE uuid NOT LIKE 'name:%'
+        AND lower(username) = lower(?)
+        AND uuid <> ?
+      LIMIT 1
+    `).get(username, uuid)
+    if (!others) return false
+    const ghostUuid = `name:${username}`
+    const realUuids = [uuid, others.uuid].sort()
+    const exists = this.db.prepare(`
+      SELECT 1 FROM wallet_identity_conflicts
+      WHERE lower(username) = lower(?)
+        AND ghost_uuid = ?
+        AND status = 'open'
+        AND (real_uuid = ? OR real_uuid = ?)
+      LIMIT 1
+    `).get(username, ghostUuid, realUuids.join(','), [...realUuids].reverse().join(','))
+    if (exists) return true
+    this.db.prepare(`
+      INSERT INTO wallet_identity_conflicts (username, ghost_uuid, real_uuid, created_at_ms)
+      VALUES (?, ?, ?, ?)
+    `).run(username, ghostUuid, realUuids.join(','), Date.now())
+    console.warn(`[identity] 玩家 ${username} 存在多个真实 UUID（${realUuids.join(' / ')}），库存可能分裂，请在 Web 管理页处理。`)
+    return true
+  }
+
+  listPlayerIdentityConflicts (limit = 200) {
+    const rows = this.db.prepare(`
+      SELECT id, username, ghost_uuid AS ghostUuid, real_uuid AS realUuid,
+             status, created_at_ms AS createdAtMs
+      FROM wallet_identity_conflicts
+      WHERE status = 'open'
+        AND real_uuid LIKE '%,%'
+      ORDER BY id DESC LIMIT ?
+    `).all(Math.max(1, Math.min(1000, Number(limit) || 200)))
+    return rows.map(row => ({
+      ...row,
+      uuids: String(row.realUuid || '').split(',').map(uuid => uuid.trim()).filter(Boolean)
+    }))
+  }
+
+  hasIdentityConflict (username) {
+    return Boolean(this.db.prepare(`
+      SELECT 1 FROM wallet_identity_conflicts
+      WHERE status = 'open' AND real_uuid LIKE '%,%' AND lower(username) = lower(?)
+      LIMIT 1
+    `).get(String(username || '')))
+  }
+
+  // 把 secondaryUuid 的全部身份与账本合并进 primaryUuid（同一个人的两个真实 UUID）。
+  // 管理员在 Web 页确认后调用；游戏内 upsertPlayer 只登记冲突，不自动合并。
+  // 方向由调用方决定：一般把“库存多/更常用”的号留作 primary。
+  mergePlayerIdentities (primaryUuid, secondaryUuid, adminUsername = '') {
+    const primary = String(primaryUuid || '').trim()
+    const secondary = String(secondaryUuid || '').trim()
+    if (!primary || !secondary) throw new Error('缺少要合并的 UUID。')
+    if (primary === secondary) throw new Error('两个 UUID 相同，无需合并。')
+    for (const uuid of [primary, secondary]) {
+      if (uuid.startsWith('name:') || uuid.startsWith('vault:')) {
+        throw new Error(`UUID 不是真实玩家身份：${uuid}`)
+      }
+    }
+    const primaryPlayer = this.db.prepare('SELECT username FROM players WHERE uuid = ?').get(primary)
+    const secondaryPlayer = this.db.prepare('SELECT username FROM players WHERE uuid = ?').get(secondary)
+    if (!primaryPlayer || !secondaryPlayer) throw new Error('至少有一个 UUID 不存在于玩家表。')
+    const username = primaryPlayer.username || secondaryPlayer.username
+
+    const mergedItems = []
+    const countRows = (uuid) => this.db.prepare(`
+      SELECT COUNT(*) AS types, COALESCE(SUM(amount), 0) AS amount
+      FROM balances WHERE owner_uuid = ?
+    `).get(uuid)
+
+    return this.transaction(() => {
+      const before = { primary: countRows(primary), secondary: countRows(secondary) }
+
+      // 1. 账本：secondary 的余额并入 primary，同种物品数量相加。
+      for (const row of this.db.prepare('SELECT item_key AS itemKey, amount FROM balances WHERE owner_uuid = ?').all(secondary)) {
+        const current = this.getBalance(primary, row.itemKey)
+        this.db.prepare(`
+          INSERT INTO balances (owner_uuid, item_key, amount)
+          VALUES (?, ?, ?)
+          ON CONFLICT(owner_uuid, item_key) DO UPDATE SET amount = excluded.amount
+        `).run(primary, row.itemKey, current + row.amount)
+        if (row.amount > 0) mergedItems.push({ itemKey: row.itemKey, amount: row.amount })
+      }
+      this.db.prepare('DELETE FROM balances WHERE owner_uuid = ?').run(secondary)
+
+      // 2. 两个都创建了个人仓库时留 primary 的（旧数据历史更久）。
+      if (this.hasPersonalWarehouse(primary) && this.hasPersonalWarehouse(secondary)) {
+        this.db.prepare('DELETE FROM personal_warehouses WHERE owner_uuid = ?').run(secondary)
+      } else if (this.hasPersonalWarehouse(secondary)) {
+        this.db.prepare('UPDATE personal_warehouses SET owner_uuid = ?, username = ? WHERE owner_uuid = ?').run(primary, username, secondary)
+      }
+
+      // 3. 组织仓库成员身份：保留 admin 角色。
+      for (const row of this.db.prepare('SELECT warehouse_name_lower AS nameLower, role FROM custom_warehouse_members WHERE player_uuid = ?').all(secondary)) {
+        const existing = this.db.prepare('SELECT role FROM custom_warehouse_members WHERE warehouse_name_lower = ? AND player_uuid = ?').get(row.nameLower, primary)
+        if (existing) {
+          if (row.role === 'admin' && existing.role !== 'admin') {
+            this.db.prepare('UPDATE custom_warehouse_members SET role = ? WHERE warehouse_name_lower = ? AND player_uuid = ?').run('admin', row.nameLower, primary)
+          }
+          this.db.prepare('DELETE FROM custom_warehouse_members WHERE warehouse_name_lower = ? AND player_uuid = ?').run(row.nameLower, secondary)
+        } else {
+          this.db.prepare('UPDATE custom_warehouse_members SET player_uuid = ?, username = ? WHERE warehouse_name_lower = ? AND player_uuid = ?').run(primary, username, row.nameLower, secondary)
+        }
+      }
+
+      // 4. 默认归属：primary 空时借用 secondary 的。
+      const primaryDefault = this.db.prepare('SELECT default_owner_uuid AS d FROM players WHERE uuid = ?').get(primary)?.d
+      if (!String(primaryDefault || '').trim() && this.db.prepare('SELECT default_owner_uuid AS d FROM players WHERE uuid = ?').get(secondary)?.d) {
+        this.db.prepare('UPDATE players SET default_owner_uuid = ? WHERE uuid = ?').run(
+          String(this.db.prepare('SELECT default_owner_uuid AS d FROM players WHERE uuid = ?').get(secondary).d), primary
+        )
+      }
+
+      // 5. 其余按玩家 UUID 关联的表整体改挂（沿用幽灵号迁移的口径）。
+      this.migrateGhostPlayerItemAliases(secondary, primary)
+      this.migrateGhostPlayerAliases(secondary, primary)
+      this.migrateGhostWebLoginToken(secondary, primary, username)
+      this.migrateGhostPlayerQuota(secondary, primary)
+      this.migrateGhostWalletIdentity(secondary, primary, username)
+      this.db.prepare('UPDATE web_sessions SET owner_uuid = ?, username = ? WHERE owner_uuid = ?').run(primary, username, secondary)
+      this.db.prepare('UPDATE inventory_reservations SET owner_uuid = ? WHERE owner_uuid = ?').run(primary, secondary)
+      this.db.prepare('UPDATE warehouse_subscriptions SET owner_uuid = ? WHERE owner_uuid = ?').run(primary, secondary)
+      this.db.prepare('UPDATE warehouse_feature_settings SET owner_uuid = ? WHERE owner_uuid = ?').run(primary, secondary)
+      this.db.prepare('UPDATE transactions SET player_uuid = ?, username = ? WHERE player_uuid = ?').run(primary, username, secondary)
+      this.db.prepare('UPDATE custom_warehouses SET creator_uuid = ?, creator_username = ? WHERE creator_uuid = ?').run(primary, username, secondary)
+      this.db.prepare(`
+        UPDATE admin_users
+        SET uuid = CASE WHEN uuid IS NULL OR uuid = ? THEN ? ELSE uuid END
+        WHERE lower(username) = lower(?)
+      `).run(secondary, primary, username)
+      // 登录密码（web_login_tokens）两个号各有一份时在 migrateGhostWebLoginToken 里已丢弃 secondary 的。
+
+      this.db.prepare('DELETE FROM players WHERE uuid = ?').run(secondary)
+
+      // 6. 关闭冲突登记，留合并审计。
+      this.db.prepare(`
+        UPDATE wallet_identity_conflicts
+        SET status = 'resolved'
+        WHERE status = 'open'
+          AND lower(username) = lower(?)
+          AND (real_uuid = ? OR real_uuid = ?)
+      `).run(username, `${primary},${secondary}`, `${secondary},${primary}`)
+      this.db.prepare(`
+        INSERT INTO wallet_identity_conflicts (username, ghost_uuid, real_uuid, status, created_at_ms)
+        VALUES (?, ?, ?, 'merged', ?)
+      `).run(username, secondary, primary, Date.now())
+
+      this.addTransaction(
+        'web_admin_identity_merge',
+        'ok',
+        primary,
+        username,
+        mergedItems.map(item => ({
+          ...this.db.prepare('SELECT item_id AS itemId, display_name AS displayName, nbt_json AS nbtJson, meta_json AS metaJson FROM items WHERE item_key = ?').get(item.itemKey),
+          itemKey: item.itemKey,
+          amount: item.amount
+        })),
+        `admin=${adminUsername}; from=${secondary}`
+      )
+
+      const after = countRows(primary)
+      return {
+        primary,
+        secondary,
+        username,
+        mergedTypes: mergedItems.length,
+        mergedAmount: mergedItems.reduce((sum, item) => sum + item.amount, 0),
+        primaryBefore: before.primary,
+        primaryAfter: after
+      }
     })
   }
 
