@@ -596,7 +596,7 @@ class CloudStoreWebServer {
     const online = onlineName ? service.bot.players[onlineName] : null
     if (online?.uuid) {
       this.db.upsertPlayer(online.uuid, onlineName)
-      return { uuid: online.uuid, username: onlineName }
+      return { uuid: this.db.canonicalPlayerUuid(online.uuid), username: onlineName }
     }
     const player = this.db.getPlayerByUsername(raw)
     if (!player?.uuid || player.uuid.startsWith('name:')) throw new Error(`找不到玩家：${raw}。玩家需要在线或曾经使用过云仓库。`)
@@ -1456,7 +1456,7 @@ class CloudStoreWebServer {
     const online = onlineName ? service.bot.players[onlineName] : null
     if (online?.uuid) {
       this.db.upsertPlayer(online.uuid, onlineName)
-      return { uuid: online.uuid, username: onlineName }
+      return { uuid: this.db.canonicalPlayerUuid(online.uuid), username: onlineName }
     }
     const known = this.db.getPlayerByUsername(raw)
     if (known?.uuid) return known
@@ -2335,8 +2335,9 @@ class CloudStoreWebServer {
     const online = onlineName ? service.bot.players[onlineName] : null
     if (online?.uuid) {
       this.db.upsertPlayer(online.uuid, onlineName)
-      if (!this.db.hasPersonalWarehouse(online.uuid)) throw new Error(`${onlineName} 还没有个人仓库。请先由管理员创建。`)
-      return online.uuid
+      const uuid = this.db.canonicalPlayerUuid(online.uuid)
+      if (!this.db.hasPersonalWarehouse(uuid)) throw new Error(`${onlineName} 还没有个人仓库。请先由管理员创建。`)
+      return uuid
     }
 
     const player = this.db.getPlayerByUsername(raw)

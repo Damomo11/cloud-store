@@ -9,6 +9,7 @@ function createFixture () {
   const db = {
     upsertPlayer: () => {},
     canonicalPlayerUuid: uuid => uuid,
+    resolveOfflineUuidToMojang: uuid => uuid,
     getEffectiveDefaultOwnerUuid: uuid => uuid,
     hasPersonalWarehouse: () => true,
     currentCommandLogId: () => 1,

@@ -1391,9 +1391,14 @@ class StoreDb {
   }
 
   upsertPlayer (uuid, username) {
-    const cleanUuid = String(uuid || '').trim()
+    let cleanUuid = String(uuid || '').trim()
     const cleanUsername = String(username || '').trim()
     if (!cleanUuid || !cleanUsername) return
+
+    // “正版 v4 为准”：已被合并的旧 UUID、以及 v3 离线派生 UUID（同名 v4 主号在库），
+    // 一律改挂主号。否则 v3 会原样插回 players 表，管理-库存又出现两个同名仓库。
+    cleanUuid = this.canonicalPlayerUuid(cleanUuid)
+    cleanUuid = this.resolveOfflineUuidToMojang(cleanUuid, cleanUsername)
 
     this.transaction(() => {
       this.db.prepare(`
@@ -1449,6 +1454,24 @@ class StoreDb {
       ORDER BY last_seen_at DESC LIMIT 1
     `).get(username)
     return known?.uuid && known.uuid !== cleanUuid ? known.uuid : cleanUuid
+  }
+
+  // v3 离线派生 UUID（不在 players 表）遇到同名 v4 正版主号已在库时，
+  // 一律改挂主号：v3 是服务器离线验证从用户名算出来的确定性 UUID，
+  // 与 v4 的同名等价是“正版为准”策略下成立的；阻止它再插回 players 表。
+  resolveOfflineUuidToMojang (uuid, username) {
+    const cleanUuid = String(uuid || '').trim()
+    if (!cleanUuid || !this.isOfflineDerivedUuid(cleanUuid)) return cleanUuid
+    const exists = this.db.prepare('SELECT 1 FROM players WHERE uuid = ? LIMIT 1').get(cleanUuid)
+    if (exists) return cleanUuid
+    const mojang = this.db.prepare(`
+      SELECT uuid FROM players
+      WHERE substr(uuid, 15, 1) = '4'
+        AND uuid NOT LIKE 'name:%'
+        AND lower(username) = lower(?)
+      ORDER BY last_seen_at DESC LIMIT 1
+    `).get(String(username || ''))
+    return mojang?.uuid || cleanUuid
   }
 
   // 同一用户名出现多个真实 UUID（正版改离线/皮肤站换 UUID 等场景）时，
@@ -1510,7 +1533,7 @@ class StoreDb {
   // 服务器在正版/离线验证间切换时，同一个玩家会被两种模式分别记账，
   // 按“正版 v4 为准”的策略自动把离线 v3 身份并进 v4 主号。
   uuidVersion (uuid) {
-    const match = String(uuid || '').match(/^[0-9a-f]{8}-[0-9a-f]{4}-([0-9a-f])-/i)
+    const match = String(uuid || '').match(/^[0-9a-f]{8}-[0-9a-f]{4}-([0-9a-f])[0-9a-f]{3}-/i)
     return match ? Number.parseInt(match[1], 16) : -1
   }
 

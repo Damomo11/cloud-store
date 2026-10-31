@@ -193,7 +193,8 @@ test('正版 v4 为准：启动自动合并把 v3 离线身份账本并入 v4 �
   const mojangUuid = 'eea2e783-d003-468b-a831-33d5185cde5e'   // v4 正版
   const offlineUuid = 'b419bf89-1f25-3fd5-bc6a-ede63b0da311'   // v3 离线派生
   seedDb.upsertPlayer(mojangUuid, 'TwinGuy')
-  seedDb.upsertPlayer(offlineUuid, 'TwinGuy')
+  // 旧版本运行时留下的 v3 行：绕过 upsertPlayer 直插（现在的 upsert 会把 v3 改挂 v4）
+  seedDb.db.prepare("INSERT INTO players (uuid, username, last_seen_at) VALUES (?, 'TwinGuy', CURRENT_TIMESTAMP)").run(offlineUuid)
   seedDb.createPersonalWarehouse(offlineUuid, 'TwinGuy', { username: 'auto:deposit' })
   seedDb.addBalanceItems(offlineUuid, [{ ...wool, amount: 37 }, { ...glass, amount: 64 }])
   seedDb.addBalanceItems(mojangUuid, [{ ...wool, amount: 8153 }])
@@ -250,4 +251,83 @@ test('没有 v4 主号的 v3 玩家不会被自动合并（避免丢库存）', 
 
   db.close()
   fs.rmSync(directory, { recursive: true, force: true })
+})
+
+test('v3 离线身份上线不再插回 players 表（修复管理页双仓库复发）', () => {
+  const context = createContext()
+  const { db } = context
+  const mojangUuid = 'eea2e783-d003-468b-a831-33d5185cde5e'   // v4
+  const offlineUuid = 'b419bf89-1f25-3fd5-bc6a-ede63b0da311'   // v3 离线派生
+
+  db.upsertPlayer(mojangUuid, 'TwinGuy')
+  db.addBalanceItems(mojangUuid, [{ ...context.wool, amount: 100 }])
+
+  // 玩家以 v3 离线身份上线：upsertPlayer 必须改挂 v4，不能原样插入
+  db.upsertPlayer(offlineUuid, 'TwinGuy')
+
+  const rows = db.db.prepare('SELECT uuid FROM players WHERE lower(username) = lower(?)').all('TwinGuy').map(row => row.uuid)
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0], mojangUuid)
+
+  // resolveOfflineUuidToMojang：v3 + 同名 v4 在库 → 返回 v4
+  assert.equal(db.resolveOfflineUuidToMojang(offlineUuid, 'TwinGuy'), mojangUuid)
+  // canonical + resolveOffline 的组合即 service.getPlayer 的调用链
+  assert.equal(db.resolveOfflineUuidToMojang(db.canonicalPlayerUuid(offlineUuid), 'TwinGuy'), mojangUuid)
+
+  // v4 玩家没有 v3 名下余额可丢：v3 从未落库
+  assert.equal(db.getBalance(offlineUuid, context.wool.itemKey), 0)
+  assert.equal(db.getBalance(mojangUuid, context.wool.itemKey), 100)
+
+  // 没有 v4 主号时 v3 原样返回（不能误挂到别人身上）
+  assert.equal(db.resolveOfflineUuidToMojang('c31d3e42-abcd-3efa-bbbb-000000000000', 'NoMainGuy'), 'c31d3e42-abcd-3efa-bbbb-000000000000')
+
+  // 版本位解析回归：v3/v4 正确识别
+  assert.equal(db.uuidVersion(offlineUuid), 3)
+  assert.equal(db.uuidVersion(mojangUuid), 4)
+  assert.equal(db.uuidVersion('name:Ghost'), -1)
+  assert.ok(db.isOfflineDerivedUuid(offlineUuid))
+  assert.equal(db.isOfflineDerivedUuid(mojangUuid), false)
+  assert.equal(db.isOfflineDerivedUuid('name:Ghost'), false)
+
+  context.close()
+})
+
+test('历史脏数据：v3 与 v4 都在库时重启自动清回单身份，再上线不复发', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'cloud-store-identity-dirty-'))
+  const config = { admins: [], momoOwner: '__momo__', storage: {} }
+
+  const mojangUuid = 'eea2e783-d003-468b-a831-33d5185cde5e'
+  const offlineUuid = 'b419bf89-1f25-3fd5-bc6a-ede63b0da311'
+
+  // 旧版本运行期间留下的脏数据：两个身份都存在，v3 名下还有库存
+  const seedDb = new StoreDb(path.join(directory, 'store.sqlite'), config)
+  seedDb.upsertItem(context0Wool())
+  seedDb.upsertItem(context0Glass())
+  seedDb.upsertPlayer(mojangUuid, 'TwinGuy')
+  seedDb.addBalanceItems(mojangUuid, [{ ...context0Wool(), amount: 100 }])
+  // 绕过 canonical 直插 v3（模拟旧代码写入）
+  seedDb.db.prepare("INSERT INTO players (uuid, username, last_seen_at) VALUES (?, 'TwinGuy', CURRENT_TIMESTAMP)").run(offlineUuid)
+  seedDb.createPersonalWarehouse(offlineUuid, 'TwinGuy', { username: 'dirty' })
+  seedDb.addBalanceItems(offlineUuid, [{ ...context0Glass(), amount: 64 }])
+  seedDb.close()
+
+  // 重开（构造器里自动合并执行）
+  const db = new StoreDb(path.join(directory, 'store.sqlite'), config)
+  const rows = db.db.prepare('SELECT uuid FROM players WHERE lower(username) = lower(?)').all('TwinGuy').map(row => row.uuid)
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0], mojangUuid)
+  assert.equal(db.getBalance(mojangUuid, context0Wool().itemKey), 100)
+  assert.equal(db.getBalance(mojangUuid, context0Glass().itemKey), 64)
+
+  // 合并后 v3 再上线：不复发
+  db.upsertPlayer(offlineUuid, 'TwinGuy')
+  const rowsAfter = db.db.prepare('SELECT uuid FROM players WHERE lower(username) = lower(?)').all('TwinGuy').map(row => row.uuid)
+  assert.equal(rowsAfter.length, 1)
+  assert.equal(rowsAfter[0], mojangUuid)
+
+  db.close()
+  fs.rmSync(directory, { recursive: true, force: true })
+
+  function context0Wool () { return { itemKey: 'minecraft:white_wool|aaaa', itemId: 'minecraft:white_wool', displayName: '白色羊毛', nbtJson: 'null', metaJson: '{}' } }
+  function context0Glass () { return { itemKey: 'minecraft:glass|bbbb', itemId: 'minecraft:glass', displayName: '玻璃', nbtJson: 'null', metaJson: '{}' } }
 })

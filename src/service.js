@@ -3616,7 +3616,9 @@ class CloudStoreService {
 
   getPlayer (username) {
     const rawUuid = this.bot.players[username]?.uuid || `name:${username}`
-    const uuid = this.db.canonicalPlayerUuid(rawUuid)
+    // upsertPlayer 内部会再过一次 canonical + v3→v4 改挂；这里先 canonical 是为了
+    // 返回给调用方的 uuid 就是最终归属，避免调用方拿旧 v3 去写 balances。
+    const uuid = this.db.resolveOfflineUuidToMojang(this.db.canonicalPlayerUuid(rawUuid), username)
     this.db.upsertPlayer(uuid, username)
     return { uuid, username }
   }
@@ -3625,7 +3627,7 @@ class CloudStoreService {
     const onlineName = Object.keys(this.bot.players).find(name => name.toLowerCase() === username.toLowerCase())
     const online = onlineName ? this.bot.players[onlineName] : null
     if (online?.uuid) {
-      const uuid = this.db.canonicalPlayerUuid(online.uuid)
+      const uuid = this.db.resolveOfflineUuidToMojang(this.db.canonicalPlayerUuid(online.uuid), onlineName)
       this.db.upsertPlayer(uuid, onlineName)
       return { uuid, username: onlineName }
     }
@@ -3697,8 +3699,9 @@ class CloudStoreService {
     const online = onlineName ? this.bot.players[onlineName] : null
     if (online?.uuid) {
       this.db.upsertPlayer(online.uuid, onlineName)
-      if (!this.db.hasPersonalWarehouse(online.uuid)) throw new Error(`${onlineName} 还没有个人仓库。请先创建仓库。`)
-      return { uuid: online.uuid, username: onlineName, scope: 'personal' }
+      const uuid = this.db.canonicalPlayerUuid(online.uuid)
+      if (!this.db.hasPersonalWarehouse(uuid)) throw new Error(`${onlineName} 还没有个人仓库。请先创建仓库。`)
+      return { uuid, username: onlineName, scope: 'personal' }
     }
     const known = this.db.getPlayerByUsername(raw)
     if (!known) {
