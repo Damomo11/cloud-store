@@ -480,6 +480,13 @@ class StoreDb {
     if (cleanup.invalidQuotas || cleanup.orphanPlayers) {
       console.log(`Cleaned ghost owners: invalid quotas ${cleanup.invalidQuotas}, orphan players ${cleanup.orphanPlayers}`)
     }
+
+    // 正版 v4 为准：同名离线 v3 身份的账本并入 v4 主号并删除 v3 行（见 autoMergeOfflineIdentities）。
+    // 启动时执行一次即可覆盖存量；upsertPlayer 里的 canonicalPlayerUuid 保证后续离线身份上线自动改挂主号。
+    const merged = this.autoMergeOfflineIdentities()
+    if (merged.length) {
+      console.log(`[identity] 已按“正版 UUID 为准”合并 ${merged.length} 个离线身份。`)
+    }
   }
 
   setCatalog (catalog) {
@@ -1499,6 +1506,53 @@ class StoreDb {
     `).get(String(username || '')))
   }
 
+  // UUID 版本位：v3（名字派生，服务器离线验证生成）= 3；v4（Mojang 正版账号）= 4。
+  // 服务器在正版/离线验证间切换时，同一个玩家会被两种模式分别记账，
+  // 按“正版 v4 为准”的策略自动把离线 v3 身份并进 v4 主号。
+  uuidVersion (uuid) {
+    const match = String(uuid || '').match(/^[0-9a-f]{8}-[0-9a-f]{4}-([0-9a-f])-/i)
+    return match ? Number.parseInt(match[1], 16) : -1
+  }
+
+  isOfflineDerivedUuid (uuid) {
+    return !String(uuid || '').startsWith('name:') && this.uuidVersion(uuid) === 3
+  }
+
+  // 找出所有“同名 v3 离线身份 + v4 正版身份”的配对。
+  // 只处理两个都真实存在于 players 表的；v4 不在库里的（v3 玩家从没用过正版身份）
+  // 不动——没有主号可并，擅自清掉会丢库存。
+  listOfflineUuidPairsToMerge () {
+    return this.db.prepare(`
+      SELECT v3.uuid AS offlineUuid, v3.username AS offlineUsername,
+             v4.uuid AS mojangUuid, v4.username AS mojangUsername
+      FROM players v3
+      JOIN players v4 ON lower(v4.username) = lower(v3.username)
+      WHERE substr(v3.uuid, 15, 1) = '3'
+        AND substr(v4.uuid, 15, 1) = '4'
+        AND v3.uuid NOT LIKE 'name:%'
+        AND v4.uuid NOT LIKE 'name:%'
+        AND v3.uuid <> v4.uuid
+      ORDER BY lower(v3.username)
+    `).all()
+  }
+
+  // 启动时自动执行：所有 v3 离线身份并入同名 v4 正版主号，并删除 v3 行。
+  // 返回本次合并明细（给启动日志用）。
+  autoMergeOfflineIdentities () {
+    const pairs = this.listOfflineUuidPairsToMerge()
+    const merged = []
+    for (const pair of pairs) {
+      try {
+        const result = this.mergePlayerIdentities(pair.mojangUuid, pair.offlineUuid, 'system')
+        merged.push(result)
+        console.log(`[identity] 自动合并：${result.username} 的离线身份 ${result.secondary} 已并入正版主号 ${result.primary}（${result.mergedTypes} 种、${result.mergedAmount} 个）。`)
+      } catch (error) {
+        console.warn(`[identity] 自动合并失败 ${pair.offlineUsername}（${pair.offlineUuid} -> ${pair.mojangUuid}）：${error.message}`)
+      }
+    }
+    return merged
+  }
+
   // 把 secondaryUuid 的全部身份与账本合并进 primaryUuid（同一个人的两个真实 UUID）。
   // 管理员在 Web 页确认后调用；游戏内 upsertPlayer 只登记冲突，不自动合并。
   // 方向由调用方决定：一般把“库存多/更常用”的号留作 primary。
@@ -1576,8 +1630,14 @@ class StoreDb {
       this.db.prepare('UPDATE inventory_reservations SET owner_uuid = ? WHERE owner_uuid = ?').run(primary, secondary)
       this.db.prepare('UPDATE warehouse_subscriptions SET owner_uuid = ? WHERE owner_uuid = ?').run(primary, secondary)
       this.db.prepare('UPDATE warehouse_feature_settings SET owner_uuid = ? WHERE owner_uuid = ?').run(primary, secondary)
+      this.db.prepare('UPDATE inventory_mismatches SET owner_uuid = ?, username = ? WHERE owner_uuid = ?').run(primary, username, secondary)
+      this.db.prepare('UPDATE active_recovery_tasks SET owner_uuid = ?, owner_username = ?, target_username = ? WHERE owner_uuid = ?').run(primary, username, username, secondary)
+      this.db.prepare('UPDATE bot_recovery_tasks SET owner_uuid = ?, owner_username = ?, target_username = ? WHERE owner_uuid = ?').run(primary, username, username, secondary)
+      this.db.prepare('UPDATE shulker_repack_recovery SET owner_uuid = ?, owner_username = ? WHERE owner_uuid = ?').run(primary, username, secondary)
       this.db.prepare('UPDATE transactions SET player_uuid = ?, username = ? WHERE player_uuid = ?').run(primary, username, secondary)
       this.db.prepare('UPDATE custom_warehouses SET creator_uuid = ?, creator_username = ? WHERE creator_uuid = ?').run(primary, username, secondary)
+      this.db.prepare('UPDATE subscription_orders SET payer_uuid = ?, payer_username = ? WHERE payer_uuid = ?').run(primary, username, secondary)
+      this.db.prepare('UPDATE wallet_ledger SET player_uuid = ?, username = ? WHERE player_uuid = ?').run(primary, username, secondary)
       this.db.prepare(`
         UPDATE admin_users
         SET uuid = CASE WHEN uuid IS NULL OR uuid = ? THEN ? ELSE uuid END

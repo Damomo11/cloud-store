@@ -174,3 +174,80 @@ test('canonicalPlayerUuid 对未知新号不误绑', () => {
 
   context.close()
 })
+
+test('正版 v4 为准：启动自动合并把 v3 离线身份账本并入 v4 并删除 v3', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'cloud-store-identity-auto-'))
+  const config = {
+    admins: [],
+    momoOwner: '__momo__',
+    storage: { defaultQuotaSlots: 270, defaultCustomWarehouseQuotaSlots: 270 }
+  }
+
+  // 先用普通方式建库并塞入“已分裂”的数据（v4 正版 + v3 离线两个身份）
+  const seedDb = new StoreDb(path.join(directory, 'store.sqlite'), config)
+  const wool = { itemKey: 'minecraft:white_wool|aaaa', itemId: 'minecraft:white_wool', displayName: '白色羊毛', nbtJson: 'null', metaJson: '{}' }
+  const glass = { itemKey: 'minecraft:glass|bbbb', itemId: 'minecraft:glass', displayName: '玻璃', nbtJson: 'null', metaJson: '{}' }
+  seedDb.upsertItem(wool)
+  seedDb.upsertItem(glass)
+
+  const mojangUuid = 'eea2e783-d003-468b-a831-33d5185cde5e'   // v4 正版
+  const offlineUuid = 'b419bf89-1f25-3fd5-bc6a-ede63b0da311'   // v3 离线派生
+  seedDb.upsertPlayer(mojangUuid, 'TwinGuy')
+  seedDb.upsertPlayer(offlineUuid, 'TwinGuy')
+  seedDb.createPersonalWarehouse(offlineUuid, 'TwinGuy', { username: 'auto:deposit' })
+  seedDb.addBalanceItems(offlineUuid, [{ ...wool, amount: 37 }, { ...glass, amount: 64 }])
+  seedDb.addBalanceItems(mojangUuid, [{ ...wool, amount: 8153 }])
+  seedDb.setWebLoginToken(mojangUuid, 'TwinGuy', 'pw-main')
+  seedDb.close()
+
+  // 重开数据库：构造器里 autoMergeOfflineIdentities 自动执行
+  const db = new StoreDb(path.join(directory, 'store.sqlite'), config)
+
+  // v3 行已删，v4 是唯一身份
+  assert.equal(db.db.prepare('SELECT COUNT(*) c FROM players WHERE uuid = ?').get(offlineUuid).c, 0)
+  const remaining = db.db.prepare('SELECT uuid, username FROM players WHERE lower(username) = lower(?)').all('TwinGuy')
+  assert.equal(remaining.length, 1)
+  assert.equal(remaining[0].uuid, mojangUuid)
+
+  // 账本并入主号：羊毛 8153+37，玻璃 64
+  assert.equal(db.getBalance(mojangUuid, wool.itemKey), 8190)
+  assert.equal(db.getBalance(mojangUuid, glass.itemKey), 64)
+
+  // 个人仓库也改挂到主号
+  assert.ok(db.hasPersonalWarehouse(mojangUuid))
+  assert.equal(db.hasPersonalWarehouse(offlineUuid), false)
+
+  // 旧的离线 UUID 再上线会被 canonical 指回主号
+  assert.equal(db.canonicalPlayerUuid(offlineUuid), mojangUuid)
+
+  // 幂等：再跑一遍没有可合并的
+  assert.equal(db.autoMergeOfflineIdentities().length, 0)
+  assert.equal(db.listOfflineUuidPairsToMerge().length, 0)
+
+  db.close()
+  fs.rmSync(directory, { recursive: true, force: true })
+})
+
+test('没有 v4 主号的 v3 玩家不会被自动合并（避免丢库存）', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'cloud-store-identity-solo-'))
+  const config = { admins: [], momoOwner: '__momo__', storage: {} }
+
+  const seedDb = new StoreDb(path.join(directory, 'store.sqlite'), config)
+  const sand = { itemKey: 'minecraft:sand|5e0e', itemId: 'minecraft:sand', displayName: '沙子', nbtJson: 'null', metaJson: '{}' }
+  seedDb.upsertItem(sand)
+  const offlineOnlyUuid = 'b419bf89-1f25-3fd5-bc6a-ede63b0da311'  // v3
+  const v4OtherName = 'eea2e783-d003-468b-a831-33d5185cde5e'     // v4 但用户名不同
+  seedDb.upsertPlayer(offlineOnlyUuid, 'OfflineOnlyGuy')
+  seedDb.upsertPlayer(v4OtherName, 'SomeoneElse')
+  seedDb.addBalanceItems(offlineOnlyUuid, [{ ...sand, amount: 100 }])
+  seedDb.close()
+
+  const db = new StoreDb(path.join(directory, 'store.sqlite'), config)
+  // v3 玩家没有同名 v4 主号：原样保留
+  assert.equal(db.listOfflineUuidPairsToMerge().length, 0)
+  assert.equal(db.getBalance(offlineOnlyUuid, sand.itemKey), 100)
+  assert.ok(db.db.prepare('SELECT 1 FROM players WHERE uuid = ?').get(offlineOnlyUuid))
+
+  db.close()
+  fs.rmSync(directory, { recursive: true, force: true })
+})
