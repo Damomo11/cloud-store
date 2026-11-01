@@ -141,6 +141,28 @@ test('new server payment format is recognized and balance suffix is ignored', ()
   context.close(manager)
 })
 
+test('bot outgoing transfer receipt is not mistaken for a deposit', () => {
+  const context = createContext()
+  const manager = new SubscriptionManager(context.db, context.config, { disableNetworkTime: true })
+  manager.networkTime.trusted = true
+  manager.networkTime.now = () => 1_800_000_000_000
+  context.db.upsertPlayer('uuid-nan', 'NanKinz2')
+
+  // bot 向别人转账成功的回执：任何层都不能把它记成对方的充值。
+  const outgoing = manager.handleSystemMessage('✔ 已向「NanKinz2」转账 25.00 TSLC，剩余 5.00', 'XMCBot01')
+  assert.equal(outgoing.matched, false)
+  assert.equal(manager.getWallet('uuid-nan').balanceCents, 0)
+  // 「向你转账」是收款方向，不拦。
+  const incoming = manager.handleSystemMessage('✔ 已向你转账 25.00 TSLC', 'XMCBot01')
+  assert.equal(incoming.matched, false)
+  // 转出措辞变体同样拦住。
+  for (const text of ['已向 NanKinz2 转入 25.00 TSLC', '「NanKinz2」 转出 25.00 TSLC']) {
+    assert.equal(manager.handleSystemMessage(text, 'XMCBot01').matched, false)
+  }
+  assert.equal(manager.getWallet('uuid-nan').balanceCents, 0)
+  context.close(manager)
+})
+
 test('payment heuristic handles format variants, amounts and non-payment messages', () => {
   const context = createContext()
   const manager = new SubscriptionManager(context.db, context.config, { disableNetworkTime: true })

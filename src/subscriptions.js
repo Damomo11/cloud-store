@@ -18,10 +18,14 @@ const BUILTIN_PAYMENT_PATTERNS = [
   String.raw`\[TSLLLLL\]\s*你收到了来自\s+(?<player>\S+)\s+的\s+(?<![\d.])(?<amount>\d+(?:\.\d{1,2})?)\s*C`
 ].map(source => new RegExp(source, 'i'))
 
-// 「当前余额」后的数字不是到账金额，启发式抽取金额时要排除。
+// 「当前余额/剩余」后的数字不是到账金额，启发式抽取金额时要排除。
 const PAYMENT_HINT_KEYWORDS = ['收到', '到账', '入账', '转来', '转入', '转账']
 const PAYMENT_HINT_PATTERN = new RegExp(PAYMENT_HINT_KEYWORDS.join('|'))
-const PAYMENT_BALANCE_SUFFIX_PATTERN = /(?:当前\s*)?余额\s*[:：]?\s*\d+(?:\.\d+)?/
+const PAYMENT_BALANCE_SUFFIX_PATTERN = /(?:当前\s*)?(?:余额|剩余)\s*[:：]?\s*\d+(?:\.\d+)?/
+// bot 自己转账成功的回执（已向「X」转账 N，剩余 M）不是到账：玩家名、金额、货币单位全齐，
+// 启发式会把它误认成 X 的充值，必须在所有识别层之前排除。
+// 「向你」是收款方向的措辞不能拦；向 + 具体玩家名（带引号或空白分隔）才是转出方向。
+const PAYMENT_OUTGOING_PATTERN = new RegExp(String.raw`已?向\s*(?!你)(?:[「『"']\s*)?[A-Za-z0-9_\-]{1,16}(?:\s*[」』"'])?\s*(?:转账|转入|转来|支付|付款)|转出`)
 
 // 玩家名的启发式合法域：比 Minecraft 正式规则宽松（允许 -），够筛掉普通中文词。
 const HEURISTIC_PLAYER_PATTERN = /^[A-Za-z0-9_\-]{1,16}$/
@@ -378,6 +382,8 @@ class SubscriptionManager {
   handleSystemMessage (message, botName, sendNotice) {
     const text = String(message || '').trim()
     if (!text) return { matched: false }
+    // bot 自己转出成功的回执不是到账：在所有识别层之前排除，启发式会误认成收款。
+    if (PAYMENT_OUTGOING_PATTERN.test(text)) return { matched: false }
     const settings = this.getSettings()
 
     // 第一层：管理页正则（多行，按顺序）。
