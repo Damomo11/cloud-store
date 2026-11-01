@@ -3942,7 +3942,7 @@ const HTML = `<!doctype html>
             <div class="panel"><h3>套餐配置</h3><div id="adminSubscriptionPlans"></div></div>
           </div>
           <h3 class="section-title">充值正则测试</h3>
-          <div class="panel"><div class="settings-grid"><label class="wide">测试日志<textarea id="adminPaymentRegexSample">[12:36:38] [TSLLLLL] 你收到了来自 NanKinz1 的 1.00 C</textarea></label></div><div class="alias-add"><button id="adminPaymentRegexTest" class="primary">测试当前正则</button><span id="adminPaymentRegexResult" class="muted"></span></div></div>
+          <div class="panel"><div class="settings-grid"><label class="wide">测试日志<textarea id="adminPaymentRegexSample">✔ 收到「AMU471」转来的 5.00 TSLC，当前余额 29.00</textarea></label></div><div class="alias-add"><button id="adminPaymentRegexTest" class="primary">测试当前正则</button><span id="adminPaymentRegexResult" class="muted"></span></div></div>
           <h3 class="section-title">全部充值记录</h3><div id="adminPaymentRecords" class="panel tablewrap"></div>
           <div class="pager"><button id="adminPaymentPrev">上一页</button><span id="adminPaymentPage" class="muted"></span><button id="adminPaymentNext">下一页</button></div>
           <h3 class="section-title">未识别到账日志</h3><div id="adminPaymentLogs" class="panel tablewrap"></div>
@@ -6064,7 +6064,7 @@ const HTML = `<!doctype html>
         '<label><span>私信发送间隔 ms</span><input type="number" data-sub-setting="paymentMessageIntervalMs" value="' + esc(settings.paymentMessageIntervalMs) + '"></label>' +
         '<label><span>未识别日志保留天数</span><input type="number" data-sub-setting="paymentLogRetentionDays" value="' + esc(settings.paymentLogRetentionDays) + '"></label>' +
         '<label><span>网络时间同步间隔 ms</span><input type="number" data-sub-setting="networkTimeSyncIntervalMs" value="' + esc(settings.networkTimeSyncIntervalMs) + '"></label>' +
-        '<label class="wide"><span>到账正则</span><textarea data-sub-setting="paymentRegex">' + esc(settings.paymentRegex) + '</textarea></label>' +
+        '<label class="wide"><span>到账正则（每行一条，按顺序匹配；识别不到时自动使用内置格式与关键词识别）</span><textarea data-sub-setting="paymentRegex" rows="4">' + esc(settings.paymentRegex) + '</textarea></label>' +
         '<label class="wide"><span>NTP 时间源（每行一个）</span><textarea data-sub-setting="networkTimeSources">' + esc((settings.networkTimeSources || []).join('\\n')) + '</textarea></label>';
       $('adminSubscriptionPlans').innerHTML = (data.plans || []).map(plan =>
         '<div class="plan-editor" data-plan-editor="' + esc(plan.id) + '"><strong>' + esc(plan.id) + '</strong>' +
@@ -6340,7 +6340,7 @@ const HTML = `<!doctype html>
     $('adminPlayerLoad').addEventListener('click', () => loadAdminSubscriptionUsers().catch(error => toast(error.message)));
     $('adminSubscriptionSettingsSave').addEventListener('click', () => saveAdminSubscriptionSettings().catch(error => toast(error.message)));
     $('adminSubscriptionTimeSync').addEventListener('click', async () => { try { const data = await post('/api/admin/subscription/time/sync'); toast(data.message); await loadAdminSubscriptionConfig(); } catch (error) { toast(error.message); } });
-    $('adminPaymentRegexTest').addEventListener('click', async () => { try { const settings = collectAdminSubscriptionSettings(); const data = await post('/api/admin/subscription/regex/test', { paymentRegex: settings.paymentRegex, sample: $('adminPaymentRegexSample').value }); $('adminPaymentRegexResult').textContent = data.matched ? '匹配成功：' + data.player + ' / ' + data.amount + ' TSLC' : '未匹配'; } catch (error) { toast(error.message); } });
+      $('adminPaymentRegexTest').addEventListener('click', async () => { try { const settings = collectAdminSubscriptionSettings(); const data = await post('/api/admin/subscription/regex/test', { paymentRegex: settings.paymentRegex, sample: $('adminPaymentRegexSample').value }); if (!data.matched) { $('adminPaymentRegexResult').textContent = '未匹配（含内置与关键词兜底）'; } else { const via = data.lineIndex > 0 ? '第 ' + data.lineIndex + ' 行正则' : (data.lineIndex === 0 ? '内置格式' : '关键词识别'); $('adminPaymentRegexResult').textContent = '匹配成功（' + via + '）：' + data.player + ' / ' + data.amount + ' TSLC（' + (data.amountCents / 100).toFixed(2) + '）'; } } catch (error) { toast(error.message); } });
     $('adminPaymentPrev').addEventListener('click', () => { if (state.adminPaymentPage > 1) state.adminPaymentPage--; loadAdminPaymentRecords().catch(error => toast(error.message)); });
     $('adminPaymentNext').addEventListener('click', () => { if (state.adminPaymentPage < state.adminPaymentTotalPages) state.adminPaymentPage++; loadAdminPaymentRecords().catch(error => toast(error.message)); });
     $('myRefresh').addEventListener('click', () => loadMyCurrent().catch(error => toast(error.message)));

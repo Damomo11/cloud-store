@@ -122,3 +122,74 @@ test('automatic registration respects trigger switches and daily limit', () => {
   assert.equal(manager.maybeAutoRegister({ uuid: 'uuid-b', username: 'PlayerB' }, 'web_login').reason, 'disabled')
   context.close(manager)
 })
+
+test('new server payment format is recognized and balance suffix is ignored', () => {
+  const context = createContext()
+  const manager = new SubscriptionManager(context.db, context.config, { disableNetworkTime: true })
+  manager.networkTime.trusted = true
+  manager.networkTime.now = () => 1_800_000_000_000
+  context.db.upsertPlayer('uuid-amu', 'AMU471')
+
+  const payment = manager.handleSystemMessage('✔ 收到「AMU471」转来的 5.00 TSLC，当前余额 29.00', 'BotOne')
+  assert.equal(payment.matched, true)
+  assert.equal(payment.player.username, 'AMU471')
+  assert.equal(payment.amountCents, 500)
+  assert.equal(manager.getWallet('uuid-amu').balanceCents, 500)
+
+  const logs = manager.listUnrecognizedPaymentLogs()
+  assert.equal(logs.length, 0)
+  context.close(manager)
+})
+
+test('payment heuristic handles format variants, amounts and non-payment messages', () => {
+  const context = createContext()
+  const manager = new SubscriptionManager(context.db, context.config, { disableNetworkTime: true })
+  manager.networkTime.trusted = true
+  manager.networkTime.now = () => 1_800_000_000_000
+  context.db.upsertPlayer('uuid-alice', 'Alice')
+  context.db.upsertPlayer('uuid-bob', 'Bob')
+  // 用一条绝不会命中的自定义正则，逼管道走到启发式层。
+  manager.updateSettings({ ...manager.getSettings(), paymentRegex: String.raw`\[NEVER\]\s*(?<player>\S+)\s+的\s+(?<amount>\d+\.\d{2})\s+C` })
+
+  assert.equal(manager.handleSystemMessage('收到来自 Alice 的 3.5 TSLC', 'BotOne').amountCents, 350)
+  assert.equal(manager.handleSystemMessage('「Bob」 转入 5 TSLC', 'BotOne').amountCents, 500)
+  assert.equal(manager.handleSystemMessage('✔ 收到「Alice」转来 0.5 TSLC，余额 1.00', 'BotOne').amountCents, 50)
+  // 金额格式非法（三位小数）→ 不入账，进未识别日志。
+  assert.equal(manager.handleSystemMessage('收到来自 Alice 的 5.555 TSLC', 'BotOne').matched, false)
+  // 含关键词但不是到账消息 → 不入账，进未识别日志。
+  assert.equal(manager.handleSystemMessage('你收到了一封邮件', 'BotOne').matched, false)
+  // 与到账无关的 system 消息既不入账也不留日志。
+  assert.equal(manager.handleSystemMessage('Steve 加入了游戏', 'BotOne').matched, false)
+  const logs = manager.listUnrecognizedPaymentLogs()
+  assert.equal(logs.length, 2)
+  assert.ok(logs.every(row => row.message.includes('收到')))
+  assert.equal(manager.getWallet('uuid-alice').balanceCents, 400)
+  assert.equal(manager.getWallet('uuid-bob').balanceCents, 500)
+  context.close(manager)
+})
+
+test('payment regex list matches per line and skips broken lines at runtime', () => {
+  const context = createContext()
+  const manager = new SubscriptionManager(context.db, context.config, { disableNetworkTime: true })
+  manager.networkTime.trusted = true
+  manager.networkTime.now = () => 1_800_000_000_000
+  context.db.upsertPlayer('uuid-nan', 'NanKinz1')
+  // 先用合法的两行过保存校验，再直接写 DB 把第一行改成语法坏行（模拟存量脏数据）：
+  // 运行时应跳过坏行、由第二行命中。
+  const validButNeverLine = String.raw`\[NEVER\]\s*(?<player>\S+)\s+(?<amount>\d+) 坏行`
+  const goodLine = String.raw`\[TSLLLLL\]\s*你收到了来自\s+(?<player>\S+)\s+的\s+(?<amount>\d+(?:\.\d{1,2})?)\s*C`
+  manager.updateSettings({ ...manager.getSettings(), paymentRegex: [validButNeverLine, goodLine].join('\n') })
+  manager.setSetting('paymentRegex', [String.raw`\[NEVER\]\s*(?<player>\S+)(`, goodLine].join('\n'))
+
+  const payment = manager.handleSystemMessage('[12:36:38] [TSLLLLL] 你收到了来自 NanKinz1 的 1.00 C', 'BotOne')
+  assert.equal(payment.matched, true)
+  assert.equal(payment.player.username, 'NanKinz1')
+  assert.equal(payment.amountCents, 100)
+
+  const probe = manager.testPaymentRegex(manager.getSettings().paymentRegex, '✔ 收到「AMU471」转来的 5.00 TSLC，当前余额 29.00')
+  assert.equal(probe.matched, true)
+  assert.equal(probe.lineIndex, 0)
+  assert.equal(probe.player, 'AMU471')
+  assert.equal(probe.amountCents, 500)
+  context.close(manager)
+})

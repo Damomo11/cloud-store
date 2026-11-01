@@ -2,7 +2,68 @@ const crypto = require('node:crypto')
 const NetworkTime = require('./networkTime')
 
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000
-const DEFAULT_PAYMENT_REGEX = String.raw`\[TSLLLLL\]\s*你收到了来自\s+(?<player>\S+)\s+的\s+(?<amount>\d+\.\d{2})\s+C`
+
+// 到账消息三层识别：管理页正则（可多行）→ 内置格式 → 关键词启发式。
+// 服务器端经济插件改文案只影响前两层，第三层按关键词+玩家名+金额结构兜底。
+const LEGACY_PAYMENT_REGEX = String.raw`\[TSLLLLL\]\s*你收到了来自\s+(?<player>\S+)\s+的\s+(?<amount>\d+\.\d{2})\s+C`
+// (?<![\d.]) 防止把 5.555 截成 555 入账：三位小数的金额宁可进未识别日志也不误记。
+const DEFAULT_PAYMENT_REGEX = [
+  String.raw`收到\s*[「『"']?\s*(?<player>[A-Za-z0-9_\-]{1,16})\s*[」』"']?\s*(?:转来|转入|转账)\s*的?\s*(?<![\d.])(?<amount>\d+(?:\.\d{1,2})?)\s*(?:枚|个)?\s*(?:TSLC|C)\b`,
+  LEGACY_PAYMENT_REGEX
+].join('\n')
+
+// 内置格式不依赖 DB 配置：存量库不改管理页设置也能识别新格式。
+const BUILTIN_PAYMENT_PATTERNS = [
+  String.raw`收到\s*[「『"']?\s*(?<player>[A-Za-z0-9_\-]{1,16})\s*[」』"']?\s*(?:转来|转入|转账)\s*的?\s*(?<![\d.])(?<amount>\d+(?:\.\d{1,2})?)\s*(?:枚|个)?\s*(?:TSLC|C)\b`,
+  String.raw`\[TSLLLLL\]\s*你收到了来自\s+(?<player>\S+)\s+的\s+(?<![\d.])(?<amount>\d+(?:\.\d{1,2})?)\s*C`
+].map(source => new RegExp(source, 'i'))
+
+// 「当前余额」后的数字不是到账金额，启发式抽取金额时要排除。
+const PAYMENT_HINT_KEYWORDS = ['收到', '到账', '入账', '转来', '转入', '转账']
+const PAYMENT_HINT_PATTERN = new RegExp(PAYMENT_HINT_KEYWORDS.join('|'))
+const PAYMENT_BALANCE_SUFFIX_PATTERN = /(?:当前\s*)?余额\s*[:：]?\s*\d+(?:\.\d+)?/
+
+// 玩家名的启发式合法域：比 Minecraft 正式规则宽松（允许 -），够筛掉普通中文词。
+const HEURISTIC_PLAYER_PATTERN = /^[A-Za-z0-9_\-]{1,16}$/
+
+function amountToCents (text) {
+  const raw = String(text || '').trim().replace(/^\+/, '')
+  if (!/^\d+(?:\.\d{1,2})?$/.test(raw)) return null
+  const cents = Number.parseInt(raw.replace('.', '').padEnd(3, '0'), 10)
+  return cents > 0 ? cents : null
+}
+
+// 启发式兜底：去掉「当前余额」尾巴后，在触发词附近找玩家名和带货币单位的金额。
+function parsePaymentHeuristic (text) {
+  const raw = String(text || '').trim()
+  if (!PAYMENT_HINT_PATTERN.test(raw)) return null
+  const balanceMatch = raw.match(PAYMENT_BALANCE_SUFFIX_PATTERN)
+  const body = balanceMatch ? raw.slice(0, balanceMatch.index) : raw
+
+  const player = extractHeuristicPlayer(body)
+  if (!player) return null
+
+  const amountMatch = body.match(/(?<![\d.])(\d+(?:\.\d{1,2})?)\s*(?:枚|个)?\s*(?:TSLC|C)\b/i)
+  if (!amountMatch) return null
+  const amountCents = amountToCents(amountMatch[1])
+  if (!amountCents) return null
+  return { player, amount: amountMatch[1], amountCents, via: 'heuristic' }
+}
+
+function extractHeuristicPlayer (text) {
+  const patterns = [
+    /[「『"']\s*([^」』"'\s]{1,16})\s*[」』"']/,
+    /来自\s+([A-Za-z0-9_\-]{1,16})\s+的/,
+    /(?:^|[\s>»】])\s*([A-Za-z0-9_\-]{1,16})\s*(?:转来|转入|转账)/
+  ]
+  for (const pattern of patterns) {
+    const match = text.match(pattern)
+    if (!match) continue
+    const candidate = match[1]?.trim()
+    if (candidate && HEURISTIC_PLAYER_PATTERN.test(candidate)) return candidate
+  }
+  return null
+}
 
 const DEFAULT_SETTINGS = {
   autoRegisterOnDeposit: false,
@@ -89,6 +150,14 @@ class SubscriptionManager {
         VALUES (?, ?)
       `).run(key, JSON.stringify(value))
     }
+    // 迁移：存量库里的正则如果还是旧默认值，说明管理员没自定义过，直接升级到新默认；
+    // 自定义过的值一律不动。
+    let storedRegex = null
+    try {
+      const row = this.db.db.prepare(`SELECT value_json AS valueJson FROM subscription_settings WHERE key = 'paymentRegex'`).get()
+      storedRegex = row ? JSON.parse(row.valueJson) : null
+    } catch {}
+    if (storedRegex === LEGACY_PAYMENT_REGEX) this.setSetting('paymentRegex', DEFAULT_PAYMENT_REGEX)
     for (const plan of DEFAULT_PLANS) {
       this.db.db.prepare(`
         INSERT OR IGNORE INTO subscription_plans (
@@ -152,8 +221,15 @@ class SubscriptionManager {
         .map(value => String(value || '').trim()).filter(Boolean),
       networkTimeSyncIntervalMs: this.integer(input.networkTimeSyncIntervalMs, 60000, 7 * 24 * 60 * 60 * 1000, '时间同步间隔')
     }
-    if (!next.paymentRegex) throw new Error('充值正则不能为空。')
-    this.compilePaymentRegex(next.paymentRegex)
+    const regexLines = next.paymentRegex.split(/\r?\n/).map(line => line.trim()).filter(Boolean)
+    if (!regexLines.length) throw new Error('充值正则不能为空。')
+    // 保存时严格校验每一行，让管理页拿到明确的行号报错；运行时才按“跳过坏行”处理。
+    regexLines.forEach((line, index) => {
+      try { new RegExp(line, 'i') } catch (error) { throw new Error(`充值正则第 ${index + 1} 行无效：${error.message}`) }
+      if (!line.includes('(?<player>') || !line.includes('(?<amount>')) {
+        throw new Error(`充值正则第 ${index + 1} 行必须包含命名捕获组 player 和 amount。`)
+      }
+    })
     if (!next.networkTimeSources.length) throw new Error('至少需要一个网络时间源。')
     for (const key of Object.keys(DEFAULT_SETTINGS)) this.setSetting(key, next[key])
     this.networkTime.configure({ sources: next.networkTimeSources, intervalMs: next.networkTimeSyncIntervalMs })
@@ -226,55 +302,106 @@ class SubscriptionManager {
     return this.getPlan(id)
   }
 
+  compilePaymentRegexList (source) {
+    const lines = String(source || '').split(/\r?\n/).map(line => line.trim()).filter(Boolean)
+    if (!lines.length) throw new Error('充值正则不能为空。')
+    return lines.map((line, index) => {
+      try {
+        const regex = new RegExp(line, 'i')
+        if (!line.includes('(?<player>') || !line.includes('(?<amount>')) {
+          throw new Error('充值正则必须包含命名捕获组 player 和 amount。')
+        }
+        return regex
+      } catch (error) {
+        // 单行语法错误只跳过该行，不影响其余行；抛错会打断每条消息的识别。
+        console.error(`[subscription] 充值正则第 ${index + 1} 行无效，已忽略：${error.message}`)
+        return null
+      }
+    }).filter(Boolean)
+  }
+
   compilePaymentRegex (source) {
+    // 兼容旧调用方：只编译第一行并保留强校验。
+    const firstLine = String(source || '').split(/\r?\n/).map(line => line.trim()).filter(Boolean)[0]
+    if (!firstLine) throw new Error('充值正则不能为空。')
     let regex
-    try { regex = new RegExp(source, 'i') } catch (error) { throw new Error(`充值正则无效：${error.message}`) }
-    if (!String(source).includes('(?<player>') || !String(source).includes('(?<amount>')) {
+    try { regex = new RegExp(firstLine, 'i') } catch (error) { throw new Error(`充值正则无效：${error.message}`) }
+    if (!firstLine.includes('(?<player>') || !firstLine.includes('(?<amount>')) {
       throw new Error('充值正则必须包含命名捕获组 player 和 amount。')
     }
     return regex
   }
 
   testPaymentRegex (source, sample) {
-    const regex = this.compilePaymentRegex(source)
-    const match = regex.exec(String(sample || ''))
-    return {
-      matched: Boolean(match),
-      player: match?.groups?.player || '',
-      amount: match?.groups?.amount || ''
+    const lines = String(source || '').split(/\r?\n/).map(line => line.trim()).filter(Boolean)
+    const text = String(sample || '')
+    let result = { matched: false, lineIndex: 0, player: '', amount: '', amountCents: 0 }
+    lines.forEach((line, index) => {
+      if (result.matched) return
+      try {
+        const regex = new RegExp(line, 'i')
+        const match = regex.exec(text)
+        if (match) {
+          result = {
+            matched: true,
+            lineIndex: index + 1,
+            player: match.groups?.player || '',
+            amount: match.groups?.amount || '',
+            amountCents: amountToCents(match.groups?.amount) || 0
+          }
+        }
+      } catch {}
+    })
+    if (!result.matched) {
+      const builtin = this.matchPaymentPatterns(text, BUILTIN_PAYMENT_PATTERNS)
+      if (builtin) result = { matched: true, lineIndex: 0, player: builtin.player, amount: builtin.amount, amountCents: builtin.amountCents }
     }
+    if (!result.matched) {
+      const heuristic = parsePaymentHeuristic(text)
+      if (heuristic) result = { matched: true, lineIndex: -1, player: heuristic.player, amount: heuristic.amount, amountCents: heuristic.amountCents }
+    }
+    return result
+  }
+
+  matchPaymentPatterns (text, patterns) {
+    for (const regex of patterns) {
+      const match = regex.exec(text)
+      if (!match) continue
+      const player = String(match.groups?.player || '').trim()
+      const amountCents = amountToCents(match.groups?.amount)
+      if (!player || !amountCents) continue
+      return { player, amount: String(match.groups.amount), amountCents, via: 'builtin' }
+    }
+    return null
   }
 
   handleSystemMessage (message, botName, sendNotice) {
     const text = String(message || '').trim()
     if (!text) return { matched: false }
-    const regex = this.compilePaymentRegex(this.getSettings().paymentRegex)
-    const match = regex.exec(text)
-    if (!match) {
-      if (text.includes('收到')) this.saveUnrecognizedPaymentLog(botName, text)
+    const settings = this.getSettings()
+
+    // 第一层：管理页正则（多行，按顺序）。
+    const customPatterns = this.compilePaymentRegexList(settings.paymentRegex)
+    let payment = this.matchPaymentPatterns(text, customPatterns)
+    // 第二层：内置格式（存量库不改设置也能识别新格式）。
+    if (!payment) payment = this.matchPaymentPatterns(text, BUILTIN_PAYMENT_PATTERNS)
+    // 第三层：关键词启发式（服务器再改文案也能按结构识别）。
+    if (!payment) payment = parsePaymentHeuristic(text)
+
+    if (!payment) {
+      if (PAYMENT_HINT_PATTERN.test(text)) this.saveUnrecognizedPaymentLog(botName, text)
       return { matched: false }
     }
-    const username = String(match.groups.player || '').trim()
-    const amountText = String(match.groups.amount || '').trim()
-    if (!username || !/^\d+\.\d{2}$/.test(amountText)) {
-      this.saveUnrecognizedPaymentLog(botName, text)
-      return { matched: false }
-    }
-    const amountCents = Number.parseInt(amountText.replace('.', ''), 10)
-    if (!Number.isSafeInteger(amountCents) || amountCents <= 0) {
-      this.saveUnrecognizedPaymentLog(botName, text)
-      return { matched: false }
-    }
-    const player = this.resolveWalletIdentity(username)
-    const wallet = this.adjustBalance(player.uuid, player.username, amountCents, {
+    const player = this.resolveWalletIdentity(payment.player)
+    const wallet = this.adjustBalance(player.uuid, player.username, payment.amountCents, {
       type: 'server_payment',
       referenceType: 'minecraft_bot',
       referenceId: String(botName || ''),
       message: text,
       now: this.networkTime.trusted ? this.networkTime.now() : Date.now()
     })
-    this.queuePaymentSummary(player.username, amountCents, wallet.balanceCents, sendNotice)
-    return { matched: true, player, amountCents, balanceCents: wallet.balanceCents }
+    this.queuePaymentSummary(player.username, payment.amountCents, wallet.balanceCents, sendNotice)
+    return { matched: true, player, amountCents: payment.amountCents, balanceCents: wallet.balanceCents, via: payment.via }
   }
 
   resolveWalletIdentity (username) {
