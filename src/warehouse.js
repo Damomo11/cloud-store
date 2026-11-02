@@ -1,5 +1,5 @@
 const { GoalBlock, GoalNear } = require('mineflayer-pathfinder').goals
-const { Movements } = require('mineflayer-pathfinder')
+const warehouseMovements = require('./warehouseMovements')
 const Vec3 = require('vec3')
 const { sleep, sumBy } = require('./utils')
 const { logLocalError } = require('./localErrorLog')
@@ -3025,14 +3025,7 @@ class Warehouse {
 
   setupMovements () {
     if (!this.bot.pathfinder) return
-    const movements = new Movements(this.bot)
-    movements.canDig = false
-    movements.allow1by1towers = false
-    movements.allowParkour = false
-    movements.scafoldingBlocks = []
-    movements.countScaffoldingItems = () => 0
-    movements.getScaffoldingItem = () => null
-    this.bot.pathfinder.setMovements(movements)
+    this.bot.pathfinder.setMovements(warehouseMovements(this.bot))
   }
 
   async gotoWithMovements (goal, label) {
