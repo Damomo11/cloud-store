@@ -119,7 +119,21 @@ const DEFAULT_CONFIG = {
   language: {
     file: 'data/zh_cn.json'
   },
-  aliases: {}
+  aliases: {},
+  // Synthesis (ported from olela bot, 2026-11-02).
+  craft: {
+    // Master switch for the ported crafting feature.
+    enabled: true,
+    // The only station the ported chain requires: one crafting-table coordinate.
+    // Leave null to disable 3x3 recipes (2x2 recipes still work without a table).
+    table: {
+      x: null,
+      y: null,
+      z: null
+    },
+    // Optional command timeout override for a single craft order.
+    timeoutMs: 1200000
+  }
 }
 
 function stripJsonComments (text) {

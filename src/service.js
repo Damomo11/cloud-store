@@ -797,6 +797,17 @@ class CloudStoreService {
       return
     }
 
+    // Synthesis (ported from olela bot): administrator-only for now — the durable
+    // ledger must not be spent by arbitrary players until the cost model is agreed.
+    if (text.startsWith('!合成')) {
+      if (!this.isAdmin(username)) {
+        this.msg(username, '你没有权限使用合成命令。')
+        return
+      }
+      await this.handleCraft(username, text, this.defaultStorageOwnerForPlayer(this.getPlayer(username)))
+      return
+    }
+
     if (text === '!存物品' || text === '!存') {
       const player = this.getPlayer(username)
       if (!this.db.hasPersonalWarehouse(player.uuid) && this.subscriptions) this.subscriptions.maybeAutoRegister(player, 'deposit')
@@ -1861,6 +1872,132 @@ class CloudStoreService {
       return
     }
     this.sendQueryResult(username, this.queryOwnerLabel(owner), items, shulkers)
+  }
+
+  // Synthesis (ported from olela bot, 2026-11-02): craft an item using only what the
+  // warehouse already holds. No collection chain — the planner rejects orders whose
+  // inputs are missing from storage. Runs as an exclusive task so only one bot crafts.
+  // This is the internal entry point; the web panel and the mods are untouched.
+  async handleCraft (username, text, storageOwner = null) {
+    if (!this.bot._craftingExecutor) {
+      this.msg(username, '合成功能未启用（缺少合成执行器）。')
+      return
+    }
+    const parts = text.split(/\s+/).filter(Boolean)
+    const request = parts.slice(1).join(' ')
+    const parsed = this.parseCraftRequest(request)
+    if (!parsed.ok) {
+      this.msg(username, parsed.error)
+      return
+    }
+
+    const owner = storageOwner || { ...this.getPlayer(username), scope: 'personal' }
+    const available = this.availableCraftStock(owner.uuid)
+    const planned = require('./craft').planToCraftCommand({
+      item: parsed.itemName,
+      quantity: parsed.quantity,
+      available,
+      config: this.config
+    })
+    if (!planned.ok) {
+      this.msg(username, this.describeCraftRejection(planned, parsed))
+      return
+    }
+
+    const command = planned.command
+    command.player = username
+    command.notify = message => this.msg(username, message)
+    const stepCount = command.craftSteps.length
+    this.msg(username, `开始合成 ${parsed.itemName} ×${parsed.quantity}（${stepCount} 步），正在从仓库取料。`)
+
+    await this.enqueueTask(username, 'craft', worker => worker.runCraftCommand(command), { exclusive: true })
+  }
+
+  // Parse "!合成 <物品名>[ 数量]" — quantity defaults to 1 like the withdraw command.
+  parseCraftRequest (request) {
+    const raw = String(request || '').trim()
+    if (!raw) return { ok: false, error: '格式：!合成 物品名 [数量]，例如 !合成 石头 64' }
+    const match = raw.match(/^(.*?)(?:\s+(\d+))?$/)
+    const itemName = (match?.[1] || raw).trim()
+    const quantity = match?.[2] ? Math.max(1, Number.parseInt(match[2], 10)) : 1
+    if (!itemName) return { ok: false, error: '格式：!合成 物品名 [数量]' }
+    if (!Number.isFinite(quantity) || quantity <= 0) return { ok: false, error: '数量必须是正整数。' }
+    return { ok: true, itemName, quantity }
+  }
+
+  // Available stock by plain item base name (planner vocabulary uses names without
+  // the minecraft: prefix). One aggregate query; reservations are already excluded.
+  availableCraftStock (ownerUuid) {
+    const available = {}
+    for (const row of this.db.getOwnerAvailableTotalsByBaseName(ownerUuid)) {
+      const baseName = String(row.itemId || '').replace(/^minecraft:/, '')
+      if (!baseName) continue
+      available[baseName] = (available[baseName] || 0) + Number(row.amount || 0)
+    }
+    return available
+  }
+
+  describeCraftRejection (planned, parsed) {
+    if (planned.reason === 'needs_collection') {
+      const gaps = (planned.plan.collectGaps || [])
+        .slice(0, 5)
+        .map(gap => `${gap.name}×${gap.qty}`)
+        .join('、')
+      return `仓库内原料不足，无法合成 ${parsed.itemName}：缺少 ${gaps}（本功能只使用仓库已有物品，不采集）。`
+    }
+    if (planned.reason === 'no_workstation_configured') {
+      return '该配方需要工作台（3x3），但配置里没有设置合成台坐标（config.craft.table）。'
+    }
+    if (planned.reason === 'already_in_warehouse') {
+      return `仓库里已有足够 ${parsed.itemName}，无需合成。`
+    }
+    return `无法合成 ${parsed.itemName}：配方不可达或所需中间产物无法获得。`
+  }
+
+  // Runs inside an exclusive task; delegates to the ported executor and reports the
+  // outcome. The ported executor reports through its event sink, so this wrapper
+  // turns the terminal events into player-facing messages.
+  async runCraftCommand (command) {
+    const executor = this.bot._craftingExecutor
+    const notify = typeof command.notify === 'function' ? command.notify : () => {}
+    const target = command.target?.name || '目标物品'
+    const sink = this.bot._craftSink
+    const previous = sink && sink.onEvent
+    if (sink) {
+      sink.onEvent = (type, payload, opts) => {
+        if (previous) previous(type, payload, opts)
+        if (type === 'craft_completed') {
+          notify(`合成完成：${payload?.finalItem || target} 已交付${Number.isFinite(payload?.delivered) ? ` ×${payload.delivered}` : ''}。`)
+        } else if (type === 'deposit_completed') {
+          notify(`交付完成：${payload?.finalItem || target}${Number.isFinite(payload?.delivered) ? ` ×${payload.delivered}` : ''} 已入成品箱。`)
+        } else if (type === 'craft_failed') {
+          notify(`合成失败：${this.describeCraftFailure(payload?.reason)}`)
+        }
+      }
+    }
+    try {
+      await executor.handleCommand(command)
+    } catch (error) {
+      notify(`合成失败：${this.describeCraftFailure(error && (error.reason || error.message))}`)
+    } finally {
+      if (sink && previous) sink.onEvent = previous
+    }
+  }
+
+  // Turn executor reasons into short player-facing text; keep the raw reason for
+  // operators in the console when debug is on.
+  describeCraftFailure (reason) {
+    const text = String(reason || 'unknown')
+    if (this.config.debug) console.warn(`[craft] failure reason: ${text}`)
+    if (text.startsWith('buffer_deposit_incomplete')) return '成品未能完整存入仓库，请让管理员检查木桶余量。'
+    if (text.startsWith('buffer_material_access_failed') || text.startsWith('insufficient_buffer_materials')) return '仓库原料取出失败或不足，请让管理员执行 !同步 对账。'
+    if (text.startsWith('no_buffer_barrel')) return '没有可用的仓库木桶。'
+    if (text.startsWith('no_output_container')) return '没有可用的成品容器。'
+    if (text.startsWith('workstation')) return '工作台不可用（检查 config.craft.table 坐标）。'
+    if (text.startsWith('craft_transaction_failed') || text.startsWith('craft_result_unconfirmed')) return '合成点击未被服务器确认，物料已尽量回存。'
+    if (text.startsWith('executor_busy')) return '机器人正忙，请稍后再试。'
+    if (text.startsWith('executor_timeout')) return '合成超时，物料已尽量回存。'
+    return text
   }
 
   async handleCreateCustomWarehouse (username, text) {

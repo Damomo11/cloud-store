@@ -1,0 +1,867 @@
+{
+  "meta": {
+    "generatedAt": "2026-07-22T04:44:28.940Z",
+    "recipesVersion": "1.21.4",
+    "recipesPath": "recipes.json",
+    "mapPath": "OlelaSystem2\\src-api\\data\\resource-source-map.json"
+  },
+  "aliases": {
+    "coal": {
+      "product": "coal",
+      "sources": [
+        {
+          "sourceMapKey": "coal_ore",
+          "sourceBlock": "coal_ore",
+          "method": "mine_underground",
+          "biomes": null,
+          "yRange": {
+            "min": 0,
+            "max": 256
+          },
+          "tool": {
+            "hasBlockForm": true,
+            "sourceBlock": "coal_ore",
+            "material": "mineable/pickaxe",
+            "harvestTools": [
+              "851",
+              "856",
+              "861",
+              "866",
+              "871",
+              "876"
+            ]
+          },
+          "poolStatus": "active"
+        },
+        {
+          "sourceMapKey": "deepslate_coal_ore",
+          "sourceBlock": "deepslate_coal_ore",
+          "method": "mine_underground",
+          "biomes": null,
+          "yRange": {
+            "min": -64,
+            "max": 16
+          },
+          "tool": {
+            "hasBlockForm": true,
+            "sourceBlock": "deepslate_coal_ore",
+            "material": "mineable/pickaxe",
+            "harvestTools": [
+              "851",
+              "856",
+              "861",
+              "866",
+              "871",
+              "876"
+            ]
+          },
+          "poolStatus": "active"
+        }
+      ]
+    },
+    "raw_iron": {
+      "product": "raw_iron",
+      "sources": [
+        {
+          "sourceMapKey": "iron_ore",
+          "sourceBlock": "iron_ore",
+          "method": "mine_underground",
+          "biomes": null,
+          "yRange": {
+            "min": -24,
+            "max": 56
+          },
+          "tool": {
+            "hasBlockForm": true,
+            "sourceBlock": "iron_ore",
+            "material": "incorrect_for_wooden_tool",
+            "harvestTools": [
+              "856",
+              "866",
+              "871",
+              "876"
+            ]
+          },
+          "poolStatus": "active"
+        },
+        {
+          "sourceMapKey": "deepslate_iron_ore",
+          "sourceBlock": "deepslate_iron_ore",
+          "method": "mine_underground",
+          "biomes": null,
+          "yRange": {
+            "min": -64,
+            "max": 0
+          },
+          "tool": {
+            "hasBlockForm": true,
+            "sourceBlock": "deepslate_iron_ore",
+            "material": "incorrect_for_wooden_tool",
+            "harvestTools": [
+              "856",
+              "866",
+              "871",
+              "876"
+            ]
+          },
+          "poolStatus": "active"
+        }
+      ]
+    },
+    "raw_copper": {
+      "product": "raw_copper",
+      "sources": [
+        {
+          "sourceMapKey": "copper_ore",
+          "sourceBlock": "copper_ore",
+          "method": "mine_underground",
+          "biomes": null,
+          "yRange": {
+            "min": -16,
+            "max": 112
+          },
+          "tool": {
+            "hasBlockForm": true,
+            "sourceBlock": "copper_ore",
+            "material": "incorrect_for_wooden_tool",
+            "harvestTools": [
+              "856",
+              "866",
+              "871",
+              "876"
+            ]
+          },
+          "poolStatus": "active"
+        },
+        {
+          "sourceMapKey": "deepslate_copper_ore",
+          "sourceBlock": "deepslate_copper_ore",
+          "method": "mine_underground",
+          "biomes": null,
+          "yRange": {
+            "min": -16,
+            "max": 0
+          },
+          "tool": {
+            "hasBlockForm": true,
+            "sourceBlock": "deepslate_copper_ore",
+            "material": "incorrect_for_wooden_tool",
+            "harvestTools": [
+              "856",
+              "866",
+              "871",
+              "876"
+            ]
+          },
+          "poolStatus": "active"
+        }
+      ]
+    },
+    "raw_gold": {
+      "product": "raw_gold",
+      "sources": [
+        {
+          "sourceMapKey": "gold_ore",
+          "sourceBlock": "gold_ore",
+          "method": "mine_underground",
+          "biomes": null,
+          "yRange": {
+            "min": -48,
+            "max": 16
+          },
+          "tool": {
+            "hasBlockForm": true,
+            "sourceBlock": "gold_ore",
+            "material": "incorrect_for_wooden_tool",
+            "harvestTools": [
+              "866",
+              "871",
+              "876"
+            ]
+          },
+          "poolStatus": "active"
+        },
+        {
+          "sourceMapKey": "deepslate_gold_ore",
+          "sourceBlock": "deepslate_gold_ore",
+          "method": "mine_underground",
+          "biomes": null,
+          "yRange": {
+            "min": -48,
+            "max": -16
+          },
+          "tool": {
+            "hasBlockForm": true,
+            "sourceBlock": "deepslate_gold_ore",
+            "material": "incorrect_for_wooden_tool",
+            "harvestTools": [
+              "866",
+              "871",
+              "876"
+            ]
+          },
+          "poolStatus": "active"
+        }
+      ]
+    },
+    "redstone": {
+      "product": "redstone",
+      "sources": [
+        {
+          "sourceMapKey": "redstone_ore",
+          "sourceBlock": "redstone_ore",
+          "method": "mine_underground",
+          "biomes": null,
+          "yRange": {
+            "min": -64,
+            "max": 16
+          },
+          "tool": {
+            "hasBlockForm": true,
+            "sourceBlock": "redstone_ore",
+            "material": "incorrect_for_wooden_tool",
+            "harvestTools": [
+              "866",
+              "871",
+              "876"
+            ]
+          },
+          "poolStatus": "active"
+        },
+        {
+          "sourceMapKey": "deepslate_redstone_ore",
+          "sourceBlock": "deepslate_redstone_ore",
+          "method": "mine_underground",
+          "biomes": null,
+          "yRange": {
+            "min": -64,
+            "max": 16
+          },
+          "tool": {
+            "hasBlockForm": true,
+            "sourceBlock": "deepslate_redstone_ore",
+            "material": "incorrect_for_wooden_tool",
+            "harvestTools": [
+              "866",
+              "871",
+              "876"
+            ]
+          },
+          "poolStatus": "active"
+        }
+      ]
+    },
+    "lapis_lazuli": {
+      "product": "lapis_lazuli",
+      "sources": [
+        {
+          "sourceMapKey": "lapis_ore",
+          "sourceBlock": "lapis_ore",
+          "method": "mine_underground",
+          "biomes": null,
+          "yRange": {
+            "min": -64,
+            "max": 64
+          },
+          "tool": {
+            "hasBlockForm": true,
+            "sourceBlock": "lapis_ore",
+            "material": "incorrect_for_wooden_tool",
+            "harvestTools": [
+              "856",
+              "866",
+              "871",
+              "876"
+            ]
+          },
+          "poolStatus": "active"
+        },
+        {
+          "sourceMapKey": "deepslate_lapis_ore",
+          "sourceBlock": "deepslate_lapis_ore",
+          "method": "mine_underground",
+          "biomes": null,
+          "yRange": {
+            "min": -64,
+            "max": 64
+          },
+          "tool": {
+            "hasBlockForm": true,
+            "sourceBlock": "deepslate_lapis_ore",
+            "material": "incorrect_for_wooden_tool",
+            "harvestTools": [
+              "856",
+              "866",
+              "871",
+              "876"
+            ]
+          },
+          "poolStatus": "active"
+        }
+      ]
+    },
+    "diamond": {
+      "product": "diamond",
+      "sources": [
+        {
+          "sourceMapKey": "diamond_ore",
+          "sourceBlock": "diamond_ore",
+          "method": "mine_underground",
+          "biomes": null,
+          "yRange": {
+            "min": 0,
+            "max": 16
+          },
+          "tool": {
+            "hasBlockForm": true,
+            "sourceBlock": "diamond_ore",
+            "material": "incorrect_for_wooden_tool",
+            "harvestTools": [
+              "866",
+              "871",
+              "876"
+            ]
+          },
+          "poolStatus": "active"
+        },
+        {
+          "sourceMapKey": "deepslate_diamond_ore",
+          "sourceBlock": "deepslate_diamond_ore",
+          "method": "mine_underground",
+          "biomes": null,
+          "yRange": {
+            "min": -59,
+            "max": -58
+          },
+          "tool": {
+            "hasBlockForm": true,
+            "sourceBlock": "deepslate_diamond_ore",
+            "material": "incorrect_for_wooden_tool",
+            "harvestTools": [
+              "866",
+              "871",
+              "876"
+            ]
+          },
+          "poolStatus": "active"
+        }
+      ]
+    },
+    "emerald": {
+      "product": "emerald",
+      "sources": [
+        {
+          "sourceMapKey": "emerald_ore",
+          "sourceBlock": "emerald_ore",
+          "method": "mine_underground",
+          "biomes": [
+            "minecraft:windswept_hills",
+            "minecraft:windswept_gravelly_hills",
+            "minecraft:windswept_forest",
+            "minecraft:meadow",
+            "minecraft:cherry_grove",
+            "minecraft:grove",
+            "minecraft:snowy_slopes",
+            "minecraft:jagged_peaks",
+            "minecraft:frozen_peaks",
+            "minecraft:stony_peaks"
+          ],
+          "yRange": {
+            "min": 0,
+            "max": 320
+          },
+          "tool": {
+            "hasBlockForm": true,
+            "sourceBlock": "emerald_ore",
+            "material": "incorrect_for_wooden_tool",
+            "harvestTools": [
+              "866",
+              "871",
+              "876"
+            ]
+          },
+          "poolStatus": "active"
+        },
+        {
+          "sourceMapKey": "deepslate_emerald_ore",
+          "sourceBlock": "deepslate_emerald_ore",
+          "method": "mine_underground",
+          "biomes": null,
+          "yRange": {
+            "min": -16,
+            "max": 320
+          },
+          "tool": {
+            "hasBlockForm": true,
+            "sourceBlock": "deepslate_emerald_ore",
+            "material": "incorrect_for_wooden_tool",
+            "harvestTools": [
+              "866",
+              "871",
+              "876"
+            ]
+          },
+          "poolStatus": "active"
+        }
+      ]
+    },
+    "quartz": {
+      "product": "quartz",
+      "sources": [
+        {
+          "sourceMapKey": "nether_quartz_ore",
+          "sourceBlock": "nether_quartz_ore",
+          "method": "mine_underground",
+          "biomes": null,
+          "yRange": {
+            "min": 10,
+            "max": 117
+          },
+          "tool": {
+            "hasBlockForm": true,
+            "sourceBlock": "nether_quartz_ore",
+            "material": "mineable/pickaxe",
+            "harvestTools": [
+              "851",
+              "856",
+              "861",
+              "866",
+              "871",
+              "876"
+            ]
+          },
+          "poolStatus": "active"
+        }
+      ]
+    },
+    "gold_nugget": {
+      "product": "gold_nugget",
+      "sources": [
+        {
+          "sourceMapKey": "nether_gold_ore",
+          "sourceBlock": "nether_gold_ore",
+          "method": "mine_underground",
+          "biomes": null,
+          "yRange": {
+            "min": 10,
+            "max": 117
+          },
+          "tool": {
+            "hasBlockForm": true,
+            "sourceBlock": "nether_gold_ore",
+            "material": "mineable/pickaxe",
+            "harvestTools": [
+              "851",
+              "856",
+              "861",
+              "866",
+              "871",
+              "876"
+            ]
+          },
+          "poolStatus": "active"
+        }
+      ]
+    }
+  },
+  "blocking": {
+    "blocked": false,
+    "undetermined": [],
+    "determinedLeaves": [
+      {
+        "name": "baked_potato",
+        "mismatch": "leaf_not_in_map",
+        "resolution": {
+          "by": "no_furnace_intermediate",
+          "detail": "baked_potato 仅由被过滤配方(冶炼/切石等)产出，一期无熔炉，规划器如实标为不可达"
+        }
+      },
+      {
+        "name": "brick",
+        "mismatch": "leaf_not_in_map",
+        "resolution": {
+          "by": "no_furnace_intermediate",
+          "detail": "brick 仅由被过滤配方(冶炼/切石等)产出，一期无熔炉，规划器如实标为不可达"
+        }
+      },
+      {
+        "name": "charcoal",
+        "mismatch": "leaf_not_in_map",
+        "resolution": {
+          "by": "no_furnace_intermediate",
+          "detail": "charcoal 仅由被过滤配方(冶炼/切石等)产出，一期无熔炉，规划器如实标为不可达"
+        }
+      },
+      {
+        "name": "cooked_rabbit",
+        "mismatch": "leaf_not_in_map",
+        "resolution": {
+          "by": "no_furnace_intermediate",
+          "detail": "cooked_rabbit 仅由被过滤配方(冶炼/切石等)产出，一期无熔炉，规划器如实标为不可达"
+        }
+      },
+      {
+        "name": "glass",
+        "mismatch": "leaf_not_in_map",
+        "resolution": {
+          "by": "no_furnace_intermediate",
+          "detail": "glass 仅由被过滤配方(冶炼/切石等)产出，一期无熔炉，规划器如实标为不可达"
+        }
+      },
+      {
+        "name": "green_dye",
+        "mismatch": "leaf_not_in_map",
+        "resolution": {
+          "by": "no_furnace_intermediate",
+          "detail": "green_dye 仅由被过滤配方(冶炼/切石等)产出，一期无熔炉，规划器如实标为不可达"
+        }
+      },
+      {
+        "name": "nether_brick",
+        "mismatch": "leaf_not_in_map",
+        "resolution": {
+          "by": "no_furnace_intermediate",
+          "detail": "nether_brick 仅由被过滤配方(冶炼/切石等)产出，一期无熔炉，规划器如实标为不可达"
+        }
+      },
+      {
+        "name": "netherite_scrap",
+        "mismatch": "leaf_not_in_map",
+        "resolution": {
+          "by": "no_furnace_intermediate",
+          "detail": "netherite_scrap 仅由被过滤配方(冶炼/切石等)产出，一期无熔炉，规划器如实标为不可达"
+        }
+      },
+      {
+        "name": "popped_chorus_fruit",
+        "mismatch": "leaf_not_in_map",
+        "resolution": {
+          "by": "no_furnace_intermediate",
+          "detail": "popped_chorus_fruit 仅由被过滤配方(冶炼/切石等)产出，一期无熔炉，规划器如实标为不可达"
+        }
+      },
+      {
+        "name": "quartz",
+        "mismatch": "leaf_not_in_map",
+        "resolution": {
+          "by": "ore_alias",
+          "detail": "产物 quartz 经别名表由对应矿石方块采集获得"
+        }
+      },
+      {
+        "name": "resin_brick",
+        "mismatch": "leaf_not_in_map",
+        "resolution": {
+          "by": "no_furnace_intermediate",
+          "detail": "resin_brick 仅由被过滤配方(冶炼/切石等)产出，一期无熔炉，规划器如实标为不可达"
+        }
+      },
+      {
+        "name": "smooth_quartz",
+        "mismatch": "leaf_not_in_map",
+        "resolution": {
+          "by": "no_furnace_intermediate",
+          "detail": "smooth_quartz 仅由被过滤配方(冶炼/切石等)产出，一期无熔炉，规划器如实标为不可达"
+        }
+      },
+      {
+        "name": "smooth_red_sandstone",
+        "mismatch": "leaf_not_in_map",
+        "resolution": {
+          "by": "no_furnace_intermediate",
+          "detail": "smooth_red_sandstone 仅由被过滤配方(冶炼/切石等)产出，一期无熔炉，规划器如实标为不可达"
+        }
+      },
+      {
+        "name": "smooth_sandstone",
+        "mismatch": "leaf_not_in_map",
+        "resolution": {
+          "by": "no_furnace_intermediate",
+          "detail": "smooth_sandstone 仅由被过滤配方(冶炼/切石等)产出，一期无熔炉，规划器如实标为不可达"
+        }
+      },
+      {
+        "name": "smooth_stone",
+        "mismatch": "leaf_not_in_map",
+        "resolution": {
+          "by": "no_furnace_intermediate",
+          "detail": "smooth_stone 仅由被过滤配方(冶炼/切石等)产出，一期无熔炉，规划器如实标为不可达"
+        }
+      },
+      {
+        "name": "stone",
+        "mismatch": "leaf_not_in_map",
+        "resolution": {
+          "by": "no_furnace_intermediate",
+          "detail": "stone 仅由被过滤配方(冶炼/切石等)产出，一期无熔炉，规划器如实标为不可达"
+        }
+      },
+      {
+        "name": "terracotta",
+        "mismatch": "leaf_not_in_map",
+        "resolution": {
+          "by": "no_furnace_intermediate",
+          "detail": "terracotta 仅由被过滤配方(冶炼/切石等)产出，一期无熔炉，规划器如实标为不可达"
+        }
+      }
+    ],
+    "determinedMapKeys": [
+      {
+        "name": "ancient_debris",
+        "mismatch": "map_key_not_in_input",
+        "resolution": {
+          "by": "map_superset_unused",
+          "detail": "映射表冗余 key（仅被过滤配方使用或未被任何配方引用）；规划以配方物品名为真值源，非阻断"
+        }
+      },
+      {
+        "name": "beef",
+        "mismatch": "map_key_not_in_input",
+        "resolution": {
+          "by": "map_superset_unused",
+          "detail": "映射表冗余 key（仅被过滤配方使用或未被任何配方引用）；规划以配方物品名为真值源，非阻断"
+        }
+      },
+      {
+        "name": "cactus",
+        "mismatch": "map_key_not_in_input",
+        "resolution": {
+          "by": "map_superset_unused",
+          "detail": "映射表冗余 key（仅被过滤配方使用或未被任何配方引用）；规划以配方物品名为真值源，非阻断"
+        }
+      },
+      {
+        "name": "chicken",
+        "mismatch": "map_key_not_in_input",
+        "resolution": {
+          "by": "map_superset_unused",
+          "detail": "映射表冗余 key（仅被过滤配方使用或未被任何配方引用）；规划以配方物品名为真值源，非阻断"
+        }
+      },
+      {
+        "name": "chorus_fruit",
+        "mismatch": "map_key_not_in_input",
+        "resolution": {
+          "by": "map_superset_unused",
+          "detail": "映射表冗余 key（仅被过滤配方使用或未被任何配方引用）；规划以配方物品名为真值源，非阻断"
+        }
+      },
+      {
+        "name": "coal_ore",
+        "mismatch": "map_key_not_in_input",
+        "resolution": {
+          "by": "ore_alias",
+          "detail": "矿石方块 coal_ore 经别名表映射为其产物的采集源"
+        }
+      },
+      {
+        "name": "cod",
+        "mismatch": "map_key_not_in_input",
+        "resolution": {
+          "by": "map_superset_unused",
+          "detail": "映射表冗余 key（仅被过滤配方使用或未被任何配方引用）；规划以配方物品名为真值源，非阻断"
+        }
+      },
+      {
+        "name": "copper_ore",
+        "mismatch": "map_key_not_in_input",
+        "resolution": {
+          "by": "ore_alias",
+          "detail": "矿石方块 copper_ore 经别名表映射为其产物的采集源"
+        }
+      },
+      {
+        "name": "deepslate_coal_ore",
+        "mismatch": "map_key_not_in_input",
+        "resolution": {
+          "by": "ore_alias",
+          "detail": "矿石方块 deepslate_coal_ore 经别名表映射为其产物的采集源"
+        }
+      },
+      {
+        "name": "deepslate_copper_ore",
+        "mismatch": "map_key_not_in_input",
+        "resolution": {
+          "by": "ore_alias",
+          "detail": "矿石方块 deepslate_copper_ore 经别名表映射为其产物的采集源"
+        }
+      },
+      {
+        "name": "deepslate_diamond_ore",
+        "mismatch": "map_key_not_in_input",
+        "resolution": {
+          "by": "ore_alias",
+          "detail": "矿石方块 deepslate_diamond_ore 经别名表映射为其产物的采集源"
+        }
+      },
+      {
+        "name": "deepslate_emerald_ore",
+        "mismatch": "map_key_not_in_input",
+        "resolution": {
+          "by": "ore_alias",
+          "detail": "矿石方块 deepslate_emerald_ore 经别名表映射为其产物的采集源"
+        }
+      },
+      {
+        "name": "deepslate_gold_ore",
+        "mismatch": "map_key_not_in_input",
+        "resolution": {
+          "by": "ore_alias",
+          "detail": "矿石方块 deepslate_gold_ore 经别名表映射为其产物的采集源"
+        }
+      },
+      {
+        "name": "deepslate_iron_ore",
+        "mismatch": "map_key_not_in_input",
+        "resolution": {
+          "by": "ore_alias",
+          "detail": "矿石方块 deepslate_iron_ore 经别名表映射为其产物的采集源"
+        }
+      },
+      {
+        "name": "deepslate_lapis_ore",
+        "mismatch": "map_key_not_in_input",
+        "resolution": {
+          "by": "ore_alias",
+          "detail": "矿石方块 deepslate_lapis_ore 经别名表映射为其产物的采集源"
+        }
+      },
+      {
+        "name": "deepslate_redstone_ore",
+        "mismatch": "map_key_not_in_input",
+        "resolution": {
+          "by": "ore_alias",
+          "detail": "矿石方块 deepslate_redstone_ore 经别名表映射为其产物的采集源"
+        }
+      },
+      {
+        "name": "diamond_ore",
+        "mismatch": "map_key_not_in_input",
+        "resolution": {
+          "by": "ore_alias",
+          "detail": "矿石方块 diamond_ore 经别名表映射为其产物的采集源"
+        }
+      },
+      {
+        "name": "emerald_ore",
+        "mismatch": "map_key_not_in_input",
+        "resolution": {
+          "by": "ore_alias",
+          "detail": "矿石方块 emerald_ore 经别名表映射为其产物的采集源"
+        }
+      },
+      {
+        "name": "gold_ore",
+        "mismatch": "map_key_not_in_input",
+        "resolution": {
+          "by": "ore_alias",
+          "detail": "矿石方块 gold_ore 经别名表映射为其产物的采集源"
+        }
+      },
+      {
+        "name": "iron_ore",
+        "mismatch": "map_key_not_in_input",
+        "resolution": {
+          "by": "ore_alias",
+          "detail": "矿石方块 iron_ore 经别名表映射为其产物的采集源"
+        }
+      },
+      {
+        "name": "kelp",
+        "mismatch": "map_key_not_in_input",
+        "resolution": {
+          "by": "map_superset_unused",
+          "detail": "映射表冗余 key（仅被过滤配方使用或未被任何配方引用）；规划以配方物品名为真值源，非阻断"
+        }
+      },
+      {
+        "name": "lapis_ore",
+        "mismatch": "map_key_not_in_input",
+        "resolution": {
+          "by": "ore_alias",
+          "detail": "矿石方块 lapis_ore 经别名表映射为其产物的采集源"
+        }
+      },
+      {
+        "name": "mutton",
+        "mismatch": "map_key_not_in_input",
+        "resolution": {
+          "by": "map_superset_unused",
+          "detail": "映射表冗余 key（仅被过滤配方使用或未被任何配方引用）；规划以配方物品名为真值源，非阻断"
+        }
+      },
+      {
+        "name": "nether_gold_ore",
+        "mismatch": "map_key_not_in_input",
+        "resolution": {
+          "by": "ore_alias",
+          "detail": "矿石方块 nether_gold_ore 经别名表映射为其产物的采集源"
+        }
+      },
+      {
+        "name": "nether_quartz_ore",
+        "mismatch": "map_key_not_in_input",
+        "resolution": {
+          "by": "ore_alias",
+          "detail": "矿石方块 nether_quartz_ore 经别名表映射为其产物的采集源"
+        }
+      },
+      {
+        "name": "porkchop",
+        "mismatch": "map_key_not_in_input",
+        "resolution": {
+          "by": "map_superset_unused",
+          "detail": "映射表冗余 key（仅被过滤配方使用或未被任何配方引用）；规划以配方物品名为真值源，非阻断"
+        }
+      },
+      {
+        "name": "potato",
+        "mismatch": "map_key_not_in_input",
+        "resolution": {
+          "by": "map_superset_unused",
+          "detail": "映射表冗余 key（仅被过滤配方使用或未被任何配方引用）；规划以配方物品名为真值源，非阻断"
+        }
+      },
+      {
+        "name": "rabbit",
+        "mismatch": "map_key_not_in_input",
+        "resolution": {
+          "by": "map_superset_unused",
+          "detail": "映射表冗余 key（仅被过滤配方使用或未被任何配方引用）；规划以配方物品名为真值源，非阻断"
+        }
+      },
+      {
+        "name": "redstone_ore",
+        "mismatch": "map_key_not_in_input",
+        "resolution": {
+          "by": "ore_alias",
+          "detail": "矿石方块 redstone_ore 经别名表映射为其产物的采集源"
+        }
+      },
+      {
+        "name": "salmon",
+        "mismatch": "map_key_not_in_input",
+        "resolution": {
+          "by": "map_superset_unused",
+          "detail": "映射表冗余 key（仅被过滤配方使用或未被任何配方引用）；规划以配方物品名为真值源，非阻断"
+        }
+      },
+      {
+        "name": "sea_pickle",
+        "mismatch": "map_key_not_in_input",
+        "resolution": {
+          "by": "map_superset_unused",
+          "detail": "映射表冗余 key（仅被过滤配方使用或未被任何配方引用）；规划以配方物品名为真值源，非阻断"
+        }
+      },
+      {
+        "name": "wet_sponge",
+        "mismatch": "map_key_not_in_input",
+        "resolution": {
+          "by": "map_superset_unused",
+          "detail": "映射表冗余 key（仅被过滤配方使用或未被任何配方引用）；规划以配方物品名为真值源，非阻断"
+        }
+      }
+    ]
+  }
+}

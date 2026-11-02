@@ -2777,6 +2777,22 @@ class StoreDb {
     `).all(ownerUuid, itemId)
   }
 
+  // Synthesis (ported from olela bot): one-shot aggregate of an owner's available
+  // stock grouped by base item id. Same reservation-aware accounting as
+  // getOwnerItemsByItemId, but in a single query so the planner can be fed cheaply.
+  getOwnerAvailableTotalsByBaseName (ownerUuid) {
+    return this.db.prepare(`
+      SELECT i.item_id AS itemId,
+             SUM(b.amount - COALESCE((SELECT SUM(r.amount) FROM inventory_reservations r
+               WHERE r.owner_uuid = b.owner_uuid AND r.item_key = b.item_key), 0)) AS amount
+      FROM balances b
+      JOIN items i ON i.item_key = b.item_key
+      WHERE b.owner_uuid = ?
+      GROUP BY i.item_id
+      HAVING amount > 0
+    `).all(ownerUuid)
+  }
+
   getOwnerItemsByItemKey (ownerUuid, itemKey) {
     return this.db.prepare(`
       SELECT b.owner_uuid AS ownerUuid, b.item_key AS itemKey,
