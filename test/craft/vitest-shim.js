@@ -91,6 +91,12 @@ function expect (actual) {
         try { assert.deepEqual(actual, expected) } catch { equal = false }
         assert.ok(!equal, `expected values not to be deep-equal`)
       },
+      toContain (value) {
+        const found = Array.isArray(actual)
+          ? actual.some(entry => deepEqual(entry, value))
+          : String(actual).includes(String(value))
+        assert.ok(!found, `expected value not to contain ${JSON.stringify(value)}`)
+      },
       toContainEqual (value) {
         const found = actual.some(entry => {
           if (isObjectContaining(value)) return matchesObjectContaining(entry, value)
@@ -120,7 +126,7 @@ function parameterized (runner) {
   }
 }
 
-const it = parameterized(nodeTest.it)
+const it = (...args) => nodeTest.it(...args)
 it.each = parameterized(nodeTest.it)
 
 module.exports = {

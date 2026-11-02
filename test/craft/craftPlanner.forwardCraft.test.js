@@ -2,7 +2,8 @@ var import_vitest = require("./vitest-shim");
 var import_RecipeGraph = require("../../src/craft/preparation/RecipeGraph");
 var import_CraftPlanner = require("../../src/craft/preparation/CraftPlanner");
 var import_types = require("../../src/craft/preparation/types");
-const graph = new import_RecipeGraph.RecipeGraph();
+// Preserve these upstream regressions against the historical recipe snapshot.
+const graph = new import_RecipeGraph.RecipeGraph({ recipesPath: require.resolve("../../data/recipes.json") });
 const planner = new import_CraftPlanner.CraftPlanner(graph);
 (0, import_vitest.describe)("CraftPlanner white_wool \u771F\u670D\u56DE\u5F52", () => {
   (0, import_vitest.it)("\u73B0\u6709 3 \u7F8A\u6BDB + 5 \u67D3\u6599\u65F6\u628A\u7F3A\u53E3\u89C4\u5212\u4E3A\u730E\u53D6\u767D\u7F8A\u6BDB\uFF0C\u4E0D\u751F\u6210\u65E0\u57FA\u6750\u67D3\u8272\u6B65\u9AA4", () => {

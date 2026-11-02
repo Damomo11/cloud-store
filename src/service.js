@@ -25,6 +25,7 @@ class CloudStoreService {
     this.subscriptions = subscriptions
     this.botId = String(config.server?.botName || config.server?.username || bot.username || 'bot').toLowerCase()
     this.ready = false
+    this.connectionInvalidated = false
     this.active = null
     this.deathContext = null
     this.recoveringFromDeath = false
@@ -41,7 +42,10 @@ class CloudStoreService {
   }
 
   invalidateConnection (reason = 'connection invalidated') {
+    this.connectionInvalidated = true
+    this.ready = false
     this.active && (this.active.cancelled = true)
+    this.craftController?.cancel(reason)
     this.warehouse.invalidateConnection(reason)
   }
 
@@ -104,7 +108,7 @@ class CloudStoreService {
       this.withBotContext(() => this.recoverPersistedTaskOnSpawn()).catch(error => {
         console.error('[disconnect-recovery] failed:', error)
       }).finally(() => {
-        this.ready = true
+        this.ready = !this.connectionInvalidated
         this.taskPool?.dispatch()
       })
     }, 1500)
@@ -120,6 +124,7 @@ class CloudStoreService {
       this.deathContext = { type: 'idle', username: '', player: null, phase: 'idle' }
     }
     this.bot.pathfinder?.stop()
+    this.craftController?.cancel('机器人死亡，合成已停止并保留恢复记录。')
     this.bot.clearControlStates()
   }
 
@@ -128,6 +133,24 @@ class CloudStoreService {
     this.recoveringFromDeath = true
     const context = this.deathContext
     this.deathContext = null
+
+    // The craft controller keeps its lease until every outstanding craft call
+    // drains. Do not run generic death cleanup or erase its durable journal.
+    if (context.type === 'craft' || context.type === 'craft_recovery' || this.db.hasPendingCraft?.(this.botId)) {
+      try {
+        this.craftController?.cancel('机器人死亡后等待合成恢复。')
+        if (this.taskPool?.hasInFlightCraft?.(this.botId)) {
+          await this.taskPool.waitForCraftDrain?.(this.botId)
+        }
+        if (this.connectionInvalidated) throw new Error('连接已失效，合成恢复留待新连接。')
+        if (this.craftController?.isBusy() || this.bot._craftingExecutor?.isBusy()) return
+        await this.getCraftController().recover()
+      } finally {
+        this.recoveringFromDeath = false
+        this.taskPool?.dispatch()
+      }
+      return
+    }
 
     const trace = startTrace({
       bot: this.botId,
@@ -269,6 +292,16 @@ class CloudStoreService {
   }
 
   async recoverPersistedTaskOnSpawn () {
+    if (this.db.hasPendingCraft?.(this.botId)) {
+      if (this.connectionInvalidated) throw new Error('连接已失效，合成恢复留待新连接。')
+      // An old disconnected instance may still be draining a network Promise.
+      if (this.taskPool?.hasInFlightCraft?.(this.botId)) {
+        await this.taskPool.waitForCraftDrain?.(this.botId)
+      }
+      if (this.connectionInvalidated) throw new Error('连接已失效，合成恢复留待新连接。')
+      await this.getCraftController().recover()
+      return
+    }
     const task = this.db.getRecoveryTask(this.botId)
     const held = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
     const pendingRecord = this.db.getShulkerRepackRecovery?.(this.botId) || null
@@ -797,8 +830,12 @@ class CloudStoreService {
       return
     }
 
-    // Synthesis (ported from olela bot): administrator-only for now — the durable
-    // ledger must not be spent by arbitrary players until the cost model is agreed.
+    // Crafting remains an administrator command; it settles against the explicitly
+    // selected personal or organization warehouse after server confirmation.
+    if (text === '!合成恢复') {
+      await this.handleCraftRecovery(username)
+      return
+    }
     if (text.startsWith('!合成')) {
       if (!this.isAdmin(username)) {
         this.msg(username, '你没有权限使用合成命令。')
@@ -835,6 +872,11 @@ class CloudStoreService {
     if (this.emergencyRescueActive) return false
     this.emergencyRescueActive = true
     try {
+      if (this.craftController?.isBusy() || this.db.hasPendingCraft?.(this.botId)) {
+        this.craftController?.cancel('管理员急救请求：合成停止，物品保留归属等待恢复。')
+        this.msg(username, '合成仍在结束或等待恢复，已请求停止；请在操作结束后执行 !合成恢复，核对物品归属。')
+        return false
+      }
       const cancelledQueued = this.taskPool?.cancelQueuedForWorker(this, 'emergency rescue') || 0
       if (cancelledQueued && this.config.debug) {
         console.log(`[emergency-rescue:${this.botId}] cancelled queued tasks=${cancelledQueued}`)
@@ -911,6 +953,11 @@ class CloudStoreService {
   }
 
   async runExclusive (username, type, fn, extra = {}) {
+    if (type !== 'craft_recovery') this.db.assertNoPendingCraft?.()
+    const migration = this.db.runDeferredMigrations?.()
+    if (migration?.catalogError || migration?.offlineIdentityError) {
+      throw new Error('恢复后的库存身份迁移尚未完成，请检查日志并重试。')
+    }
     const active = { type, username, cancelled: false, dead: false, phase: 'start', player: null, ...extra }
     this.active = active
     try {
@@ -935,7 +982,10 @@ class CloudStoreService {
 
   enqueueTask (username, type, run, options = {}) {
     if (!this.taskPool) return this.runExclusive(username, type, () => run(this))
-    const stickyWorker = options.stickyWorker && this.taskPool.workers.has(options.stickyWorker) ? options.stickyWorker : null
+    const stickyWorker = options.stickyWorker &&
+      (type === 'craft_recovery' || this.taskPool.workers.has(options.stickyWorker))
+      ? options.stickyWorker
+      : null
     return this.taskPool.enqueue({
       username,
       type,
@@ -1878,126 +1928,117 @@ class CloudStoreService {
   // warehouse already holds. No collection chain — the planner rejects orders whose
   // inputs are missing from storage. Runs as an exclusive task so only one bot crafts.
   // This is the internal entry point; the web panel and the mods are untouched.
+  craftLedger () {
+    if (!this._craftLedger) {
+      const CraftLedger = require('./craft/ledger')
+      this._craftLedger = new CraftLedger(this.db)
+    }
+    return this._craftLedger
+  }
+
+  getCraftController () {
+    if (!this.craftController) {
+      const { CraftController } = require('./craft/controller')
+      this.craftController = new CraftController({
+        bot: this.bot, db: this.db, catalog: this.catalog, config: this.config,
+        warehouse: this.warehouse, executor: this.bot._craftingExecutor,
+        botId: this.botId, ledger: this.craftLedger(),
+        validateOwner: (owner, actor) => this.validateCraftOwner(owner, actor),
+        quota: owner => this.getStorageQuota(owner.uuid, owner.scope)
+      })
+    }
+    return this.craftController
+  }
+
+  validateCraftOwner (owner, username) {
+    if (!this.isAdmin(username)) throw new Error('合成只允许系统管理员使用。')
+    const player = this.getPlayer(username)
+    if (owner.scope === 'custom' || owner.uuid.startsWith('vault:')) {
+      const name = owner.vaultName || owner.uuid.slice(6)
+      if (!this.db.getCustomWarehouse(name) || !this.db.isCustomWarehouseMember(name, player.uuid)) {
+        throw new Error('组织仓库已不存在或你已不是该仓库成员。')
+      }
+    } else if (owner.uuid !== player.uuid) throw new Error('合成仓库归属与请求玩家不一致。')
+  }
+
   async handleCraft (username, text, storageOwner = null) {
-    if (!this.bot._craftingExecutor) {
+    if (this.config.craft?.enabled === false || !this.bot._craftingExecutor) {
       this.msg(username, '合成功能未启用（缺少合成执行器）。')
       return
     }
-    const parts = text.split(/\s+/).filter(Boolean)
-    const request = parts.slice(1).join(' ')
-    const parsed = this.parseCraftRequest(request)
-    if (!parsed.ok) {
-      this.msg(username, parsed.error)
-      return
-    }
-
-    const owner = storageOwner || { ...this.getPlayer(username), scope: 'personal' }
-    const available = this.availableCraftStock(owner.uuid)
+    const parsed = this.parseCraftRequest(String(text).replace(/^!合成\s*/, ''))
+    if (!parsed.ok) { this.msg(username, parsed.error); return }
+    const player = this.getPlayer(username)
+    const owner = storageOwner || { ...player, scope: 'personal' }
+    this.validateCraftOwner(owner, username)
+    const alias = this.resolveByAliasChain(parsed.itemName, player.uuid)
+    if (alias.layer === 'disabled') throw new Error('该物品别名已停用。')
+    const resolved = this.catalog.resolveName(alias.item?.itemId || parsed.itemName)
     const planned = require('./craft').planToCraftCommand({
-      item: parsed.itemName,
-      quantity: parsed.quantity,
-      available,
-      config: this.config
+      item: resolved.name, quantity: parsed.quantity,
+      available: this.availableCraftStock(owner.uuid), config: this.config
     })
-    if (!planned.ok) {
-      this.msg(username, this.describeCraftRejection(planned, parsed))
-      return
+    if (!planned.ok) { this.msg(username, this.describeCraftRejection(planned, parsed)); return }
+    // Capture request intent and explicit owner. The selected worker replans and
+    // reserves current stock under the warehouse lock when execution begins.
+    const request = {
+      player: username, owner: { ...owner }, target: { name: resolved.name, quantity: parsed.quantity },
+      notify: message => this.msg(username, message)
     }
-
-    const command = planned.command
-    command.player = username
-    command.notify = message => this.msg(username, message)
-    const stepCount = command.craftSteps.length
-    this.msg(username, `开始合成 ${parsed.itemName} ×${parsed.quantity}（${stepCount} 步），正在从仓库取料。`)
-
-    await this.enqueueTask(username, 'craft', worker => worker.runCraftCommand(command), { exclusive: true })
+    this.msg(username, '合成请求已提交：' + parsed.itemName + ' ×' + parsed.quantity + '；开工时重新核对库存。')
+    await this.enqueueTask(username, 'craft', worker => worker.runCraftCommand(request), { exclusive: true })
   }
 
-  // Parse "!合成 <物品名>[ 数量]" — quantity defaults to 1 like the withdraw command.
   parseCraftRequest (request) {
     const raw = String(request || '').trim()
-    if (!raw) return { ok: false, error: '格式：!合成 物品名 [数量]，例如 !合成 石头 64' }
-    const match = raw.match(/^(.*?)(?:\s+(\d+))?$/)
-    const itemName = (match?.[1] || raw).trim()
-    const quantity = match?.[2] ? Math.max(1, Number.parseInt(match[2], 10)) : 1
-    if (!itemName) return { ok: false, error: '格式：!合成 物品名 [数量]' }
-    if (!Number.isFinite(quantity) || quantity <= 0) return { ok: false, error: '数量必须是正整数。' }
+    if (!raw) return { ok: false, error: '格式：!合成 物品名 [数量]，例如 !合成 木棍 64' }
+    const match = raw.match(/^(.*?)(?:\s+([^\s]+))?$/)
+    let itemName = raw
+    let quantity = 1
+    if (match?.[2] && /^[+\-\d.]/.test(match[2])) {
+      itemName = match[1].trim()
+      if (!/^\d+$/.test(match[2])) return { ok: false, error: '数量必须是安全的正整数。' }
+      quantity = Number(match[2])
+    }
+    if (!itemName || !Number.isSafeInteger(quantity) || quantity <= 0 || quantity > 1000000) {
+      return { ok: false, error: '数量必须是 1 到 1000000 之间的整数。' }
+    }
     return { ok: true, itemName, quantity }
   }
 
-  // Available stock by plain item base name (planner vocabulary uses names without
-  // the minecraft: prefix). One aggregate query; reservations are already excluded.
   availableCraftStock (ownerUuid) {
     const available = {}
-    for (const row of this.db.getOwnerAvailableTotalsByBaseName(ownerUuid)) {
-      const baseName = String(row.itemId || '').replace(/^minecraft:/, '')
-      if (!baseName) continue
-      available[baseName] = (available[baseName] || 0) + Number(row.amount || 0)
+    for (const row of this.craftLedger().getCraftAvailableItems(ownerUuid)) {
+      const baseName = row.itemId.replace(/^minecraft:/, '')
+      available[baseName] = (available[baseName] || 0) + row.amount
     }
     return available
   }
 
   describeCraftRejection (planned, parsed) {
-    if (planned.reason === 'needs_collection') {
-      const gaps = (planned.plan.collectGaps || [])
-        .slice(0, 5)
-        .map(gap => `${gap.name}×${gap.qty}`)
-        .join('、')
-      return `仓库内原料不足，无法合成 ${parsed.itemName}：缺少 ${gaps}（本功能只使用仓库已有物品，不采集）。`
-    }
-    if (planned.reason === 'no_workstation_configured') {
-      return '该配方需要工作台（3x3），但配置里没有设置合成台坐标（config.craft.table）。'
-    }
-    if (planned.reason === 'already_in_warehouse') {
-      return `仓库里已有足够 ${parsed.itemName}，无需合成。`
-    }
-    return `无法合成 ${parsed.itemName}：配方不可达或所需中间产物无法获得。`
+    if (planned.reason === 'needs_collection') return '仓库内原料不足，无法合成 ' + parsed.itemName + '（只使用散装库存，不采集）。'
+    if (planned.reason === 'no_workstation_configured') return '该配方需要工作台（3x3），请配置 config.craft.table。'
+    if (planned.reason === 'already_in_warehouse') return '仓库里已有足够 ' + parsed.itemName + '，无需合成。'
+    return '无法合成 ' + parsed.itemName + '：配方不可达、原料不足或合成配置无效。'
   }
 
-  // Runs inside an exclusive task; delegates to the ported executor and reports the
-  // outcome. The ported executor reports through its event sink, so this wrapper
-  // turns the terminal events into player-facing messages.
   async runCraftCommand (command) {
-    const executor = this.bot._craftingExecutor
-    const notify = typeof command.notify === 'function' ? command.notify : () => {}
-    const target = command.target?.name || '目标物品'
-    const sink = this.bot._craftSink
-    const previous = sink && sink.onEvent
-    if (sink) {
-      sink.onEvent = (type, payload, opts) => {
-        if (previous) previous(type, payload, opts)
-        if (type === 'craft_completed') {
-          notify(`合成完成：${payload?.finalItem || target} 已交付${Number.isFinite(payload?.delivered) ? ` ×${payload.delivered}` : ''}。`)
-        } else if (type === 'deposit_completed') {
-          notify(`交付完成：${payload?.finalItem || target}${Number.isFinite(payload?.delivered) ? ` ×${payload.delivered}` : ''} 已入成品箱。`)
-        } else if (type === 'craft_failed') {
-          notify(`合成失败：${this.describeCraftFailure(payload?.reason)}`)
-        }
-      }
-    }
-    try {
-      await executor.handleCommand(command)
-    } catch (error) {
-      notify(`合成失败：${this.describeCraftFailure(error && (error.reason || error.message))}`)
-    } finally {
-      if (sink && previous) sink.onEvent = previous
-    }
+    const result = await this.getCraftController().run({
+      actor: command.player, owner: command.owner, item: command.target.name, quantity: command.target.quantity
+    })
+    const notify = command.notify || (message => this.msg(command.player, message))
+    if (result.status === 'complete') notify('合成完成：' + command.target.name + ' ×' + command.target.quantity + '，产物与余料已回云仓并记账。')
+    else if (result.status === 'already_sufficient') notify('仓库里已有足够目标物品，无需继续合成。')
+    return result
   }
 
-  // Turn executor reasons into short player-facing text; keep the raw reason for
-  // operators in the console when debug is on.
-  describeCraftFailure (reason) {
-    const text = String(reason || 'unknown')
-    if (this.config.debug) console.warn(`[craft] failure reason: ${text}`)
-    if (text.startsWith('buffer_deposit_incomplete')) return '成品未能完整存入仓库，请让管理员检查木桶余量。'
-    if (text.startsWith('buffer_material_access_failed') || text.startsWith('insufficient_buffer_materials')) return '仓库原料取出失败或不足，请让管理员执行 !同步 对账。'
-    if (text.startsWith('no_buffer_barrel')) return '没有可用的仓库木桶。'
-    if (text.startsWith('no_output_container')) return '没有可用的成品容器。'
-    if (text.startsWith('workstation')) return '工作台不可用（检查 config.craft.table 坐标）。'
-    if (text.startsWith('craft_transaction_failed') || text.startsWith('craft_result_unconfirmed')) return '合成点击未被服务器确认，物料已尽量回存。'
-    if (text.startsWith('executor_busy')) return '机器人正忙，请稍后再试。'
-    if (text.startsWith('executor_timeout')) return '合成超时，物料已尽量回存。'
-    return text
+  async handleCraftRecovery (username) {
+    if (!this.isAdmin(username)) throw new Error('合成恢复只允许系统管理员使用。')
+    return this.enqueueTask(username, 'craft_recovery', async worker => {
+      const result = await worker.getCraftController().recover()
+      worker.msg(username, result.status === 'empty' ? '本机器人没有待恢复的合成任务。' : '合成中断状态已核验，物品已回云仓；可重新提交合成。')
+      return result
+    }, { exclusive: true, stickyWorker: this })
   }
 
   async handleCreateCustomWarehouse (username, text) {
@@ -3625,6 +3666,7 @@ class CloudStoreService {
   }
 
   async flushResidual () {
+    if (this.db.hasPendingCraft?.(this.botId)) throw new Error('存在合成恢复记录，禁止将其残留物记入 momo；请执行 !合成恢复。')
     const held = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
     const task = this.db.getRecoveryTask(this.botId)
     if (!held.length) {

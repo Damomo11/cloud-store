@@ -23,6 +23,10 @@ class BotTaskPool {
     this.queue = []
     this.sequence = 0
     this.seenMessages = new Map()
+    // Retain the execution lease even when death/reconnect changes worker.active
+    // or unregisters a disconnected worker. Its network calls may still drain.
+    this.inFlight = new Map()
+    this.drainWaiters = new Set()
     this.warehouseMutex = new AsyncMutex()
     this.warehouseState = { revision: 0, chestRevisions: new Map() }
   }
@@ -40,6 +44,18 @@ class BotTaskPool {
     const cancelled = []
     this.queue = this.queue.filter(task => {
       if (task.stickyWorker !== worker) return true
+      cancelled.push(task)
+      task.resolve?.(null)
+      return false
+    })
+    if (cancelled.length) this.dispatch()
+    return cancelled.length
+  }
+
+  cancelQueuedCraftRecovery (botId) {
+    const cancelled = []
+    this.queue = this.queue.filter(task => {
+      if (task.type !== 'craft_recovery' || task.stickyWorker?.botId !== botId) return true
       cancelled.push(task)
       task.resolve?.(null)
       return false
@@ -78,12 +94,41 @@ class BotTaskPool {
   }
 
   eligibleWorkerForTask (task) {
+    // Craft recovery is bound to the bot that owns its physical inventory and
+    // durable journal. Unlike ordinary private tasks, it must never fall back.
+    if (task.type === 'craft_recovery') {
+      const original = task.stickyWorker
+      const sticky = this.workers.has(original) ? original : original?.botId
+        ? [...this.workers].find(worker => worker.botId === original.botId)
+        : null
+      if (!sticky) return null
+      return sticky.ready && !sticky.active && !this.inFlight.has(sticky) && !sticky.recoveringFromDeath && !sticky.emergencyRescueActive ? sticky : null
+    }
     // 私聊进来的业务任务绑定接收私信的机器人；该机器人掉线后退回任意空闲机器人，避免任务卡死。
     if (task.stickyWorker && this.workers.has(task.stickyWorker)) {
       const sticky = task.stickyWorker
-      return sticky.ready && !sticky.active && !sticky.recoveringFromDeath && !sticky.emergencyRescueActive ? sticky : null
+      return sticky.ready && !sticky.active && !this.inFlight.has(sticky) && !sticky.recoveringFromDeath && !sticky.emergencyRescueActive ? sticky : null
     }
-    return [...this.workers].find(candidate => candidate.ready && !candidate.active && !candidate.recoveringFromDeath && !candidate.emergencyRescueActive) || null
+    return [...this.workers].find(candidate => candidate.ready && !candidate.active && !this.inFlight.has(candidate) && !candidate.recoveringFromDeath && !candidate.emergencyRescueActive) || null
+  }
+
+  hasInFlightCraft (botId = '') {
+    return [...this.inFlight].some(([worker, task]) =>
+      (task.type === 'craft' || task.type === 'craft_recovery') && (!botId || worker.botId === botId))
+  }
+
+  waitForCraftDrain (botId = '') {
+    if (!this.hasInFlightCraft(botId)) return Promise.resolve()
+    return new Promise(resolve => this.drainWaiters.add({ botId, resolve }))
+  }
+
+  resolveCraftDrainWaiters () {
+    for (const waiter of this.drainWaiters) {
+      if (!this.hasInFlightCraft(waiter.botId)) {
+        this.drainWaiters.delete(waiter)
+        waiter.resolve()
+      }
+    }
   }
 
   snapshot () {
@@ -103,9 +148,10 @@ class BotTaskPool {
   }
 
   dispatch () {
+    if ([...this.inFlight.values()].some(task => task.exclusive)) return
     if ([...this.workers].some(worker => worker.active?.exclusive)) return
     if (this.queue[0]?.exclusive) {
-      if ([...this.workers].some(worker => worker.active)) return
+      if (this.inFlight.size || [...this.workers].some(worker => worker.active)) return
       const worker = this.eligibleWorkerForTask(this.queue[0])
       if (!worker) return
       this.run(worker, this.queue.shift())
@@ -123,6 +169,7 @@ class BotTaskPool {
   }
 
   async run (worker, task) {
+    this.inFlight.set(worker, task)
     try {
       const result = await worker.runExclusive(task.username, task.type, () => task.run(worker), {
         taskId: task.id,
@@ -134,6 +181,8 @@ class BotTaskPool {
       worker.handleCommandError(task.username, error)
       task.resolve(null)
     } finally {
+      this.inFlight.delete(worker)
+      this.resolveCraftDrainWaiters()
       this.dispatch()
     }
   }

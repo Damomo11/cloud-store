@@ -1,25 +1,23 @@
 // 备料系统 · 阶段2 — W1 自研合成引擎 RecipeGraph（离线可单测）。
-// 依据 design.md §3.1 与 requirements.md Requirement 1.1–1.5：
-//   1.1 服务端启动，从项目根 recipes.json(1.21.4) 读入配方数据，建立
+// 基于上游 design.md §3.1 与 requirements.md Requirement 1.1–1.5 改编：
+//   1.1 生产环境从配置版本的 minecraft-data 可执行配方建立
 //       recipesByResult[产物名] → UsableRecipe[] 索引。
 //   1.2 仅保留 shaped / shapeless；加载期过滤 smelting/blasting/campfire_cooking/
 //       smoking/stonecutting/smithing_transform/transmute/special/decorated_pot。
 //   1.3 归一化为「含产物名与数量的结果」+「每个输入的候选物品名集合与所需数量」。
 //   1.4 输入以 tag 给出时展开为候选物品名集合（含 recipes.json 的嵌套 tag，递归 + 环剪除），
 //       候选集合中任一物品可得即视为满足（对齐 MC tag 语义）。
-//   1.5 使用 minecraft-data 的 1.21.4 registry 校验/归一化；无法提供 1.21.4 registry 时
-//       拒绝启动并记录版本不匹配错误（由 versionGuard.loadMcRegistry() 抛 VersionMismatchError）。
+//   1.5 使用同版本 registry 校验/归一化；无法提供所需 registry 或配方时拒绝启用。
 //
-// 规划真值源：recipes.json(1.21.4) 的物品名（去 minecraft: 前缀归一化）为唯一真值源；
-// registry 仅用于名称校验（剔除 registry 未知的名称并记日志）。实测 1.21.4 下
-// shaped/shapeless 的所有产物名与输入候选名均在 registry 内，故正常情况下不会剔除任何名称。
+// 生产规划与执行共用 minecraft-data 的具体配方；历史 recipes.json(1.21.4)
+// 仅通过 recipesJson / recipesPath 显式注入，用于保留上游 tag 等离线回归场景。
 
 import fs from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
+import minecraftData from "minecraft-data";
+import { standardRecipeOutputs } from "../recipe-outputs";
 
 import type { McRegistry } from "./versionGuard";
-import { loadMcRegistry } from "./versionGuard";
+import { loadMcRegistry, PREPARATION_MC_VERSION } from "./versionGuard";
 import type { RecipeInput, RecipeResult, UsableRecipe, UsableRecipeType } from "./types";
 
 // ---------------------------------------------------------------------------
@@ -178,6 +176,8 @@ interface RawRecipe {
   /** 该配方对应的数据包文件名（如 iron_ingot_from_iron_block.json），用作稳定 id。 */
   file?: string;
   group?: string;
+  requiresTable?: boolean;
+  outputs?: RecipeResult[];
 }
 
 interface RawRecipesJson {
@@ -245,16 +245,59 @@ export function buildTagResolver(tagsJson: Record<string, string[]> | undefined)
 }
 
 // ---------------------------------------------------------------------------
-// 默认 recipes.json 路径解析（项目根）
+// 从生产 registry 生成归一化前的配方记录
 // ---------------------------------------------------------------------------
 
-function defaultRecipesPath(): string {
-  const __filename = fileURLToPath(import.meta.url);
-  const __dirname = path.dirname(__filename);
-  // __dirname = <root>/OlelaSystem2/src-api/src/core/preparation
-  const SRC_API_DIR = path.resolve(__dirname, "..", "..", ".."); // → src-api
-  const PROJECT_ROOT = path.resolve(SRC_API_DIR, "..", ".."); // → 项目根
-  return path.join(PROJECT_ROOT, "recipes.json");
+// Production uses the executor's concrete registry recipes. The legacy JSON
+// remains an explicit fixture seam; it must not fill gaps in a newer catalog.
+function recipesFromRegistry(registry: McRegistry): RawRecipesJson {
+  const recipesByResult: Record<string, RawRecipe[]> = {};
+  const itemName = (value: unknown): string | undefined => {
+    const id = typeof value === "object" && value !== null ? (value as { id?: number }).id : value;
+    return typeof id === "number" ? registry.items?.[id]?.name : undefined;
+  };
+  for (const list of Object.values(registry.recipes ?? {})) {
+    if (!Array.isArray(list)) continue;
+    for (const [index, entry] of list.entries()) {
+      const resultName = itemName(entry.result);
+      if (!resultName) continue;
+      let invalid = false;
+      let inputCount = 0;
+      const slot = (value: unknown): RawSlot => {
+        if (value == null || value === -1) return null;
+        const name = itemName(value);
+        if (!name) invalid = true;
+        else inputCount += 1;
+        return name ? { item: name } : null;
+      };
+      let raw: RawRecipe;
+      if (Array.isArray(entry.inShape)) {
+        const pattern = entry.inShape.map(row => row.map(slot));
+        raw = {
+          type: "shaped",
+          pattern,
+          requiresTable: pattern.length > 2 || pattern.some(row => row.length > 2),
+        };
+      } else if (Array.isArray(entry.ingredients)) {
+        const ingredients = entry.ingredients.map(slot);
+        raw = { type: "shapeless", ingredients, requiresTable: ingredients.length > 4 };
+      } else {
+        continue; // Furnace, stonecutter and other workstation recipes are excluded.
+      }
+      if (invalid || inputCount === 0) continue;
+      try {
+        raw.outputs = standardRecipeOutputs(registry, entry).map(output => ({
+          name: registry.items[output.id].name, count: output.count,
+        }));
+      } catch {
+        continue; // Unknown or unsupported container returns must never reach execution.
+      }
+      raw.result = { item: resultName, count: entry.result.count ?? 1 };
+      raw.file = `${resultName}__${index}`;
+      (recipesByResult[resultName] ??= []).push(raw);
+    }
+  }
+  return { meta: { version: registry.version?.minecraftVersion ?? "unknown" }, recipesByResult };
 }
 
 // ---------------------------------------------------------------------------
@@ -262,7 +305,9 @@ function defaultRecipesPath(): string {
 // ---------------------------------------------------------------------------
 
 export interface RecipeGraphOptions {
-  /** 覆盖 recipes.json 路径（默认项目根 recipes.json）。测试可注入。 */
+  /** 与实际 bot/config.server.version 一致；默认生产版本。 */
+  version?: string;
+  /** 显式加载历史/测试配方快照；生产默认使用 registry recipes。 */
   recipesPath?: string;
   /** 直接注入已解析的 recipes.json 对象（优先于 recipesPath）。测试可注入。 */
   recipesJson?: unknown;
@@ -273,15 +318,15 @@ export interface RecipeGraphOptions {
 /**
  * RecipeGraph —— 归一化的可用配方索引。
  *
- * 构造即：① 校验并加载 1.21.4 registry（无法提供则抛 VersionMismatchError → 拒绝启动）；
- * ② 读入 recipes.json；③ 过滤为 shaped/shapeless；④ 展开 tag、归一化并建立
+ * 构造即：① 校验并加载配置版本 registry；② 默认读取 registry recipes，
+ * 测试可显式注入历史 JSON；③ 过滤为 shaped/shapeless；④ 展开 tag、归一化并建立
  * recipesByResult[产物名] → UsableRecipe[] 索引。
  */
 export class RecipeGraph {
   /** 索引：产物名（归一化） → 可用配方列表。 */
   private readonly recipesByResult: Map<string, UsableRecipe[]> = new Map();
 
-  /** minecraft-data 1.21.4 registry（名称校验用）。 */
+  /** 对应配置版本的 minecraft-data registry（生产配方与名称校验）。 */
   private readonly registry: McRegistry;
 
   /** 加载统计（供日志/单测断言）。 */
@@ -297,8 +342,13 @@ export class RecipeGraph {
   };
 
   constructor(options: RecipeGraphOptions = {}) {
-    // Requirement 1.5：校验 1.21.4 registry；无法提供则抛 VersionMismatchError。
-    this.registry = options.registry ?? loadMcRegistry();
+    // 无法提供配置版本的 registry 时拒绝启用，避免使用另一版本的配方。
+    const version = options.version ?? PREPARATION_MC_VERSION;
+    this.registry = options.registry ?? (version === PREPARATION_MC_VERSION
+      ? loadMcRegistry() : minecraftData(version));
+    if (!this.registry?.itemsByName) {
+      throw new Error(`RecipeGraph: no minecraft-data registry for version '${version}'`);
+    }
 
     const recipesJson = this.resolveRecipesJson(options);
     const resolveTag = buildTagResolver(recipesJson.tags);
@@ -372,7 +422,7 @@ export class RecipeGraph {
     return [...this.recipesByResult.keys()];
   }
 
-  /** 该名称是否为 1.21.4 registry 已知物品（Requirement 1.5 归一化/校验辅助）。 */
+  /** 该名称是否为当前 registry 已知物品（归一化/校验辅助）。 */
   isKnownItem(itemName: string): boolean {
     return Boolean(this.registry.itemsByName?.[stripNamespace(itemName)]);
   }
@@ -385,7 +435,11 @@ export class RecipeGraph {
     if (options.recipesJson !== undefined) {
       return options.recipesJson as RawRecipesJson;
     }
-    const recipesPath = options.recipesPath ?? defaultRecipesPath();
+    if (options.recipesPath === undefined) {
+      if (!this.registry.recipes) throw new Error("RecipeGraph: registry has no executable recipes");
+      return recipesFromRegistry(this.registry);
+    }
+    const recipesPath = options.recipesPath;
     let raw: string;
     try {
       raw = fs.readFileSync(recipesPath, "utf8");
@@ -462,6 +516,7 @@ export class RecipeGraph {
       // Ported addition: keep the recipe's own 3x3 requirement so callers can decide
       // whether a configured workbench is needed before a bot is attached.
       requiresTable: Boolean(raw.requiresTable),
+      outputs: raw.outputs ?? [{ ...result }],
     });
     return { recipe, droppedEmptyInputSlot };
   }
@@ -508,17 +563,15 @@ export class RecipeGraph {
 // 单例（服务端启动加载一次；测试用 new RecipeGraph(...) 注入）
 // ---------------------------------------------------------------------------
 
-let cachedGraph: RecipeGraph | null = null;
+const cachedGraphs = new Map<string, RecipeGraph>();
 
-/** 获取进程级 RecipeGraph 单例（首次调用时从项目根 recipes.json 加载）。 */
-export function getRecipeGraph(): RecipeGraph {
-  if (!cachedGraph) {
-    cachedGraph = new RecipeGraph();
-  }
-  return cachedGraph;
+/** 按版本缓存生产 RecipeGraph（首次调用时从对应 registry 加载配方）。 */
+export function getRecipeGraph(version: string = PREPARATION_MC_VERSION): RecipeGraph {
+  if (!cachedGraphs.has(version)) cachedGraphs.set(version, new RecipeGraph({ version }));
+  return cachedGraphs.get(version)!;
 }
 
 /** 仅供测试：清除单例缓存。 */
 export function resetRecipeGraphForTest(): void {
-  cachedGraph = null;
+  cachedGraphs.clear();
 }

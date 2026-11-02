@@ -40,8 +40,8 @@ __export(RecipeGraph_exports, {
 });
 module.exports = __toCommonJS(RecipeGraph_exports);
 var import_node_fs = __toESM(require("node:fs"));
-var import_node_path = __toESM(require("node:path"));
-var import_node_url = require("node:url");
+var import_minecraft_data = __toESM(require("minecraft-data"));
+var import_recipe_outputs = require("../recipe-outputs");
 var import_versionGuard = require("./versionGuard");
 const USABLE_RECIPE_TYPES = /* @__PURE__ */ new Set([
   "shaped",
@@ -157,19 +157,69 @@ function buildTagResolver(tagsJson) {
   };
   return resolve;
 }
-function defaultRecipesPath() {
-  // Ported from olela: recipes.json truth source now lives in cloud-store's data/.
-  return import_node_path.default.join(__dirname, "..", "..", "..", "data", "recipes.json");
+function recipesFromRegistry(registry) {
+  const recipesByResult = {};
+  const itemName = (value) => {
+    const id = typeof value === "object" && value !== null ? value.id : value;
+    return typeof id === "number" ? registry.items?.[id]?.name : void 0;
+  };
+  for (const list of Object.values(registry.recipes ?? {})) {
+    if (!Array.isArray(list)) continue;
+    for (const [index, entry] of list.entries()) {
+      const resultName = itemName(entry.result);
+      if (!resultName) continue;
+      let invalid = false;
+      let inputCount = 0;
+      const slot = (value) => {
+        if (value == null || value === -1) return null;
+        const name = itemName(value);
+        if (!name) invalid = true;
+        else inputCount += 1;
+        return name ? { item: name } : null;
+      };
+      let raw;
+      if (Array.isArray(entry.inShape)) {
+        const pattern = entry.inShape.map((row) => row.map(slot));
+        raw = {
+          type: "shaped",
+          pattern,
+          requiresTable: pattern.length > 2 || pattern.some((row) => row.length > 2)
+        };
+      } else if (Array.isArray(entry.ingredients)) {
+        const ingredients = entry.ingredients.map(slot);
+        raw = { type: "shapeless", ingredients, requiresTable: ingredients.length > 4 };
+      } else {
+        continue;
+      }
+      if (invalid || inputCount === 0) continue;
+      try {
+        raw.outputs = (0, import_recipe_outputs.standardRecipeOutputs)(registry, entry).map((output) => ({
+          name: registry.items[output.id].name,
+          count: output.count
+        }));
+      } catch {
+        continue;
+      }
+      raw.result = { item: resultName, count: entry.result.count ?? 1 };
+      raw.file = `${resultName}__${index}`;
+      (recipesByResult[resultName] ??= []).push(raw);
+    }
+  }
+  return { meta: { version: registry.version?.minecraftVersion ?? "unknown" }, recipesByResult };
 }
 class RecipeGraph {
   /** 索引：产物名（归一化） → 可用配方列表。 */
   recipesByResult = /* @__PURE__ */ new Map();
-  /** minecraft-data 1.21.4 registry（名称校验用）。 */
+  /** 对应配置版本的 minecraft-data registry（生产配方与名称校验）。 */
   registry;
   /** 加载统计（供日志/单测断言）。 */
   stats;
   constructor(options = {}) {
-    this.registry = options.registry ?? (0, import_versionGuard.loadMcRegistry)();
+    const version = options.version ?? import_versionGuard.PREPARATION_MC_VERSION;
+    this.registry = options.registry ?? (version === import_versionGuard.PREPARATION_MC_VERSION ? (0, import_versionGuard.loadMcRegistry)() : (0, import_minecraft_data.default)(version));
+    if (!this.registry?.itemsByName) {
+      throw new Error(`RecipeGraph: no minecraft-data registry for version '${version}'`);
+    }
     const recipesJson = this.resolveRecipesJson(options);
     const resolveTag = buildTagResolver(recipesJson.tags);
     const recipesByResult = recipesJson.recipesByResult ?? {};
@@ -230,7 +280,7 @@ class RecipeGraph {
   producibleItems() {
     return [...this.recipesByResult.keys()];
   }
-  /** 该名称是否为 1.21.4 registry 已知物品（Requirement 1.5 归一化/校验辅助）。 */
+  /** 该名称是否为当前 registry 已知物品（归一化/校验辅助）。 */
   isKnownItem(itemName) {
     return Boolean(this.registry.itemsByName?.[stripNamespace(itemName)]);
   }
@@ -241,7 +291,11 @@ class RecipeGraph {
     if (options.recipesJson !== void 0) {
       return options.recipesJson;
     }
-    const recipesPath = options.recipesPath ?? defaultRecipesPath();
+    if (options.recipesPath === void 0) {
+      if (!this.registry.recipes) throw new Error("RecipeGraph: registry has no executable recipes");
+      return recipesFromRegistry(this.registry);
+    }
+    const recipesPath = options.recipesPath;
     let raw;
     try {
       raw = import_node_fs.default.readFileSync(recipesPath, "utf8");
@@ -307,7 +361,8 @@ class RecipeGraph {
       inputs: Array.from(slots.values()),
       // Ported addition: keep the recipe's own 3x3 requirement so callers can decide
       // whether a configured workbench is needed before a bot is attached.
-      requiresTable: Boolean(raw.requiresTable)
+      requiresTable: Boolean(raw.requiresTable),
+      outputs: raw.outputs ?? [{ ...result }]
     });
     return { recipe, droppedEmptyInputSlot };
   }
@@ -346,13 +401,24 @@ class RecipeGraph {
     return `${resultName}#${raw.type}`;
   }
 }
-let cachedGraph = null;
-function getRecipeGraph() {
-  if (!cachedGraph) {
-    cachedGraph = new RecipeGraph();
-  }
-  return cachedGraph;
+const cachedGraphs = /* @__PURE__ */ new Map();
+function getRecipeGraph(version = import_versionGuard.PREPARATION_MC_VERSION) {
+  if (!cachedGraphs.has(version)) cachedGraphs.set(version, new RecipeGraph({ version }));
+  return cachedGraphs.get(version);
 }
 function resetRecipeGraphForTest() {
-  cachedGraph = null;
+  cachedGraphs.clear();
 }
+// Annotate the CommonJS export names for ESM import in node:
+0 && (module.exports = {
+  FILTERED_RECIPE_TYPES,
+  RecipeGraph,
+  USABLE_RECIPE_TYPES,
+  buildTagResolver,
+  completeKnownRecipeInputs,
+  getRecipeGraph,
+  narrowToExecutableNames,
+  resetExecutableIngredientCache,
+  resetRecipeGraphForTest,
+  stripNamespace
+});

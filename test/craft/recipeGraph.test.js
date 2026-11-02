@@ -134,7 +134,7 @@ const syntheticRecipesJson = {
   });
 });
 (0, import_vitest.describe)("RecipeGraph (real recipes.json smoke test)", () => {
-  const graph = new import_RecipeGraph.RecipeGraph();
+  const graph = new import_RecipeGraph.RecipeGraph({ recipesPath: require.resolve("../../data/recipes.json") });
   (0, import_vitest.it)("loads the 1.21.4 recipe catalog against the production 1.21.11 registry", () => {
     (0, import_vitest.expect)(graph.stats.sourceVersion).toBe("1.21.4");
     (0, import_vitest.expect)(graph.stats.usableRecipeCount).toBe(931);
@@ -235,7 +235,7 @@ const syntheticRecipesJson = {
     (0, import_vitest.expect)((0, import_RecipeGraph.narrowToExecutableNames)("oak_planks", bogus)).toEqual(bogus);
   });
   (0, import_vitest.it)("\u6536\u7A84\u540E\u7684\u5019\u9009\u96C6\u4F1A\u4F53\u73B0\u5728\u771F\u5B9E RecipeGraph \u7684 oak_planks \u914D\u65B9\u8F93\u5165\u91CC", () => {
-    const real = new import_RecipeGraph.RecipeGraph();
+    const real = new import_RecipeGraph.RecipeGraph({ recipesPath: require.resolve("../../data/recipes.json") });
     const recipes = real.getRecipesFor("oak_planks");
     (0, import_vitest.expect)(recipes.length).toBeGreaterThan(0);
     const slot = recipes[0].inputs[0];

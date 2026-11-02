@@ -5,6 +5,7 @@ const { sleep, sumBy } = require('./utils')
 const { logLocalError } = require('./localErrorLog')
 const { isFatalProtocolReadError } = require('./botConnection')
 const { traceEvent, shortKey } = require('./traceLog')
+const { openServerContainer, readServerContainer } = require('./craft/server-container-evidence')
 
 class Warehouse {
   constructor (bot, db, catalog, config, warehouseMutex = null, warehouseState = null) {
@@ -235,7 +236,7 @@ class Warehouse {
     return { deposited, leftover: after, stopReason: depositResult.stopReason || '' }
   }
 
-  async depositAllPossible () {
+  async depositAllPossible (options = {}) {
     const chests = this.db.listChests()
     if (!chests.length) {
       this.trace('error', 'deposit_no_registered_chests', {
@@ -312,6 +313,8 @@ class Warehouse {
         this.closeContainerQuietly(container)
       }
 
+      if (options.requireServerEvidence) await this.verifyCraftContainer(chest)
+
       if (movedInChest <= 0) {
         skippedNoProgress.add(chest.chestId)
         if (fullRecordCandidate) fullAttempts++
@@ -333,6 +336,35 @@ class Warehouse {
     }
 
     return { stopReason }
+  }
+
+  async verifyCraftContainer (chest) {
+    try {
+      const expectedChest = this.db.listChestSlots().filter(row => row.chestId === chest.chestId && row.slot !== null)
+        .map(row => ({ slot: row.slot, itemKey: row.itemKey, amount: row.amount }))
+      const expectedPlayer = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
+      const snapshot = await readServerContainer(this, chest, this.catalog, this.bot)
+      this.db.replaceChestSlots(chest.chestId, snapshot.chestSlots)
+      const localPlayer = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
+      if (!this.sameCraftChestSlots(snapshot.chestSlots, expectedChest) || !this.sameCraftItems(snapshot.playerItems, expectedPlayer) ||
+        !this.sameCraftItems(snapshot.playerItems, localPlayer) || this.bot.currentWindow || this.bot.inventory.selectedItem ||
+        this.bot.inventory.slots?.slice(0, 5).some(Boolean)) {
+        throw new Error('取存后的服务端箱子或背包快照与预测结果不一致，等待合成恢复。')
+      }
+    } catch (error) {
+      error.uncertainTransfer = true
+      throw error
+    }
+  }
+
+  sameCraftChestSlots (left, right) {
+    const entries = values => JSON.stringify(values.map(value => [value.slot, value.itemKey, value.amount]).sort((a, b) => a[0] - b[0]))
+    return entries(left) === entries(right)
+  }
+
+  sameCraftItems (left, right) {
+    const totals = values => JSON.stringify(values.map(value => [value.itemKey, value.amount]).sort((a, b) => a[0].localeCompare(b[0])))
+    return totals(left) === totals(right)
   }
 
   nextDepositChest (skipped = new Set(), options = {}) {
@@ -587,7 +619,7 @@ class Warehouse {
     return this.withWarehouseLock(() => this.withdrawAllocationsLocked(allocations))
   }
 
-  async withdrawAllocationsLocked (allocations) {
+  async withdrawAllocationsLocked (allocations, options = {}) {
     const withdrawn = []
     const missing = []
     const unlocated = []
@@ -595,6 +627,7 @@ class Warehouse {
 
     for (const allocation of allocations) {
       if (allocation.withdrawMode === 'shulker_extract') {
+        if (options.requireServerEvidence) throw new Error('合成取料只支持已登记的散装库存。')
         const result = await this.withdrawFromShulkerBoxes(allocation)
         withdrawn.push(...result.withdrawn)
         missing.push(...result.missing)
@@ -627,6 +660,7 @@ class Warehouse {
       // 读到什么就用实测内容刷新该桶记录，凑够或搜完为止。
       let searchBarrels = false
       if (!chestGroups.length) {
+        if (options.requireServerEvidence) throw new Error('合成取料缺少已登记的箱子槽位，等待人工核对。')
         this.reportMissingLooseRecord(allocation, itemInfo)
         unlocated.push({ ...itemInfo, amount: allocation.amount })
         chestGroups = this.buildUnlocatedSearchGroups()
@@ -727,7 +761,30 @@ class Warehouse {
           hop: missingBarrelHops,
           decision: `定位到木桶 ${this.describeChest(chest)}（账本 ${group.recordedAmount} 个），走去打开`
         })
-        let container = await this.openContainerAt(chest)
+        let container
+        if (options.requireServerEvidence) {
+          let snapshot
+          try { snapshot = await openServerContainer(this, chest, this.catalog, this.bot) } catch (error) {
+            error.uncertainTransfer = true
+            throw error
+          }
+          container = snapshot.container
+          const recorded = this.db.listChestSlots().filter(row => row.chestId === chest.chestId && Number.isInteger(row.slot))
+            .map(row => ({ slot: row.slot, itemKey: row.itemKey, amount: Number(row.amount) }))
+          const localChest = this.containerContentItems(container).map(item => ({
+            ...this.catalog.fromPrismarineItem(item), slot: item.slot, amount: item.count
+          }))
+          const windowPlayer = this.catalog.aggregatePrismarineItems(container.items())
+          if (!this.sameCraftChestSlots(snapshot.chestSlots, recorded) || !this.sameCraftChestSlots(snapshot.chestSlots, localChest) ||
+            !this.sameCraftItems(snapshot.playerItems, windowPlayer) || !this.sameCraftItems(snapshot.playerItems, this.catalog.aggregatePrismarineItems(this.bot.inventory.items())) ||
+            container.selectedItem || this.bot.currentWindow !== container) {
+            this.closeContainerQuietly(container)
+            const error = new Error('合成取料开箱时服务端实物与背包记录不一致，等待人工核对。')
+            error.uncertainTransfer = true
+            throw error
+          }
+        } else container = await this.openContainerAt(chest)
+        let transferAttempted = false
         // 开窗前的该桶 revision：读窗期间若被其他流程改写（如紧急救援直写库存），
         // 多出部分可能是在途物品，跳过自动入账留给 !同步，避免双重记账。
         const revisionBeforeOpen = this.warehouseState?.chestRevisions?.get(chestId) || 0
@@ -770,6 +827,11 @@ class Warehouse {
           }
           this.debug(`window slots container=0..${container.inventoryStart - 1} inventory=${container.inventoryStart}..${container.inventoryEnd - 1}`)
           const toTake = Math.min(remaining, available)
+          if (options.requireServerEvidence && available !== group.recordedAmount) {
+            const error = new Error('合成取料时箱子实物与记录不一致，等待人工核对。')
+            error.uncertainTransfer = true
+            throw error
+          }
           this.debug(`withdraw open ${this.describeChest(chest)} recorded=${group.recordedAmount} actual=${available} need=${remaining}`)
           this.trace('open', 'barrel_open', {
             chest: this.describeChest(chest),
@@ -780,6 +842,7 @@ class Warehouse {
             contents: this.snapshotContainerContents(container),
             decision: `打开木桶：目标物品实际 ${available} 个（账本 ${group.recordedAmount}），本次计划取 ${toTake}`
           })
+          transferAttempted = true
           const moved = await this.tryWithdrawExactFrom(container, allocation.itemKey, toTake, group.slots.map(row => row.slot))
           if (moved > 0) {
             withdrawn.push({ ...itemInfo, amount: moved })
@@ -837,7 +900,12 @@ class Warehouse {
             }
           }
         } catch (error) {
+          if (options.requireServerEvidence && transferAttempted) {
+            error.uncertainTransfer = true
+            throw error
+          }
           if (error?.uncertainTransfer) {
+            if (options.requireServerEvidence) throw error
             // 点击级重试已用尽仍无法确认实物状态：不刷新该桶记录（窗口内容存疑，避免写入过期状态），
             // 保留原记录并换下一个木桶，任务继续，剩余数量最终计入缺失。
             missingBarrelHops++
@@ -861,6 +929,7 @@ class Warehouse {
         } finally {
           this.closeContainerQuietly(container)
         }
+        if (options.requireServerEvidence && transferAttempted) await this.verifyCraftContainer(chest)
       }
 
       if (remaining > 0) {
@@ -2462,6 +2531,7 @@ class Warehouse {
   }
 
   async applyWarehouseScan (scan, radius, options = {}) {
+    this.db.assertNoPendingCraft?.()
     const { blocks, snapshots } = scan
     this.assertConnectionHealthy()
 

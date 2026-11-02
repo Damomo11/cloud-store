@@ -48,6 +48,10 @@ export interface UsableRecipe {
   result: RecipeResult;
   /** 归一化输入位集合。 */
   inputs: RecipeInput[];
+  /** Whether this concrete recipe needs a 3x3 crafting table. */
+  requiresTable: boolean;
+  /** Main result and deterministic returned containers from one trigger. */
+  outputs?: RecipeResult[];
 }
 
 // ---------------------------------------------------------------------------
@@ -207,6 +211,10 @@ export interface CraftStep {
   recipeId: string;
   /** 该步骤产出的产物（物品名 + 目标产出数量）。 */
   result: RecipeResult;
+  /** Preserved through branch cloning and step merging for workstation checks. */
+  requiresTable: boolean;
+  /** Gross produced items, including returned containers, for one trigger. */
+  outputs?: RecipeResult[];
   /** 需触发该配方的次数 times = ceil(净缺口 / result.count)。 */
   times: number;
   /** 触发所需的输入位集合（与配方 inputs 同构，count 已乘以 times 的语义由消费方约定）。 */

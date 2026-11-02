@@ -1,0 +1,516 @@
+'use strict'
+
+const test = require('node:test')
+const assert = require('node:assert/strict')
+const { EventEmitter } = require('node:events')
+const Vec3 = require('vec3')
+const ItemCatalog = require('../../src/itemCatalog')
+const registry = require('minecraft-data')('1.21.11')
+const Recipe = require('prismarine-recipe')(registry).Recipe
+const Item = require('prismarine-item')(registry)
+const { createInventoryExecutor } = require('../../src/craft/inventory-executor')
+
+function item (name, count, customName) {
+  const value = new Item(registry.itemsByName[name].id, count, null)
+  if (customName) value.components = [{ type: 'custom_name', data: customName }]
+  return value
+}
+
+function fixture (before, after, options = {}) {
+  const bot = new EventEmitter()
+  let inventory = before
+  const calls = []
+  const table = { name: 'crafting_table', position: new Vec3(10, 64, 10) }
+  const slots = new Array(46).fill(null)
+  before.forEach((value, index) => { value.slot = 9 + index; slots[9 + index] = value })
+  bot._client = new EventEmitter()
+  bot.registry = registry
+  bot.inventory = { id: 0, inventoryStart: 9, inventoryEnd: 45, items: () => inventory, selectedItem: null, slots }
+  bot.entity = { position: new Vec3(10, 64, 9), height: 1.8 }
+  bot.pathfinder = { stop: () => calls.push('stop') }
+  bot.clearControlStates = () => calls.push('clear')
+  bot.blockAt = () => table
+  bot.closeWindow = window => {
+    calls.push(['close', window])
+    bot.currentWindow = null
+  }
+  bot.recipesAll = (id, metadata, block) => Recipe.find(id, metadata).filter(recipe => !recipe.requiresTable || block)
+  bot.clickWindow = async slot => calls.push(['click', slot])
+  bot.craft = async (recipe, count, block) => {
+    calls.push(['craft', recipe, count, block])
+    inventory = after
+    if (options.predictedOnly) return
+    if (block) {
+      const window = { id: 3, type: 'minecraft:crafting', inventoryStart: 10, inventoryEnd: 46, slots: new Array(46).fill(null) }
+      bot.currentWindow = window
+      bot.emit('windowOpen', window)
+    }
+    const windowId = bot.currentWindow?.id || 0
+    bot._client.emit('set_slot', { windowId, slot: 0, item: Item.toNotch(item(registry.items[recipe.result.id].name, recipe.result.count)) })
+    await bot.clickWindow(0, 0, 0)
+    const serverSlots = Array.from({ length: 46 }, () => Item.toNotch(null))
+    after.forEach((value, index) => { serverSlots[(block ? 10 : 9) + index] = Item.toNotch(value) })
+    bot._client.emit('window_items', { windowId, items: serverSlots })
+    bot._client.emit('set_cursor_item', { contents: Item.toNotch(null) })
+    if (bot.currentWindow) bot.closeWindow(bot.currentWindow)
+  }
+  const warehouse = { gotoNear: async (...position) => calls.push(['goto', ...position]) }
+  const catalog = new ItemCatalog('1.21.11', {}, { serverEnchantmentsFile: '/missing-test-mappings.json' })
+  const config = { craft: { table: { x: 10, y: 64, z: 10 }, timeoutMs: 5000, confirmTimeoutMs: 60, settleMs: 5 } }
+  const executor = createInventoryExecutor(bot, catalog, config, warehouse)
+  return { bot, calls, table, warehouse, catalog, config, executor, setInventory: value => { inventory = value } }
+}
+
+const stickStep = {
+  recipeId: 'sticks', requiresTable: false,
+  result: { name: 'stick', count: 4 },
+  inputs: [{ names: ['oak_planks'], count: 2 }]
+}
+
+function amounts (items) {
+  return items.map(({ itemId, amount }) => [itemId, amount]).sort((a, b) => a[0].localeCompare(b[0]))
+}
+
+test('2x2 crafting consumes only the concrete input variants and produces one trigger', async () => {
+  const f = fixture([item('oak_planks', 1, 'Alice'), item('oak_planks', 1, 'Bob')], [item('stick', 4)])
+  const result = await f.executor.execute({ step: { ...stickStep, times: 99 } })
+  assert.deepEqual(amounts(result.before), [['minecraft:oak_planks', 1], ['minecraft:oak_planks', 1]])
+  assert.deepEqual(amounts(result.after), [['minecraft:stick', 4]])
+  assert.deepEqual(result.consumed.map(entry => entry.itemKey).sort(), result.before.map(entry => entry.itemKey).sort())
+  assert.deepEqual(amounts(result.produced), [['minecraft:stick', 4]])
+  const craft = f.calls.find(call => Array.isArray(call) && call[0] === 'craft')
+  assert.equal(craft[2], 1)
+  assert.equal(craft[3], undefined)
+  assert.equal(f.executor.isBusy(), false)
+})
+
+test('3x3 crafting navigates through Warehouse and passes the validated table block', async () => {
+  const f = fixture([item('oak_planks', 8)], [item('chest', 1)])
+  const result = await f.executor.execute({ step: { requiresTable: true, result: { name: 'chest', count: 1 }, inputs: [{ names: ['oak_planks'], count: 8 }] } })
+  assert.deepEqual(amounts(result.consumed), [['minecraft:oak_planks', 8]])
+  assert.deepEqual(f.calls.find(call => Array.isArray(call) && call[0] === 'goto'), ['goto', 10, 64, 10])
+  assert.equal(f.calls.find(call => Array.isArray(call) && call[0] === 'craft')[3], f.table)
+})
+
+test('shapeless crafting selects the exact input ids instead of the first result recipe', async () => {
+  const f = fixture([item('oak_log', 1)], [item('oak_planks', 4)])
+  const result = await f.executor.execute({ step: { requiresTable: false, result: { name: 'oak_planks', count: 4 }, inputs: [{ names: ['oak_log'], count: 1 }] } })
+  assert.deepEqual(amounts(result.produced), [['minecraft:oak_planks', 4]])
+  const chosen = f.calls.find(call => Array.isArray(call) && call[0] === 'craft')[1]
+  assert.equal(chosen.ingredients[0].id, registry.itemsByName.oak_log.id)
+})
+
+test('historical inventory, unresolved alternatives, and recipe mismatches fail before crafting', async () => {
+  for (const { before, step } of [
+    { before: [item('oak_planks', 2), item('stick', 1)], step: stickStep },
+    { before: [item('oak_planks', 3)], step: stickStep },
+    { before: [item('oak_planks', 2)], step: { ...stickStep, inputs: [{ names: ['oak_planks', 'birch_planks'], count: 2 }] } },
+    { before: [item('oak_planks', 2)], step: { ...stickStep, result: { name: 'stick', count: 8 } } },
+    { before: [item('oak_planks', 2)], step: { ...stickStep, requiresTable: true } }
+  ]) {
+    const f = fixture(before, [item('stick', 4)])
+    await assert.rejects(f.executor.execute({ step }))
+    assert.equal(f.calls.some(call => Array.isArray(call) && call[0] === 'craft'), false)
+    assert.equal(f.executor.isBusy(), false)
+  }
+})
+
+test('a wrong table block or an out-of-reach arrival never starts crafting', async () => {
+  for (const wrongBlock of [true, false]) {
+    const f = fixture([item('oak_planks', 8)], [item('chest', 1)])
+    if (wrongBlock) f.bot.blockAt = () => ({ name: 'barrel', position: new Vec3(10, 64, 10) })
+    else f.warehouse.gotoNear = async () => { f.bot.entity.position = new Vec3(50, 64, 50) }
+    await assert.rejects(f.executor.execute({ step: { requiresTable: true, result: { name: 'chest', count: 1 }, inputs: [{ names: ['oak_planks'], count: 8 }] } }))
+    assert.equal(f.calls.some(call => Array.isArray(call) && call[0] === 'craft'), false)
+  }
+})
+
+test('physical inventory mismatches require recovery, including equal-name metadata substitutions', async () => {
+  for (const after of [[item('stick', 3)], [item('stick', 4), item('oak_planks', 1)], [item('stick', 4, 'unexpected')]]) {
+    const f = fixture([item('oak_planks', 2)], after)
+    await assert.rejects(f.executor.execute({ step: stickStep }), error => error.recoveryRequired === true)
+    assert.equal(f.executor.isBusy(), false)
+  }
+})
+
+test('recipe remainders are included in the exact post-craft inventory and produced entries', async () => {
+  const f = fixture([item('milk_bucket', 1)], [item('cake', 1), item('bucket', 1)])
+  const milk = registry.itemsByName.milk_bucket.id
+  const cake = registry.itemsByName.cake.id
+  const bucket = registry.itemsByName.bucket.id
+  f.bot.recipesAll = () => [{
+    result: { id: cake, metadata: null, count: 1 },
+    inShape: [[{ id: milk, metadata: null, count: 1 }]],
+    outShape: [[{ id: bucket, metadata: null, count: 1 }]], ingredients: null, requiresTable: false,
+    delta: [{ id: milk, metadata: null, count: -1 }, { id: cake, metadata: null, count: 1 }, { id: bucket, metadata: null, count: 1 }]
+  }]
+  const result = await f.executor.execute({ step: { requiresTable: false, result: { name: 'cake', count: 1 }, inputs: [{ names: ['milk_bucket'], count: 1 }] } })
+  assert.deepEqual(amounts(result.produced), [['minecraft:bucket', 1], ['minecraft:cake', 1]])
+})
+
+test('the real honey-block recipe prepares and confirms four returned glass bottles', async () => {
+  const f = fixture([item('honey_bottle', 4)], [item('honey_block', 1), item('glass_bottle', 4)])
+  const step = { requiresTable: false, result: { name: 'honey_block', count: 1 }, inputs: [{ names: ['honey_bottle'], count: 4 }] }
+  assert.deepEqual(amounts(f.executor.preview(step).expectedProduced), [['minecraft:glass_bottle', 4], ['minecraft:honey_block', 1]])
+  const result = await f.executor.execute({ step })
+  assert.deepEqual(amounts(result.produced), [['minecraft:glass_bottle', 4], ['minecraft:honey_block', 1]])
+})
+
+test('the real cake recipe prepares and confirms all three returned buckets', async () => {
+  const recipe = Recipe.find(registry.itemsByName.cake.id)[0]
+  const inputs = new Map()
+  for (const entry of recipe.inShape.flat()) {
+    if (entry.id < 0) continue
+    const name = registry.items[entry.id].name
+    inputs.set(name, (inputs.get(name) || 0) + 1)
+  }
+  const f = fixture([...inputs].map(([name, count]) => item(name, count)), [item('cake', 1), item('bucket', 3)])
+  const step = { requiresTable: true, result: { name: 'cake', count: 1 }, inputs: [...inputs].map(([name, count]) => ({ names: [name], count })) }
+  assert.deepEqual(amounts(f.executor.preview(step).expectedProduced), [['minecraft:bucket', 3], ['minecraft:cake', 1]])
+  const result = await f.executor.execute({ step })
+  assert.deepEqual(amounts(result.produced), [['minecraft:bucket', 3], ['minecraft:cake', 1]])
+})
+
+test('unknown filled-container returns are rejected before any craft mutation', async () => {
+  const f = fixture([item('cod_bucket', 1)], [item('stick', 1)])
+  const id = registry.itemsByName.cod_bucket.id
+  f.bot.recipesAll = () => [{ result: { id: registry.itemsByName.stick.id, count: 1 },
+    ingredients: [{ id, count: -1 }], requiresTable: false,
+    delta: [{ id, count: -1 }, { id: registry.itemsByName.stick.id, count: 1 }] }]
+  const step = { requiresTable: false, result: { name: 'stick', count: 1 }, inputs: [{ names: ['cod_bucket'], count: 1 }] }
+  assert.throws(() => f.executor.preview(step), /no standard recipe/)
+  await assert.rejects(f.executor.execute({ step }), /no standard recipe/)
+  assert.equal(f.calls.some(call => Array.isArray(call) && call[0] === 'craft'), false)
+})
+
+test('a pre-aborted signal and an expired deadline perform no network mutation', async () => {
+  for (const request of [{ signal: AbortSignal.abort(new Error('stop')) }, { deadline: Date.now() - 1 }]) {
+    const f = fixture([item('oak_planks', 2)], [item('stick', 4)])
+    await assert.rejects(f.executor.execute({ step: stickStep, ...request }))
+    assert.equal(f.calls.some(call => Array.isArray(call) && call[0] === 'craft'), false)
+  }
+})
+
+test('timeout drains the original craft promise and refuses overlapping operations', async () => {
+  const f = fixture([item('oak_planks', 2)], [item('stick', 4)])
+  const originalClick = f.bot.clickWindow
+  let settle
+  let started
+  const crafting = new Promise(resolve => { started = resolve })
+  f.bot.craft = () => {
+    started()
+    f.bot.currentWindow = { id: 7 }
+    return new Promise(resolve => { settle = resolve })
+  }
+  const request = f.executor.execute({ step: stickStep, deadline: Date.now() + 25 })
+  let finished = false
+  request.finally(() => { finished = true }).catch(() => {})
+  await crafting
+  await new Promise(resolve => setTimeout(resolve, 60))
+  assert.equal(finished, false)
+  assert.equal(f.executor.isBusy(), true)
+  assert.notEqual(f.bot.clickWindow, originalClick)
+  assert.ok(f.calls.includes('stop'))
+  assert.ok(f.calls.some(call => Array.isArray(call) && call[0] === 'close'))
+  await assert.rejects(f.executor.execute({ step: stickStep }), /busy/)
+  settle()
+  await assert.rejects(request, error => error.recoveryRequired === true && /timeout|deadline/.test(error.message))
+  assert.equal(f.executor.isBusy(), false)
+  assert.equal(f.bot.clickWindow, originalClick)
+})
+
+test('cancel stops immediately, closes late windows, and waits for a rejected craft to settle', async () => {
+  const f = fixture([item('oak_planks', 2)], [item('stick', 4)])
+  let rejectCraft
+  let start
+  const started = new Promise(resolve => { start = resolve })
+  f.bot.craft = () => { start(); return new Promise((resolve, reject) => { rejectCraft = reject }) }
+  const request = f.executor.execute({ step: stickStep })
+  await started
+  assert.equal(f.executor.cancel('operator cancellation'), true)
+  const lateWindow = { id: 8 }
+  f.bot.currentWindow = lateWindow
+  f.bot.emit('windowOpen', lateWindow)
+  assert.equal(f.executor.isBusy(), true)
+  assert.ok(f.calls.some(call => Array.isArray(call) && call[0] === 'close' && call[1] === lateWindow))
+  rejectCraft(new Error('window closed'))
+  await assert.rejects(request, error => error.recoveryRequired === true && /operator cancellation/.test(error.message))
+  assert.equal(f.executor.isBusy(), false)
+  assert.equal(f.bot.listenerCount('windowOpen'), 0)
+  assert.equal(f.executor.cancel('idle'), false)
+})
+
+test('locally predicted output without authoritative server updates requires recovery', async () => {
+  const f = fixture([item('oak_planks', 2)], [item('stick', 4)], { predictedOnly: true })
+  await assert.rejects(f.executor.execute({ step: stickStep }), error => error.recoveryRequired === true && /server|authoritative/.test(error.message))
+})
+
+test('a nonempty server cursor after crafting requires recovery even when local cursor is empty', async () => {
+  const f = fixture([item('oak_planks', 2)], [item('stick', 4)])
+  const craft = f.bot.craft
+  f.bot.craft = async (...args) => {
+    await craft(...args)
+    f.bot._client.emit('set_cursor_item', { contents: Item.toNotch(item('stick', 1)) })
+  }
+  await assert.rejects(f.executor.execute({ step: stickStep }), error => error.recoveryRequired === true && /cursor|光标/.test(error.message))
+  assert.equal(f.bot.inventory.selectedItem, null)
+})
+
+test('a full server content packet cannot hide a nonempty carried item behind the local cursor', async () => {
+  const f = fixture([item('oak_planks', 2)], [item('stick', 4)])
+  const craft = f.bot.craft
+  f.bot.craft = async (...args) => {
+    await craft(...args)
+    const slots = Array.from({ length: 46 }, () => Item.toNotch(null))
+    slots[9] = Item.toNotch(item('stick', 4))
+    f.bot._client.emit('window_items', { windowId: 0, items: slots, carriedItem: Item.toNotch(item('stick', 1)) })
+  }
+  await assert.rejects(f.executor.execute({ step: stickStep }), error => error.recoveryRequired === true)
+})
+
+test('a legacy server cursor slot must be empty after the final craft click', async () => {
+  const f = fixture([item('oak_planks', 2)], [item('stick', 4)])
+  const craft = f.bot.craft
+  f.bot.craft = async (...args) => {
+    await craft(...args)
+    f.bot._client.emit('set_slot', { windowId: -1, slot: -1, item: Item.toNotch(item('stick', 1)) })
+  }
+  await assert.rejects(f.executor.execute({ step: stickStep }), error => error.recoveryRequired === true)
+})
+
+function finalContainerSnapshot (f, playerItems, options = {}) {
+  const chest = { chestId: '0,64,0', x: 0, y: 64, z: 0, blockName: 'barrel' }
+  f.warehouse.db = { listChests: () => [chest] }
+  f.warehouse.openContainerAt = async () => {
+    f.calls.push('serverSnapshot')
+    const container = require('prismarine-windows')(registry).createWindow(71, 'minecraft:generic_9x3', 'Barrel')
+    playerItems.forEach((value, index) => { container.updateSlot(27 + index, value) })
+    f.bot.currentWindow = container
+    const slots = Array.from({ length: 63 }, () => Item.toNotch(null))
+    playerItems.forEach((value, index) => { slots[27 + index] = Item.toNotch(value) })
+    f.bot._client.emit('open_window', { windowId: container.id, inventoryType: 'minecraft:generic_9x3', windowTitle: 'Barrel' })
+    if (!options.noPackets) f.bot._client.emit('window_items', {
+      windowId: container.id, items: slots, carriedItem: Item.toNotch(options.cursor || null)
+    })
+    const opened = f.bot.currentWindow
+    f.bot.emit('windowOpen', opened)
+    return opened
+  }
+  f.warehouse.closeContainerQuietly = container => f.bot.closeWindow(container)
+}
+
+test('result-slot-only server updates can be confirmed by a fresh full server container snapshot', async () => {
+  const f = fixture([item('oak_planks', 2)], [item('stick', 4)])
+  f.bot.craft = async () => {
+    f.setInventory([item('stick', 4)])
+    f.bot._client.emit('set_slot', { windowId: 0, slot: 0, item: Item.toNotch(item('stick', 4)) })
+    await f.bot.clickWindow(0, 0, 0)
+  }
+  finalContainerSnapshot(f, [item('stick', 4)])
+  const result = await f.executor.execute({ step: stickStep })
+  assert.deepEqual(amounts(result.produced), [['minecraft:stick', 4]])
+  assert.equal(f.calls.filter(value => value === 'serverSnapshot').length, 1)
+})
+
+test('the real Mineflayer plugins confirm sparse result-slot packets through the final server snapshot', async () => {
+  const f = fixture([item('oak_planks', 2)], [item('stick', 4)])
+  f.bot.version = registry.version.minecraftVersion
+  f.bot.supportFeature = registry.supportFeature
+  require('mineflayer/lib/plugins/inventory')(f.bot, { hideErrors: true })
+  require('mineflayer/lib/plugins/craft')(f.bot)
+  f.bot.inventory.updateSlot(9, item('oak_planks', 2))
+  f.bot._client.write = (name, packet) => {
+    if (name !== 'window_click') return
+    if (packet.slot >= 1 && packet.slot <= 4) {
+      const count = f.bot.inventory.slots.slice(1, 5).reduce((sum, value) => sum + (value?.count || 0), 0)
+      queueMicrotask(() => f.bot._client.emit('set_slot', { windowId: 0, slot: 0, item: Item.toNotch(count === 2 ? item('stick', 4) : null) }))
+    } else if (packet.slot === 0) {
+      for (let slot = 1; slot <= 4; slot++) {
+        f.bot._client.emit('set_slot', { windowId: 0, slot, item: Item.toNotch(null) })
+      }
+    }
+  }
+  finalContainerSnapshot(f, [item('stick', 4)])
+  const result = await f.executor.execute({ step: stickStep })
+  assert.deepEqual(amounts(result.produced), [['minecraft:stick', 4]])
+  assert.equal(f.calls.filter(value => value === 'serverSnapshot').length, 1)
+})
+
+test('final server snapshots still require independent result-slot evidence', async () => {
+  const f = fixture([item('oak_planks', 2)], [item('stick', 4)], { predictedOnly: true })
+  finalContainerSnapshot(f, [item('stick', 4)])
+  await assert.rejects(f.executor.execute({ step: stickStep }), error => error.recoveryRequired === true)
+  assert.equal(f.calls.includes('serverSnapshot'), false)
+})
+
+test('final server snapshot failure or mismatched items retain recovery', async () => {
+  for (const options of [{ noPackets: true }, { cursor: item('stick', 1) }, { wrongItems: true }]) {
+    const f = fixture([item('oak_planks', 2)], [item('stick', 4)])
+    f.bot.craft = async () => {
+      f.setInventory([item('stick', 4)])
+      f.bot._client.emit('set_slot', { windowId: 0, slot: 0, item: Item.toNotch(item('stick', 4)) })
+      await f.bot.clickWindow(0, 0, 0)
+    }
+    finalContainerSnapshot(f, options.wrongItems ? [item('oak_planks', 2)] : [item('stick', 4)], options)
+    await assert.rejects(f.executor.execute({ step: stickStep }), error => error.recoveryRequired === true)
+  }
+})
+
+test('a server correction after the final snapshot still requires recovery', async () => {
+  const f = fixture([item('oak_planks', 2)], [item('stick', 4)])
+  f.config.craft.settleMs = 30
+  f.bot.craft = async () => {
+    f.setInventory([item('stick', 4)])
+    f.bot._client.emit('set_slot', { windowId: 0, slot: 0, item: Item.toNotch(item('stick', 4)) })
+    await f.bot.clickWindow(0, 0, 0)
+  }
+  finalContainerSnapshot(f, [item('stick', 4)])
+  const read = f.warehouse.openContainerAt
+  f.warehouse.openContainerAt = async (...args) => {
+    const container = await read(...args)
+    setTimeout(() => f.bot._client.emit('set_slot', { windowId: container.id, slot: 27, item: Item.toNotch(item('oak_planks', 2)) }), 5)
+    return container
+  }
+  await assert.rejects(f.executor.execute({ step: stickStep }), error => error.recoveryRequired === true)
+})
+
+test('server evidence before the final click cannot confirm a later predicted output', async () => {
+  const f = fixture([item('oak_planks', 2)], [item('stick', 4)])
+  const craft = f.bot.craft
+  f.bot.craft = async (...args) => { await craft(...args); await f.bot.clickWindow(0, 0, 0) }
+  await assert.rejects(f.executor.execute({ step: stickStep }), error => error.recoveryRequired === true && /server|authoritative/.test(error.message))
+})
+
+test('the click fence blocks dropping and is restored only after the original craft settles', async () => {
+  const f = fixture([item('oak_planks', 2)], [item('stick', 4)])
+  const originalClick = f.bot.clickWindow
+  f.bot.craft = () => f.bot.clickWindow(-999, 0, 0)
+  await assert.rejects(f.executor.execute({ step: stickStep }), error => error.recoveryRequired === true && /drop|slot/.test(error.message))
+  assert.equal(f.calls.some(call => Array.isArray(call) && call[0] === 'click' && call[1] === -999), false)
+  assert.equal(f.bot.clickWindow, originalClick)
+})
+
+test('cursor parking fails closed instead of falling back to Mineflayer overflow tossing', async () => {
+  const f = fixture([item('oak_planks', 2)], [item('stick', 4)])
+  let unsafeCalls = 0
+  const originalPark = async () => { unsafeCalls++ }
+  f.bot.putSelectedItemRange = originalPark
+  f.bot.craft = async () => {
+    f.bot.inventory.selectedItem = item('stick', 4)
+    f.bot.inventory.slots.fill(item('stone', 64), 9, 45)
+    await f.bot.putSelectedItemRange(9, 45, f.bot.inventory, null)
+  }
+  await assert.rejects(f.executor.execute({ step: stickStep }), error => error.recoveryRequired === true && /cursor|space/.test(error.message))
+  assert.equal(unsafeCalls, 0)
+  assert.equal(f.bot.putSelectedItemRange, originalPark)
+  assert.equal(f.calls.some(call => Array.isArray(call) && call[0] === 'click' && call[1] === -999), false)
+})
+
+test('preview exposes canonical gross inputs and outputs before any craft mutation', () => {
+  const f = fixture([item('oak_planks', 2, 'allocated')], [item('stick', 4)])
+  const preview = f.executor.preview(stickStep)
+  assert.deepEqual(amounts(preview.expectedConsumed), [['minecraft:oak_planks', 2]])
+  assert.deepEqual(amounts(preview.expectedProduced), [['minecraft:stick', 4]])
+  assert.equal(preview.expectedConsumed[0].itemKey, f.catalog.fromPrismarineItem(item('oak_planks', 2, 'allocated')).itemKey)
+  assert.equal(f.calls.length, 0)
+})
+
+test('a positive-slot drop mode is blocked by the craft click fence', async () => {
+  const f = fixture([item('oak_planks', 2)], [item('stick', 4)])
+  f.bot.craft = () => f.bot.clickWindow(9, 0, 4)
+  await assert.rejects(f.executor.execute({ step: stickStep }), error => error.recoveryRequired === true && /drop|click/.test(error.message))
+  assert.equal(f.calls.some(call => Array.isArray(call) && call[0] === 'click'), false)
+})
+
+test('server shadow inventory does not inherit local mutations of its initial input objects', async () => {
+  const input = item('oak_planks', 2)
+  const f = fixture([input], [item('stick', 4)])
+  f.bot.craft = async () => {
+    input.count = 0
+    f.setInventory([item('stick', 4)])
+    f.bot._client.emit('set_slot', { windowId: 0, slot: 0, item: Item.toNotch(item('stick', 4)) })
+    await f.bot.clickWindow(0, 0, 0)
+    // Server never acknowledges removal of the allocated input in slot 9.
+    f.bot._client.emit('set_slot', { windowId: 0, slot: 10, item: Item.toNotch(item('stick', 4)) })
+  }
+  await assert.rejects(f.executor.execute({ step: stickStep }), error => error.recoveryRequired === true)
+})
+
+test('the standard Mineflayer crafting plugin works through the executor guards', async () => {
+  for (const { before, step, output, returns = [] } of [
+    { before: [item('oak_planks', 2)], step: stickStep, output: item('stick', 4) },
+    { before: [item('oak_log', 1)], step: { requiresTable: false, result: { name: 'oak_planks', count: 4 }, inputs: [{ names: ['oak_log'], count: 1 }] }, output: item('oak_planks', 4) },
+    { before: [item('honey_bottle', 4)], step: { requiresTable: false, result: { name: 'honey_block', count: 1 }, inputs: [{ names: ['honey_bottle'], count: 4 }] }, output: item('honey_block', 1), returns: [item('glass_bottle', 4)] },
+    { before: [item('honey_bottle', 1)], step: { requiresTable: false, result: { name: 'sugar', count: 3 }, inputs: [{ names: ['honey_bottle'], count: 1 }] }, output: item('sugar', 3), returns: [item('glass_bottle', 1)] }
+  ]) {
+    const f = fixture(before, [output])
+    const window = require('prismarine-windows')(registry).createWindow(0, 'minecraft:inventory', 'Inventory')
+    before.forEach((value, index) => window.updateSlot(9 + index, value))
+    f.bot.inventory = window
+    require('mineflayer/lib/plugins/craft')(f.bot)
+    f.bot.clickWindow = async (slot, mouseButton, mode) => {
+      if (slot === 0) f.bot._client.emit('set_slot', { windowId: 0, slot: 0, item: Item.toNotch(output) })
+      window.acceptClick({ slot, mouseButton, mode, item: window.slots[slot] })
+      f.bot._client.emit('window_items', { windowId: 0, items: window.slots.map(value => Item.toNotch(value)), carriedItem: Item.toNotch(window.selectedItem) })
+    }
+    const result = await f.executor.execute({ step })
+    assert.deepEqual(amounts(result.produced), amounts(f.catalog.aggregatePrismarineItems([output, ...returns])))
+    assert.equal(window.selectedItem, null)
+    assert.equal(window.slots.slice(0, 5).some(Boolean), false)
+  }
+})
+
+test('abort keeps navigation busy until it drains and prevents Warehouse retry movement', async () => {
+  const f = fixture([item('oak_planks', 8)], [item('chest', 1)])
+  let release
+  let start
+  let underlyingPaths = 0
+  let movementAfterAbort = 0
+  const started = new Promise(resolve => { start = resolve })
+  const originalGoto = () => {
+    underlyingPaths++
+    if (underlyingPaths > 1) return Promise.resolve()
+    start()
+    return new Promise(resolve => { release = resolve })
+  }
+  f.bot.pathfinder.goto = originalGoto
+  f.bot.setControlState = () => { movementAfterAbort++ }
+  f.warehouse.gotoNear = async () => {
+    await f.bot.pathfinder.goto({})
+    try { await f.bot.pathfinder.goto({}) } catch {}
+    try { f.bot.setControlState('back', true) } catch {}
+  }
+  const abort = new AbortController()
+  const request = f.executor.execute({ step: { requiresTable: true, result: { name: 'chest', count: 1 }, inputs: [{ names: ['oak_planks'], count: 8 }] }, signal: abort.signal })
+  await started
+  abort.abort(new Error('stop navigation'))
+  assert.equal(f.executor.isBusy(), true)
+  release()
+  await assert.rejects(request, /stop navigation/)
+  assert.equal(underlyingPaths, 1)
+  assert.equal(movementAfterAbort, 0)
+  assert.equal(f.bot.pathfinder.goto, originalGoto)
+  assert.equal(f.executor.isBusy(), false)
+})
+
+test('a non-Error rejection after craft starts still carries recovery evidence', async () => {
+  const f = fixture([item('oak_planks', 2)], [item('stick', 4)])
+  f.bot.craft = () => Promise.reject('network failure')
+  await assert.rejects(f.executor.execute({ step: stickStep }), error => error.recoveryRequired === true && /network failure/.test(error.message) && Array.isArray(error.before))
+})
+
+test('server evidence must remain stable instead of accepting a transient predicted match', async () => {
+  const f = fixture([item('oak_planks', 2)], [item('stick', 4)])
+  const craft = f.bot.craft
+  f.config.craft.settleMs = 40
+  f.bot.craft = async (...args) => {
+    await craft(...args)
+    setTimeout(() => {
+      const rejected = Array.from({ length: 46 }, () => Item.toNotch(null))
+      rejected[9] = Item.toNotch(item('oak_planks', 2))
+      f.bot._client.emit('window_items', { windowId: 0, items: rejected })
+      f.setInventory([item('oak_planks', 2)])
+    }, 5)
+  }
+  await assert.rejects(f.executor.execute({ step: stickStep }), error => error.recoveryRequired === true)
+})

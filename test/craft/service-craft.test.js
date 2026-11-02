@@ -25,7 +25,7 @@ function createFixture () {
     players: { Alice: { uuid: 'uuid-alice', username: 'Alice' } },
     inventory: { items: () => [] },
     _craftingExecutor: {
-      handleCommand: async () => {}
+      execute: async () => {}
     }
   }
   const warehouse = {}
@@ -80,6 +80,9 @@ test('parseCraftRequest parses name and optional quantity', () => {
     assert.deepEqual(fixture.service.parseCraftRequest('石头 64'), { ok: true, itemName: '石头', quantity: 64 })
     assert.deepEqual(fixture.service.parseCraftRequest('stick'), { ok: true, itemName: 'stick', quantity: 1 })
     assert.equal(fixture.service.parseCraftRequest('').ok, false)
+    for (const value of ['stick 0', 'stick -1', 'stick 1.5', 'stick 9007199254740993']) {
+      assert.equal(fixture.service.parseCraftRequest(value).ok, false, value)
+    }
   } finally {
     fixture.close()
   }
@@ -157,16 +160,15 @@ test('handleCraft reports warehouse stock as "already sufficient" without crafti
   }
 })
 
-test('runCraftCommand forwards terminal executor events to the player', async () => {
+test('runCraftCommand reports success only after the warehouse controller settles', async () => {
   const fixture = createFixture()
   try {
-    let emitted = null
-    fixture.bot._craftSink = { onEvent: (type, payload) => { emitted = { type, payload } } }
-    fixture.bot._craftingExecutor.handleCommand = async () => {
-      emitted && emitted.type // no-op; executor reports through sink
-      fixture.bot._craftSink.onEvent('craft_completed', { finalItem: 'stick', delivered: 8 })
-    }
-    await fixture.service.runCraftCommand({ target: { name: 'stick' }, notify: text => fixture.sent.push({ user: 'Alice', text }) })
+    let settled = false
+    fixture.service.craftController = { run: async () => { settled = true; return { status: 'complete', target: { name: 'stick', quantity: 8 } } } }
+    await fixture.service.runCraftCommand({ player: 'Alice', owner: { uuid: 'uuid-alice' }, target: { name: 'stick', quantity: 8 }, notify: text => {
+      assert.equal(settled, true)
+      fixture.sent.push({ user: 'Alice', text })
+    } })
     const last = fixture.sent[fixture.sent.length - 1].text
     assert.match(last, /合成完成：stick/)
   } finally {
@@ -174,17 +176,26 @@ test('runCraftCommand forwards terminal executor events to the player', async ()
   }
 })
 
-test('runCraftCommand turns craft_failed reasons into readable messages', async () => {
+test('runCraftCommand propagates an unsettled failure without a success message', async () => {
   const fixture = createFixture()
   try {
-    fixture.bot._craftSink = { onEvent: (type, payload) => {} }
-    fixture.bot._craftingExecutor.handleCommand = async () => {
-      fixture.bot._craftSink.onEvent('craft_failed', { reason: 'insufficient_buffer_materials' })
-    }
-    await fixture.service.runCraftCommand({ target: { name: 'stick' }, notify: text => fixture.sent.push({ user: 'Alice', text }) })
-    const last = fixture.sent[fixture.sent.length - 1].text
-    assert.match(last, /仓库原料取出失败或不足/)
+    fixture.service.craftController = { run: async () => { throw new Error('仓库原料取出失败或不足') } }
+    await assert.rejects(fixture.service.runCraftCommand({ player: 'Alice', owner: { uuid: 'uuid-alice' }, target: { name: 'stick', quantity: 4 } }), /原料/)
+    assert.equal(fixture.sent.some(row => /合成完成/.test(row.text)), false)
   } finally {
     fixture.close()
   }
+})
+
+test('Chinese targets normalize through the cloud catalog before entering the queue', async () => {
+  const fixture = createFixture()
+  try {
+    giveStock(fixture, 'uuid-alice', 'minecraft:oak_planks', 2)
+    await fixture.service.handleCraft('Alice', '!合成 木棍 4', { uuid: 'uuid-alice', scope: 'personal' })
+    assert.equal(fixture.tasks.length, 1)
+    let request
+    await fixture.tasks[0].run({ runCraftCommand: async value => { request = value } })
+    assert.equal(request.target.name, 'stick')
+    assert.equal(request.owner.uuid, 'uuid-alice')
+  } finally { fixture.close() }
 })

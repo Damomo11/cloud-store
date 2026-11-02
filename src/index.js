@@ -12,7 +12,6 @@ const CloudStoreService = require('./service')
 const CloudStoreWebServer = require('./webServer')
 const SubscriptionManager = require('./subscriptions')
 const { BotTaskPool } = require('./taskPool')
-const { attachCraftingExecutor } = require('./craft')
 const {
   invalidateMinecraftAccessTokenCache,
   isMinecraftProfileAuthError,
@@ -216,6 +215,7 @@ function drainBot (state) {
   if (state.reconnectTimer) clearTimeout(state.reconnectTimer)
   state.reconnectTimer = null
   if (state.service) taskPool.unregister(state.service)
+  taskPool.cancelQueuedCraftRecovery(String(state.account.botName || state.account.username || '').toLowerCase())
   if (state.service?.active) {
     state.status = 'draining'
     if (!state.drainTimer) {
@@ -290,14 +290,11 @@ function launchBot (state) {
   // It registers itself as bot._craftingExecutor; the service enqueues craft tasks.
   if (launchConfig.craft?.enabled !== false) {
     try {
+      const { attachCraftingExecutor } = require('./craft')
       attachCraftingExecutor(bot, {
-        id: String(launchConfig.server?.botName || bot.username || 'bot'),
-        db,
         config: launchConfig,
         catalog,
-        onEvent: (type, payload) => {
-          if (launchConfig.debug) console.log(`[craft:${String(launchConfig.server?.botName || bot.username)}] ${type}`, JSON.stringify(payload).slice(0, 400))
-        }
+        warehouse
       })
     } catch (error) {
       console.warn(`[craft] executor attach failed: ${error.message}`)

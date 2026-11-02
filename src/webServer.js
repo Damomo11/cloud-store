@@ -2638,7 +2638,10 @@ class CloudStoreWebServer {
       web_admin_alias_save: '保存物品别名',
       web_admin_alias_delete: '删除物品别名',
       web_admin_quota_save: '设置仓库额度',
-      web_admin_quick_shulker_extraction_save: '设置快捷潜影盒取货'
+      web_admin_quick_shulker_extraction_save: '设置快捷潜影盒取货',
+      craft_consume: '合成消耗',
+      craft_produce: '合成产出',
+      craft: '合成订单'
     }
     return labels[type] || String(type || '')
   }

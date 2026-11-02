@@ -36,7 +36,6 @@ __export(CraftPlanner_exports, {
 module.exports = __toCommonJS(CraftPlanner_exports);
 var import_node_fs = __toESM(require("node:fs"));
 var import_node_path = __toESM(require("node:path"));
-var import_node_url = require("node:url");
 var import_versionGuard = require("./versionGuard");
 var import_ReconciliationCheck = require("./ReconciliationCheck");
 var import_directCollectionCapabilities = require("./directCollectionCapabilities");
@@ -165,7 +164,7 @@ class CraftPlanner {
     }
     for (const recipe of recipes) {
       const trial = cloneState(state);
-      this.expandRecipe(item, remaining, recipe, trial, resolver, depth);
+      this.expandRecipe(item, remaining, recipe, trial, resolver, depth, qty - remaining);
       const cost = branchCostOf(state, trial);
       if (bestCost === null || compareBranchCost(cost, bestCost) < 0) {
         bestCost = cost;
@@ -183,20 +182,26 @@ class CraftPlanner {
    * times = ceil(qty / result.count)；先递归规划各输入（post-order 记步 → 拓扑序），
    * 再把超出所需的产出登记回 available（Req 3.5），最后记录该合成步骤。
    */
-  expandRecipe(item, qty, recipe, state, resolver, depth) {
+  expandRecipe(item, qty, recipe, state, resolver, depth, seedAvailable) {
     const count = Math.max(1, recipe.result.count);
-    const times = Math.ceil(qty / count);
-    const produced = times * count;
-    const surplus = produced - qty;
+    const selfInputCount = recipe.inputs.filter((input) => input.names.length === 1 && input.names[0] === item).reduce((total, input) => total + input.count, 0);
+    const selfSeeded = selfInputCount > 0 && seedAvailable >= selfInputCount && count > selfInputCount;
+    const times = Math.ceil(qty / (selfSeeded ? count - selfInputCount : count));
+    const surplus = times * (selfSeeded ? count - selfInputCount : count) - qty;
     state.path.add(item);
+    const concreteInputs = [];
     for (const input of recipe.inputs) {
       const needed = input.count * times;
       const candidate = this.chooseCandidate(input.names, state);
-      this.planItem(candidate, needed, state, resolver, depth + 1);
+      if (!(selfSeeded && candidate === item)) this.planItem(candidate, needed, state, resolver, depth + 1);
+      concreteInputs.push({ names: [candidate], count: input.count });
     }
     state.path.delete(item);
     if (surplus > 0) {
       addAvailable(state, item, surplus);
+    }
+    for (const output of recipe.outputs ?? []) {
+      if (output.name !== recipe.result.name) addAvailable(state, output.name, output.count * times);
     }
     state.craftTriggers += times;
     state.steps.push({
@@ -204,9 +209,10 @@ class CraftPlanner {
       result: { name: recipe.result.name, count },
       // Ported addition: carry the recipe's 3x3 requirement to the command.
       requiresTable: Boolean(recipe.requiresTable),
+      outputs: (recipe.outputs ?? [recipe.result]).map((output) => ({ ...output })),
       times,
       // 保留「单次触发」的输入位（count 为单次量）；总量 = count * times。
-      inputs: recipe.inputs.map((i) => ({ names: [...i.names], count: i.count }))
+      inputs: concreteInputs
     });
   }
   /**
@@ -444,6 +450,7 @@ function cloneState(s) {
       recipeId: st.recipeId,
       result: { ...st.result },
       requiresTable: Boolean(st.requiresTable),
+      outputs: st.outputs?.map((output) => ({ ...output })),
       times: st.times,
       inputs: st.inputs.map((i) => ({ names: [...i.names], count: i.count }))
     })),
@@ -493,6 +500,7 @@ function finalizeSteps(steps) {
         recipeId: s.recipeId,
         result: { ...s.result },
         requiresTable: Boolean(s.requiresTable),
+        outputs: s.outputs?.map((output) => ({ ...output })),
         times: s.times,
         inputs: s.inputs.map((i) => ({ names: [...i.names], count: i.count }))
       });

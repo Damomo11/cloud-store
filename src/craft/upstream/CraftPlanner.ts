@@ -41,6 +41,7 @@ import type {
   CollectTool,
   CraftPlan,
   CraftStep,
+  RecipeInput,
   ReasonCategory,
   UsableRecipe,
   Unreachable,
@@ -322,7 +323,7 @@ export class CraftPlanner {
     }
     for (const recipe of recipes) {
       const trial = cloneState(state);
-      this.expandRecipe(item, remaining, recipe, trial, resolver, depth);
+      this.expandRecipe(item, remaining, recipe, trial, resolver, depth, qty - remaining);
       const cost = branchCostOf(state, trial);
       if (bestCost === null || compareBranchCost(cost, bestCost) < 0) {
         bestCost = cost;
@@ -350,23 +351,34 @@ export class CraftPlanner {
     state: PlanState,
     resolver: LeafResolver,
     depth: number,
+    seedAvailable: number,
   ): void {
     const count = Math.max(1, recipe.result.count);
-    const times = Math.ceil(qty / count);
-    const produced = times * count;
-    const surplus = produced - qty;
+    const selfInputCount = recipe.inputs
+      .filter((input) => input.names.length === 1 && input.names[0] === item)
+      .reduce((total, input) => total + input.count, 0);
+    const selfSeeded = selfInputCount > 0 && seedAvailable >= selfInputCount && count > selfInputCount;
+    // A duplication recipe can use an existing target as its first input, then
+    // reuse an output as the seed for each later trigger.
+    const times = Math.ceil(qty / (selfSeeded ? count - selfInputCount : count));
+    const surplus = times * (selfSeeded ? count - selfInputCount : count) - qty;
 
     state.path.add(item);
+    const concreteInputs: RecipeInput[] = [];
     for (const input of recipe.inputs) {
       const needed = input.count * times;
       const candidate = this.chooseCandidate(input.names, state);
-      this.planItem(candidate, needed, state, resolver, depth + 1);
+      if (!(selfSeeded && candidate === item)) this.planItem(candidate, needed, state, resolver, depth + 1);
+      concreteInputs.push({ names: [candidate], count: input.count });
     }
     state.path.delete(item);
 
     // Req 3.5：一次合成产出 > 所需 → 超出量登记回 available，供后续 input 优先消费。
     if (surplus > 0) {
       addAvailable(state, item, surplus);
+    }
+    for (const output of recipe.outputs ?? []) {
+      if (output.name !== recipe.result.name) addAvailable(state, output.name, output.count * times);
     }
 
     // 触发次数累计供分支择优的末位度量使用（同等采集成本下偏好更少的真服合成往返）。
@@ -378,9 +390,10 @@ export class CraftPlanner {
       result: { name: recipe.result.name, count },
       // Ported addition: carry the recipe's 3x3 requirement to the command.
       requiresTable: Boolean(recipe.requiresTable),
+      outputs: (recipe.outputs ?? [recipe.result]).map(output => ({ ...output })),
       times,
       // 保留「单次触发」的输入位（count 为单次量）；总量 = count * times。
-      inputs: recipe.inputs.map((i) => ({ names: [...i.names], count: i.count })),
+      inputs: concreteInputs,
     });
   }
 
@@ -657,6 +670,8 @@ function cloneState(s: PlanState): PlanState {
     steps: s.steps.map((st) => ({
       recipeId: st.recipeId,
       result: { ...st.result },
+      requiresTable: Boolean(st.requiresTable),
+      outputs: st.outputs?.map(output => ({ ...output })),
       times: st.times,
       inputs: st.inputs.map((i) => ({ names: [...i.names], count: i.count })),
     })),
@@ -719,6 +734,8 @@ function finalizeSteps(steps: CraftStep[]): CraftStep[] {
       merged.set(s.recipeId, {
         recipeId: s.recipeId,
         result: { ...s.result },
+        requiresTable: Boolean(s.requiresTable),
+        outputs: s.outputs?.map(output => ({ ...output })),
         times: s.times,
         inputs: s.inputs.map((i) => ({ names: [...i.names], count: i.count })),
       });
