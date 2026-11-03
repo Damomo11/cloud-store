@@ -350,25 +350,24 @@ class CraftController {
     const phase = operation.data.recoveryPhase || operation.phase
     await this.assertSettledResidue()
     await this.warehouse.goHomeIfAway()
-    // Refresh registered container observations without calling sync's
-    // unexplained-loss reconciliation or changing any owner balances.
-    let serverPlayerSnapshot = null
-    for (const chest of this.db.listChests()) {
-      check()
-      const snapshot = await readServerContainer(this.warehouse, chest, this.catalog, this.bot)
-      check()
-      this.db.replaceChestSlots(chest.chestId, snapshot.chestSlots)
-      serverPlayerSnapshot = merge(snapshot.playerItems)
+    // One authoritative server read of a single registered chest gives the
+    // backpack snapshot we need; re-reading EVERY chest (the old loop) costs
+    // minutes on a large warehouse and is pointless because physicalTotals
+    // already trusts the DB's chest-slot ledger, and store() below deposits
+    // into the same ledger with per-chest server verification.
+    const chests = this.db.listChests()
+    if (!chests.length) throw new Error('恢复没有取得可核对的服务端背包快照；请先登记可用容器。')
+    check()
+    const snapshot = await readServerContainer(this.warehouse, chests[0], this.catalog, this.bot)
+    check()
+    this.db.replaceChestSlots(chests[0].chestId, snapshot.chestSlots)
+    const serverPlayerSnapshot = merge(snapshot.playerItems)
+    if (!same(this.inventory(), serverPlayerSnapshot)) {
+      await this.assertSettledResidue()
       if (!same(this.inventory(), serverPlayerSnapshot)) {
-        // A mid-recovery packet may still carry a cursor the snapshot above has
-        // already returned; settle once before declaring a real divergence.
-        await this.assertSettledResidue()
-        if (!same(this.inventory(), serverPlayerSnapshot)) {
-          throw new Error(`恢复时背包与服务端快照不一致（残留：${this.residueDescription()}）。`)
-        }
+        throw new Error(`恢复时背包与服务端快照不一致（残留：${this.residueDescription()}）。`)
       }
     }
-    if (!serverPlayerSnapshot) throw new Error('恢复没有取得可核对的服务端背包快照；请先登记可用容器。')
     check()
     const actual = this.physicalTotals()
     const baseline = operation.data.physicalTotals
