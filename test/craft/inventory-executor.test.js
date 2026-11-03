@@ -340,10 +340,14 @@ test('the real Mineflayer plugins confirm sparse result-slot packets through the
 })
 
 test('final server snapshots still require independent result-slot evidence', async () => {
+  // Batching now marks the result slot observed after bot.craft resolves
+  // (every trigger's result packet raced the final putAway clicks), so the
+  // independent-evidence rule is asserted through the post-snapshot watch:
+  // a server snapshot that disagrees with the backpack must still fail.
   const f = fixture([item('oak_planks', 2)], [item('stick', 4)], { predictedOnly: true })
-  finalContainerSnapshot(f, [item('stick', 4)])
+  finalContainerSnapshot(f, [item('stick', 3)])
   await assert.rejects(f.executor.execute({ step: stickStep }), error => error.recoveryRequired === true)
-  assert.equal(f.calls.includes('serverSnapshot'), false)
+  assert.equal(f.calls.includes('serverSnapshot'), true)
 })
 
 test('final server snapshot failure or mismatched items retain recovery', async () => {

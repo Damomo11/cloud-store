@@ -267,6 +267,27 @@ class CraftLedger {
     }
   }
 
+  // Partial settlement keeps only the integrity rails: the step must match the
+  // prepared pending journal, consumption must stay within what the batch
+  // withdrew, and after must equal the real conversion. The full expected
+  // consumed/produced equality is dropped — a mid-batch failure means exactly
+  // those deltas diverged from the plan.
+  validatePartialSettlement (operation, stepId, before, consumed, produced) {
+    if (operation.phase !== 'crafting') throw new Error('craft operation is not in crafting phase')
+    const pending = operation.data.pending
+    if (!pending || String(pending.stepId || '') !== stepId) throw new Error('craft step does not match prepared pending step')
+    if (!Array.isArray(pending.before)) throw new Error('craft pending step is missing prepared snapshots')
+    if (!equalItems(before, pending.before)) throw new Error('craft partial settlement before snapshot does not match pending state')
+    const consumedTotals = new Map()
+    for (const item of consumed) consumedTotals.set(item.itemKey, (consumedTotals.get(item.itemKey) || 0) + item.amount)
+    for (const [itemKey, amount] of consumedTotals) {
+      const expectedInput = pending.expectedConsumed?.find(item => item.itemKey === itemKey)
+      if (!expectedInput || amount > expectedInput.amount) {
+        throw new Error(`craft partial settlement consumed more than the batch withdrew: ${itemKey}`)
+      }
+    }
+  }
+
   confirm (id, batchKey, consumed, produced, data = {}) {
     const operationId = String(id || '')
     const operation = this.getCraftOperation(operationId)
@@ -283,7 +304,28 @@ class CraftLedger {
     }, before, after)
   }
 
-  _confirm (operationId, batchKey, consumed, produced, nextData, before, after) {
+  // Mid-batch failure settlement: the executor captured concrete before/after
+  // snapshots, so we book the real consumption/production instead of matching
+  // the full expected trigger deltas. Everything else (reservation coverage,
+  // balance updates, batch journal, phase transition) follows the same rules
+  // as a normal confirm.
+  confirmPartial (id, batchKey, consumed, produced, data = {}) {
+    const operationId = String(id || '')
+    const operation = this.getCraftOperation(operationId)
+    const before = data.before || operation?.data?.pending?.before || operation?.data?.held || []
+    if (Array.isArray(data.after) && Array.isArray(data.held) && !equalItems(data.after, data.held)) {
+      throw new Error('craft after snapshot does not match held state')
+    }
+    const after = data.after || data.held || []
+    return this._confirm(operationId, String(batchKey || ''), items(consumed || [], 'consumed item'), items(produced || [], 'produced item'), {
+      ...clone(data),
+      held: items(after, 'after item'),
+      pending: null,
+      stepIndex: data.stepIndex ?? ((operation?.data?.stepIndex || 0) + 1)
+    }, before, after, { partial: true })
+  }
+
+  _confirm (operationId, batchKey, consumed, produced, nextData, before, after, options = {}) {
     if (!String(batchKey || '').trim()) throw new Error('craft step is missing stepId')
     const commit = () => this.transaction(() => {
       const operation = this.getCraftOperation(operationId)
@@ -297,7 +339,11 @@ class CraftLedger {
         return this.getCraftOperation(operationId)
       }
       if (TERMINAL.has(operation.state)) throw new Error(`craft operation is already ${operation.state}`)
-      this.validatePending(operation, batchKey, before, consumed, produced)
+      if (options.partial) {
+        this.validatePartialSettlement(operation, batchKey, before, consumed, produced)
+      } else {
+        this.validatePending(operation, batchKey, before, consumed, produced)
+      }
       const expectedAfter = this.computeAfter(before, consumed, produced)
       if (!equalItems(after, expectedAfter)) throw new Error('craft after snapshot does not match conversion')
       const reservation = new Map(this.listCraftReservations(operationId).map(row => [row.itemKey, row.amount]))

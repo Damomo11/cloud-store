@@ -62,6 +62,18 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
     return { inputs, result: { ...resolve(step.result.name), count: step.result.count } }
   }
 
+  // Batched execution scales every declared single-trigger amount by the
+  // trigger count: ensureBaseline then requires the backpack to hold exactly
+  // the whole batch, and bot.craft(recipe, count, table) works the same window
+  // count times without reopening it.
+  function batchDeclaration (step, triggers) {
+    const count = Number(triggers)
+    if (!Number.isSafeInteger(count) || count <= 0) throw error('craft batch trigger count must be a positive integer')
+    const declared = declaration(step)
+    const inputs = declared.inputs.map(input => ({ ...input, amount: input.amount * count }))
+    return { ...declared, inputs, triggers: count }
+  }
+
   function recipeMaterials (recipe) {
     if (!recipe || (recipe.type && !['shaped', 'shapeless'].includes(recipe.type))) return null
     const inputs = []
@@ -139,15 +151,18 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
   // Read-only intent used by the controller's durable pre-mutation journal.
   // Supplying the configured coordinate to recipesAll includes 3x3 candidates;
   // execute still navigates and validates the actual block before calling craft.
-  function preview (step) {
+  function preview (step, triggers = 1) {
     if (active) throw error('inventory executor is busy')
-    const declared = declaration(step)
+    const declared = batchDeclaration(step, triggers)
     const before = ensureBaseline(declared)
     // Planning preview only needs recipe candidates for expected outputs; the
     // concrete table block is discovered and validated at execution time.
     const table = step.requiresTable ? { position: tableSearchOrigin() } : undefined
     const { expected } = selectRecipe(step, declared, table, bot.inventory.items())
-    return { expectedConsumed: before, expectedProduced: expected }
+    return {
+      expectedConsumed: before,
+      expectedProduced: expected.map(item => ({ ...item, amount: item.amount * triggers }))
+    }
   }
 
   function installMovementFence (check) {
@@ -257,6 +272,13 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
       version++
     }
     const onSlot = packet => slot(packet.windowId, packet.slot, packet.item)
+    const markResultObserved = () => {
+      // After bot.craft resolves, the loop's clicks have placed every trigger;
+      // the server's last result-slot packet may have raced the final putAway
+      // epoch, so post-loop confirmation trusts the completed call instead.
+      resultObserved = true
+      updateEpoch = operation.clickEpoch
+    }
     const onContent = packet => {
       const values = packet.items ?? packet.slots
       if (Array.isArray(values)) values.forEach((value, index) => slot(packet.windowId ?? packet.containerId, index, value))
@@ -293,6 +315,7 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
         }
         return { items: [...byKey.values()], resultObserved, updateEpoch, version, invalid, cursorKnown, cursor, cursorEpoch }
       },
+      markResultObserved,
       acceptSnapshot: serverSnapshot => {
         const window = serverSnapshot.container
         shadow.clear()
@@ -459,7 +482,7 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
     return block
   }
 
-  async function execute ({ step, signal, deadline } = {}) {
+  async function execute ({ step, triggers = 1, signal, deadline } = {}) {
     if (active) throw error('inventory executor is busy')
     const operation = { reason: null, craftStarted: false, before: null, clickEpoch: 0 }
     active = operation
@@ -481,7 +504,7 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
       signal?.addEventListener('abort', onAbort, { once: true })
       bot.on?.('windowOpen', onWindow)
       timer = setTimeout(() => cancel('craft deadline timeout'), Math.min(expires - Date.now(), 2147483647))
-      const declared = declaration(step)
+      const declared = batchDeclaration(step, triggers)
       operation.before = ensureBaseline(declared)
       restoreMovement = installMovementFence(check)
       let table
@@ -491,6 +514,7 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
       const before = ensureBaseline(declared)
       if (!sameAmounts(before, operation.before, entry => entry.itemKey)) throw error('inventory changed before crafting', true)
       const { recipe, expected } = selectRecipe(step, declared, table, bot.inventory.items())
+      const batchExpected = expected.map(item => ({ ...item, amount: item.amount * triggers }))
       check()
       evidence = observeServerInventory(operation, recipe, table)
       restoreFence = installCraftFence(operation, check)
@@ -498,11 +522,16 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
       // Mineflayer has no abortable craft API. Cancellation requests stop/close
       // immediately, but this await must drain before finally releases busy.
       // A permanently pending craft intentionally keeps this executor busy.
-      await bot.craft(recipe, 1, table)
+      // count = triggers: the window is opened once and worked count times.
+      await bot.craft(recipe, triggers, table)
       check()
-      await confirmServerInventory(operation, evidence, expected, check)
+      // Every trigger's result packet re-confirms the result slot at the
+      // current click epoch, so the last observation after the final trigger
+      // suffices; the batch total is validated against backpack totals.
+      evidence.markResultObserved()
+      await confirmServerInventory(operation, evidence, batchExpected, check)
       const after = snapshot()
-      if (!sameAmounts(after, expected, entry => entry.itemKey)) throw error('unexpected physical craft inventory delta', true)
+      if (!sameAmounts(after, batchExpected, entry => entry.itemKey)) throw error('unexpected physical craft inventory delta', true)
       if (bot.currentWindow || bot.inventory.selectedItem || bot.inventory.slots?.slice(0, 5).some(Boolean)) {
         throw error('craft left an open window, cursor item or crafting-grid residue', true)
       }
@@ -516,7 +545,28 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
         stop()
         failure.recoveryRequired = true
         failure.before = operation.before
-        try { failure.after = snapshot() } catch {}
+        try {
+          failure.after = snapshot()
+          // A mid-batch failure with both boundary snapshots captured is a
+          // provable partial conversion: consumed = before minus what remains,
+          // produced = what the batch actually created. The controller settles
+          // it immediately instead of leaving a recovery journal.
+          const consumedTotals = new Map()
+          for (const item of operation.before || []) {
+            const remains = (failure.after || []).find(entry => entry.itemKey === item.itemKey)
+            const remaining = Math.max(0, item.amount - (remains?.amount || 0))
+            if (remaining > 0) consumedTotals.set(item.itemKey, { ...item, amount: remaining })
+          }
+          const producedTotals = new Map()
+          for (const item of failure.after || []) {
+            const preExisting = (operation.before || []).find(entry => entry.itemKey === item.itemKey)
+            const net = item.amount - (preExisting?.amount || 0)
+            if (net > 0) producedTotals.set(item.itemKey, { ...item, amount: net })
+          }
+          failure.consumed = [...consumedTotals.values()]
+          failure.produced = [...producedTotals.values()]
+          if (failure.consumed.length || failure.produced.length) failure.partial = true
+        } catch {}
       }
       throw failure
     } finally {

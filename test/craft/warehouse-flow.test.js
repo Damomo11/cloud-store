@@ -117,12 +117,16 @@ function fixture () {
     return row
   }
   const executor = {
-    execute: async ({ step }) => {
+    execute: async ({ step, triggers = 1 }) => {
       const before = catalog.aggregatePrismarineItems(inventory)
-      inventory = [make(step.result.name, step.result.count)]
+      inventory = [make(step.result.name, step.result.count * triggers)]
       const after = catalog.aggregatePrismarineItems(inventory)
       return { before, after, consumed: before, produced: after }
     },
+    preview: (step, triggers = 1) => ({
+      expectedConsumed: catalog.aggregatePrismarineItems(inventory),
+      expectedProduced: [{ ...catalog.fromPrismarineItem(make(step.result.name, step.result.count * triggers)) }]
+    }),
     cancel: () => {},
     isBusy: () => false
   }
@@ -192,9 +196,9 @@ test('multi-step recipes keep intermediates reserved and return surplus output t
     const log = f.seed('alice', 'oak_log', 1)
     const controller = new CraftController({ ...f, botId: 'bot-a' })
     const run = f.executor.execute
-    let triggers = 0
+    let batches = 0
     f.executor.execute = async args => {
-      triggers++
+      batches++
       assert.equal(controller.ledger.pending().length, 1)
       assert.ok(controller.ledger.listCraftReservations(controller.ledger.pending()[0].id).length)
       assert.throws(() => f.db.adjustBalance('alice', log.itemKey, 1), /合成|craft/)
@@ -202,7 +206,9 @@ test('multi-step recipes keep intermediates reserved and return surplus output t
     }
     const result = await controller.run({ actor: 'Alice', owner: { uuid: 'alice' }, item: 'stick', quantity: 5 })
     assert.equal(result.status, 'complete')
-    assert.equal(triggers, 3)
+    // Two steps (log→planks 1 trigger, planks→stick 2 triggers) but batching
+    // merges each step's triggers into one batch: 2 batches total.
+    assert.equal(batches, 2)
     assert.equal(f.db.getOwnerItemsByItemId('alice', 'minecraft:stick')[0].amount, 8)
     assert.equal(f.db.getOwnerItemsByItemId('alice', 'minecraft:oak_planks').length, 0)
     assert.deepEqual(controller.ledger.pending(), [])
@@ -283,7 +289,28 @@ test('full warehouse keeps settled outputs reserved and never issues a second de
   } finally { f.db.close() }
 })
 
-test('cancel after a confirmed trigger returns that output and releases only safely stored reservations', async () => {
+test('cancel after a confirmed batch returns that output and releases only safely stored reservations', async () => {
+  const { CraftController } = require('../../src/craft/controller')
+  const f = fixture()
+  try {
+    f.seed('alice', 'oak_planks', 8)
+    const controller = new CraftController({ ...f, botId: 'bot-a' })
+    const run = f.executor.execute
+    f.executor.execute = async args => { const result = await run(args); controller.cancel('cancel test'); return result }
+    // 8 sticks = 2 triggers = one batch (4 planks withdrawn at once).
+    // The cancel fires after the only batch confirmed and stored, so the run
+    // has no remaining work to abort: it completes with the full output.
+    const result = await controller.run({ actor: 'Alice', owner: { uuid: 'alice' }, item: 'stick', quantity: 8 })
+    assert.equal(result.status, 'complete')
+    assert.equal(f.db.getOwnerItemsByItemId('alice', 'minecraft:stick')[0].amount, 8)
+    // 8 planks seeded, 4 consumed by the single batch: 4 remain in stock.
+    assert.equal(f.db.getOwnerItemsByItemId('alice', 'minecraft:oak_planks')[0].amount, 4)
+    assert.deepEqual(f.getInventory(), [])
+    assert.deepEqual(controller.ledger.pending(), [])
+  } finally { f.db.close() }
+})
+
+test('cancel between batches aborts the queued batch and returns already-crafted output', async () => {
   const { CraftController } = require('../../src/craft/controller')
   const f = fixture()
   try {
@@ -291,11 +318,20 @@ test('cancel after a confirmed trigger returns that output and releases only saf
     const controller = new CraftController({ ...f, botId: 'bot-a' })
     const run = f.executor.execute
     f.executor.execute = async args => { const result = await run(args); controller.cancel('cancel test'); return result }
-    await assert.rejects(controller.run({ actor: 'Alice', owner: { uuid: 'alice' }, item: 'stick', quantity: 8 }), /cancel test/)
-    assert.equal(f.db.getOwnerItemsByItemId('alice', 'minecraft:stick')[0].amount, 4)
-    assert.equal(f.db.getOwnerItemsByItemId('alice', 'minecraft:oak_planks')[0].amount, 2)
-    assert.deepEqual(f.getInventory(), [])
-    assert.deepEqual(controller.ledger.pending(), [])
+    // Quantity 8 needs 2 triggers of 2 planks; capacity allows 18 triggers per
+    // batch, so force a second batch by capping capacity through a crafted step.
+    const step = { inputs: [{ names: ['oak_planks'], count: 2 }], result: { name: 'stick', count: 4 }, requiresTable: false }
+    const original = controller.maxTriggersPerBatch.bind(controller)
+    controller.maxTriggersPerBatch = () => 1
+    try {
+      await assert.rejects(controller.run({ actor: 'Alice', owner: { uuid: 'alice' }, item: 'stick', quantity: 8 }), /cancel test/)
+      assert.equal(f.db.getOwnerItemsByItemId('alice', 'minecraft:stick')[0].amount, 4)
+      assert.equal(f.db.getOwnerItemsByItemId('alice', 'minecraft:oak_planks')[0].amount, 2)
+      assert.deepEqual(f.getInventory(), [])
+      assert.deepEqual(controller.ledger.pending(), [])
+    } finally {
+      controller.maxTriggersPerBatch = original
+    }
   } finally { f.db.close() }
 })
 

@@ -52,6 +52,62 @@ class CraftController {
       this.bot.inventory.slots?.slice(0, 5).some(Boolean))
   }
 
+  residueDescription () {
+    const parts = []
+    if (this.bot.currentWindow) parts.push(`窗口 type=${this.bot.currentWindow.type || 'unknown'}`)
+    if (this.bot.inventory.selectedItem) {
+      const cursor = this.catalog.fromPrismarineItem(this.bot.inventory.selectedItem)
+      parts.push(`光标 ${cursor.displayName || cursor.itemId}`)
+    }
+    const grid = this.bot.inventory.slots?.slice(0, 5)
+    if (Array.isArray(grid)) {
+      for (const [slot, value] of grid.entries()) {
+        if (!value) continue
+        const item = this.catalog.fromPrismarineItem(value)
+        parts.push(`合成格${slot} ${item.displayName || item.itemId}×${value.count}`)
+      }
+    }
+    return parts.join('；') || '未知残留'
+  }
+
+  // Recovery self-heal: an interrupted bot.craft() may leave the cursor holding
+  // a picked-up stack or a mid-click window open. Closing the window returns
+  // grid items to the server-side inventory; parking the cursor merges it back
+  // into backpack slots. Both moves relocate existing items without creating or
+  // destroying any, so the operation's physicalTotals baseline stays valid.
+  async settleResidue () {
+    if (this.bot.currentWindow) {
+      try { this.bot.closeWindow(this.bot.currentWindow) } catch {}
+      await new Promise(resolve => setTimeout(resolve, 150))
+    }
+    const selectedItem = this.bot.inventory.selectedItem
+    if (!selectedItem) return
+    const cursor = this.catalog.fromPrismarineItem(selectedItem)
+    const slots = this.bot.inventory.slots
+    if (!Array.isArray(slots)) throw new Error(`无法自愈光标残留：${cursor.displayName || cursor.itemId}（背包槽位数据不可用）。`)
+    let target = -1
+    for (let slot = 9; slot < 45; slot++) {
+      const value = slots[slot]
+      if (value && value.count < value.stackSize && this.catalog.fromPrismarineItem(value).itemKey === cursor.itemKey) { target = slot; break }
+    }
+    if (target < 0) {
+      for (let slot = 9; slot < 45; slot++) {
+        if (!slots[slot]) { target = slot; break }
+      }
+    }
+    if (target < 0) throw new Error(`无法自愈光标残留：${cursor.displayName || cursor.itemId}（背包没有可合并或空置的槽位）。`)
+    await this.bot.clickWindow(target, 0, 0)
+  }
+
+  // One settle attempt must clear window + cursor; crafting-grid phantoms are
+  // server-side-packet staleness and get corrected by the container re-read.
+  async assertSettledResidue () {
+    await this.settleResidue()
+    if (this.bot.currentWindow || this.bot.inventory.selectedItem) {
+      throw new Error(`自愈后仍存在光标/窗口残留：${this.residueDescription()}；需要人工核对。`)
+    }
+  }
+
   assertCleanInventory () {
     if (this.hasInventoryResidue()) throw new Error('需先处理机器人背包、窗口、光标或合成格残留物品。')
   }
@@ -100,8 +156,11 @@ class CraftController {
     // A final-only estimate misses peaks while some inputs still occupy slots.
     const reserved = new Map(this.allocate(plan.inventoryUses, this.availableItems(owner.uuid)).map(row => [row.itemKey, { ...row }]))
     for (const step of plan.craftSteps) {
-      for (let trigger = 0; trigger < step.times; trigger++) {
-        const inputs = this.allocate(step.inputs.map(input => ({ name: input.names[0], quantity: input.count })),
+      // Batch granularity mirrors execution: each batch deducts its full input
+      // set at once, then credits outputs after the batch's triggers complete.
+      for (let start = 0; start < step.times; start += this.maxTriggersPerBatch(step)) {
+        const triggers = Math.min(this.maxTriggersPerBatch(step), step.times - start)
+        const inputs = this.allocate(step.inputs.map(input => ({ name: input.names[0], quantity: input.count * triggers })),
           [...reserved.values()].sort((a, b) => a.itemKey.localeCompare(b.itemKey)))
         for (const input of inputs) {
           amount.get(input.itemKey).amount -= input.amount
@@ -109,16 +168,41 @@ class CraftController {
         }
         for (const output of step.outputs || [step.result]) {
           const resolved = this.catalog.resolveName(output.name)
-          const item = this.catalog.fromPrismarineItem(new Item(resolved.type, output.count, output.metadata))
+          const item = this.catalog.fromPrismarineItem(new Item(resolved.type, output.count * triggers, output.metadata))
           for (const pool of [amount, reserved]) {
             const previous = pool.get(item.itemKey)
-            pool.set(item.itemKey, { ...item, amount: (previous?.amount || 0) + output.count })
+            pool.set(item.itemKey, { ...item, amount: (previous?.amount || 0) + output.count * triggers })
           }
         }
         const used = [...amount.values()].reduce((sum, item) => sum + Math.ceil(item.amount / Math.max(1, this.catalog.getStackSize(item.itemId))), 0)
         if (used > quota.quotaSlots) throw new Error(`合成过程中的仓库占用超出额度（${used}/${quota.quotaSlots} 槽）。`)
       }
     }
+  }
+
+  // Backpack-window capacity: 36 usable slots (9..45). One batch withdraws all
+  // of its inputs at once and carries produced outputs alongside them before
+  // the final store, so inputs+outputs must fit together at peak.
+  maxTriggersPerBatch (step) {
+    const INVENTORY_SLOTS = 36
+    const slotsFor = (items) => items.reduce((sum, entry) =>
+      sum + Math.ceil(entry.amount / Math.max(1, this.catalog.getStackSize(entry.itemId))), 0)
+    const inputTotals = new Map()
+    for (const input of step.inputs) {
+      const resolved = this.catalog.resolveName(input.names[0])
+      const previous = inputTotals.get(resolved.name)
+      inputTotals.set(resolved.name, { itemId: `minecraft:${resolved.name}`, amount: (previous?.amount || 0) + input.count })
+    }
+    const outputTotals = new Map()
+    for (const output of step.outputs || [step.result]) {
+      const previous = outputTotals.get(output.name)
+      outputTotals.set(output.name, { itemId: `minecraft:${output.name}`, amount: (previous?.amount || 0) + output.count })
+    }
+    const perTriggerSlots = slotsFor([...inputTotals.values()]) + slotsFor([...outputTotals.values()])
+    // A recipe never exceeds 9 input slots + 9 output slots per trigger, so
+    // one trigger always fits; scale until inputs+outputs would overflow.
+    if (perTriggerSlots > INVENTORY_SLOTS) return 1
+    return Math.max(1, Math.floor(INVENTORY_SLOTS / perTriggerSlots))
   }
 
   async run (request) {
@@ -155,31 +239,35 @@ class CraftController {
         try {
           await this.warehouse.goHomeIfAway()
           for (const [index, step] of planned.command.craftSteps.entries()) {
-            for (let trigger = 0; trigger < step.times; trigger++) {
+            let trigger = 0
+            while (trigger < step.times) {
+              const triggers = Math.min(this.maxTriggersPerBatch(step), step.times - trigger)
               check()
               this.assertCleanInventory()
               const heldAllocations = this.ledger.listCraftReservations(id).map(row => ({ ...this.db.getItemByKey(row.itemKey), amount: row.amount }))
-              const inputs = this.allocate(step.inputs.map(input => ({ name: input.names[0], quantity: input.count })), heldAllocations)
+              const inputs = this.allocate(step.inputs.map(input => ({ name: input.names[0], quantity: input.count * triggers })), heldAllocations)
               const data = { ...operation.data, held: [], pending: null, physicalTotals: this.physicalTotals(), inputs, stepIndex: index, trigger }
               operation = this.ledger.checkpoint(id, 'withdrawing', data)
               await this.warehouse.withdrawAllocationsLocked(inputs, { requireServerEvidence: true })
               const before = this.inventory()
               if (!same(before, inputs)) throw new Error('仓库原料取出失败或不足。')
               check()
-              const intent = this.executor.preview ? this.executor.preview(step) : {
-                expectedConsumed: before, expectedProduced: [{ itemId: `minecraft:${step.result.name}`, amount: step.result.count }]
+              const intent = this.executor.preview ? this.executor.preview(step, triggers) : {
+                expectedConsumed: before,
+                expectedProduced: [{ itemId: `minecraft:${step.result.name}`, amount: step.result.count * triggers }]
               }
-              const stepId = `${index}:${trigger}`
+              const stepId = `${index}:${trigger}+${triggers}`
               operation = this.ledger.checkpoint(id, 'crafting', { ...data, held: before,
                 physicalTotals: this.physicalTotals(), pending: { stepId, before, ...intent } })
-              const result = await this.executor.execute({ step, signal: abort.signal, deadline })
+              const result = await this.executor.execute({ step, triggers, signal: abort.signal, deadline })
               if (!same(result.before, before) || !same(result.after, this.inventory())) throw new Error('合成前后物品证据不一致。')
               operation = this.ledger.confirm(id, stepId, result.consumed, result.produced, {
                 ...operation.data, before: result.before, after: result.after, held: result.after, pending: null,
                 physicalTotals: this.physicalTotals()
               })
               operation = await this.store(operation)
-              request.onProgress?.({ index, trigger, steps: planned.command.craftSteps.length })
+              request.onProgress?.({ index, trigger: trigger + triggers, steps: planned.command.craftSteps.length })
+              trigger += triggers
             }
           }
           this.assertCleanInventory()
@@ -198,6 +286,21 @@ class CraftController {
               operation = this.ledger.checkpoint(id, 'storing', { ...operation.data, held: this.inventory(), pending: null, physicalTotals: this.physicalTotals() })
               operation = await this.store(operation)
               this.ledger.finish(id, 'failed', error.message)
+            } else if (error.partial && operation.data.pending) {
+              // Batched craft failed midway but the executor captured concrete
+              // before/after inventories: settle what actually happened right
+              // now instead of leaving a recovery journal behind.
+              const pending = operation.data.pending
+              const consumed = error.consumed
+              // The executor's after snapshot IS the live backpack (it stopped
+              // right before rethrowing), so physicalTotals already includes
+              // these items; store() then deposits them into the warehouse.
+              operation = this.ledger.confirmPartial(id, pending.stepId, consumed, error.produced, {
+                ...operation.data, before: pending.before, after: error.after, held: error.after, pending: null,
+                physicalTotals: this.physicalTotals()
+              })
+              operation = await this.store(operation)
+              this.ledger.finish(id, 'failed', `部分批次已按实际消耗产出销账：${error.message}`)
             } else if (operation.phase === 'ready' && !this.hasInventoryResidue()) {
               this.ledger.finish(id, 'failed', error.message)
             } else this.ledger.markRecovery(id, error.message, { ...operation.data, held: this.inventory() })
@@ -245,7 +348,7 @@ class CraftController {
     if (operations.length !== 1) throw new Error('同一机器人存在多个合成恢复记录，需要人工核对。')
     let operation = operations[0]
     const phase = operation.data.recoveryPhase || operation.phase
-    if (this.bot.currentWindow || this.bot.inventory.selectedItem || this.bot.inventory.slots?.slice(0, 5).some(Boolean)) throw new Error('恢复前需核对光标和合成格残留物。')
+    await this.assertSettledResidue()
     await this.warehouse.goHomeIfAway()
     // Refresh registered container observations without calling sync's
     // unexplained-loss reconciliation or changing any owner balances.
@@ -256,8 +359,14 @@ class CraftController {
       check()
       this.db.replaceChestSlots(chest.chestId, snapshot.chestSlots)
       serverPlayerSnapshot = merge(snapshot.playerItems)
-      if (!same(this.inventory(), serverPlayerSnapshot) || this.bot.currentWindow || this.bot.inventory.selectedItem ||
-        this.bot.inventory.slots?.slice(0, 5).some(Boolean)) throw new Error('恢复时背包、光标或窗口与服务端快照不一致。')
+      if (!same(this.inventory(), serverPlayerSnapshot)) {
+        // A mid-recovery packet may still carry a cursor the snapshot above has
+        // already returned; settle once before declaring a real divergence.
+        await this.assertSettledResidue()
+        if (!same(this.inventory(), serverPlayerSnapshot)) {
+          throw new Error(`恢复时背包与服务端快照不一致（残留：${this.residueDescription()}）。`)
+        }
+      }
     }
     if (!serverPlayerSnapshot) throw new Error('恢复没有取得可核对的服务端背包快照；请先登记可用容器。')
     check()

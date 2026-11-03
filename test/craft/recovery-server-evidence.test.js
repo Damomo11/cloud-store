@@ -68,7 +68,7 @@ function fixture (options = {}) {
   }
   const controller = new CraftController({ bot, db, catalog, config, warehouse, ledger, executor: { isBusy: () => false }, botId: 'bot-a' })
   return {
-    db, bot, ledger, controller, before, products, chest,
+    db, bot, ledger, controller, before, products, chest, warehouse,
     deposits: () => deposits,
     confirmed: () => db.db.prepare('SELECT COUNT(*) AS n FROM craft_batches').get().n,
     close: () => db.close()
@@ -162,5 +162,82 @@ test('an interrupted ready operation with a recorded baseline can close without 
     assert.equal(f.confirmed(), 0)
     assert.equal(f.db.getBalance('alice', f.before[0].itemKey), 2)
     assert.equal(f.ledger.pending().length, 0)
+  } finally { f.close() }
+})
+
+test('recovery self-heals an open window before reconciliation', async () => {
+  const f = fixture({})
+  try {
+    // Simulate a mid-click abort: a crafting window left open. The server
+    // returns grid items to the backpack on close, so the reconciliation
+    // must succeed without human intervention.
+    f.bot.closeWindow = () => { f.bot.currentWindow = null }
+    f.bot.currentWindow = { id: 3, type: 'minecraft:crafting' }
+    const result = await f.controller.recover()
+    assert.equal(result.status, 'recovered')
+    assert.equal(f.confirmed(), 1)
+    assert.equal(f.ledger.pending().length, 0)
+  } finally { f.close() }
+})
+
+test('recovery parks a cursor holding a crafted stack into a backpack slot', async () => {
+  const f = fixture({})
+  try {
+    const catalog = f.controller.catalog
+    const Item = require('prismarine-item')(catalog.mcData)
+    const refresh = () => f.db.replaceChestSlots(f.chest.chestId, f.serverStored().map((value, slot) => ({ ...catalog.fromPrismarineItem(value), slot })))
+    // Mid-pickup abort: cursor holds the crafted sticks, backpack empty.
+    // Parking merges the cursor into a backpack slot before the container
+    // loop; the fixture's closeContainerQuietly then resyncs the backpack
+    // from the server snapshot (same sticks), the conversion confirms, and
+    // the store balances.
+    const cursorStack = new Item(catalog.mcData.itemsByName.stick.id, 4)
+    let backpack = []
+    f.bot.inventory = {
+      items: () => backpack,
+      selectedItem: cursorStack,
+      slots: new Array(46).fill(null)
+    }
+    f.bot.clickWindow = async slot => {
+      f.bot.inventory.slots[slot] = f.bot.inventory.selectedItem
+      backpack = [f.bot.inventory.selectedItem]
+      f.bot.inventory.selectedItem = null
+    }
+    f.bot.closeWindow = () => {}
+    // depositAllPossible must pick up the PARKED backpack: the fixture
+    // closure's own `inventory` variable went stale when we replaced
+    // bot.inventory. Re-bind it to the parked stack, writing into the same
+    // chest-slot store the fixture uses (depositAllPossible in production
+    // runs inside the craft ledger's transaction context which permits
+    // balance writes; here we mirror the chest-slot update directly).
+    f.warehouse.depositAllPossible = async () => {
+      const rows = backpack.map((value, index) => ({ ...catalog.fromPrismarineItem(value), slot: index }))
+      backpack = []
+      f.db.db.transaction(() => {
+        f.db.db.prepare('DELETE FROM chest_slots WHERE chest_id = ?').run(f.chest.chestId)
+        for (const row of rows) {
+          f.db.upsertItem({ itemKey: row.itemKey, itemId: row.itemId, displayName: row.displayName, nbtJson: row.nbtJson ?? '', metaJson: row.metaJson ?? '' })
+          f.db.db.prepare('INSERT INTO chest_slots (chest_id, slot, item_key, amount) VALUES (?, ?, ?, ?)')
+            .run(f.chest.chestId, row.slot, row.itemKey, row.amount)
+        }
+      })()
+    }
+    const result = await f.controller.recover()
+    assert.equal(result.status, 'recovered')
+    assert.equal(f.bot.inventory.selectedItem, null)
+    assert.ok(f.bot.inventory.slots.some(Boolean))
+    assert.equal(f.ledger.pending().length, 0)
+    assert.equal(f.db.getBalance('alice', f.products[0].itemKey), 4)
+  } finally { f.close() }
+})
+
+test('recovery reports a real divergence after settling with a descriptive context', async () => {
+  const f = fixture({ unchanged: true, noResync: true })
+  try {
+    f.bot.clickWindow = async () => {}
+    f.bot.closeWindow = () => {}
+    await assert.rejects(f.controller.recover(), /快照|不一致/)
+    assert.equal(f.confirmed(), 0)
+    assert.equal(f.ledger.pending().length, 1)
   } finally { f.close() }
 })
