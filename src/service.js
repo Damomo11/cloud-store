@@ -830,17 +830,13 @@ class CloudStoreService {
       return
     }
 
-    // Crafting remains an administrator command; it settles against the explicitly
-    // selected personal or organization warehouse after server confirmation.
+    // Crafting is available to the owner of the selected personal or
+    // organization warehouse; validateCraftOwner checks membership.
     if (text === '!合成恢复') {
       await this.handleCraftRecovery(username)
       return
     }
     if (text.startsWith('!合成')) {
-      if (!this.isAdmin(username)) {
-        this.msg(username, '你没有权限使用合成命令。')
-        return
-      }
       await this.handleCraft(username, text, this.defaultStorageOwnerForPlayer(this.getPlayer(username)))
       return
     }
@@ -1951,12 +1947,11 @@ class CloudStoreService {
   }
 
   validateCraftOwner (owner, username) {
-    if (!this.isAdmin(username)) throw new Error('合成只允许系统管理员使用。')
     const player = this.getPlayer(username)
     if (owner.scope === 'custom' || owner.uuid.startsWith('vault:')) {
       const name = owner.vaultName || owner.uuid.slice(6)
       if (!this.db.getCustomWarehouse(name) || !this.db.isCustomWarehouseMember(name, player.uuid)) {
-        throw new Error('组织仓库已不存在或你已不是该仓库成员。')
+        throw new Error('组织仓库已不存在或你不是该仓库成员，无法使用合成。')
       }
     } else if (owner.uuid !== player.uuid) throw new Error('合成仓库归属与请求玩家不一致。')
   }
@@ -1971,12 +1966,14 @@ class CloudStoreService {
     const player = this.getPlayer(username)
     const owner = storageOwner || { ...player, scope: 'personal' }
     this.validateCraftOwner(owner, username)
+    // Same resolution chain as deposit/withdraw: personal alias -> global alias
+    // -> catalog display names. Falls back to the raw string for catalog ids.
     const alias = this.resolveByAliasChain(parsed.itemName, player.uuid)
     if (alias.layer === 'disabled') throw new Error('该物品别名已停用。')
     const resolved = this.catalog.resolveName(alias.item?.itemId || parsed.itemName)
     const planned = require('./craft').planToCraftCommand({
       item: resolved.name, quantity: parsed.quantity,
-      available: this.availableCraftStock(owner.uuid), config: this.config
+      available: this.availableCraftStock(owner.uuid), config: this.config, forceCraft: true
     })
     if (!planned.ok) { this.msg(username, this.describeCraftRejection(planned, parsed)); return }
     // Capture request intent and explicit owner. The selected worker replans and
@@ -1989,18 +1986,27 @@ class CloudStoreService {
     await this.enqueueTask(username, 'craft', worker => worker.runCraftCommand(request), { exclusive: true })
   }
 
+  // Mirrors parseWithdraw's name/quantity grammar so !合成 accepts the same
+  // forms as !取: bare alias ("!合成 木棍"), trailing count ("!合成 木棍 64"),
+  // and glued count ("!合成 木棍64"). Missing quantity crafts one.
   parseCraftRequest (request) {
     const raw = String(request || '').trim()
-    if (!raw) return { ok: false, error: '格式：!合成 物品名 [数量]，例如 !合成 木棍 64' }
-    const match = raw.match(/^(.*?)(?:\s+([^\s]+))?$/)
+    if (!raw) return { ok: false, error: '格式：!合成 物品名 [数量]，例如 !合成 木棍 64、!合成 木棍64、!合成 木棍' }
     let itemName = raw
     let quantity = 1
-    if (match?.[2] && /^[+\-\d.]/.test(match[2])) {
-      itemName = match[1].trim()
-      if (!/^\d+$/.test(match[2])) return { ok: false, error: '数量必须是安全的正整数。' }
-      quantity = Number(match[2])
+    const trailing = raw.match(/^(.*?)(?:\s+)(\d+)$/)
+    if (trailing) {
+      itemName = trailing[1].trim()
+      quantity = Number(trailing[2])
+    } else {
+      const glued = raw.match(/^(.*?)(\d+)$/)
+      if (glued && glued[1].trim()) {
+        itemName = glued[1].trim()
+        quantity = Number(glued[2])
+      }
     }
-    if (!itemName || !Number.isSafeInteger(quantity) || quantity <= 0 || quantity > 1000000) {
+    if (!itemName) return { ok: false, error: '缺少物品名，例如 !合成 木棍 64。' }
+    if (!Number.isSafeInteger(quantity) || quantity <= 0 || quantity > 1000000) {
       return { ok: false, error: '数量必须是 1 到 1000000 之间的整数。' }
     }
     return { ok: true, itemName, quantity }
@@ -2017,7 +2023,6 @@ class CloudStoreService {
 
   describeCraftRejection (planned, parsed) {
     if (planned.reason === 'needs_collection') return '仓库内原料不足，无法合成 ' + parsed.itemName + '（只使用散装库存，不采集）。'
-    if (planned.reason === 'no_workstation_configured') return '该配方需要工作台（3x3），请配置 config.craft.table。'
     if (planned.reason === 'already_in_warehouse') return '仓库里已有足够 ' + parsed.itemName + '，无需合成。'
     return '无法合成 ' + parsed.itemName + '：配方不可达、原料不足或合成配置无效。'
   }

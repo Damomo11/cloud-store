@@ -74,15 +74,24 @@ function giveStock (fixture, ownerUuid, itemId, count) {
   }])
 }
 
-test('parseCraftRequest parses name and optional quantity', () => {
+test('parseCraftRequest parses name, glued count and optional quantity', () => {
   const fixture = createFixture()
   try {
     assert.deepEqual(fixture.service.parseCraftRequest('石头 64'), { ok: true, itemName: '石头', quantity: 64 })
     assert.deepEqual(fixture.service.parseCraftRequest('stick'), { ok: true, itemName: 'stick', quantity: 1 })
+    // Glued form mirrors !取: 木棍64 crafts 64.
+    assert.deepEqual(fixture.service.parseCraftRequest('木棍64'), { ok: true, itemName: '木棍', quantity: 64 })
+    // Multi-word names keep every token.
+    assert.deepEqual(fixture.service.parseCraftRequest('oak wood 4'), { ok: true, itemName: 'oak wood', quantity: 4 })
     assert.equal(fixture.service.parseCraftRequest('').ok, false)
-    for (const value of ['stick 0', 'stick -1', 'stick 1.5', 'stick 9007199254740993']) {
+    for (const value of ['stick 0', 'stick 9007199254740993', 'stick 1000001']) {
       assert.equal(fixture.service.parseCraftRequest(value).ok, false, value)
     }
+    // Non-quantity tails stay part of the item name for alias resolution.
+    assert.equal(fixture.service.parseCraftRequest('stick -1').ok, true)
+    assert.equal(fixture.service.parseCraftRequest('stick 0x10').ok, true)
+    assert.equal(fixture.service.parseCraftRequest('stick 1.5').ok, true)
+    assert.equal(fixture.service.parseCraftRequest('木棍64x').ok, true)
   } finally {
     fixture.close()
   }
@@ -118,15 +127,15 @@ test('handleCraft explains a collection gap instead of starting a task', async (
   }
 })
 
-test('handleCraft rejects 3x3 recipes when no crafting table is configured', async () => {
+test('handleCraft enqueues 3x3 recipes even without a configured table (autodiscovery)', async () => {
   const fixture = createFixture()
   try {
     fixture.config.craft.table = { x: null, y: null, z: null }
     giveStock(fixture, 'uuid-alice', 'minecraft:oak_planks', 8)
     await fixture.service.handleCraft('Alice', '!合成 chest 1', { uuid: 'uuid-alice', scope: 'personal' })
-    assert.equal(fixture.tasks.length, 0)
+    assert.equal(fixture.tasks.length, 1)
     const last = fixture.sent[fixture.sent.length - 1].text
-    assert.match(last, /工作台/)
+    assert.match(last, /已提交/)
   } finally {
     fixture.close()
   }
@@ -147,14 +156,17 @@ test('handleCraft enqueues one exclusive craft task with a valid plan', async ()
   }
 })
 
-test('handleCraft reports warehouse stock as "already sufficient" without crafting', async () => {
+test('handleCraft crafts on top of existing warehouse stock instead of refusing', async () => {
   const fixture = createFixture()
   try {
+    // Target itself is stocked AND enough planks exist: the order must still
+    // plan a craft (forceCraft hides the target stock from the planner).
     giveStock(fixture, 'uuid-alice', 'minecraft:stick', 64)
+    giveStock(fixture, 'uuid-alice', 'minecraft:oak_planks', 4)
     await fixture.service.handleCraft('Alice', '!合成 stick 8', { uuid: 'uuid-alice', scope: 'personal' })
-    assert.equal(fixture.tasks.length, 0)
+    assert.equal(fixture.tasks.length, 1)
     const last = fixture.sent[fixture.sent.length - 1].text
-    assert.match(last, /无需合成/)
+    assert.match(last, /已提交/)
   } finally {
     fixture.close()
   }

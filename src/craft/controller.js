@@ -132,10 +132,13 @@ class CraftController {
         await this.validateOwner?.(request.owner, request.actor)
         this.assertCleanInventory()
         const rows = this.availableItems(request.owner.uuid)
-        const planned = planToCraftCommand({ item: request.item, quantity: request.quantity, available: this.availableStock(request.owner.uuid), config: this.config })
+        const planned = planToCraftCommand({ item: request.item, quantity: request.quantity, available: this.availableStock(request.owner.uuid), config: this.config, forceCraft: true })
         if (!planned.ok) {
+          // A stocked target is not a failure: the planner already reported
+          // already_in_warehouse for zero-craft-step plans, but any other
+          // rejection (missing inputs, unreachable recipe) stops the order.
           if (planned.reason === 'already_in_warehouse') return { status: 'already_sufficient' }
-          const failure = new Error(planned.reason === 'no_workstation_configured' ? '该配方需要配置工作台。' : '仓库原料不足或配方不可达；合成仅使用散装库存。')
+          const failure = new Error('仓库原料不足或配方不可达；合成仅使用散装库存。')
           failure.reason = planned.reason
           throw failure
         }

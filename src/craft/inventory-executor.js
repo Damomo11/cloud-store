@@ -143,7 +143,9 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
     if (active) throw error('inventory executor is busy')
     const declared = declaration(step)
     const before = ensureBaseline(declared)
-    const table = step.requiresTable ? { position: configuredTable() } : undefined
+    // Planning preview only needs recipe candidates for expected outputs; the
+    // concrete table block is discovered and validated at execution time.
+    const table = step.requiresTable ? { position: tableSearchOrigin() } : undefined
     const { expected } = selectRecipe(step, declared, table, bot.inventory.items())
     return { expectedConsumed: before, expectedProduced: expected }
   }
@@ -378,6 +380,73 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
     return new Vec3(Math.floor(position.x), Math.floor(position.y), Math.floor(position.z))
   }
 
+  function tableSearchOrigin () {
+    if (configuredTable) {
+      try { return configuredTable() } catch { /* fall through to auto discovery */ }
+    }
+    const position = warehouse?.homePosition || bot.entity?.position
+    if (!position || !['x', 'y', 'z'].every(axis => Number.isFinite(position[axis]))) {
+      throw error('crafting table autodiscovery has no scan origin (no bot position)')
+    }
+    return new Vec3(Math.floor(position.x), Math.floor(position.y), Math.floor(position.z))
+  }
+
+  // Automatic discovery: scan loaded chunks around the warehouse for crafting
+  // tables, then walk to the nearest reachable one. A configured coordinate
+  // (if any) is tried first and autodiscovery is the fallback; the recovery
+  // journal never depends on which table was used — every craft step re-reads
+  // server container evidence before settling accounts.
+  function discoverTablePositions (origin, radius) {
+    if (typeof bot.findBlocks !== 'function') {
+      throw error('crafting table autodiscovery is unavailable (no findBlocks)')
+    }
+    const positions = bot.findBlocks({
+      matching: block => block?.name === 'crafting_table',
+      maxDistance: Math.max(1, radius || 64),
+      count: 64
+    })
+    const unique = []
+    const seen = new Set()
+    for (const position of positions) {
+      const key = `${position.x},${position.y},${position.z}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      const block = bot.blockAt(position)
+      if (block?.name === 'crafting_table') unique.push(new Vec3(position.x, position.y, position.z))
+    }
+    unique.sort((a, b) => a.distanceTo(origin) - b.distanceTo(origin))
+    return unique
+  }
+
+  async function resolveTable (check) {
+    if (typeof warehouse?.gotoNear !== 'function') throw error('Warehouse.gotoNear is required for table navigation')
+    const candidates = []
+    if (config?.craft?.table && ['x', 'y', 'z'].every(axis => Number.isFinite(config.craft.table[axis]))) {
+      candidates.push(configuredTable())
+    }
+    const origin = tableSearchOrigin()
+    for (const position of discoverTablePositions(origin, config?.craft?.tableSearchRadius)) {
+      if (!candidates.some(candidate => candidate.equals(position))) candidates.push(position)
+    }
+    if (!candidates.length) {
+      throw error('no reachable crafting table: none configured and none discovered nearby', true)
+    }
+    let lastError = null
+    for (const position of candidates) {
+      check()
+      try {
+        // Await the original navigation promise even after abort. Releasing the
+        // lock early would allow a late path operation to overlap the next task.
+        await warehouse.gotoNear(position.x, position.y, position.z)
+        check()
+        return validateArrival(position)
+      } catch (navigationError) {
+        lastError = navigationError
+      }
+    }
+    throw error(`no reachable crafting table among ${candidates.length} candidate(s): ${lastError?.message || 'navigation failed'}`, true)
+  }
+
   function validateArrival (position) {
     const block = bot.blockAt(position)
     if (block?.name !== 'crafting_table' || !block.position || !['x', 'y', 'z'].every(axis => block.position[axis] === position[axis])) {
@@ -417,14 +486,7 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
       restoreMovement = installMovementFence(check)
       let table
       if (step.requiresTable) {
-        const position = configuredTable()
-        if (typeof warehouse?.gotoNear !== 'function') throw error('Warehouse.gotoNear is required for table navigation')
-        check()
-        // Await the original navigation promise even after abort. Releasing the
-        // lock early would allow a late path operation to overlap the next task.
-        await warehouse.gotoNear(position.x, position.y, position.z)
-        check()
-        table = validateArrival(position)
+        table = await resolveTable(check)
       }
       const before = ensureBaseline(declared)
       if (!sameAmounts(before, operation.before, entry => entry.itemKey)) throw error('inventory changed before crafting', true)

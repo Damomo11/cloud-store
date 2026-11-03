@@ -30,6 +30,9 @@ function fixture (before, after, options = {}) {
   bot.pathfinder = { stop: () => calls.push('stop') }
   bot.clearControlStates = () => calls.push('clear')
   bot.blockAt = () => table
+  // Autodiscovery scans for crafting tables when the configured coordinate
+  // is missing or unreachable; the fake world only has the configured table.
+  bot.findBlocks = () => [table.position.clone()]
   bot.closeWindow = window => {
     calls.push(['close', window])
     bot.currentWindow = null

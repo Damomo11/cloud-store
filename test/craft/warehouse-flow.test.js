@@ -25,6 +25,22 @@ test('warehouse planner uses the configured live recipe version', () => {
   assert.equal(result.command.craftSteps[0].requiresTable, true)
 })
 
+test('forceCraft plans the full quantity even when the target is already stocked', () => {
+  const config = structuredClone(DEFAULT_CONFIG)
+  const planned = planToCraftCommand({ item: 'stick', quantity: 4, available: { stick: 64, oak_planks: 2 }, config, forceCraft: true })
+  assert.equal(planned.ok, true)
+  assert.deepEqual(planned.command.inventoryUses, [{ name: 'oak_planks', quantity: 2 }])
+})
+
+test('forceCraft still refuses items the warehouse alone cannot produce', () => {
+  const config = structuredClone(DEFAULT_CONFIG)
+  // diamond_ore has no recipe: forceCraft must not hide its stock only to
+  // fail plan-reachability instead of the clearer stocked answer.
+  const planned = planToCraftCommand({ item: 'diamond_ore', quantity: 4, available: { diamond_ore: 64 }, config, forceCraft: true })
+  assert.equal(planned.ok, false)
+  assert.equal(['plan_unreachable', 'already_in_warehouse'].includes(planned.reason), true)
+})
+
 test('warehouse plan cannot collect missing inputs or accept unsafe quantities', () => {
   const config = structuredClone(DEFAULT_CONFIG)
   assert.equal(planToCraftCommand({ item: 'stick', quantity: 4, available: {}, config }).ok, false)
@@ -193,16 +209,19 @@ test('multi-step recipes keep intermediates reserved and return surplus output t
   } finally { f.db.close() }
 })
 
-test('requested quantity is target stock and existing finished items reduce production', async () => {
+test('requested quantity is crafted on top of existing finished items', async () => {
   const { CraftController } = require('../../src/craft/controller')
   const f = fixture()
   try {
-    f.seed('alice', 'oak_planks', 2)
+    f.seed('alice', 'oak_planks', 4)
     const sticks = f.seed('alice', 'stick', 2)
     const controller = new CraftController({ ...f, botId: 'bot-a' })
+    // 6 requested with 2 already stored: forceCraft crafts the full 6.
+    // The graph's cheapest stick recipe yields 4 per trigger (2 planks),
+    // so two triggers cover 6: 2 existing + 8 crafted = 10 final.
     await controller.run({ actor: 'Alice', owner: { uuid: 'alice' }, item: 'stick', quantity: 6 })
-    assert.equal(f.db.getBalance('alice', sticks.itemKey), 6)
-    assert.equal(f.stored.get(sticks.itemKey).count, 6)
+    assert.equal(f.db.getBalance('alice', sticks.itemKey), 10)
+    assert.equal(f.stored.get(sticks.itemKey).count, 10)
   } finally { f.db.close() }
 })
 

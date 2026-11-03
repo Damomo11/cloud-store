@@ -124,13 +124,17 @@ const DEFAULT_CONFIG = {
   craft: {
     // Master switch for the ported crafting feature.
     enabled: true,
-    // The only station the ported chain requires: one crafting-table coordinate.
-    // Leave null to disable 3x3 recipes (2x2 recipes still work without a table).
+    // Optional preferred crafting-table coordinate. When set, that block is
+    // tried first; otherwise (or when unreachable) the bot autodiscovers the
+    // nearest reachable crafting table around its home position.
     table: {
       x: null,
       y: null,
       z: null
     },
+    // Autodiscovery search radius (blocks) around home when table is unset
+    // or unreachable. Only loaded chunks are scanned.
+    tableSearchRadius: 64,
     // Optional command timeout override for a single craft order.
     timeoutMs: 1200000
   }

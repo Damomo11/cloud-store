@@ -286,17 +286,22 @@
     ]
   },
 
-  // Admin !合成 <item> <target quantity>, using cloud warehouse stock and ownership.
+  // !合成 <item> [quantity], using cloud warehouse stock and ownership.
+  // Available to whoever owns the selected personal/organization warehouse.
   "craft": {
     "enabled": true,
 
-    // Coordinates of one accessible crafting table for recipes larger than 2x2.
-    // Leave null to allow only recipes that fit the player's 2x2 crafting grid.
+    // Optional preferred crafting-table coordinates for recipes larger than 2x2.
+    // When null (or unreachable) the bot autodiscovers the nearest reachable
+    // crafting table around its home position instead.
     "table": {
       "x": null,
       "y": null,
       "z": null
     },
+
+    // Autodiscovery search radius in blocks around home (only loaded chunks).
+    "tableSearchRadius": 64,
 
     // Maximum duration of one craft order, in milliseconds (20 minutes).
     "timeoutMs": 1200000
