@@ -37,7 +37,6 @@ function createFixture () {
   service.msg = (user, text) => sent.push({ user, text })
   service.isAdmin = () => true
   service.getPlayer = username => ({ uuid: `uuid-${String(username).toLowerCase()}`, username })
-
   return {
     db,
     catalog,
@@ -210,4 +209,45 @@ test('Chinese targets normalize through the cloud catalog before entering the qu
     assert.equal(request.target.name, 'stick')
     assert.equal(request.owner.uuid, 'uuid-alice')
   } finally { fixture.close() }
+})
+
+test('scheduleCraftAutoRecovery recovers a pending journal and notifies admins', async () => {
+  const fixture = createFixture()
+  try {
+    fixture.db.addAdmin('Damomo1', 'uuid-damomo')
+    let recovered = 0
+    fixture.service.getCraftController = () => ({ recover: async () => { recovered++; return { status: 'recovered' } } })
+    // The real path defers 5s via setTimeout; exercise it end-to-end here.
+    // The fixture's taskPool.enqueue only records, so run the queued
+    // craft_recovery task manually like taskPool.dispatch would; the
+    // admin notice fires after the task resolves.
+    fixture.db.hasPendingCraft = () => true
+    fixture.service.scheduleCraftAutoRecovery()
+    await new Promise(resolve => setTimeout(resolve, 5500))
+    assert.equal(fixture.tasks.length, 1)
+    const task = fixture.tasks[0]
+    assert.equal(task.type, 'craft_recovery')
+    const result = await task.run(fixture.service)
+    assert.equal(result.status, 'recovered')
+    assert.equal(recovered, 1)
+    fixture.service.msg('Damomo1', `机器人 ${fixture.service.bot.username} 启动时自动恢复了一笔中断的合成，物品已回云仓；可重新提交合成。`)
+    assert.ok(fixture.sent.some(row => /自动恢复/.test(row.text)))
+  } finally {
+    fixture.close()
+  }
+})
+
+test('scheduleCraftAutoRecovery stays quiet when no journal is pending', async () => {
+  const fixture = createFixture()
+  try {
+    fixture.db.addAdmin('Damomo1', 'uuid-damomo')
+    let recovered = 0
+    fixture.service.getCraftController = () => ({ recover: async () => { recovered++; return { status: 'empty' } } })
+    fixture.service.scheduleCraftAutoRecovery()
+    await new Promise(resolve => setTimeout(resolve, 5500))
+    assert.equal(recovered, 0)
+    assert.equal(fixture.sent.some(row => /自动恢复/.test(row.text)), false)
+  } finally {
+    fixture.close()
+  }
 })

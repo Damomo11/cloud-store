@@ -72,6 +72,7 @@ class CloudStoreService {
 
   start () {
     this.db.claimLegacyRecoveryTask(this.botId)
+    this.scheduleCraftAutoRecovery()
     this.bot.on('chat', (username, message) => {
       if (username === this.bot.username) return
       this.handleIncoming(username, message, 'chat', { channel: 'public' })
@@ -2044,6 +2045,43 @@ class CloudStoreService {
       worker.msg(username, result.status === 'empty' ? '本机器人没有待恢复的合成任务。' : '合成中断状态已核验，物品已回云仓；可重新提交合成。')
       return result
     }, { exclusive: true, stickyWorker: this })
+  }
+
+  // Automatic craft recovery: a bot that spawns (first login, reconnect after a
+  // drop, or web-admin restart) with a pending craft journal reconciles it
+  // itself instead of blocking every deposit/withdraw until an admin runs
+  // !合成恢复 manually. Runs through the same exclusive craft_recovery task
+  // as the manual command; admins get a notice with the outcome.
+  scheduleCraftAutoRecovery () {
+    const run = async () => {
+      try {
+        if (this.config.craft?.enabled === false || !this.bot._craftingExecutor) return
+        if (!this.db.hasPendingCraft?.(this.botId)) return
+        const admin = this.db.listAdmins().find(row => row.username)?.username || ''
+        console.log(`[craft:auto-recover] ${this.bot.username} has a pending craft journal; recovering automatically`)
+        const result = await this.enqueueTask(admin, 'craft_recovery', async worker => {
+          const outcome = await worker.getCraftController().recover()
+          return outcome
+        }, { exclusive: true, stickyWorker: this })
+        const notice = result?.status === 'recovered'
+          ? `机器人 ${this.bot.username} 启动时自动恢复了一笔中断的合成，物品已回云仓；可重新提交合成。`
+          : null
+        if (notice) {
+          for (const row of this.db.listAdmins()) {
+            if (row.username) this.msg(row.username, notice)
+          }
+        }
+      } catch (error) {
+        console.error(`[craft:auto-recover] ${this.bot.username} failed:`, error?.message || error)
+        const notice = `机器人 ${this.bot.username} 启动时自动合成恢复失败：${error?.message || error}；请管理员执行 !合成恢复 核对。`
+        for (const row of this.db.listAdmins()) {
+          if (row.username) this.msg(row.username, notice)
+        }
+      }
+    }
+    // Give the world a moment to stream in before walking home and opening
+    // containers; recoverLocked itself re-reads server evidence anyway.
+    setTimeout(() => { run() }, 5000)
   }
 
   async handleCreateCustomWarehouse (username, text) {
