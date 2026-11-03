@@ -748,9 +748,18 @@ class CloudStoreWebServer {
     // 散装视图（不显示潜影盒）下允许用盒内物品补足；仓库关闭快捷潜影盒取货时保持只取散装。
     const includeBoxed = body.includeBoxed === true &&
       (!this.db.isQuickShulkerExtractionEnabled || this.db.isQuickShulkerExtractionEnabled(ownerUuid))
+    const service = this.requireService()
+    let eligibleOwnerUuids = [ownerUuid]
+    try {
+      const owner = service.resolveWebStorageOwner(user, ownerUuid)
+      eligibleOwnerUuids = service.withdrawSourceOwners(user, owner).map(source => source.uuid)
+    } catch {
+      // Keep explicit-owner planning available for lightweight service fixtures
+      // and custom integrations that do not expose the default-owner helpers.
+    }
     return {
       ok: true,
-      ...this.buildLitematicWithdrawPlan(ownerUuid, materials, user.uuid, { includeBoxed })
+      ...this.buildLitematicWithdrawPlan(ownerUuid, materials, user.uuid, { includeBoxed, eligibleOwnerUuids })
     }
   }
 
@@ -891,7 +900,9 @@ class CloudStoreWebServer {
     let shortagePlan = null
     if (typeof service?.buildShortageCraftPlan === 'function') {
       try {
-        shortagePlan = service.buildShortageCraftPlan(ownerUuid, requests, allocations)
+        shortagePlan = service.buildShortageCraftPlan(ownerUuid, requests, allocations, {
+          eligibleOwnerUuids: options.eligibleOwnerUuids
+        })
       } catch {
         shortagePlan = null
       }

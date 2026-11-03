@@ -67,9 +67,28 @@ function subtractCraftUses (stock, uses) {
 }
 
 function addCraftOutputs (stock, plan, fallbackItem, fallbackAmount) {
-  let added = false
-  for (const step of plan?.craftSteps || []) {
+  const steps = Array.isArray(plan?.craftSteps) ? plan.craftSteps : []
+  const targetName = itemName(normalizeItemId(fallbackItem))
+  const targetAmount = positiveAmount(fallbackAmount)
+  if (!steps.length) {
+    subtractCraftUses(stock, plan?.inventoryUses)
+    if (targetName && targetAmount) stock[targetName] = (stock[targetName] || 0) + targetAmount
+    return
+  }
+
+  // inventoryUses are the leaves taken from the owner's stock. Intermediate
+  // inputs are settled below when their produced batches are consumed.
+  subtractCraftUses(stock, plan?.inventoryUses)
+  const producedNames = new Set()
+  for (const step of steps) {
     const times = positiveAmount(step?.times) || 1
+    for (const input of step?.inputs || []) {
+      const name = itemName(normalizeItemId(input?.names?.[0] || input?.name || input?.itemId))
+      const amount = positiveAmount(input?.count) * times
+      if (name && amount && producedNames.has(name)) {
+        stock[name] = Math.max(0, Number(stock[name] || 0) - amount)
+      }
+    }
     const outputs = Array.isArray(step?.outputs) && step.outputs.length
       ? step.outputs
       : (step?.result ? [step.result] : [])
@@ -78,16 +97,11 @@ function addCraftOutputs (stock, plan, fallbackItem, fallbackAmount) {
       const amount = positiveAmount(output?.count ?? output?.amount) * times
       if (!name || !amount) continue
       stock[name] = (stock[name] || 0) + amount
-      added = true
+      producedNames.add(name)
     }
   }
-
-  // Injectable planners used by callers may omit steps; retain the old target
-  // fallback for those plans while real CraftPlanner plans use exact outputs.
-  if (!added) {
-    const name = itemName(normalizeItemId(fallbackItem))
-    const amount = positiveAmount(fallbackAmount)
-    if (name && amount) stock[name] = (stock[name] || 0) + amount
+  if (targetName && targetAmount) {
+    stock[targetName] = Math.max(0, Number(stock[targetName] || 0) - targetAmount)
   }
 }
 
@@ -95,7 +109,18 @@ function classifyCraftFailure (reason) {
   return reason === 'needs_collection' ? 'unavailable' : 'unsupported'
 }
 
-function planShortages ({ requests = [], allocations = [], availableCraftStock = {}, config, craftPlanner = defaultCraftPlanner } = {}) {
+function craftTargetVariant (shortage, requests, catalog) {
+  if (typeof catalog?.fromItemIdAmount !== 'function') return null
+  const canonical = catalog.fromItemIdAmount(shortage.itemId, 1)?.itemKey
+  const variants = (requests || [])
+    .filter(request => request?.itemId === shortage?.itemId && request?.itemKey)
+    .map(request => request.itemKey)
+  return canonical && variants.some(itemKey => itemKey !== canonical)
+    ? variants.find(itemKey => itemKey !== canonical)
+    : null
+}
+
+function planShortages ({ requests = [], allocations = [], availableCraftStock = {}, availableCraftStockByOwner = null, config, catalog, craftPlanner = defaultCraftPlanner } = {}) {
   const normalizedRequests = requests.map((request, requestIndex) => ({
     ...request,
     requestIndex,
@@ -147,34 +172,66 @@ function planShortages ({ requests = [], allocations = [], availableCraftStock =
   }
 
   const craftStock = cloneCraftStock(availableCraftStock)
+  const ownerStocks = availableCraftStockByOwner
+    ? [...(availableCraftStockByOwner instanceof Map
+        ? availableCraftStockByOwner.entries()
+        : Object.entries(availableCraftStockByOwner))]
+        .map(([ownerUuid, stock]) => ({ ownerUuid, stock: cloneCraftStock(stock) }))
+    : null
   const craft = []
   for (const shortage of shortages) {
     const target = itemName(shortage.itemId)
-    let planned
-    try {
-      planned = craftPlanner({
-        item: target,
-        quantity: shortage.missing,
-        available: { ...craftStock },
-        config,
-        forceCraft: true
+    const nonCraftableVariant = craftTargetVariant(shortage, normalizedRequests, catalog)
+    if (nonCraftableVariant) {
+      craft.push({
+        itemId: shortage.itemId,
+        itemKey: nonCraftableVariant,
+        displayName: shortage.displayName,
+        amount: shortage.missing,
+        status: 'unsupported',
+        reason: 'item_variant_not_craftable'
       })
-    } catch (error) {
-      planned = { ok: false, reason: 'planner_error', error: error?.message || String(error) }
+      continue
+    }
+    const candidates = ownerStocks || [{ ownerUuid: undefined, stock: craftStock }]
+    let planned = null
+    let plannedOwnerUuid
+    let lastFailure = null
+    for (const candidate of candidates) {
+      try {
+        planned = craftPlanner({
+          item: target,
+          quantity: shortage.missing,
+          available: { ...candidate.stock },
+          config,
+          forceCraft: true
+        })
+      } catch (error) {
+        planned = { ok: false, reason: 'planner_error', error: error?.message || String(error) }
+      }
+      if (planned?.ok && planned.plan) {
+        subtractCraftUses(candidate.stock, planned.plan.inventoryUses)
+        addCraftOutputs(candidate.stock, planned.plan, target, shortage.missing)
+        plannedOwnerUuid = candidate.ownerUuid
+        break
+      }
+      lastFailure = planned
     }
     if (planned?.ok && planned.plan) {
-      subtractCraftUses(craftStock, planned.plan.inventoryUses)
-      addCraftOutputs(craftStock, planned.plan, target, shortage.missing)
-      craft.push({
+      const entry = {
         itemId: shortage.itemId,
         displayName: shortage.displayName,
         amount: shortage.missing,
         status: 'planned',
         plan: planned.plan
+      }
+      if (plannedOwnerUuid !== undefined) entry.ownerUuid = plannedOwnerUuid
+      craft.push({
+        ...entry
       })
       continue
     }
-    const reason = String(planned?.reason || planned?.error || 'plan_unreachable')
+    const reason = String(lastFailure?.reason || lastFailure?.error || 'plan_unreachable')
     craft.push({
       itemId: shortage.itemId,
       displayName: shortage.displayName,

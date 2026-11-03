@@ -1068,7 +1068,8 @@ class CloudStoreService {
     const requests = this.normalizeWebWithdrawRequests(user, webRequests)
     const player = { uuid: user.uuid, username: user.username }
     const plan = this.buildWithdrawPlanForRequest(player, owner, requests)
-    const shortage = this.buildShortageCraftPlan(owner, requests, plan.allocations)
+    const eligibleOwnerUuids = this.withdrawSourceOwners(player, owner).map(source => source.uuid)
+    const shortage = this.buildShortageCraftPlan(owner, requests, plan.allocations, { eligibleOwnerUuids })
     return {
       owner,
       requests,
@@ -1086,6 +1087,9 @@ class CloudStoreService {
     const primaryOwnerUuid = typeof owner === 'string' ? owner : owner?.uuid
     const ownerUuids = new Set()
     if (primaryOwnerUuid) ownerUuids.add(String(primaryOwnerUuid))
+    for (const ownerUuid of options?.eligibleOwnerUuids || []) {
+      if (ownerUuid) ownerUuids.add(String(ownerUuid))
+    }
     for (const allocation of allocations || []) {
       if (allocation?.ownerUuid) ownerUuids.add(String(allocation.ownerUuid))
     }
@@ -1107,8 +1111,13 @@ class CloudStoreService {
       }
     }
 
-    const availableCraftStock = {}
+    const stockByOwner = new Map()
     for (const ownerUuid of ownerUuids) {
+      const availableCraftStock = {}
+      const ownerConsumedByKey = new Map()
+      for (const [key, amount] of consumedByKey) {
+        if (key.startsWith(`${ownerUuid}\u0000`)) ownerConsumedByKey.set(key, amount)
+      }
       let rows = []
       try {
         rows = typeof this.db.getCraftAvailableItems === 'function'
@@ -1126,19 +1135,21 @@ class CloudStoreService {
         if (!itemId || !Number.isFinite(amount) || amount <= 0) continue
         const rowOwner = String(row?.ownerUuid || ownerUuid)
         const consumedKey = `${rowOwner}\u0000${itemKey}`
-        const consumed = Number(consumedByKey.get(consumedKey) || 0)
+        const consumed = Number(ownerConsumedByKey.get(consumedKey) || 0)
         const remaining = Math.max(0, amount - consumed)
-        if (consumedByKey.has(consumedKey)) consumedByKey.set(consumedKey, Math.max(0, consumed - amount))
+        if (ownerConsumedByKey.has(consumedKey)) ownerConsumedByKey.set(consumedKey, Math.max(0, consumed - amount))
         if (!remaining) continue
         const name = itemId.replace(/^minecraft:/, '')
         availableCraftStock[name] = Number(availableCraftStock[name] || 0) + remaining
       }
+      stockByOwner.set(ownerUuid, availableCraftStock)
     }
 
     return planShortages({
       requests,
       allocations,
-      availableCraftStock,
+      availableCraftStock: {},
+      availableCraftStockByOwner: stockByOwner,
       config: this.config,
       catalog: this.catalog
     })
@@ -1529,6 +1540,7 @@ class CloudStoreService {
       this.msg(username, message)
     }
     const msgTarget = message => this.msg(deliveryTarget, message)
+    const eligibleOwnerUuids = this.withdrawSourceOwners(player, storageOwner).map(owner => owner.uuid)
     let shortagePlan = null
     const withShortagePlan = result => shortagePlan
       ? {
@@ -1540,7 +1552,10 @@ class CloudStoreService {
         }
       : result
     const recordShortagePlan = (allocations, options, decision) => {
-      shortagePlan = this.buildShortageCraftPlan(storageOwner, requests, allocations, options)
+      shortagePlan = this.buildShortageCraftPlan(storageOwner, requests, allocations, {
+        ...options,
+        eligibleOwnerUuids
+      })
       traceEvent(trace, 'plan', 'shortage_plan', {
         requested: shortagePlan.requested,
         allocated: shortagePlan.allocated,

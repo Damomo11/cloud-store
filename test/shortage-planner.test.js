@@ -94,7 +94,7 @@ test('craft batch surplus is available to later shortage candidates', () => {
         }
       }
       assert.equal(item, 'torch')
-      assert.equal(available.stick, 4)
+      assert.equal(available.stick, 3)
       return {
         ok: true,
         plan: { inventoryUses: [{ name: 'stick', quantity: 1 }], craftSteps: [] }
@@ -122,4 +122,42 @@ test('unsupported shortage is returned as data instead of throwing', () => {
     status: 'unsupported',
     reason: 'plan_unreachable'
   }])
+})
+
+test('owner-scoped craft candidates never combine stock from separate warehouses', () => {
+  const seen = []
+  const result = planShortages({
+    requests: [{ itemId: 'minecraft:stick', amount: 2 }],
+    allocations: [],
+    availableCraftStock: {},
+    availableCraftStockByOwner: {
+      alice: { oak_planks: 1 },
+      team: { oak_planks: 1 }
+    },
+    craftPlanner: ({ available }) => {
+      seen.push({ ...available })
+      return available.oak_planks >= 2
+        ? { ok: true, plan: { inventoryUses: [{ name: 'oak_planks', quantity: 2 }], craftSteps: [] } }
+        : { ok: false, reason: 'needs_collection' }
+    }
+  })
+
+  assert.deepEqual(seen, [{ oak_planks: 1 }, { oak_planks: 1 }])
+  assert.equal(result.craft[0].status, 'unavailable')
+})
+
+test('mixed item variants do not produce a generic craft candidate', () => {
+  const result = planShortages({
+    requests: [
+      { itemId: 'minecraft:stick', itemKey: 'minecraft:stick|plain', amount: 1 },
+      { itemId: 'minecraft:stick', itemKey: 'minecraft:stick|named', amount: 1 }
+    ],
+    allocations: [],
+    availableCraftStock: { oak_planks: 1 },
+    catalog: { fromItemIdAmount: () => ({ itemKey: 'minecraft:stick|plain' }) },
+    craftPlanner: () => ({ ok: true, plan: { inventoryUses: [{ name: 'oak_planks', quantity: 1 }], craftSteps: [] } })
+  })
+
+  assert.equal(result.craft[0].status, 'unsupported')
+  assert.equal(result.craft[0].reason, 'item_variant_not_craftable')
 })

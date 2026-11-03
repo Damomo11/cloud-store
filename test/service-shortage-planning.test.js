@@ -16,6 +16,7 @@ function createFixture () {
   const db = {
     canWebUserAccessOwner: () => true,
     getCustomWarehouse: () => null,
+    listCustomWarehousesForPlayer: () => [],
     getItemByKey: itemKey => items.get(itemKey) || null,
     reserveInventory: () => { calls.reservations++ },
     adjustBalance: () => { calls.balances++ }
@@ -111,6 +112,30 @@ test('post-reservation planning does not subtract the same allocation twice', ()
     { reservationsAlreadyApplied: true }
   )
 
+  assert.equal(result.craft[0].status, 'planned')
+})
+
+test('default personal withdrawal planning includes eligible organization stock for craft candidates', () => {
+  const { service } = createFixture()
+  service.db.getCraftAvailableItems = ownerUuid => ownerUuid === 'vault:team'
+    ? [{
+        ownerUuid: 'vault:team', itemKey: 'minecraft:oak_planks|plain',
+        itemId: 'minecraft:oak_planks', displayName: '橡木板', amount: 2
+      }]
+    : []
+  service.withdrawSourceOwners = () => [
+    { uuid: 'uuid-alice', username: 'Alice', scope: 'personal' },
+    { uuid: 'vault:team', username: '仓库:team', scope: 'custom', vaultName: 'team' }
+  ]
+  service.buildWithdrawPlanForRequest = () => ({ notices: [], allocations: [] })
+
+  const result = service.previewWithdrawShortage(
+    { uuid: 'uuid-alice', username: 'Alice' },
+    'uuid-alice',
+    [{ itemKey: 'minecraft:stick|plain', amount: 2 }]
+  )
+
+  assert.equal(result.shortages[0].missing, 2)
   assert.equal(result.craft[0].status, 'planned')
 })
 
