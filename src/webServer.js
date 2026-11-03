@@ -145,6 +145,10 @@ class CloudStoreWebServer {
         const body = await this.readBody(req)
         return this.sendJson(res, this.apiWithdraw(session, body))
       }
+      if (req.method === 'POST' && url.pathname === '/api/action/withdraw/plan') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiWithdrawPlan(session, body))
+      }
       if (req.method === 'POST' && url.pathname === '/api/default-owner') {
         const body = await this.readBody(req)
         return this.sendJson(res, this.apiDefaultOwner(session, body))
@@ -688,6 +692,19 @@ class CloudStoreWebServer {
     return { ok: true, message, active: this.activeSnapshot() }
   }
 
+  apiWithdrawPlan (session, body) {
+    const user = this.requireUser(session)
+    const ownerUuid = String(body.ownerUuid || user.uuid).trim()
+    this.requireOwnerAccess(user, ownerUuid)
+    const items = body.items
+    if (!Array.isArray(items) || !items.length) throw new Error('请先选择要取出的物品。')
+    const targetUsername = String(body.targetUsername || user.username || '').trim()
+    if (targetUsername && !/^[A-Za-z0-9_]{3,16}$/.test(targetUsername)) throw new Error('目标玩家 ID 格式不正确。')
+    const service = this.requireService()
+    const plan = service.previewWithdrawShortage(user, ownerUuid, items)
+    return { ok: true, ...plan, active: this.activeSnapshot() }
+  }
+
   apiDefaultOwner (session, body) {
     const user = this.requireUser(session)
     const ownerUuid = String(body.ownerUuid || user.uuid).trim()
@@ -742,11 +759,20 @@ class CloudStoreWebServer {
     const selected = []
     const missing = []
     const unavailable = parsed.unavailable || []
+    const requests = []
+    const allocations = []
     let usedSlots = 0
     let boxedSelectedAmount = 0
     const findSelected = itemKey => selected.find(row => row.itemKey === itemKey)
 
-    for (const material of parsed.materials || []) {
+    for (const [requestIndex, material] of (parsed.materials || []).entries()) {
+      const wanted = Number(material.amount || 0)
+      requests.push({
+        itemId: material.itemId,
+        displayName: material.displayName || material.itemId,
+        amount: wanted,
+        requestIndex
+      })
       const rows = this.db.getOwnerItemsByItemId(ownerUuid, material.itemId)
       const shulkerRows = includeBoxed
         ? this.db.getOwnerShulkersContainingItemId(ownerUuid, material.itemId)
@@ -756,17 +782,17 @@ class CloudStoreWebServer {
         ...shulkerRows.map(row => row.containedItemKey)
       ].filter(Boolean))
       const stackSize = Number(material.stackSize || 64)
-      const looseAvailable = rows.reduce((sum, row) => sum + Number(row.amount || 0), 0)
+      const availableAmount = row => Math.max(0, Number(row.available ?? row.amount ?? 0))
+      const looseAvailable = rows.reduce((sum, row) => sum + availableAmount(row), 0)
       const boxedByItemKey = new Map()
       let boxedAvailable = 0
       for (const row of shulkerRows) {
         const perBox = Number(row.containedAmount || 0)
-        const boxes = Math.max(0, Number(row.shulkerAmount || 0))
+        const boxes = Math.max(0, Number(row.available ?? row.shulkerAmount ?? row.amount ?? 0))
         if (!row.containedItemKey || perBox <= 0 || boxes <= 0) continue
         boxedAvailable += perBox * boxes
         boxedByItemKey.set(row.containedItemKey, (boxedByItemKey.get(row.containedItemKey) || 0) + perBox * boxes)
       }
-      const wanted = Number(material.amount || 0)
       const available = looseAvailable + boxedAvailable
       const takeTotal = Math.min(wanted, available)
 
@@ -783,7 +809,7 @@ class CloudStoreWebServer {
       let remaining = takeTotal
       for (const row of rows) {
         if (remaining <= 0) break
-        const amount = Math.min(Number(row.amount || 0), remaining)
+        const amount = Math.min(availableAmount(row), remaining)
         const slots = Math.ceil(amount / Math.max(1, stackSize))
         if (amount <= 0 || slots <= 0) continue
         const entry = findSelected(row.itemKey)
@@ -796,7 +822,7 @@ class CloudStoreWebServer {
             itemId: row.itemId,
             displayName: aliases.get(row.itemKey) || row.displayName || material.displayName || row.itemId,
             amount,
-            max: Number(row.amount || 0),
+            max: availableAmount(row),
             required: wanted,
             available,
             stackSize,
@@ -805,6 +831,14 @@ class CloudStoreWebServer {
             sourceDisplayName: material.displayName || material.itemId
           })
         }
+        allocations.push({
+          requestIndex,
+          itemId: material.itemId,
+          itemKey: row.itemKey,
+          ownerUuid,
+          amount,
+          displayName: material.displayName || row.displayName || material.itemId
+        })
         usedSlots += slots
         remaining -= amount
       }
@@ -837,6 +871,15 @@ class CloudStoreWebServer {
             sourceDisplayName: material.displayName || material.itemId
           })
         }
+        allocations.push({
+          requestIndex,
+          itemId: material.itemId,
+          itemKey,
+          ownerUuid,
+          amount: take,
+          displayName: material.displayName || row?.containedDisplayName || material.itemId,
+          withdrawMode: 'shulker_extract'
+        })
         usedSlots += slots
         boxedSelectedAmount += take
         remaining -= take
@@ -844,6 +887,24 @@ class CloudStoreWebServer {
     }
 
     const selectedAmount = selected.reduce((sum, row) => sum + row.amount, 0)
+    const service = this.serviceProvider()
+    let shortagePlan = null
+    if (typeof service?.buildShortageCraftPlan === 'function') {
+      try {
+        shortagePlan = service.buildShortageCraftPlan(ownerUuid, requests, allocations)
+      } catch {
+        shortagePlan = null
+      }
+    }
+    const shortage = shortagePlan?.shortage || shortagePlan?.shortages || missing.map(row => ({
+      itemId: row.itemId,
+      displayName: row.displayName,
+      requested: Number(row.required || row.amount || 0),
+      allocated: Number(row.selected || row.available || 0),
+      missing: Number(row.missing || 0),
+      reason: row.reason || 'short'
+    }))
+    const craft = shortagePlan?.craft || []
     return {
       blueprint: {
         name: parsed.name,
@@ -856,6 +917,8 @@ class CloudStoreWebServer {
       selected,
       missing,
       unavailable,
+      shortage,
+      craft,
       stats: {
         selectedTypes: selected.length,
         selectedAmount,
@@ -863,7 +926,9 @@ class CloudStoreWebServer {
         maxSlots: null,
         missingTypes: missing.length,
         unavailableTypes: unavailable.length,
-        boxedSelectedAmount
+        boxedSelectedAmount,
+        shortageTypes: shortage.length,
+        craftTypes: craft.length
       }
     }
   }
@@ -4716,7 +4781,7 @@ const HTML = `<!doctype html>
         item.globalAliases?.length ? '<div class="tip-line">全局别名：' + esc(item.globalAliases.join('、')) + '</div>' : '',
         item.adminDisplayName && item.adminDisplayName !== item.displayName ? '<div class="tip-line">默认名：' + esc(item.adminDisplayName) + '</div>' : '',
         item.ownerLabel ? '<div class="tip-line">归属：' + esc(item.ownerLabel) + '</div>' : '',
-        '<div class="tip-line">数量：' + num(item.amount) + bulkAmountSuffix(item) + '</div>',
+        '<div class="tip-line">可取：' + num(item.available ?? item.amount) + (Number(item.reserved || 0) > 0 ? '（总量 ' + num(item.amount) + '，预留 ' + num(item.reserved) + '）' : '') + bulkAmountSuffix(item) + '</div>',
         '<div class="tip-line">ID：' + esc(item.itemId) + '</div>'
       ].filter(Boolean);
       if (shulker.length) {
@@ -4844,7 +4909,8 @@ const HTML = `<!doctype html>
     }
 
     function defaultPickAmount(item) {
-      return Math.max(1, Math.min(Number(item.amount || 1), 64));
+      const available = Math.max(0, Number(item.available ?? item.amount ?? 0));
+      return Math.min(available, 64);
     }
 
     function toggleSelected(item) {
@@ -4856,11 +4922,12 @@ const HTML = `<!doctype html>
       if (state.selected.has(item.itemKey)) {
         state.selected.delete(item.itemKey);
       } else {
+        if (defaultPickAmount(item) <= 0) return;
         state.selected.set(item.itemKey, {
           itemKey: item.itemKey,
           displayName: item.displayName || item.itemId,
           amount: defaultPickAmount(item),
-          max: Number(item.amount || 0)
+          max: Number(item.available ?? item.amount ?? 0)
         });
       }
       renderSelected();
@@ -4876,8 +4943,12 @@ const HTML = `<!doctype html>
           continue;
         }
         row.displayName = item.displayName || row.displayName;
-        row.max = Number(item.amount || 0);
-        row.amount = Math.max(1, Math.min(Number(row.amount || 1), row.max || row.amount));
+        row.max = Number(item.available ?? item.amount ?? 0);
+        if (row.max <= 0) {
+          state.selected.delete(key);
+          continue;
+        }
+        row.amount = Math.max(1, Math.min(Number(row.amount || 1), row.max));
       }
     }
 
@@ -4946,11 +5017,24 @@ const HTML = `<!doctype html>
       }
 
       const missing = plan.missing || [];
+      const shortages = plan.shortage || plan.shortages || missing;
       const unavailable = plan.unavailable || [];
       const warnings = [];
       const boxedAmount = Number(plan.stats?.boxedSelectedAmount || 0);
-      if (missing.length) {
-        warnings.push('缺少：' + missing.map(row => esc(row.displayName || row.itemId) + ' x' + num(row.missing || row.amount)).join('，'));
+      if (shortages.length) {
+        const craftByItem = new Map((plan.craft || []).map(row => [row.itemId, row]));
+        warnings.push('缺口：' + shortages.map(row => {
+          const craft = craftByItem.get(row.itemId);
+          const status = craft?.status === 'planned'
+            ? '可合成'
+            : craft
+              ? '不可合成：' + (craft.reason || '暂无可用方案')
+              : '暂无合成方案';
+          const missingAmount = Number(row.missing || row.amount || 0);
+          const availableAmount = Number(row.allocated ?? row.available ?? row.selected ?? 0);
+          const requestedAmount = Number(row.requested ?? (availableAmount + missingAmount));
+          return esc(row.displayName || row.itemId) + '：可取 ' + num(availableAmount) + '/' + num(requestedAmount) + '，缺口 ' + num(missingAmount) + '（' + esc(status) + '）';
+        }).join('，'));
       }
       if (unavailable.length) {
         warnings.push('不可直接准备：' + unavailable.map(row => esc(row.displayName || row.blockId) + ' x' + num(row.amount)).join('，'));
@@ -4972,12 +5056,14 @@ const HTML = `<!doctype html>
     function applyLitematicSelection(plan) {
       state.selected.clear();
       for (const row of plan.selected || []) {
-        if (!row.itemKey || Number(row.amount || 0) <= 0) continue;
+        const max = Number(row.max ?? row.available ?? row.amount ?? 0);
+        const amount = Math.min(Number(row.amount || 0), max);
+        if (!row.itemKey || max <= 0 || amount <= 0) continue;
         state.selected.set(row.itemKey, {
           itemKey: row.itemKey,
           displayName: row.displayName || row.itemId,
-          amount: Number(row.amount || 0),
-          max: Number(row.max || row.amount || 0)
+          amount,
+          max
         });
       }
       renderSelected();
@@ -5028,6 +5114,8 @@ const HTML = `<!doctype html>
       target.looseAmount += loose;
       target.boxedAmount += boxed;
       target.amount = target.looseAmount + target.boxedAmount;
+      target.available = target.amount;
+      target.reserved = 0;
     }
 
     // 散装视图：潜影盒本身不展示，盒内物品按 itemKey 与散装物品合并计数。
@@ -5035,12 +5123,12 @@ const HTML = `<!doctype html>
       const merged = new Map();
       for (const item of items || []) {
         if (isShulkerItem(item)) {
-          const boxCount = Math.max(0, Number(item.amount || 0));
+          const boxCount = Math.max(0, Number(item.available ?? item.amount ?? 0));
           for (const content of item.shulkerContents || []) {
             mergeBulkItem(merged, content, 0, Math.max(0, Number(content.amount || 0)) * boxCount);
           }
         } else {
-          mergeBulkItem(merged, item, Math.max(0, Number(item.amount || 0)), 0);
+          mergeBulkItem(merged, item, Math.max(0, Number(item.available ?? item.amount ?? 0)), 0);
         }
       }
       return [...merged.values()].sort((a, b) => String(a.displayName || '').localeCompare(String(b.displayName || ''), undefined, { sensitivity: 'base' }));
@@ -5065,7 +5153,7 @@ const HTML = `<!doctype html>
         const boxedBadge = !state.shulkerBoxView && Number(item.boxedAmount || 0) > 0 ? '<span class="boxed-badge">盒</span>' : '';
         const reservedBadge = Number(item.reserved || 0) > 0 ? '<span class="boxed-badge" title="任务占用中 ' + esc(num(item.reserved)) + '，可取 ' + esc(num(item.available)) + '">占' + esc(shortCount(item.reserved)) + '</span>' : '';
         return '<div class="item' + selected + '" data-key="' + esc(item.itemKey) + '">' +
-          '<div class="icon"><img data-key="' + esc(item.itemKey) + '" alt="" loading="lazy" decoding="async"><span class="fallback">' + esc((item.displayName || item.itemId).slice(0, 4)) + '</span><span class="count">' + esc(shortCount(item.amount)) + '</span>' + boxedBadge + reservedBadge + '</div>' +
+          '<div class="icon"><img data-key="' + esc(item.itemKey) + '" alt="" loading="lazy" decoding="async"><span class="fallback">' + esc((item.displayName || item.itemId).slice(0, 4)) + '</span><span class="count">' + esc(shortCount(item.available ?? item.amount)) + '</span>' + boxedBadge + reservedBadge + '</div>' +
           '<div class="name" title="' + esc(aliasTitle) + '">' + esc(item.displayName || item.itemId) + '</div>' +
           '</div>';
       }).join('') + '</div>';
