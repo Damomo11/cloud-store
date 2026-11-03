@@ -11,6 +11,8 @@ class StoreDb {
     this.config = config
     this.momoOwner = config.momoOwner || '__momo__'
     this.catalog = null
+    this.catalogMigrationDeferred = false
+    this.offlineIdentityMergeDeferred = false
     this.transactionContext = new AsyncLocalStorage()
     this.init()
   }
@@ -469,7 +471,12 @@ class StoreDb {
     this.migrateManualItemNamesToOverrides()
     this.migratePlayerItemNameOverridesToAliases()
     this.migrateExistingPersonalWarehouses()
-    const staleReservations = this.db.prepare('DELETE FROM inventory_reservations').run().changes
+    const hasCraftOperations = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'craft_operations'").get()
+    const staleReservations = this.db.prepare(hasCraftOperations
+      ? `DELETE FROM inventory_reservations WHERE reservation_id NOT IN (
+          SELECT id FROM craft_operations WHERE state NOT IN ('completed', 'complete', 'failed')
+        )`
+      : 'DELETE FROM inventory_reservations').run().changes
     if (staleReservations) console.log(`Released ${staleReservations} stale inventory reservation(s) from the previous process`)
 
     for (const username of this.config.admins || []) {
@@ -491,11 +498,54 @@ class StoreDb {
 
   setCatalog (catalog) {
     this.catalog = catalog
+    // A durable craft journal refers to exact itemKeys. Do not migrate those
+    // identities underneath an interrupted operation during process startup.
+    if (this.hasPendingCraft()) {
+      this.catalogMigrationDeferred = true
+      return { deferred: true }
+    }
+    return this.applyCatalogMigration()
+  }
+
+  applyCatalogMigration () {
+    this.catalogMigrationDeferred = true
     const migrated = this.canonicalizeItemKeys()
     if (migrated.moved > 0) {
       console.log(`Canonicalized ${migrated.moved} item keys, merged ${migrated.mergedBalances} balance rows`)
     }
-    this.rebuildShulkerContentIndex()
+    const indexed = this.rebuildShulkerContentIndex()
+    this.catalogMigrationDeferred = false
+    return { ...migrated, indexed }
+  }
+
+  runDeferredMigrations () {
+    if (this.hasPendingCraft()) {
+      return { deferred: this.catalogMigrationDeferred || this.offlineIdentityMergeDeferred }
+    }
+    const result = {}
+    if (this.offlineIdentityMergeDeferred) {
+      try {
+        result.offlineIdentities = this.autoMergeOfflineIdentities({ throwOnError: true })
+        this.offlineIdentityMergeDeferred = false
+      } catch (error) {
+        // Retain the flag so a later safe terminal transition can retry.
+        console.warn(`[identity] deferred offline identity merge failed; will retry: ${error.message}`)
+        result.offlineIdentityError = error
+      }
+    }
+    if (this.catalogMigrationDeferred) {
+      try {
+        result.catalog = this.applyCatalogMigration()
+      } catch (error) {
+        // Keep the flag set so a later safe terminal transition can retry. A
+        // failed migration must not turn an already-finished craft into a new
+        // inventory mutation or lose the catalog work item.
+        console.warn(`[catalog] deferred item-key migration failed; will retry: ${error.message}`)
+        result.catalogError = error
+      }
+    }
+    result.deferred = this.catalogMigrationDeferred || this.offlineIdentityMergeDeferred
+    return result
   }
 
   rebuildShulkerContentIndex () {
@@ -517,6 +567,7 @@ class StoreDb {
   }
 
   canonicalizeItemKeys () {
+    this.assertNoPendingCraft()
     if (!this.catalog) return { moved: 0, mergedBalances: 0 }
 
     const rows = this.db.prepare(`
@@ -1561,7 +1612,13 @@ class StoreDb {
 
   // 启动时自动执行：所有 v3 离线身份并入同名 v4 正版主号，并删除 v3 行。
   // 返回本次合并明细（给启动日志用）。
-  autoMergeOfflineIdentities () {
+  autoMergeOfflineIdentities ({ throwOnError = false } = {}) {
+    // A durable craft operation owns exact owner/item-key rows until it
+    // finishes. Startup identity migration must wait for that journal too.
+    if (this.hasPendingCraft()) {
+      this.offlineIdentityMergeDeferred = true
+      return []
+    }
     const pairs = this.listOfflineUuidPairsToMerge()
     const merged = []
     for (const pair of pairs) {
@@ -1571,6 +1628,7 @@ class StoreDb {
         console.log(`[identity] 自动合并：${result.username} 的离线身份 ${result.secondary} 已并入正版主号 ${result.primary}（${result.mergedTypes} 种、${result.mergedAmount} 个）。`)
       } catch (error) {
         console.warn(`[identity] 自动合并失败 ${pair.offlineUsername}（${pair.offlineUuid} -> ${pair.mojangUuid}）：${error.message}`)
+        if (throwOnError) throw error
       }
     }
     return merged
@@ -1580,6 +1638,7 @@ class StoreDb {
   // 管理员在 Web 页确认后调用；游戏内 upsertPlayer 只登记冲突，不自动合并。
   // 方向由调用方决定：一般把“库存多/更常用”的号留作 primary。
   mergePlayerIdentities (primaryUuid, secondaryUuid, adminUsername = '') {
+    this.assertNoPendingCraft()
     const primary = String(primaryUuid || '').trim()
     const secondary = String(secondaryUuid || '').trim()
     if (!primary || !secondary) throw new Error('缺少要合并的 UUID。')
@@ -2326,6 +2385,7 @@ class StoreDb {
   }
 
   deleteOwnerWarehouseToMomo (ownerUuid, ownerUsername, warehouseType, adminUsername, deleteWarehouse) {
+    this.assertNoPendingCraft()
     if (!ownerUuid || ownerUuid === this.momoOwner) throw new Error('不能删除该仓库。')
     const items = this.getOwnerBalances(ownerUuid)
     const totalAmount = items.reduce((sum, item) => sum + Number(item.amount || 0), 0)
@@ -2351,6 +2411,7 @@ class StoreDb {
   }
 
   renameCustomWarehouse (name, newName) {
+    this.assertNoPendingCraft()
     const warehouse = this.getCustomWarehouse(name)
     if (!warehouse) throw new Error(`找不到仓库：${name}`)
     const nextName = String(newName || '').trim()
@@ -2704,7 +2765,21 @@ class StoreDb {
     return row ? row.amount : 0
   }
 
+  hasPendingCraft (botId = '') {
+    if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='craft_operations'").get()) return false
+    return Boolean(botId
+      ? this.db.prepare("SELECT 1 FROM craft_operations WHERE state NOT IN ('completed','complete','failed') AND bot_id = ? LIMIT 1").get(String(botId))
+      : this.db.prepare("SELECT 1 FROM craft_operations WHERE state NOT IN ('completed','complete','failed') LIMIT 1").get())
+  }
+
+  assertNoPendingCraft (allowedOperationId = '') {
+    if (!this.hasPendingCraft()) return
+    if (allowedOperationId && !this.db.prepare("SELECT 1 FROM craft_operations WHERE state NOT IN ('completed','complete','failed') AND id <> ? LIMIT 1").get(String(allowedOperationId))) return
+    throw new Error('合成仍在进行或等待恢复；为保护物品归属，暂停库存变更和同步，请执行 !合成恢复。')
+  }
+
   adjustBalance (ownerUuid, itemKey, delta) {
+    this.assertNoPendingCraft(this.transactionContext.getStore()?.craftOperationId || '')
     const current = this.getBalance(ownerUuid, itemKey)
     const next = current + delta
     if (next < 0) {
@@ -3300,6 +3375,7 @@ class StoreDb {
   }
 
   clearInventoryData () {
+    this.assertNoPendingCraft()
     const counts = {
       balances: this.db.prepare('SELECT COUNT(*) AS count FROM balances').get().count,
       chestSlots: this.db.prepare('SELECT COUNT(*) AS count FROM chest_slots').get().count,
@@ -3469,6 +3545,7 @@ class StoreDb {
   }
 
   reconcileTotalsToMomo (actualTotals) {
+    this.assertNoPendingCraft()
     const ledgerRows = this.getLedgerTotals()
     const ledger = new Map(ledgerRows.map(row => [row.itemKey, row]))
     const actual = new Map(actualTotals.map(row => [row.itemKey, row]))

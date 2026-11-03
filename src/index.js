@@ -215,6 +215,7 @@ function drainBot (state) {
   if (state.reconnectTimer) clearTimeout(state.reconnectTimer)
   state.reconnectTimer = null
   if (state.service) taskPool.unregister(state.service)
+  taskPool.cancelQueuedCraftRecovery(String(state.account.botName || state.account.username || '').toLowerCase())
   if (state.service?.active) {
     state.status = 'draining'
     if (!state.drainTimer) {
@@ -285,6 +286,20 @@ function launchBot (state) {
 
   const warehouse = new Warehouse(bot, db, catalog, launchConfig, taskPool.warehouseMutex, taskPool.warehouseState)
   const service = new CloudStoreService(bot, db, catalog, warehouse, launchConfig, taskPool, subscriptions)
+  // Synthesis (ported from olela bot): attach the crafting executor to this bot.
+  // It registers itself as bot._craftingExecutor; the service enqueues craft tasks.
+  if (launchConfig.craft?.enabled !== false) {
+    try {
+      const { attachCraftingExecutor } = require('./craft')
+      attachCraftingExecutor(bot, {
+        config: launchConfig,
+        catalog,
+        warehouse
+      })
+    } catch (error) {
+      console.warn(`[craft] executor attach failed: ${error.message}`)
+    }
+  }
   service.setWebAuth(webServer)
   // 热重载收尾钩子：断开全部 bot 并关资源后显式退出（exit 0），
   // 由外层守护（screen 循环/systemd）或 spawnSuccessor 拉起的新进程接替。

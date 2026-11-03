@@ -286,6 +286,22 @@
     ]
   },
 
+  // Admin !合成 <item> <target quantity>, using cloud warehouse stock and ownership.
+  "craft": {
+    "enabled": true,
+
+    // Coordinates of one accessible crafting table for recipes larger than 2x2.
+    // Leave null to allow only recipes that fit the player's 2x2 crafting grid.
+    "table": {
+      "x": null,
+      "y": null,
+      "z": null
+    },
+
+    // Maximum duration of one craft order, in milliseconds (20 minutes).
+    "timeoutMs": 1200000
+  },
+
   // Localized language file used for Chinese item names.
   "language": {
     "file": "data/zh_cn.json"
