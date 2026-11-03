@@ -6,9 +6,9 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "test": "node --test test/*.test.js test/craft/*.test.js",
+    "test": "node --test test/*.test.js test/craft/*.test.js test/path/*.test.js",
     "dashboard": "python inventory-dashboard/dashboard.py",
-    "check": "node scripts/check.js",
+    "check": "node scripts/check.js && node scripts/check-pathfinder.js",
     "download:lang": "node scripts/download-lang.js",
     "preview:item-render": "node scripts/item-render-preview.js"
   },
@@ -19,7 +19,7 @@
     "better-sqlite3": "^12.10.0",
     "minecraft-data": "^3.112.0",
     "mineflayer": "^4.37.1",
-    "mineflayer-pathfinder": "^2.4.5",
+    "mineflayer-pathfinder": "file:vendor/mineflayer-pathfinder",
     "prismarine-item": "^1.18.0",
     "prismarine-nbt": "^2.8.0",
     "vec3": "^0.1.10"
