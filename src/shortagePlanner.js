@@ -193,7 +193,9 @@ function planShortages ({ requests = [], allocations = [], availableCraftStock =
       })
       continue
     }
-    const candidates = ownerStocks || [{ ownerUuid: undefined, stock: craftStock }]
+    const candidates = ownerStocks?.length
+      ? ownerStocks
+      : [{ ownerUuid: undefined, stock: craftStock }]
     let planned = null
     let plannedOwnerUuid
     let lastFailure = null
