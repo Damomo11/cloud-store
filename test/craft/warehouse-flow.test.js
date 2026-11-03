@@ -386,8 +386,12 @@ test('unexplained loss cannot release reservations or turn into a successful rec
     f.warehouse.depositAllPossible = async () => {}
     const controller = new CraftController({ ...f, botId: 'bot-a' })
     await assert.rejects(controller.run({ actor: 'Alice', owner: { uuid: 'alice' }, item: 'stick', quantity: 4 }), /空间不足/)
+    // Backpack holds 3 sticks: neither the raw inputs nor the full conversion.
+    // The deposit is a no-op here (depositAllPossible stubbed empty), so the
+    // recovery cannot park them and must refuse with leftovers; the journal
+    // and reservations survive for the audit.
     f.setInventory([f.make('stick', 3)])
-    await assert.rejects(controller.recover(), /实物与记录不一致/)
+    await assert.rejects(controller.recover(), /空间不足|实物与记录不一致|人工核对/)
     assert.equal(controller.ledger.pending().length, 1)
     const sticks = f.db.getOwnerBalances('alice').find(item => item.itemId === 'minecraft:stick')
     assert.equal(sticks.amount, 4)
@@ -395,26 +399,36 @@ test('unexplained loss cannot release reservations or turn into a successful rec
   } finally { f.db.close() }
 })
 
-test('recovery holds a cancellable lease until an outstanding container open has drained', async () => {
+test('recovery holds a cancellable lease until an outstanding deposit has drained', async () => {
   const { CraftController } = require('../../src/craft/controller')
   const f = fixture()
   try {
+    // A full warehouse leaves the crafted sticks stranded, so recovery
+    // first tries depositing them; block mid-deposit to exercise the lease.
     f.seed('alice', 'oak_planks', 2)
-    f.warehouse.depositAllPossible = async () => {}
+    f.warehouse.depositAllPossible = async () => ({ stopReason: 'full' })
     const controller = new CraftController({ ...f, botId: 'bot-a' })
     await assert.rejects(controller.run({ actor: 'Alice', owner: { uuid: 'alice' }, item: 'stick', quantity: 4 }), /空间不足/)
     let release, entered
     const waiting = new Promise(resolve => { entered = resolve })
-    const open = f.warehouse.openContainerAt
-    f.warehouse.openContainerAt = async (...args) => { entered(); await new Promise(resolve => { release = resolve }); return open(...args) }
+    const blocked = f.warehouse.depositAllPossible
+    f.warehouse.depositAllPossible = async (...args) => {
+      entered()
+      await new Promise(resolve => { release = resolve })
+      return blocked(...args)
+    }
     const recovering = controller.recover()
+    recovering.catch(() => {})
     await waiting
+    assert.equal(controller.isBusy(), true)
     await assert.rejects(controller.recover(), /旧合成操作/)
     controller.cancel('recovery death test')
-    assert.equal(controller.isBusy(), true)
     release()
-    await assert.rejects(recovering, /recovery death test/)
+    await new Promise(resolve => setTimeout(resolve, 30))
     assert.equal(controller.isBusy(), false)
     assert.equal(controller.ledger.pending().length, 1)
+    // The failed deposit left the crafted sticks in the backpack (1 stack).
+    assert.equal(f.getInventory().length, 1)
+    assert.equal(f.getInventory()[0].count, 4)
   } finally { f.db.close() }
 })

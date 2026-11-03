@@ -267,6 +267,19 @@ class CraftLedger {
     }
   }
 
+  // Recovery settlement: the backpack was already parked into the warehouse
+  // before this confirm runs, so data.held is empty by design. The full
+  // validatePending rails otherwise apply unchanged.
+  validateRecoverySettlement (operation, stepId, before, consumed, produced) {
+    const savedHeld = operation.data.held
+    operation.data.held = operation.data.pending?.before || before
+    try {
+      this.validatePending(operation, stepId, before, consumed, produced)
+    } finally {
+      operation.data.held = savedHeld
+    }
+  }
+
   // Partial settlement keeps only the integrity rails: the step must match the
   // prepared pending journal, consumption must stay within what the batch
   // withdrew, and after must equal the real conversion. The full expected
@@ -292,7 +305,10 @@ class CraftLedger {
     const operationId = String(id || '')
     const operation = this.getCraftOperation(operationId)
     const before = data.before || operation?.data?.pending?.before || operation?.data?.held || []
-    if (Array.isArray(data.after) && Array.isArray(data.held) && !equalItems(data.after, data.held)) {
+    // Recovery settlements pass after = the pre-deposit backpack while held is
+    // legitimately empty (the items are already back in the warehouse).
+    const recovery = Boolean(data.recovery)
+    if (!recovery && Array.isArray(data.after) && Array.isArray(data.held) && !equalItems(data.after, data.held)) {
       throw new Error('craft after snapshot does not match held state')
     }
     const after = data.after || data.held || []
@@ -301,7 +317,7 @@ class CraftLedger {
       held: items(after, 'after item'),
       pending: null,
       stepIndex: data.stepIndex ?? ((operation?.data?.stepIndex || 0) + 1)
-    }, before, after)
+    }, before, after, { recovery })
   }
 
   // Mid-batch failure settlement: the executor captured concrete before/after
@@ -341,6 +357,8 @@ class CraftLedger {
       if (TERMINAL.has(operation.state)) throw new Error(`craft operation is already ${operation.state}`)
       if (options.partial) {
         this.validatePartialSettlement(operation, batchKey, before, consumed, produced)
+      } else if (options.recovery) {
+        this.validateRecoverySettlement(operation, batchKey, before, consumed, produced)
       } else {
         this.validatePending(operation, batchKey, before, consumed, produced)
       }

@@ -348,46 +348,59 @@ class CraftController {
     if (operations.length !== 1) throw new Error('同一机器人存在多个合成恢复记录，需要人工核对。')
     let operation = operations[0]
     const phase = operation.data.recoveryPhase || operation.phase
-    await this.assertSettledResidue()
-    await this.warehouse.goHomeIfAway()
-    // One authoritative server read of a single registered chest gives the
-    // backpack snapshot we need; re-reading EVERY chest (the old loop) costs
-    // minutes on a large warehouse and is pointless because physicalTotals
-    // already trusts the DB's chest-slot ledger, and store() below deposits
-    // into the same ledger with per-chest server verification.
-    const chests = this.db.listChests()
-    if (!chests.length) throw new Error('恢复没有取得可核对的服务端背包快照；请先登记可用容器。')
-    check()
-    const snapshot = await readServerContainer(this.warehouse, chests[0], this.catalog, this.bot)
-    check()
-    this.db.replaceChestSlots(chests[0].chestId, snapshot.chestSlots)
-    const serverPlayerSnapshot = merge(snapshot.playerItems)
-    if (!same(this.inventory(), serverPlayerSnapshot)) {
-      await this.assertSettledResidue()
-      if (!same(this.inventory(), serverPlayerSnapshot)) {
-        throw new Error(`恢复时背包与服务端快照不一致（残留：${this.residueDescription()}）。`)
-      }
-    }
-    check()
-    const actual = this.physicalTotals()
     const baseline = operation.data.physicalTotals
     if (!baseline) throw new Error('恢复记录缺少实物基线，需要人工核对。')
-    if (phase === 'crafting' || operation.data.pending) {
-      const pending = operation.data.pending
+    await this.assertSettledResidue()
+    await this.warehouse.goHomeIfAway()
+    check()
+    const heldBeforeDeposit = this.inventory()
+    // Keep a copy of the interrupted intent: the checkpoints below clear
+    // data.pending so the store/finish path never sees a live conversion.
+    const pendingIntent = operation.data.pending || null
+    // Mirrors withdraw interruption recovery (depositInventoryWithoutBalance):
+    // park the interrupted backpack into the warehouse FIRST, then reconcile
+    // the ledger against the combined totals. The old flow instead walked
+    // around opening every chest for server snapshots before deciding; the
+    // deposit path already verifies each chest server-side as it stores, so
+    // recovery cost is bounded by what the backpack actually holds.
+    if (!this.db.listChests().length) throw new Error('恢复没有可用的入库木桶；请先登记可用容器。')
+    const depositBaseline = this.physicalTotals()
+    operation = this.ledger.checkpoint(operation.id, 'storing', {
+      ...operation.data, held: heldBeforeDeposit, pending: null, physicalTotals: depositBaseline
+    })
+    await this.warehouse.depositAllPossible({ requireServerEvidence: true })
+    if (!same(this.physicalTotals(), depositBaseline)) throw new Error('合成回库实物总量校验失败。')
+    const leftover = this.inventory()
+    if (leftover.length) throw new Error('仓库空间不足，恢复的物品保留在机器人背包并等待恢复。')
+    this.assertCleanInventory()
+    operation = this.ledger.checkpoint(operation.id, 'ready', { ...operation.data, held: [], pending: null })
+    check()
+    // Reconcile the journal now that every interrupted item is back in the
+    // warehouse ledger. physicalTotals reads the same DB slots the deposit
+    // updated, so totals still include everything the bot was holding.
+    const actual = this.physicalTotals()
+    if (phase === 'crafting' || pendingIntent) {
+      const pending = pendingIntent
       if (!pending) throw new Error('恢复记录缺少合成意图。')
       if (same(actual, baseline)) {
-        operation = this.ledger.checkpoint(operation.id, 'storing', { ...operation.data, pending: null, held: this.inventory() })
+        // Nothing was consumed: the withdrawal had not reached the table.
       } else if (pending.expectedProduced.every(item => item.itemKey) &&
-        same(actual, converted(baseline, pending.expectedConsumed, pending.expectedProduced)) && same(this.inventory(), pending.expectedProduced)) {
-        operation = this.ledger.checkpoint(operation.id, 'crafting', { ...operation.data, held: pending.before })
-        operation = this.ledger.confirm(operation.id, pending.stepId, pending.expectedConsumed, this.inventory(), {
-          ...operation.data, before: pending.before, after: this.inventory(), held: this.inventory(), pending: null, physicalTotals: actual
+        same(actual, converted(baseline, pending.expectedConsumed, pending.expectedProduced)) &&
+        same(heldBeforeDeposit, pending.expectedProduced)) {
+        // confirm validates against the crafting journal, so re-enter that
+        // phase with the pre-deposit backpack before settling the conversion.
+        operation = this.ledger.checkpoint(operation.id, 'crafting', {
+          ...operation.data, held: pending.before, pending, physicalTotals: depositBaseline
         })
-      } else throw new Error('无法确认中断合成的实际消耗和产出；已保留归属及预留，需要人工核对。')
+        operation = this.ledger.confirm(operation.id, pending.stepId, pending.expectedConsumed, heldBeforeDeposit, {
+          ...operation.data, before: pending.before, after: heldBeforeDeposit, held: [], pending: null, physicalTotals: actual, recovery: true
+        })
+        // confirm left phase 'storing' with a pre-deposit held snapshot; the
+        // items are physically back in the warehouse already, so re-mark the
+        // journal ready (empty held) before finishing.
+        operation = this.ledger.checkpoint(operation.id, 'ready', { ...operation.data, held: [], pending: null, physicalTotals: actual })
+      } else throw new Error('无法确认中断合成的实际消耗和产出；已回库并保留归属及预留，需要人工核对。')
     } else if (!same(actual, baseline)) throw new Error('中断取存的实物与记录不一致，需要人工核对。')
-    operation = this.ledger.checkpoint(operation.id, 'storing', { ...operation.data, held: this.inventory(), pending: null, physicalTotals: actual })
-    operation = await this.store(operation)
-    check()
     this.ledger.finish(operation.id, 'failed', 'interrupted craft safely returned; request may be submitted again')
     return { status: 'recovered', operationId: operation.id }
   }
