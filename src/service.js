@@ -2167,6 +2167,41 @@ class CloudStoreService {
   }
 
   async runCraftCommand (command) {
+    // The exclusive craft task already holds the task-pool lease. Cleanup
+    // must precede controller.run(): deposit helpers acquire the same
+    // non-reentrant warehouse mutex that the controller holds while crafting.
+    const active = this.active
+    const check = () => {
+      if (this.connectionInvalidated) throw new Error('连接已失效，合成任务已停止。')
+      this.warehouse.assertConnectionHealthy?.()
+      if (active?.cancelled || active?.dead || this.isActiveCancelled()) {
+        throw new Error(active?.dead ? '机器人死亡，合成任务已停止。' : '合成任务已取消。')
+      }
+    }
+    const assertWorkspaceClear = () => {
+      if (this.bot.currentWindow || this.bot.inventory.selectedItem || this.bot.inventory.slots?.slice(0, 5).some(Boolean)) {
+        throw new Error('需先处理机器人窗口、光标或合成格残留物品。')
+      }
+    }
+    check()
+    this.db.assertNoPendingCraft?.()
+    this.validateCraftOwner(command.owner, command.player)
+    // Do not reinterpret an ambiguous window/cursor/grid as ordinary idle
+    // inventory. Pending craft assets must use their evidence-based recovery.
+    assertWorkspaceClear()
+    if (this.bot.inventory.items().length) {
+      if (active) active.phase = 'craft_inventory_cleanup'
+      const notify = command.notify || (message => this.msg(command.player, message))
+      notify('合成前先清理机器人背包，按原有归属规则回存云仓。')
+      await this.warehouse.goHomeIfAway()
+      check()
+      assertWorkspaceClear()
+      await this.flushResidual()
+      check()
+    }
+    // Cancellation before run() cannot be remembered by controller.cancel(),
+    // because its AbortController does not exist until run() starts.
+    check()
     const result = await this.getCraftController().run({
       actor: command.player, owner: command.owner, item: command.target.name, quantity: command.target.quantity
     })

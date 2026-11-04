@@ -134,6 +134,197 @@ function fixture () {
     getInventory: () => inventory, setInventory: items => { inventory = items } }
 }
 
+// Keep the real service, accounting wrappers, controller, ledger and
+// non-reentrant warehouse mutex; fake only navigation and item transfers.
+function preflightFixture () {
+  const Service = require('../../src/service')
+  const Warehouse = require('../../src/warehouse')
+  const { AsyncMutex } = require('../../src/taskPool')
+  const f = fixture()
+  f.warehouse = Object.assign(new Warehouse(f.bot, f.db, f.catalog, f.config, new AsyncMutex()), f.warehouse, {
+    withWarehouseLock: Warehouse.prototype.withWarehouseLock
+  })
+  f.bot._craftingExecutor = f.executor
+  f.service = new Service(f.bot, f.db, f.catalog, f.warehouse, f.config)
+  f.service.craftLedger()
+  f.service.getPlayer = () => ({ uuid: 'alice', username: 'Alice' })
+  f.messages = []
+  f.service.msg = (username, message) => f.messages.push(message)
+  f.command = { player: 'Alice', owner: { uuid: 'alice', username: 'Alice', scope: 'personal' }, target: { name: 'stick', quantity: 4 } }
+  f.run = async () => {
+    let result
+    await f.service.runExclusive('Alice', 'craft', async () => { result = await f.service.runCraftCommand(f.command) })
+    return result
+  }
+  f.balance = (owner, name) => f.db.getOwnerItemsByItemId(owner, `minecraft:${name}`).reduce((sum, item) => sum + item.amount, 0)
+  f.assertNotStarted = () => {
+    assert.equal(f.db.db.prepare('SELECT COUNT(*) AS n FROM craft_operations').get().n, 0)
+    assert.equal(f.db.db.prepare('SELECT COUNT(*) AS n FROM inventory_reservations').get().n, 0)
+    assert.equal(f.messages.some(message => /合成完成/.test(message)), false)
+  }
+  f.seed('alice', 'oak_planks', 2)
+  return f
+}
+
+test('craft preflight stores idle inventory as momo before crafting with a real warehouse mutex', { timeout: 3000 }, async () => {
+  const f = preflightFixture()
+  try {
+    f.setInventory([f.make('cobblestone', 3)])
+    assert.equal((await f.run()).status, 'complete')
+    assert.equal(f.balance(f.config.momoOwner, 'cobblestone'), 3)
+    assert.equal(f.balance('alice', 'cobblestone'), 0)
+    assert.equal(f.balance('alice', 'stick'), 4)
+    assert.deepEqual(f.getInventory(), [])
+    assert.deepEqual(f.service.craftLedger().pending(), [])
+    assert.equal(f.db.db.prepare("SELECT COUNT(*) AS n FROM transactions WHERE type='residual_to_momo'").get().n, 1)
+  } finally { f.db.close() }
+})
+
+test('craft preflight completes a pending deposit for its original owner', async () => {
+  const f = preflightFixture()
+  try {
+    const item = f.catalog.fromPrismarineItem(f.make('cobblestone', 3))
+    f.setInventory([f.make('cobblestone', 3)])
+    f.db.saveRecoveryTask({ type: 'deposit', actorUsername: 'Bob', ownerUuid: 'bob', ownerUsername: 'Bob', phase: 'depositing', items: [item] }, f.service.botId)
+    assert.equal((await f.run()).status, 'complete')
+    assert.equal(f.balance('bob', 'cobblestone'), 3)
+    assert.equal(f.balance('alice', 'cobblestone'), 0)
+    assert.equal(f.balance(f.config.momoOwner, 'cobblestone'), 0)
+    assert.equal(f.db.getRecoveryTask(f.service.botId), null)
+  } finally { f.db.close() }
+})
+
+test('craft preflight returns undelivered withdrawals without crediting them twice', async () => {
+  const f = preflightFixture()
+  try {
+    const item = f.seed('bob', 'cobblestone', 3)
+    f.stored.get(item.itemKey).count = 0
+    f.refresh()
+    f.setInventory([f.make('cobblestone', 3)])
+    f.db.saveRecoveryTask({ type: 'withdraw', actorUsername: 'Bob', ownerUuid: 'bob', ownerUsername: 'Bob', phase: 'withdrawing', items: [item] }, f.service.botId)
+    assert.equal((await f.run()).status, 'complete')
+    assert.equal(f.balance('bob', 'cobblestone'), 3)
+    assert.equal(f.stored.get(item.itemKey).count, 3)
+    assert.equal(f.balance(f.config.momoOwner, 'cobblestone'), 0)
+    assert.equal(f.db.getRecoveryTask(f.service.botId), null)
+  } finally { f.db.close() }
+})
+
+test('a full warehouse stops preflight and retry does not double-credit idle inventory', async () => {
+  const f = preflightFixture()
+  try {
+    f.setInventory([f.make('cobblestone', 3)])
+    const deposit = f.warehouse.depositAllPossible
+    f.warehouse.depositAllPossible = async () => ({ stopReason: 'full' })
+    await assert.rejects(f.run(), /无法入库/)
+    f.assertNotStarted()
+    assert.equal(f.balance(f.config.momoOwner, 'cobblestone'), 3)
+    f.warehouse.depositAllPossible = deposit
+    assert.equal((await f.run()).status, 'complete')
+    assert.equal(f.balance(f.config.momoOwner, 'cobblestone'), 3)
+    assert.equal(f.db.db.prepare("SELECT COUNT(*) AS n FROM transactions WHERE type='residual_to_momo'").get().n, 1)
+  } finally { f.db.close() }
+})
+
+test('preflight refuses generic cleanup while another bot has a pending craft', async () => {
+  const f = preflightFixture()
+  try {
+    f.setInventory([f.make('cobblestone', 3)])
+    f.service.craftLedger().begin({ id: 'craft:other', botId: 'other-bot', actor: 'Alice', owner: f.command.owner, target: f.command.target, allocations: [] })
+    await assert.rejects(f.service.runCraftCommand(f.command), /合成|craft/i)
+    assert.equal(f.balance(f.config.momoOwner, 'cobblestone'), 0)
+    assert.equal(f.getInventory()[0].count, 3)
+    assert.equal(f.service.craftLedger().pending().length, 1)
+  } finally { f.db.close() }
+})
+
+for (const phase of ['navigation', 'deposit']) {
+  for (const reason of ['cancel', 'death', 'disconnect']) {
+    test(`craft does not start after ${reason} during preflight ${phase}`, async () => {
+      const f = preflightFixture()
+      try {
+        f.setInventory([f.make('cobblestone', 3)])
+        const interrupt = () => {
+          if (reason === 'disconnect') f.service.invalidateConnection('test disconnect')
+          else {
+            f.service.active.cancelled = true
+            f.service.active.dead = reason === 'death'
+            // Death handling may detach the current active context.
+            f.service.active = null
+          }
+        }
+        if (phase === 'navigation') f.warehouse.goHomeIfAway = async () => { interrupt() }
+        else {
+          const deposit = f.warehouse.depositAllPossible
+          f.warehouse.depositAllPossible = async () => { const result = await deposit(); interrupt(); return result }
+        }
+        await assert.rejects(f.run(), /取消|死亡|失效|断开|disconnect/)
+        f.assertNotStarted()
+        if (phase === 'navigation') assert.equal(f.balance(f.config.momoOwner, 'cobblestone'), 0)
+      } finally { f.db.close() }
+    })
+  }
+}
+
+for (const residue of ['window', 'cursor', 'grid']) {
+  test(`preflight preserves the ${residue} safety guard without moving idle items`, async () => {
+    const f = preflightFixture()
+    try {
+      f.setInventory([f.make('cobblestone', 3)])
+      if (residue === 'window') f.bot.currentWindow = { selectedItem: f.make('diamond', 1) }
+      if (residue === 'cursor') f.bot.inventory.selectedItem = f.make('diamond', 1)
+      if (residue === 'grid') f.bot.inventory.slots[1] = f.make('diamond', 1)
+      await assert.rejects(f.run(), /窗口|光标|合成格/)
+      f.assertNotStarted()
+      assert.equal(f.balance(f.config.momoOwner, 'cobblestone'), 0)
+      assert.equal(f.getInventory()[0].count, 3)
+    } finally { f.db.close() }
+  })
+}
+
+test('an empty backpack starts crafting without an extra cleanup trip', async () => {
+  const f = preflightFixture()
+  try {
+    let trips = 0
+    f.warehouse.goHomeIfAway = async () => { trips++ }
+    assert.equal((await f.run()).status, 'complete')
+    assert.equal(trips, 1)
+    assert.equal(f.db.db.prepare("SELECT COUNT(*) AS n FROM transactions WHERE type='residual_to_momo'").get().n, 0)
+  } finally { f.db.close() }
+})
+
+for (const boundary of ['warehouse lock', 'owner validation']) {
+  test(`cancellation during ${boundary} prevents craft setup and navigation`, async () => {
+    const f = preflightFixture()
+    try {
+      const controller = f.service.getCraftController()
+      let trips = 0
+      f.warehouse.goHomeIfAway = async () => { trips++ }
+      let release
+      let blocker
+      if (boundary === 'warehouse lock') {
+        let entered
+        const locked = new Promise(resolve => { entered = resolve })
+        const held = new Promise(resolve => { release = resolve })
+        blocker = f.warehouse.withWarehouseLock(async () => { entered(); await held })
+        await locked
+      } else {
+        controller.validateOwner = async () => { controller.cancel('cancelled before craft setup') }
+      }
+      const running = controller.run({ actor: 'Alice', owner: f.command.owner, item: 'stick', quantity: 4 })
+      if (boundary === 'warehouse lock') {
+        await new Promise(resolve => setImmediate(resolve))
+        controller.cancel('cancelled before craft setup')
+        release()
+        await blocker
+      }
+      await assert.rejects(running, /cancelled before craft setup/)
+      f.assertNotStarted()
+      assert.equal(trips, 0)
+    } finally { f.db.close() }
+  })
+}
+
 test('whole warehouse craft flow converts only Alice stock and returns products to the same warehouse', async () => {
   const { CraftController } = require('../../src/craft/controller')
   const f = fixture()

@@ -212,8 +212,10 @@ class CraftController {
     this.active = lease
     try {
       return await this.warehouse.withWarehouseLock(async () => {
+        abort.signal.throwIfAborted()
         if (this.ledger.pending().length) throw new Error('存在未恢复的合成任务，请先执行 !合成恢复。')
         await this.validateOwner?.(request.owner, request.actor)
+        abort.signal.throwIfAborted()
         this.assertCleanInventory()
         const rows = this.availableItems(request.owner.uuid)
         const planned = planToCraftCommand({ item: request.item, quantity: request.quantity, available: this.availableStock(request.owner.uuid), config: this.config, forceCraft: true })
