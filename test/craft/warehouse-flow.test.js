@@ -156,6 +156,54 @@ test('whole warehouse craft flow converts only Alice stock and returns products 
   } finally { f.db.close() }
 })
 
+test('real executor completes a confirmed batch through warehouse and owner ledger', async () => {
+  const { CraftController } = require('../../src/craft/controller')
+  const { createInventoryExecutor } = require('../../src/craft/inventory-executor')
+  const f = fixture()
+  try {
+    const registry = f.catalog.mcData
+    const Recipe = require('prismarine-recipe')(registry).Recipe
+    const Item = require('prismarine-item')(registry)
+    const planks = f.seed('alice', 'oak_planks', 4)
+    f.bot.registry = registry
+    f.bot.inventory.id = 0
+    f.bot.inventory.inventoryStart = 9
+    f.bot.inventory.inventoryEnd = 45
+    f.bot.inventory.slots = new Array(46).fill(null)
+    f.bot.recipesAll = (id, metadata, block) => Recipe.find(id, metadata).filter(recipe => !recipe.requiresTable || block)
+    f.bot.clickWindow = async () => {}
+    f.bot.pathfinder = { stop: () => {} }
+    f.bot.clearControlStates = () => {}
+    let craftCount = 0
+    f.bot.craft = async (recipe, count) => {
+      craftCount = count
+      f.setInventory([f.make('stick', 8)])
+      f.bot._client.emit('set_slot', { windowId: 0, slot: 0, item: Item.toNotch(f.make('stick', recipe.result.count)) })
+      await f.bot.clickWindow(0, 0, 0)
+      const items = Array.from({ length: 46 }, () => Item.toNotch(null))
+      items[9] = Item.toNotch(f.getInventory()[0])
+      f.bot._client.emit('window_items', { windowId: 0, items })
+      f.bot._client.emit('set_cursor_item', { contents: Item.toNotch(null) })
+    }
+    f.config.craft.confirmTimeoutMs = 60
+    f.config.craft.settleMs = 5
+    f.executor = createInventoryExecutor(f.bot, f.catalog, f.config, f.warehouse)
+    const controller = new CraftController({ ...f, botId: 'bot-a' })
+    const result = await controller.run({ actor: 'Alice', owner: { uuid: 'alice' }, item: 'stick', quantity: 8 })
+    assert.equal(result.status, 'complete')
+    assert.equal(craftCount, 2)
+    assert.equal(f.db.getBalance('alice', planks.itemKey), 0)
+    const sticks = f.db.getOwnerItemsByItemId('alice', 'minecraft:stick')[0]
+    assert.equal(sticks.amount, 8)
+    assert.equal(f.stored.get(sticks.itemKey).count, 8)
+    assert.deepEqual(f.getInventory(), [])
+    assert.deepEqual(controller.ledger.pending(), [])
+    assert.equal(f.db.db.prepare('SELECT COUNT(*) AS n FROM inventory_reservations').get().n, 0)
+    assert.equal(f.db.db.prepare("SELECT COUNT(*) AS n FROM transactions WHERE type='craft_consume'").get().n, 1)
+    assert.equal(f.db.db.prepare("SELECT COUNT(*) AS n FROM transactions WHERE type='craft_produce'").get().n, 1)
+  } finally { f.db.close() }
+})
+
 test('initial craft journal records the physical baseline before navigation', async () => {
   const { CraftController } = require('../../src/craft/controller')
   const f = fixture()

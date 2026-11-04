@@ -87,6 +87,54 @@ test('2x2 crafting consumes only the concrete input variants and produces one tr
   assert.equal(f.executor.isBusy(), false)
 })
 
+test('batch crafting matches a real recipe across all triggers and split input stacks', async () => {
+  const f = fixture([item('oak_planks', 1, 'Alice'), item('oak_planks', 3, 'Bob')], [item('stick', 8)])
+  const preview = f.executor.preview(stickStep, 2)
+  assert.deepEqual(amounts(preview.expectedConsumed), [['minecraft:oak_planks', 1], ['minecraft:oak_planks', 3]])
+  assert.deepEqual(amounts(preview.expectedProduced), [['minecraft:stick', 8]])
+  const result = await f.executor.execute({ step: stickStep, triggers: 2 })
+  assert.deepEqual(amounts(result.consumed), amounts(preview.expectedConsumed))
+  assert.deepEqual(amounts(result.produced), [['minecraft:stick', 8]])
+  assert.equal(f.calls.find(call => Array.isArray(call) && call[0] === 'craft')[2], 2)
+})
+
+test('batch crafting scales real recipe container remainders', async () => {
+  const f = fixture([item('honey_bottle', 8)], [item('honey_block', 2), item('glass_bottle', 8)])
+  const step = { requiresTable: false, result: { name: 'honey_block', count: 1 }, inputs: [{ names: ['honey_bottle'], count: 4 }] }
+  assert.deepEqual(amounts(f.executor.preview(step, 2).expectedProduced), [['minecraft:glass_bottle', 8], ['minecraft:honey_block', 2]])
+  const result = await f.executor.execute({ step, triggers: 2 })
+  assert.deepEqual(amounts(result.produced), [['minecraft:glass_bottle', 8], ['minecraft:honey_block', 2]])
+})
+
+test('batch crafting matches a real 3x3 recipe', async () => {
+  const f = fixture([item('oak_planks', 16)], [item('chest', 2)])
+  const step = { requiresTable: true, result: { name: 'chest', count: 1 }, inputs: [{ names: ['oak_planks'], count: 8 }] }
+  assert.deepEqual(amounts(f.executor.preview(step, 2).expectedProduced), [['minecraft:chest', 2]])
+  const result = await f.executor.execute({ step, triggers: 2 })
+  assert.deepEqual(amounts(result.produced), [['minecraft:chest', 2]])
+  assert.equal(f.calls.find(call => Array.isArray(call) && call[0] === 'craft')[3], f.table)
+})
+
+test('batch crafting requires enough metadata-specific inputs for every trigger', () => {
+  const input = registry.itemsByName.oak_planks.id
+  const output = registry.itemsByName.stick.id
+  const recipe = {
+    result: { id: output, metadata: null, count: 4 }, requiresTable: false,
+    inShape: [[{ id: input, metadata: null, count: 1 }], [{ id: input, metadata: 1, count: 1 }]],
+    delta: [{ id: input, metadata: null, count: -1 }, { id: input, metadata: 1, count: -1 }, { id: output, metadata: null, count: 4 }]
+  }
+  const specific = item('oak_planks', 2)
+  specific.metadata = 1
+  const f = fixture([item('oak_planks', 2), specific], [item('stick', 8)])
+  f.bot.recipesAll = () => [recipe]
+  assert.deepEqual(amounts(f.executor.preview(stickStep, 2).expectedProduced), [['minecraft:stick', 8]])
+  const missing = item('oak_planks', 1)
+  missing.metadata = 1
+  const g = fixture([item('oak_planks', 3), missing], [item('stick', 8)])
+  g.bot.recipesAll = () => [recipe]
+  assert.throws(() => g.executor.preview(stickStep, 2), /no standard recipe/)
+})
+
 test('3x3 crafting navigates through Warehouse and passes the validated table block', async () => {
   const f = fixture([item('oak_planks', 8)], [item('chest', 1)])
   const result = await f.executor.execute({ step: { requiresTable: true, result: { name: 'chest', count: 1 }, inputs: [{ names: ['oak_planks'], count: 8 }] } })

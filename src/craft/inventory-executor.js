@@ -5,7 +5,7 @@ const { standardRecipeOutputs, withStandardRecipeOutputs } = require('./recipe-o
 const { readServerContainer } = require('./server-container-evidence')
 
 // This boundary performs no warehouse accounting or material withdrawal. The
-// controller supplies exactly one trigger's concrete inputs in an empty bag.
+// controller supplies the batch's concrete inputs in an empty bag.
 function createInventoryExecutor (bot, catalog, config, warehouse) {
   let active = null
   const registry = bot.registry || catalog.mcData
@@ -119,15 +119,17 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
       (entry.metadata == null || Number.isSafeInteger(entry.metadata))
   }
 
-  function matchesMetadata (requirements, items) {
+  function matchesMetadata (requirements, items, triggers) {
     const remaining = items.map(entry => ({ ...entry, remaining: entry.count }))
     // Satisfy specific metadata before wildcards so a wildcard cannot consume
     // the only item satisfying a later, more specific recipe slot.
     for (const input of [...requirements].sort((a, b) => Number(a.metadata == null) - Number(b.metadata == null))) {
-      const source = remaining.find(entry => entry.remaining > 0 && entry.type === input.id &&
-        (input.metadata == null || entry.metadata === input.metadata))
-      if (!source) return false
-      source.remaining--
+      for (let index = 0; index < triggers; index++) {
+        const source = remaining.find(entry => entry.remaining > 0 && entry.type === input.id &&
+          (input.metadata == null || entry.metadata === input.metadata))
+        if (!source) return false
+        source.remaining--
+      }
     }
     return remaining.every(entry => entry.remaining === 0)
   }
@@ -140,8 +142,9 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
       let executable
       try { executable = withStandardRecipeOutputs(registry, recipe) } catch { continue }
       const materials = recipeMaterials(executable)
-      if (!materials || !sameAmounts(materials.inputs, declared.inputs, entry => entry.id ?? entry.type) ||
-        !matchesMetadata(materials.inputs, items)) continue
+      if (!materials || !sameAmounts(materials.inputs.map(input => ({ ...input, amount: input.amount * declared.triggers })),
+        declared.inputs, entry => entry.id ?? entry.type) ||
+        !matchesMetadata(materials.inputs, items, declared.triggers)) continue
       const expected = catalog.aggregatePrismarineItems(standardRecipeOutputs(registry, executable).map(entry => new Item(entry.id, entry.count, entry.metadata)))
       return { recipe: executable, expected }
     }
