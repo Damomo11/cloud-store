@@ -1,6 +1,7 @@
 const { clampInt, sleep, sumBy } = require('./utils')
 const { startTrace, traceEvent, traceSummary, traceStandalone, shortKey } = require('./traceLog')
 const { runHotReload } = require('./hotReload')
+const { planShortages, normalizeItemId } = require('./shortagePlanner')
 
 const REPAIR_BOTTLE_ITEM_ID = 'minecraft:experience_bottle'
 const REPAIR_BOTTLE_AMOUNT = 64
@@ -1018,20 +1019,7 @@ class CloudStoreService {
     const target = String(targetUsername || user.username || '').trim()
     if (!/^[A-Za-z0-9_]{3,16}$/.test(target)) throw new Error('目标玩家 ID 格式不正确。')
 
-    const requests = webRequests.map(entry => {
-      const count = this.parsePositiveAmount(entry.amount, '取出数量')
-      let resolved = null
-      if (entry.itemKey) {
-        const item = this.db.getItemByKey(entry.itemKey)
-        if (!item) throw new Error(`找不到物品：${entry.itemKey}`)
-        resolved = { ...item, displayName: String(entry.displayName || '').trim() || item.displayName }
-      } else {
-        const item = String(entry.item || '').trim()
-        if (!item) throw new Error('请填写要取出的物品。')
-        resolved = this.resolveStoredItem(item, user.uuid)
-      }
-      return { ...resolved, amount: count }
-    })
+    const requests = this.normalizeWebWithdrawRequests(user, webRequests)
 
     // Web 端取货输入记录：谁在网页上取了什么、交给谁、从哪个仓库取。
     traceStandalone('command', 'input', 'web_withdraw_request', {
@@ -1053,6 +1041,118 @@ class CloudStoreService {
     return target === user.username
       ? `取货任务已提交，将从${this.ownerScopeName(owner)}取出 ${requests.length} 种物品。`
       : `取货任务已提交，将从${this.ownerScopeName(owner)}取出 ${requests.length} 种物品并交给 ${target}。`
+  }
+
+  normalizeWebWithdrawRequests (user, webRequests) {
+    if (!Array.isArray(webRequests) || !webRequests.length) throw new Error('请先选择要取出的物品。')
+    return webRequests.map((entry, requestIndex) => {
+      const count = this.parsePositiveAmount(entry?.amount, '取出数量')
+      let resolved = null
+      if (entry?.itemKey) {
+        const item = this.db.getItemByKey(entry.itemKey)
+        if (!item) throw new Error(`找不到物品：${entry.itemKey}`)
+        resolved = { ...item, displayName: String(entry.displayName || '').trim() || item.displayName }
+      } else {
+        const item = String(entry?.item || '').trim()
+        if (!item) throw new Error('请填写要取出的物品。')
+        resolved = this.resolveStoredItem(item, user.uuid)
+      }
+      return { ...resolved, amount: count, requestIndex }
+    })
+  }
+
+  // Read-only withdrawal planning shared by Web previews and the execution path.
+  // It deliberately stops before reservation, deduction, or any other mutation.
+  previewWithdrawShortage (user, ownerUuid, webRequests) {
+    const owner = this.resolveWebStorageOwner(user, ownerUuid)
+    const requests = this.normalizeWebWithdrawRequests(user, webRequests)
+    const player = { uuid: user.uuid, username: user.username }
+    const plan = this.buildWithdrawPlanForRequest(player, owner, requests)
+    const eligibleOwnerUuids = this.withdrawSourceOwners(player, owner).map(source => source.uuid)
+    const shortage = this.buildShortageCraftPlan(owner, requests, plan.allocations, { eligibleOwnerUuids })
+    return {
+      owner,
+      requests,
+      notices: plan.notices || [],
+      allocations: plan.allocations || [],
+      ...shortage,
+      // Keep the singular alias used by Web/projection clients while retaining
+      // the planner's explicit plural field for callers that need the raw list.
+      shortage: shortage.shortages
+    }
+  }
+
+  buildShortageCraftPlan (owner, requests, allocations = [], options = {}) {
+    const reservationsAlreadyApplied = Boolean(options?.reservationsAlreadyApplied)
+    const primaryOwnerUuid = typeof owner === 'string' ? owner : owner?.uuid
+    const ownerUuids = new Set()
+    if (primaryOwnerUuid) ownerUuids.add(String(primaryOwnerUuid))
+    for (const ownerUuid of options?.eligibleOwnerUuids || []) {
+      if (ownerUuid) ownerUuids.add(String(ownerUuid))
+    }
+    for (const allocation of allocations || []) {
+      if (allocation?.ownerUuid) ownerUuids.add(String(allocation.ownerUuid))
+    }
+
+    // CraftLedger exposes loose balances with their exact item keys. Remove
+    // only the keys/amounts assigned to this withdrawal before aggregating by
+    // item id, so a planned pickup cannot also become a craft input.
+    const consumedByKey = new Map()
+    if (!reservationsAlreadyApplied) {
+      for (const allocation of allocations || []) {
+        if (allocation?.withdrawMode === 'shulker_extract') continue
+        const itemKey = String(allocation?.itemKey || '')
+        if (!itemKey) continue
+        const ownerUuid = String(allocation?.ownerUuid || primaryOwnerUuid || '')
+        const amount = Number(allocation?.amount || 0)
+        if (!ownerUuid || !Number.isFinite(amount) || amount <= 0) continue
+        const key = `${ownerUuid}\u0000${itemKey}`
+        consumedByKey.set(key, Number(consumedByKey.get(key) || 0) + amount)
+      }
+    }
+
+    const stockByOwner = new Map()
+    for (const ownerUuid of ownerUuids) {
+      const availableCraftStock = {}
+      const ownerConsumedByKey = new Map()
+      for (const [key, amount] of consumedByKey) {
+        if (key.startsWith(`${ownerUuid}\u0000`)) ownerConsumedByKey.set(key, amount)
+      }
+      let rows = []
+      try {
+        rows = typeof this.db.getCraftAvailableItems === 'function'
+          ? this.db.getCraftAvailableItems(ownerUuid) || []
+          : this.craftLedger().getCraftAvailableItems(ownerUuid) || []
+      } catch {
+        // Lightweight service fixtures may not provide a CraftLedger DB. An
+        // empty snapshot keeps preview/read-only semantics intact.
+        rows = []
+      }
+      for (const row of rows) {
+        const itemId = normalizeItemId(row?.itemId)
+        const itemKey = String(row?.itemKey || '')
+        const amount = Number(row?.amount || 0)
+        if (!itemId || !Number.isFinite(amount) || amount <= 0) continue
+        const rowOwner = String(row?.ownerUuid || ownerUuid)
+        const consumedKey = `${rowOwner}\u0000${itemKey}`
+        const consumed = Number(ownerConsumedByKey.get(consumedKey) || 0)
+        const remaining = Math.max(0, amount - consumed)
+        if (ownerConsumedByKey.has(consumedKey)) ownerConsumedByKey.set(consumedKey, Math.max(0, consumed - amount))
+        if (!remaining) continue
+        const name = itemId.replace(/^minecraft:/, '')
+        availableCraftStock[name] = Number(availableCraftStock[name] || 0) + remaining
+      }
+      stockByOwner.set(ownerUuid, availableCraftStock)
+    }
+
+    return planShortages({
+      requests,
+      allocations,
+      availableCraftStock: {},
+      availableCraftStockByOwner: stockByOwner,
+      config: this.config,
+      catalog: this.catalog
+    })
   }
 
   resolveWebStorageOwner (user, ownerUuid) {
@@ -1440,6 +1540,31 @@ class CloudStoreService {
       this.msg(username, message)
     }
     const msgTarget = message => this.msg(deliveryTarget, message)
+    const eligibleOwnerUuids = this.withdrawSourceOwners(player, storageOwner).map(owner => owner.uuid)
+    let shortagePlan = null
+    const withShortagePlan = result => shortagePlan
+      ? {
+          ...result,
+          shortagePlan,
+          shortages: shortagePlan.shortages,
+          shortage: shortagePlan.shortages,
+          craft: shortagePlan.craft
+        }
+      : result
+    const recordShortagePlan = (allocations, options, decision) => {
+      shortagePlan = this.buildShortageCraftPlan(storageOwner, requests, allocations, {
+        ...options,
+        eligibleOwnerUuids
+      })
+      traceEvent(trace, 'plan', 'shortage_plan', {
+        requested: shortagePlan.requested,
+        allocated: shortagePlan.allocated,
+        shortages: shortagePlan.shortages,
+        craft: shortagePlan.craft,
+        decision
+      })
+      return shortagePlan
+    }
     await this.warehouse.goHomeIfAway()
     if (this.isActiveCancelled()) return { status: 'cancelled', delivered: [], missing: [] }
     await this.flushResidual()
@@ -1465,6 +1590,11 @@ class CloudStoreService {
     }
 
     if (!plan.allocations.length) {
+      recordShortagePlan(
+        plan.allocations,
+        { reservationsAlreadyApplied: false },
+        '没有可直接取出的库存，按当前散装库存计算缺口合成候选（仅记录，不执行合成）'
+      )
       if (deliveryToOther) {
         msgTarget(deliveryMode === 'repair'
           ? `${username} 想给你修装备，但仓库没有可用的经验瓶。`
@@ -1474,13 +1604,21 @@ class CloudStoreService {
           : `给 ${deliveryTarget} 的取货失败：仓库没有可取出的物品。`)
       }
       else this.msg(username, '没有可取出的物品。')
-      return { status: 'empty_plan', delivered: [], missing: [] }
+      return withShortagePlan({ status: 'empty_plan', delivered: [], missing: [] })
     }
 
     const reservationId = `${this.botId}:${this.active?.taskId || Date.now()}`
     this.db.reserveInventory(reservationId, plan.allocations)
     if (this.active) this.active.reservationId = reservationId
     traceEvent(trace, 'plan', 'reserve_inventory', { reservationId })
+
+    // Reservations are already reflected by CraftLedger's available-item
+    // query, so avoid subtracting these allocations a second time here.
+    recordShortagePlan(
+      plan.allocations,
+      { reservationsAlreadyApplied: true },
+      '取货预留已建立，按当前散装库存重新计算缺口合成候选（仅记录，不执行合成）'
+    )
 
     const batches = this.splitAllocationsIntoInventoryBatches(plan.allocations, 36)
     traceEvent(trace, 'plan', 'batches_split', {
@@ -1510,7 +1648,7 @@ class CloudStoreService {
     })
 
     let attempt = await runBatches()
-    if (attempt.cancelled || attempt.aborted) return { status: attempt.aborted ? 'aborted' : 'cancelled', delivered: [], missing: [] }
+    if (attempt.cancelled || attempt.aborted) return withShortagePlan({ status: attempt.aborted ? 'aborted' : 'cancelled', delivered: [], missing: [] })
 
     let deliveredTotal = this.mergeItems(attempt.allDeducted)
     if (!deliveredTotal.length) {
@@ -1535,7 +1673,7 @@ class CloudStoreService {
         this.autoReconcileConfirmedMissing(storageOwner, missingItems, username)
         msgActor(`账本有库存，但已逐个打开 ${searchedBarrels} 个木桶仍找不到实物：${this.formatItemList(missingItems)}。已自动同步账本并登记库存异常，管理员可在Web管理页复核。`)
         this.db.clearRecoveryTask(this.botId)
-        return { status: 'failed_no_location', delivered: [], missing: this.mergeItems(missingItems) }
+        return withShortagePlan({ status: 'failed_no_location', delivered: [], missing: this.mergeItems(missingItems) })
       }
 
       // 取货时已就地核对每个木桶：实物少了当场刷新该木桶记录，读到整桶为空按服务器卡顿处理并保留原记录。
@@ -1548,7 +1686,7 @@ class CloudStoreService {
       if (!returned.leftover.length) {
         msgActor('账本有库存但没有取出任何物品，已逐个木桶核对实际库存，正在按最新记录重试……')
         attempt = await runBatches()
-        if (attempt.cancelled || attempt.aborted) return { status: attempt.aborted ? 'aborted' : 'cancelled', delivered: [], missing: [] }
+        if (attempt.cancelled || attempt.aborted) return withShortagePlan({ status: attempt.aborted ? 'aborted' : 'cancelled', delivered: [], missing: [] })
         deliveredTotal = this.mergeItems(attempt.allDeducted)
       }
     }
@@ -1575,7 +1713,7 @@ class CloudStoreService {
         this.msg(username, `账本有库存，但按本地木桶记录没有取出：${this.formatItemList(plan.allocations)}。已就地核对各木桶并重试仍未取到，账本已按实物自动修正并登记异常；若持续出现，请管理员在Web管理页检查库存异常。`)
       }
       this.db.clearRecoveryTask(this.botId)
-      return { status: 'failed_no_withdraw', delivered: [], missing: this.mergeItems(plan.allocations) }
+      return withShortagePlan({ status: 'failed_no_withdraw', delivered: [], missing: this.mergeItems(plan.allocations) })
     }
 
     const missingByItem = this.groupMissingByDisplay(plan.allocations, attempt.allWithdrawn, attempt.allMissing)
@@ -1611,10 +1749,10 @@ class CloudStoreService {
 
     if (continueWithDeposit) {
       await this.handleDeposit(username, storageOwner, { alreadyAtPlayer: attempt.stayedWithPlayerForDeposit })
-      return { status: 'delivered_then_deposit', delivered: deliveredTotal, missing: attempt.allMissing || [] }
+      return withShortagePlan({ status: 'delivered_then_deposit', delivered: deliveredTotal, missing: attempt.allMissing || [] })
     }
     this.db.clearRecoveryTask(this.botId)
-    return { status: 'delivered', delivered: deliveredTotal, missing: attempt.allMissing || [] }
+    return withShortagePlan({ status: 'delivered', delivered: deliveredTotal, missing: attempt.allMissing || [] })
   }
 
   // 取货任务收尾：把确认取不到的缺口当场修账（扣 owner 余额 + sync_deduct 流水 +

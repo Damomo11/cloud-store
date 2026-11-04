@@ -2868,6 +2868,22 @@ class StoreDb {
     `).all(ownerUuid, itemKey)
   }
 
+  // Read-only loose-stock snapshot for crafting previews. Keeping the query
+  // here avoids initializing CraftLedger (and its schema) on a preview path.
+  getCraftAvailableItems (ownerUuid) {
+    return this.db.prepare(`
+      SELECT b.owner_uuid AS ownerUuid, b.item_key AS itemKey,
+             b.amount - COALESCE((SELECT SUM(r.amount) FROM inventory_reservations r
+               WHERE r.owner_uuid = b.owner_uuid AND r.item_key = b.item_key), 0) AS amount,
+             i.item_id AS itemId, i.display_name AS displayName,
+             i.nbt_json AS nbtJson, i.meta_json AS metaJson
+      FROM balances b JOIN items i ON i.item_key = b.item_key
+      WHERE b.owner_uuid = ? AND b.amount - COALESCE((SELECT SUM(r.amount)
+        FROM inventory_reservations r WHERE r.owner_uuid = b.owner_uuid AND r.item_key = b.item_key), 0) > 0
+      ORDER BY i.item_id, i.created_at
+    `).all(String(ownerUuid || ''))
+  }
+
   getOwnerBalances (ownerUuid) {
     return this.db.prepare(`
       SELECT b.owner_uuid AS ownerUuid, b.item_key AS itemKey, b.amount,
