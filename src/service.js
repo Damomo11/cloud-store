@@ -2216,8 +2216,12 @@ class CloudStoreService {
           const outcome = await worker.getCraftController().recover()
           return outcome
         }, { exclusive: true, stickyWorker: this })
+        // recover() 重试失败会按库存差异登记销账（不再锁库），status recovered
+        // 含 diffRegistered=true 时要提示管理员有差异登记待复核。
         const notice = result?.status === 'recovered'
-          ? `机器人 ${this.bot.username} 启动时自动恢复了一笔中断的合成，物品已回云仓；可重新提交合成。`
+          ? (result?.diffRegistered
+              ? `机器人 ${this.bot.username} 启动时自动恢复了一笔中断的合成，物品已回云仓；对账差异已登记库存异常，请管理员在 Web 管理页复核。`
+              : `机器人 ${this.bot.username} 启动时自动恢复了一笔中断的合成，物品已回云仓；可重新提交合成。`)
           : null
         if (notice) {
           for (const row of this.db.listAdmins()) {

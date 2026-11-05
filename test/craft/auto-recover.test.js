@@ -138,3 +138,65 @@ test('a failed auto-recovery keeps the journal and surfaces both errors', async 
       'reservations must be retained for the audit')
   } finally { f.close() }
 })
+
+test('an unrecoverable reconciliation mismatch settles as a registered diff and unlocks the store', async () => {
+  const f = fixture()
+  try {
+    const plank = f.seed('alice', 'oak_planks', 2)
+    const stick = f.seed('alice', 'stick', 4)
+    // 中断现场：背包里多出与计划不符的实物（既非原料也非产物），对账 3 次
+    // 重试都不可能通过。旧行为（2026-11-05 生产）：抛错 + 保留记录，全库被
+    // assertNoPendingCraft 锁死直到人工。新行为：差异登记（missing/excess）
+    // + 失败销账，run() 完成闭环不锁库，原错误照常上抛。
+    const catalog = f.controller.catalog
+    f.executor.execute = async () => {
+      const before = catalog.aggregatePrismarineItems(f.bot.inventory.items())
+      f.bot.inventory.items().push(f.make('cobblestone', 1))
+      const after = catalog.aggregatePrismarineItems(f.bot.inventory.items())
+      throw Object.assign(new Error('missing ingredient'), {
+        recoveryRequired: true, before, after, partial: true, consumed: [], produced: []
+      })
+    }
+    await assert.rejects(f.controller.run(f.request()), /missing ingredient/)
+    // 闭环：没有 pending 记录，全库解锁。
+    assert.equal(f.controller.ledger.pending('bot-a').length, 0, 'mismatch must settle, not lock the store')
+    // 差异登记进库存异常（cobblestone 多 1），管理员可在 Web 复核。
+    const mismatches = f.db.db.prepare('SELECT * FROM inventory_mismatches WHERE status = ?').all('open')
+    assert.ok(mismatches.some(row => row.kind === 'excess' && row.amount === 1), 'excess cobblestone registered')
+    // 未动 alice 的既有账面：原料归属保留。
+    assert.equal(f.db.getBalance('alice', plank.itemKey), 2)
+    assert.equal(f.db.getBalance('alice', stick.itemKey), 4)
+  } finally { f.close() }
+})
+
+test('run() self-heals a leftover pending journal before starting the new craft', async () => {
+  const f = fixture()
+  try {
+    const plank = f.seed('alice', 'oak_planks', 2)
+    // 上一次失败留下的恢复记录（模拟进程重启后新请求进来）。
+    const ledger = f.controller.ledger
+    const id = 'craft:leftover'
+    ledger.begin({
+      id, botId: 'bot-a', owner: { uuid: 'alice', username: 'Alice', scope: 'personal' }, actor: 'Alice',
+      target: { name: 'stick', quantity: 4 }, allocations: [plank],
+      data: { held: [], pending: null, physicalTotals: f.controller.physicalTotals(), stepIndex: 0 }
+    })
+    ledger.markRecovery(id, 'old failure', { held: [], pending: null, physicalTotals: f.controller.physicalTotals(), stepIndex: 0 })
+    // 正常 executor：合成成功。
+    const catalog = f.controller.catalog
+    f.executor.execute = async ({ step, triggers = 1 }) => {
+      const before = catalog.aggregatePrismarineItems(f.bot.inventory.items())
+      f.bot.inventory.items().splice(0, f.bot.inventory.items().length, f.make(step.result.name, step.result.count * triggers))
+      const after = catalog.aggregatePrismarineItems(f.bot.inventory.items())
+      return { before, after, consumed: before, produced: after }
+    }
+    const result = await f.controller.run(f.request())
+    // 新合成正常完成，旧记录被开工前自愈清掉。
+    assert.equal(result.status, 'complete')
+    assert.equal(ledger.pending('bot-a').length, 0)
+    // 旧记录销账后其预留释放：新合成合法消耗这 2 个 planks 换成 stick。
+    const stickKey = f.controller.catalog.fromPrismarineItem(f.make('stick', 1)).itemKey
+    assert.equal(f.db.getBalance('alice', plank.itemKey), 0, 'released reservation lets the new craft consume the planks')
+    assert.equal(f.db.getBalance('alice', stickKey), 4, 'the new craft produced the sticks')
+  } finally { f.close() }
+})

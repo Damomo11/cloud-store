@@ -96,16 +96,31 @@ test('recovery returns unchanged inputs without a conversion when nothing reache
   } finally { f.close() }
 })
 
-test('recovery refuses a backpack that matches neither the inputs nor the expected output', async () => {
+test('a mismatched backpack settles through registered diff instead of locking the whole store', async () => {
   // Backpack holds sticks x1: neither the raw inputs nor the full conversion.
+  // 旧行为：对账失败 → 抛错 + 保留记录锁全库等人工（2026-11-05 生产事故路径）。
+  // 新行为：3 次重试后按中断基线登记逐 key 差异（2 planks missing、1 stick
+  // excess）+ 失败销账闭环：实物已回仓、归属与异常都留痕，管理员可在 Web 复核。
   const f = fixture({ held: [{ name: 'stick', count: 1 }] })
   try {
-    await assert.rejects(f.controller.recover(), /人工核对/)
-    assert.equal(f.deposits(), 1)
+    const result = await f.controller.recover()
+    assert.equal(result.status, 'recovered')
+    assert.equal(result.diffRegistered, true)
+    assert.equal(f.deposits(), 3, 'each retry attempt parks the backpack once')
     assert.equal(f.confirmed(), 0)
-    // Items are parked in the warehouse; reservations retained for the audit.
-    assert.equal(f.ledger.pending().length, 1)
-    assert.ok(f.ledger.listCraftReservations(f.ledger.pending()[0].id).length)
+    // Journal closed: no more global lock on deposits/withdraws.
+    assert.equal(f.ledger.pending().length, 0)
+    // The diff is registered as an inventory mismatch for admin review.
+    const mismatches = f.db.db.prepare('SELECT * FROM inventory_mismatches WHERE status = ? ORDER BY kind').all('open')
+    assert.equal(mismatches.length, 2)
+    const missing = mismatches.find(row => row.kind === 'missing')
+    const excess = mismatches.find(row => row.kind === 'excess')
+    assert.equal(missing.item_key, f.before[0].itemKey)
+    assert.equal(missing.amount, 2)
+    assert.equal(excess.item_key, f.products[0].itemKey)
+    assert.equal(excess.amount, 1)
+    // Owner keeps the un-consumed balance; the reservation is released.
+    assert.equal(f.db.getBalance('alice', f.before[0].itemKey), 2)
   } finally { f.close() }
 })
 
