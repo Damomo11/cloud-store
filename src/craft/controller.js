@@ -54,6 +54,10 @@ class CraftController {
 
   residueDescription () {
     const parts = []
+    const backpack = this.inventory()
+    if (backpack.length) {
+      parts.push(`背包 ${backpack.map(item => `${item.displayName || item.itemId}×${item.amount}`).join('、')}`)
+    }
     if (this.bot.currentWindow) parts.push(`窗口 type=${this.bot.currentWindow.type || 'unknown'}`)
     if (this.bot.inventory.selectedItem) {
       const cursor = this.catalog.fromPrismarineItem(this.bot.inventory.selectedItem)
@@ -109,7 +113,9 @@ class CraftController {
   }
 
   assertCleanInventory () {
-    if (this.hasInventoryResidue()) throw new Error('需先处理机器人背包、窗口、光标或合成格残留物品。')
+    // 报错带具体残留描述：笼统的"背包、窗口、光标或合成格"排查不了，
+    // 玩家/维护需要知道到底卡了什么才能处理。
+    if (this.hasInventoryResidue()) throw new Error(`需先处理机器人背包、窗口、光标或合成格残留物品。当前残留：${this.residueDescription()}`)
   }
 
   availableItems (ownerUuid) { return this.ledger.getCraftAvailableItems(ownerUuid) }
@@ -214,6 +220,11 @@ class CraftController {
       return await this.warehouse.withWarehouseLock(async () => {
         if (this.ledger.pending().length) throw new Error('存在未恢复的合成任务，请先执行 !合成恢复。')
         await this.validateOwner?.(request.owner, request.actor)
+        // 开工先自愈窗口/光标残留：多为上次取货/拆盒操作遗留的窗口未关或光标
+        // 未归位（服务器包 staleness 的幻影），关窗重读即可纠正。之前直接断言
+        // 会把幻影当真残留拒绝开工（2026-11-05 金苹果合成即被此路径打挂）。
+        // 真背包物品残留 settle 后依然 fail-fast，不会误开工。
+        await this.settleResidue()
         this.assertCleanInventory()
         const rows = this.availableItems(request.owner.uuid)
         const planned = planToCraftCommand({ item: request.item, quantity: request.quantity, available: this.availableStock(request.owner.uuid), config: this.config, forceCraft: true })
