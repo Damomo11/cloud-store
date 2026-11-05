@@ -33,6 +33,19 @@ function converted (before, consumed, produced) {
   return merge([...result.values(), ...produced])
 }
 
+// 合成失败自动恢复的兜底时限：断线后底层网络调用可能不再返回，与其无限
+// 挂住合成任务（死亡钩子也在等它 drain），不如放弃本轮，把恢复记录留给
+// 重连/spawn 钩子或人工。放弃后后台的 recover 若最终跑完，同样是一笔经
+// 对账核对的状态落库，没有账目风险。
+const AUTO_RECOVER_TIMEOUT_MS = 120000
+function withTimeout (promise, ms) {
+  let timer
+  const timeout = new Promise((resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`自动恢复超时（${Math.round(ms / 1000)} 秒）`)), ms)
+  })
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer))
+}
+
 class CraftController {
   constructor ({ bot, db, catalog, config, warehouse, executor, botId, ledger, validateOwner, quota }) {
     Object.assign(this, { bot, db, catalog, config, warehouse, executor, botId, validateOwner, quota })
@@ -321,6 +334,25 @@ class CraftController {
           throw error
         }
       })
+    } catch (error) {
+      // 合成失败若已留下恢复记录（markRecovery），趁本机器人仍在线立即自动
+      // 恢复，不再等掉线重连/进程重启/人工 !合成恢复——恢复记录挂着期间
+      // assertNoPendingCraft 锁着全库，取货、回存、同步全部停摆（2026-11-05
+      // 生产即此路径：合成失败锁库约 19 分钟，靠 bot 恰好掉线重连才解开）。
+      // recover() 自带回存+对账护栏，对不上账会抛错并保留记录，留给死亡/
+      // 重连钩子或人工核对，不会乱销账。主动取消（死亡/断线 invalidate 触发
+      // cancel）除外：那类恢复由 service 层钩子在新连接上重做，这里不抢。
+      const cancelled = abort.signal.aborted &&
+        (error === abort.signal.reason || error?.message === abort.signal.reason?.message)
+      this.active = null
+      if (!cancelled && this.ledger.pending(this.botId).length) {
+        try {
+          await withTimeout(this.recover(), AUTO_RECOVER_TIMEOUT_MS)
+        } catch (recoverError) {
+          error.message = `${error.message}；自动恢复未完成（留待重连或人工执行 !合成恢复）：${recoverError.message}`
+        }
+      }
+      throw error
     } finally {
       if (this.active === lease) this.active = null
     }
