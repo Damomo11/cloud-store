@@ -2167,10 +2167,26 @@ class CloudStoreService {
   }
 
   async runCraftCommand (command) {
+    const notify = command.notify || (message => this.msg(command.player, message))
+    // 开工前先清背包实物残留（复用每次存入前的同一套 flushResidual 归属回库）：
+    // 机器人平时开着自动捡拾，玩家掉的零散物会进背包，实物残留会让合成独占
+    // 背包的清洁检查直接失败（2026-11-05 22:38 矿车合成被"背包 潜影盒×1"打挂）。
+    // 必须在控制器取仓库锁之前执行：flushResidual 的入库封装自己会拿同一把
+    // 不可重入锁，锁内再调会死锁。窗口/光标/合成格状态异常不在本清理范围：
+    // 幻影由控制器的 settleResidue 自愈，真异常仍显式报错，绝不盲关窗丢物品。
+    if (this.bot.inventory.items().length) {
+      if (this.bot.currentWindow || this.bot.inventory.selectedItem || this.bot.inventory.slots?.slice(0, 5).some(Boolean)) {
+        throw new Error('机器人窗口、光标或合成格状态异常，请先人工处理后再合成；背包残留清理不覆盖这些状态。')
+      }
+      notify('检测到机器人背包残留物品，正在按归属回仓清理，随后自动开工合成。')
+      await this.warehouse.goHomeIfAway()
+      if (this.isActiveCancelled()) return
+      await this.flushResidual()
+      if (this.isActiveCancelled()) return
+    }
     const result = await this.getCraftController().run({
       actor: command.player, owner: command.owner, item: command.target.name, quantity: command.target.quantity
     })
-    const notify = command.notify || (message => this.msg(command.player, message))
     if (result.status === 'complete') notify('合成完成：' + command.target.name + ' ×' + command.target.quantity + '，产物与余料已回云仓并记账。')
     else if (result.status === 'already_sufficient') notify('仓库里已有足够目标物品，无需继续合成。')
     return result
