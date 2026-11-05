@@ -141,22 +141,32 @@ test('合成前背包有实物残留：按归属回仓(momo)后照常开工合�
   } finally { f.close() }
 })
 
-test('窗口/光标/合成格状态异常时拒绝合成，不盲目清理背包', async () => {
+test('窗口/光标/合成格异常时直接关窗归位，随清理回仓后照常开工', async () => {
   const f = preflightFixture()
   try {
     f.seed('alice', 'oak_planks', 2)
     f.setInventory([f.make('cobblestone', 3)])
+    // 上次操作遗留的未关窗口 + 持物光标。
     f.bot.currentWindow = { type: 'minecraft:chest', id: 7 }
+    f.bot.inventory.selectedItem = f.make('dirt', 2)
+    // 关窗把光标物退回背包（模拟服务器行为）。
+    f.bot.closeWindow = () => {
+      f.bot.currentWindow = null
+      f.setInventory([...f.getInventory(), f.bot.inventory.selectedItem])
+      f.bot.inventory.selectedItem = null
+    }
 
-    await assert.rejects(
-      f.service.runCraftCommand(f.command),
-      /窗口、光标或合成格状态异常/
-    )
-    // 未开工：无合成事务、无 momo 记账、残留物原样在背包。
-    assert.equal(f.transactionCount('craft_consume'), 0)
-    assert.equal(f.balance(f.config.momoOwner, 'cobblestone'), 0)
-    assert.equal(f.getInventory()[0].name, 'cobblestone')
-    assert.equal(f.db.db.prepare('SELECT COUNT(*) AS n FROM craft_operations').get().n, 0)
+    const result = await f.service.runCraftCommand(f.command)
+    assert.equal(result.status, 'complete')
+
+    // 窗已关；光标物与背包杂物全部随清理归 momo 回仓。
+    assert.equal(f.bot.currentWindow, null)
+    assert.equal(f.bot.inventory.selectedItem, null)
+    assert.equal(f.balance(f.config.momoOwner, 'cobblestone'), 3)
+    assert.equal(f.balance(f.config.momoOwner, 'dirt'), 2)
+    assert.deepEqual(f.getInventory(), [])
+    assert.equal(f.balance('alice', 'stick'), 4)
+    assert.equal(f.transactionCount('craft_consume'), 1)
   } finally { f.close() }
 })
 

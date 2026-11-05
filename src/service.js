@@ -2172,12 +2172,11 @@ class CloudStoreService {
     // 机器人平时开着自动捡拾，玩家掉的零散物会进背包，实物残留会让合成独占
     // 背包的清洁检查直接失败（2026-11-05 22:38 矿车合成被"背包 潜影盒×1"打挂）。
     // 必须在控制器取仓库锁之前执行：flushResidual 的入库封装自己会拿同一把
-    // 不可重入锁，锁内再调会死锁。窗口/光标/合成格状态异常不在本清理范围：
-    // 幻影由控制器的 settleResidue 自愈，真异常仍显式报错，绝不盲关窗丢物品。
+    // 不可重入锁，锁内再调会死锁。窗口/光标/合成格异常不再拦截（所有者拍板）：
+    // 直接关窗归位（settleResidue 幂等），关窗退回的物品随本次清理一并回仓。
     if (this.bot.inventory.items().length) {
-      if (this.bot.currentWindow || this.bot.inventory.selectedItem || this.bot.inventory.slots?.slice(0, 5).some(Boolean)) {
-        throw new Error('机器人窗口、光标或合成格状态异常，请先人工处理后再合成；背包残留清理不覆盖这些状态。')
-      }
+      await this.getCraftController().settleResidue()
+      if (this.isActiveCancelled()) return
       notify('检测到机器人背包残留物品，正在按归属回仓清理，随后自动开工合成。')
       await this.warehouse.goHomeIfAway()
       if (this.isActiveCancelled()) return
