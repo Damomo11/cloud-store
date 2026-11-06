@@ -172,9 +172,8 @@ class CraftController {
   }
 
   checkQuota (owner, plan) {
-    if (!this.quota) return
-    const quota = this.quota(owner)
-    if (!Number.isSafeInteger(quota.quotaSlots) || quota.quotaSlots < 0) throw new Error('仓库额度配置无效。')
+    const quota = this.quota?.(owner)
+    if (this.quota && (!Number.isSafeInteger(quota?.quotaSlots) || quota.quotaSlots < 0)) throw new Error('仓库额度配置无效。')
     const Item = require('prismarine-item')(this.catalog.mcData)
     const amount = new Map(this.db.getOwnerBalances(owner.uuid).map(row => [row.itemKey, { ...row }]))
     // Simulate the same concrete reservations and item-key order used at runtime.
@@ -183,15 +182,16 @@ class CraftController {
     for (const step of plan.craftSteps) {
       // Batch granularity mirrors execution: each batch deducts its full input
       // set at once, then credits outputs after the batch's triggers complete.
-      for (let start = 0; start < step.times; start += this.maxTriggersPerBatch(step)) {
-        const triggers = Math.min(this.maxTriggersPerBatch(step), step.times - start)
-        const inputs = this.allocate(step.inputs.map(input => ({ name: input.names[0], quantity: input.count * triggers })),
-          [...reserved.values()].sort((a, b) => a.itemKey.localeCompare(b.itemKey)))
+      for (let start = 0; start < step.times;) {
+        const remaining = step.times - start
+        const pool = [...reserved.values()].filter(item => item.amount > 0).sort((a, b) => a.itemKey.localeCompare(b.itemKey))
+        const triggers = Math.min(this.maxTriggersPerBatch(step, pool, remaining), remaining)
+        const inputs = this.allocate(step.inputs.map(input => ({ name: input.names[0], quantity: input.count * triggers })), pool)
         for (const input of inputs) {
           amount.get(input.itemKey).amount -= input.amount
           reserved.get(input.itemKey).amount -= input.amount
         }
-        for (const output of step.outputs || [step.result]) {
+        for (const output of step.outputs?.length ? step.outputs : [step.result]) {
           const resolved = this.catalog.resolveName(output.name)
           const item = this.catalog.fromPrismarineItem(new Item(resolved.type, output.count * triggers, output.metadata))
           for (const pool of [amount, reserved]) {
@@ -200,34 +200,107 @@ class CraftController {
           }
         }
         const used = [...amount.values()].reduce((sum, item) => sum + Math.ceil(item.amount / Math.max(1, this.catalog.getStackSize(item.itemId))), 0)
-        if (used > quota.quotaSlots) throw new Error(`合成过程中的仓库占用超出额度（${used}/${quota.quotaSlots} 槽）。`)
+        if (quota && used > quota.quotaSlots) throw new Error(`合成过程中的仓库占用超出额度（${used}/${quota.quotaSlots} 槽）。`)
+        start += triggers
       }
     }
   }
 
-  // Backpack-window capacity: 36 usable slots (9..45). One batch withdraws all
-  // of its inputs at once and carries produced outputs alongside them before
-  // the final store, so inputs+outputs must fit together at peak.
-  maxTriggersPerBatch (step) {
-    const INVENTORY_SLOTS = 36
-    const slotsFor = (items) => items.reduce((sum, entry) =>
-      sum + Math.ceil(entry.amount / Math.max(1, this.catalog.getStackSize(entry.itemId))), 0)
+  batchBudget (step, sourceRows, limit = 64) {
+    const inventorySlots = 36
+    const reserveSlots = 1
+    const maxUsedSlots = inventorySlots - reserveSlots
     const inputTotals = new Map()
-    for (const input of step.inputs) {
+    let gridStackLimit = 64
+    for (const input of step.inputs || []) {
       const resolved = this.catalog.resolveName(input.names[0])
-      const previous = inputTotals.get(resolved.name)
-      inputTotals.set(resolved.name, { itemId: `minecraft:${resolved.name}`, amount: (previous?.amount || 0) + input.count })
+      const itemId = `minecraft:${resolved.name}`
+      const stackSize = Math.max(1, this.catalog.getStackSize(itemId))
+      inputTotals.set(itemId, (inputTotals.get(itemId) || 0) + input.count)
+      gridStackLimit = Math.min(gridStackLimit, stackSize)
     }
+
+    const requirements = [...inputTotals].map(([itemId, count]) => ({
+      name: itemId.replace(/^minecraft:/, ''),
+      itemId,
+      count
+    }))
+    const requestedLimit = Math.max(1, Math.floor(Number(limit) || 1))
+    const pool = (sourceRows || requirements.map(input => ({
+      ...this.catalog.fromItemIdAmount(input.itemId, input.count * requestedLimit),
+      amount: input.count * requestedLimit
+    }))).filter(item => item.amount > 0).sort((a, b) => a.itemKey.localeCompare(b.itemKey))
+    const availableByItemId = new Map()
+    for (const item of pool) availableByItemId.set(item.itemId, (availableByItemId.get(item.itemId) || 0) + item.amount)
+    let supplyLimit = Math.min(gridStackLimit, requestedLimit)
+    for (const input of requirements) {
+      supplyLimit = Math.min(supplyLimit, Math.floor((availableByItemId.get(input.itemId) || 0) / input.count))
+    }
+
     const outputTotals = new Map()
-    for (const output of step.outputs || [step.result]) {
-      const previous = outputTotals.get(output.name)
-      outputTotals.set(output.name, { itemId: `minecraft:${output.name}`, amount: (previous?.amount || 0) + output.count })
+    for (const output of step.outputs?.length ? step.outputs : [step.result]) {
+      const itemId = `minecraft:${output.name}`
+      const key = `${itemId}|${output.metadata ?? ''}`
+      const previous = outputTotals.get(key)
+      outputTotals.set(key, { itemId, metadata: output.metadata, amount: (previous?.amount || 0) + output.count })
     }
-    const perTriggerSlots = slotsFor([...inputTotals.values()]) + slotsFor([...outputTotals.values()])
-    // A recipe never exceeds 9 input slots + 9 output slots per trigger, so
-    // one trigger always fits; scale until inputs+outputs would overflow.
-    if (perTriggerSlots > INVENTORY_SLOTS) return 1
-    return Math.max(1, Math.floor(INVENTORY_SLOTS / perTriggerSlots))
+
+    const layoutSlots = entries => {
+      const slots = Array(inventorySlots).fill(null)
+      for (const entry of entries) {
+        const stackSize = Math.max(1, this.catalog.getStackSize(entry.itemId))
+        const key = entry.itemKey || `${entry.itemId}|${entry.metadata ?? ''}`
+        let remaining = entry.amount
+        for (let slot = 0; slot < maxUsedSlots && remaining > 0; slot++) {
+          const occupied = slots[slot]
+          if (!occupied || occupied.key !== key || occupied.amount >= stackSize) continue
+          const moved = Math.min(stackSize - occupied.amount, remaining)
+          occupied.amount += moved
+          remaining -= moved
+        }
+        while (remaining > 0) {
+          const slot = slots.findIndex((occupied, index) => index < maxUsedSlots && !occupied)
+          if (slot < 0) return null
+          const moved = Math.min(stackSize, remaining)
+          slots[slot] = { key, itemId: entry.itemId, amount: moved }
+          remaining -= moved
+        }
+      }
+      return slots.filter(Boolean).length
+    }
+
+    for (let triggers = supplyLimit; triggers >= 1; triggers--) {
+      let allocatedInputs
+      try {
+        allocatedInputs = this.allocate(requirements.map(input => ({ name: input.name, quantity: input.count * triggers })), pool)
+      } catch { continue }
+      const inputSlots = layoutSlots(allocatedInputs)
+      const outputs = [...outputTotals.values()].map(output => ({ ...output, amount: output.amount * triggers }))
+      const outputSlots = layoutSlots(outputs)
+      if (inputSlots === null || outputSlots === null) continue
+      // The native fallback crafts one trigger at a time, leaving unconsumed
+      // inputs in the backpack while prior outputs accumulate there.
+      const usedSlots = inputSlots + outputSlots
+      if (usedSlots <= maxUsedSlots) {
+        return {
+          triggers,
+          inputSlots,
+          outputSlots,
+          usedSlots,
+          reserveSlots,
+          freeSlots: inventorySlots - usedSlots - reserveSlots,
+          gridStackLimit
+        }
+      }
+    }
+
+    return { triggers: 0, inputSlots: 0, outputSlots: 0, usedSlots: 0, reserveSlots, freeSlots: maxUsedSlots, gridStackLimit }
+  }
+
+  maxTriggersPerBatch (step, sourceRows, limit) {
+    const budget = this.batchBudget(step, sourceRows, limit)
+    if (budget.triggers < 1) throw new Error('无法在保留 1 个保险槽位时装入单次合成材料和产物。')
+    return budget.triggers
   }
 
   async run (request) {
@@ -289,10 +362,15 @@ class CraftController {
           for (const [index, step] of planned.command.craftSteps.entries()) {
             let trigger = 0
             while (trigger < step.times) {
-              const triggers = Math.min(this.maxTriggersPerBatch(step), step.times - trigger)
               check()
               this.assertCleanInventory()
-              const heldAllocations = this.ledger.listCraftReservations(id).map(row => ({ ...this.db.getItemByKey(row.itemKey), amount: row.amount }))
+              const remaining = step.times - trigger
+              const heldAllocations = this.ledger.listCraftReservations(id)
+                .map(row => ({ ...this.db.getItemByKey(row.itemKey), amount: row.amount }))
+                .sort((a, b) => a.itemKey.localeCompare(b.itemKey))
+              const triggers = Math.min(this.maxTriggersPerBatch(step, heldAllocations, remaining), remaining)
+              const budget = this.batchBudget(step, heldAllocations, triggers)
+              this.warehouse.debug?.(`craft batch budget item=${step.result.name} triggers=${triggers} inputSlots=${budget.inputSlots} outputSlots=${budget.outputSlots} usedSlots=${budget.usedSlots}/36 reserve=1 freeSlots=${budget.freeSlots} gridStackLimit=${budget.gridStackLimit}`)
               const inputs = this.allocate(step.inputs.map(input => ({ name: input.names[0], quantity: input.count * triggers })), heldAllocations)
               const data = { ...operation.data, held: [], pending: null, physicalTotals: this.physicalTotals(), inputs, stepIndex: index, trigger }
               operation = this.ledger.checkpoint(id, 'withdrawing', data)

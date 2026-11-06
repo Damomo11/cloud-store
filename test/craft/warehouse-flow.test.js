@@ -134,6 +134,121 @@ function fixture () {
     getInventory: () => inventory, setInventory: items => { inventory = items } }
 }
 
+test('batch budget fits ten pistons in one crafting transaction', async () => {
+  const { CraftController } = require('../../src/craft/controller')
+  const f = fixture()
+  try {
+    f.seed('alice', 'oak_planks', 30)
+    f.seed('alice', 'cobblestone', 40)
+    f.seed('alice', 'iron_ingot', 10)
+    f.seed('alice', 'redstone', 10)
+    const calls = []
+    const execute = f.executor.execute
+    f.executor.execute = async args => {
+      calls.push({ item: args.step.result.name, triggers: args.triggers })
+      return execute(args)
+    }
+    const controller = new CraftController({ ...f, botId: 'bot-a' })
+
+    const result = await controller.run({ actor: 'Alice', owner: { uuid: 'alice', username: 'Alice', scope: 'personal' }, item: 'piston', quantity: 10 })
+
+    assert.equal(result.status, 'complete')
+    assert.deepEqual(calls, [{ item: 'piston', triggers: 10 }])
+    assert.equal(f.db.getOwnerItemsByItemId('alice', 'minecraft:piston')[0].amount, 10)
+  } finally { f.db.close() }
+})
+
+test('batch budget respects input and output stack limits while reserving one slot', () => {
+  const { CraftController } = require('../../src/craft/controller')
+  const f = fixture()
+  try {
+    const controller = new CraftController({ ...f, botId: 'bot-a' })
+    const pool = (name, amount) => [{ ...f.catalog.fromItemIdAmount(`minecraft:${name}`, amount), amount }]
+    const step = (input, output) => ({
+      times: 64,
+      inputs: [{ names: [input], count: 1 }],
+      outputs: [{ name: output, count: 1 }],
+      result: { name: output, count: 1 }
+    })
+
+    assert.equal(controller.maxTriggersPerBatch(step('oak_log', 'ender_pearl'), pool('oak_log', 64)), 64)
+    assert.equal(controller.maxTriggersPerBatch(step('oak_log', 'stick'), pool('oak_log', 64)), 64)
+    assert.equal(controller.maxTriggersPerBatch(step('ender_pearl', 'stick'), pool('ender_pearl', 64)), 16)
+    assert.equal(controller.maxTriggersPerBatch(step('iron_pickaxe', 'stick'), pool('iron_pickaxe', 64)), 1)
+    assert.equal(controller.batchBudget(step('oak_log', 'ender_pearl'), pool('oak_log', 64)).outputSlots, 4)
+    assert.equal(controller.maxTriggersPerBatch(step('oak_log', 'iron_pickaxe'), pool('oak_log', 64)), 34)
+  } finally { f.db.close() }
+})
+
+test('batch budget keeps input and accumulated output stacks plus one empty slot', () => {
+  const { CraftController } = require('../../src/craft/controller')
+  const f = fixture()
+  try {
+    const controller = new CraftController({ ...f, botId: 'bot-a' })
+    const step = {
+      times: 64,
+      inputs: [{ names: ['oak_log'], count: 1 }],
+      outputs: [{ name: 'iron_pickaxe', count: 1 }],
+      result: { name: 'iron_pickaxe', count: 1 }
+    }
+    const budget = controller.batchBudget(step, [{ ...f.catalog.fromItemIdAmount('minecraft:oak_log', 64), amount: 64 }])
+
+    assert.equal(budget.triggers, 34)
+    assert.equal(budget.inputSlots, 1)
+    assert.equal(budget.outputSlots, 34)
+    assert.equal(budget.usedSlots, 35)
+    assert.equal(budget.freeSlots, 0)
+  } finally { f.db.close() }
+})
+
+test('preflight rejects a single craft whose input and output cannot preserve one empty slot', () => {
+  const { CraftController } = require('../../src/craft/controller')
+  const f = fixture()
+  try {
+    f.seed('alice', 'oak_log', 1)
+    const controller = new CraftController({ ...f, botId: 'bot-a' })
+    const step = {
+      times: 1,
+      inputs: [{ names: ['oak_log'], count: 1 }],
+      outputs: [{ name: 'iron_pickaxe', count: 36 }],
+      result: { name: 'iron_pickaxe', count: 36 }
+    }
+    const plan = {
+      inventoryUses: [{ name: 'oak_log', quantity: 1 }],
+      craftSteps: [step]
+    }
+
+    assert.throws(() => controller.checkQuota({ uuid: 'alice' }, plan), /无法在保留 1 个保险槽位时装入单次合成材料和产物/)
+    assert.deepEqual(f.getInventory(), [])
+  } finally { f.db.close() }
+})
+
+test('multi-step log to planks to sticks to pickaxes remains batch-compatible', async () => {
+  const { CraftController } = require('../../src/craft/controller')
+  const f = fixture()
+  try {
+    f.seed('alice', 'oak_log', 3)
+    f.seed('alice', 'iron_ingot', 30)
+    const calls = []
+    const execute = f.executor.execute
+    f.executor.execute = async args => {
+      calls.push({ item: args.step.result.name, triggers: args.triggers })
+      return execute(args)
+    }
+    const controller = new CraftController({ ...f, botId: 'bot-a' })
+
+    const result = await controller.run({ actor: 'Alice', owner: { uuid: 'alice', username: 'Alice', scope: 'personal' }, item: 'iron_pickaxe', quantity: 10 })
+
+    assert.equal(result.status, 'complete')
+    assert.deepEqual(calls, [
+      { item: 'oak_planks', triggers: 3 },
+      { item: 'stick', triggers: 5 },
+      { item: 'iron_pickaxe', triggers: 10 }
+    ])
+    assert.equal(f.db.getOwnerItemsByItemId('alice', 'minecraft:iron_pickaxe')[0].amount, 10)
+  } finally { f.db.close() }
+})
+
 test('whole warehouse craft flow converts only Alice stock and returns products to the same warehouse', async () => {
   const { CraftController } = require('../../src/craft/controller')
   const f = fixture()
@@ -302,7 +417,8 @@ test('quota checks every trigger including temporary peak before consuming all i
   try {
     f.seed('alice', 'oak_planks', 64)
     const controller = new CraftController({ ...f, botId: 'bot-a', quota: () => ({ quotaSlots: 2 }) })
-    const plan = planToCraftCommand({ item: 'stick', quantity: 128, available: { oak_planks: 64 }, config: f.config }).plan
+    f.seed('alice', 'oak_planks', 16)
+    const plan = planToCraftCommand({ item: 'stick', quantity: 160, available: { oak_planks: 80 }, config: f.config }).plan
     assert.throws(() => controller.checkQuota({ uuid: 'alice' }, plan), /额度/)
   } finally { f.db.close() }
 })

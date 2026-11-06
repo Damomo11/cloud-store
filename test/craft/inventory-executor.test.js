@@ -65,7 +65,7 @@ function fixture (before, after, options = {}) {
   return { bot, calls, table, warehouse, catalog, config, executor, setInventory: value => { inventory = value } }
 }
 
-function proportionalFixture (before, after, step, { triggers = 1, noResultPacket = false, residualResult = false, serverResidual = false } = {}) {
+function proportionalFixture (before, after, step, { triggers = 1, noResultPacket = false, residualResult = false, serverResidual = false, delayedShiftUpdate = false, delayedPlacementUpdate = false } = {}) {
   const f = fixture(before, after)
   const gridWidth = step.requiresTable ? 3 : 2
   const craftingWindow = (id, type, inventoryStart) => {
@@ -111,16 +111,34 @@ function proportionalFixture (before, after, step, { triggers = 1, noResultPacke
     f.bot.currentWindow = window
     f.bot.emit('windowOpen', window)
   }
+  let placementAckPending = false
+  let placementAckTimer
+  let shiftUpdatePending = false
   f.bot.clickWindow = async (slot, mouseButton = 0, mode = 0) => {
     const window = f.bot.currentWindow || playerWindow
     clicks.push({ slot, mouseButton, mode, grid: window.slots.slice(1, 1 + gridWidth * gridWidth).map(value => value?.count || 0) })
     if (mode === 1 && slot === 0) {
+      if (placementAckPending) throw new Error('shift-click started before the server confirmed the crafting grid')
       let recipe
-      if (!noResultPacket) {
+      if (!noResultPacket && !delayedShiftUpdate) {
         recipe = f.bot.recipesAll(registry.itemsByName[step.result.name].id, null, step.requiresTable ? f.table : undefined)
           .find(value => value.requiresTable === step.requiresTable && value.result.count === step.result.count)
         recipe = withStandardRecipeOutputs(registry, recipe)
         f.bot._client.emit('set_slot', { windowId: window.id, slot: 0, item: Item.toNotch(new Item(recipe.result.id, recipe.result.count, recipe.result.metadata)) })
+      }
+      if (delayedShiftUpdate) {
+        recipe = f.bot.recipesAll(registry.itemsByName[step.result.name].id, null, step.requiresTable ? f.table : undefined)
+          .find(value => value.requiresTable === step.requiresTable && value.result.count === step.result.count)
+        recipe = withStandardRecipeOutputs(registry, recipe)
+        f.bot._client.emit('set_slot', { windowId: window.id, slot: 0, item: Item.toNotch(new Item(recipe.result.id, recipe.result.count, recipe.result.metadata)) })
+        shiftUpdatePending = true
+        setTimeout(() => {
+          for (let cell = 1; cell < 1 + gridWidth * gridWidth; cell++) window.slots[cell] = null
+          setAfter()
+          shiftUpdatePending = false
+          emitState(window)
+        }, 20)
+        return
       }
       for (let cell = 1; cell < 1 + gridWidth * gridWidth; cell++) window.slots[cell] = null
       setAfter()
@@ -131,6 +149,9 @@ function proportionalFixture (before, after, step, { triggers = 1, noResultPacke
         }))
       }
     } else if (mode === 0) {
+      if (shiftUpdatePending && slot > 0 && slot < 1 + gridWidth * gridWidth) {
+        throw new Error('craft grid clicked before the server confirmed the shift-click')
+      }
       const current = window.slots[slot]
       if (mouseButton === 0) {
         if (!window.selectedItem) {
@@ -158,7 +179,16 @@ function proportionalFixture (before, after, step, { triggers = 1, noResultPacke
         if (window.selectedItem.count === 0) window.selectedItem = null
       }
     }
-    emitState(window)
+    if (mode === 0 && slot > 0 && slot < 1 + gridWidth * gridWidth && delayedPlacementUpdate) {
+      placementAckPending = true
+      clearTimeout(placementAckTimer)
+      placementAckTimer = setTimeout(() => {
+        placementAckPending = false
+        emitState(window)
+      }, 20)
+    } else {
+      emitState(window)
+    }
     if (serverResidual && mode === 1 && slot === 0) {
       const recipe = f.bot.recipesAll(registry.itemsByName[step.result.name].id, null, step.requiresTable ? f.table : undefined)
         .find(value => value.requiresTable === step.requiresTable && value.result.count === step.result.count)
@@ -296,6 +326,47 @@ test('proportional batch execution collects a final result left in the result sl
   assert.deepEqual(amounts(result.produced), [['minecraft:stick', 8]])
   assert.equal(f.clicks.filter(click => click.slot === 0 && click.mouseButton === 0 && click.mode === 1).length, 1)
   assert.equal(f.clicks.filter(click => click.slot === 0 && click.mouseButton === 0 && click.mode === 0).length, 1)
+})
+
+test('proportional batch waits for server grid updates before cleanup after shift-click', async () => {
+  const step = { ...stickStep, requiresTable: false }
+  const f = proportionalFixture([item('oak_planks', 2), item('oak_planks', 2)], [item('stick', 8)], step, {
+    triggers: 2,
+    delayedShiftUpdate: true
+  })
+
+  const result = await f.executor.execute({ step, triggers: 2 })
+
+  assert.deepEqual(amounts(result.produced), [['minecraft:stick', 8]])
+  const shiftIndex = f.clicks.findIndex(click => click.slot === 0 && click.mode === 1)
+  assert.ok(shiftIndex >= 0)
+  assert.equal(f.clicks.slice(shiftIndex + 1).some(click => click.slot > 0 && click.slot <= 4), false)
+})
+
+test('proportional batch confirms the placed grid before shift-clicking', async () => {
+  const step = { ...stickStep, requiresTable: false }
+  const f = proportionalFixture([item('oak_planks', 2), item('oak_planks', 2)], [item('stick', 8)], step, {
+    triggers: 2,
+    delayedPlacementUpdate: true
+  })
+
+  const result = await f.executor.execute({ step, triggers: 2 })
+
+  assert.deepEqual(amounts(result.produced), [['minecraft:stick', 8]])
+  assert.equal(f.clicks.filter(click => click.slot === 0 && click.mode === 1).length, 1)
+})
+
+test('3x3 proportional batch confirms the placed grid before shift-clicking', async () => {
+  const step = { requiresTable: true, result: { name: 'chest', count: 1 }, inputs: [{ names: ['oak_planks'], count: 8 }] }
+  const f = proportionalFixture([item('oak_planks', 16)], [item('chest', 2)], step, {
+    triggers: 2,
+    delayedPlacementUpdate: true
+  })
+
+  const result = await f.executor.execute({ step, triggers: 2 })
+
+  assert.deepEqual(amounts(result.produced), [['minecraft:chest', 2]])
+  assert.equal(f.clicks.filter(click => click.slot === 0 && click.mode === 1).length, 1)
 })
 
 test('proportional batch execution rejects a late server result-slot residual', async () => {
