@@ -151,6 +151,161 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
     throw error('no standard recipe matches the concrete input ids, counts, result and table requirement')
   }
 
+  function proportionalCells (recipe) {
+    const width = recipe.requiresTable ? 3 : 2
+    const cells = []
+    if (recipe.inShape) {
+      if (!Array.isArray(recipe.inShape) || recipe.inShape.length > width) return null
+      for (let y = 0; y < recipe.inShape.length; y++) {
+        const row = recipe.inShape[y]
+        if (!Array.isArray(row) || row.length > width) return null
+        for (let x = 0; x < row.length; x++) {
+          const ingredient = row[x]
+          if (ingredient?.id === -1) continue
+          if (!validItem(ingredient) || ingredient.count !== 1) return null
+          cells.push({ slot: 1 + x + width * y, ingredient })
+        }
+      }
+    } else if (Array.isArray(recipe.ingredients)) {
+      if (!recipe.ingredients.length || recipe.ingredients.length > width * width) return null
+      recipe.ingredients.forEach((ingredient, index) => {
+        if (!validItem(ingredient) || Math.abs(ingredient.count) !== 1) return
+        cells.push({ slot: 1 + index, ingredient })
+      })
+      if (cells.length !== recipe.ingredients.length) return null
+    } else {
+      return null
+    }
+    return cells.length ? cells : null
+  }
+
+  function proportionalPlacementPlan (window, cells, triggers) {
+    const remaining = new Map()
+    for (let slot = window.inventoryStart; slot < window.inventoryEnd; slot++) {
+      const value = window.slots[slot]
+      if (value) remaining.set(slot, { count: Number(value.count) || 0, itemKey: catalog.fromPrismarineItem(value).itemKey })
+    }
+    const plan = []
+    for (const cell of cells) {
+      const groups = new Map()
+      for (const [slot, source] of remaining) {
+        const value = window.slots[slot]
+        if (!value || source.count <= 0 || value.type !== cell.ingredient.id ||
+          (cell.ingredient.metadata != null && value.metadata !== cell.ingredient.metadata)) continue
+        const entries = groups.get(source.itemKey) || []
+        entries.push({ slot, count: source.count, stackSize: value.stackSize })
+        groups.set(source.itemKey, entries)
+      }
+      const matching = [...groups.values()].find(entries => entries[0].stackSize >= triggers &&
+        entries.reduce((sum, entry) => sum + entry.count, 0) >= triggers)
+      if (!matching) return null
+      let needed = triggers
+      const sources = []
+      for (const source of matching) {
+        if (needed <= 0) break
+        const count = Math.min(needed, source.count)
+        sources.push({ slot: source.slot, count, sourceCount: source.count })
+        remaining.set(source.slot, { ...remaining.get(source.slot), count: source.count - count })
+        needed -= count
+      }
+      plan.push({ ...cell, sources })
+    }
+    return plan
+  }
+
+  async function openCraftingWindow (table, check) {
+    if (bot.currentWindow) return bot.currentWindow
+    if (typeof bot.activateBlock !== 'function') return null
+    let resolveWindow
+    const pending = new Promise(resolve => { resolveWindow = resolve })
+    const onOpen = window => resolveWindow(window)
+    bot.once?.('windowOpen', onOpen)
+    try {
+      await bot.activateBlock(table)
+    } catch (cause) {
+      bot.removeListener?.('windowOpen', onOpen)
+      throw error('crafting table window could not be opened', true, cause)
+    }
+    let window = bot.currentWindow
+    const windowDeadline = Date.now() + 5_000
+    try {
+      while (!window && Date.now() < windowDeadline) {
+        check()
+        window = await Promise.race([pending, new Promise(resolve => setTimeout(() => resolve(null), 25))])
+      }
+      check()
+    } finally {
+      bot.removeListener?.('windowOpen', onOpen)
+    }
+    if (!window) throw error('crafting table window did not open', true)
+    if (!window.type?.startsWith('minecraft:crafting')) throw error('opened window is not a crafting table', true)
+    return window
+  }
+
+  function proportionalOutputsFit (recipe, triggers, slots) {
+    const outputs = standardRecipeOutputs(registry, recipe)
+    const required = outputs.reduce((sum, output) => {
+      const name = registry.items[output.id]?.name
+      const stackSize = Math.max(1, Number(catalog.getStackSize(`minecraft:${name}`) || 64))
+      return sum + Math.ceil((output.count * triggers) / stackSize)
+    }, 0)
+    return required <= slots
+  }
+
+  async function craftProportionally (recipe, triggers, table, check, evidence) {
+    if (triggers <= 1) return false
+    const window = table ? await openCraftingWindow(table, check) : bot.inventory
+    if (!window || !Array.isArray(window.slots) || !Number.isInteger(window.inventoryStart) || !Number.isInteger(window.inventoryEnd)) return false
+    const fallback = () => {
+      if (table && bot.currentWindow === window) bot.closeWindow(window)
+      return false
+    }
+    // The proportional path needs Mineflayer's real inventory/window model so
+    // every source stack can be planned before the first click. Lightweight
+    // callers and legacy adapters continue through bot.craft unchanged.
+    if (typeof window.findInventoryItem !== 'function') return fallback()
+    if (!proportionalOutputsFit(recipe, triggers, window.inventoryEnd - window.inventoryStart)) return fallback()
+    const cells = proportionalCells(recipe)
+    const plan = cells && proportionalPlacementPlan(window, cells, triggers)
+    if (!plan) return fallback()
+    for (const placement of plan) {
+      for (const source of placement.sources) {
+        check()
+        await bot.clickWindow(source.slot, 0, 0)
+        if (source.count === source.sourceCount) {
+          await bot.clickWindow(placement.slot, 0, 0)
+        } else {
+          for (let count = 0; count < source.count; count++) await bot.clickWindow(placement.slot, 1, 0)
+          await bot.clickWindow(source.slot, 0, 0)
+        }
+      }
+    }
+    check()
+    await bot.clickWindow(0, 0, 1)
+    const gridSize = recipe.requiresTable ? 9 : 4
+    const collectResultResidual = async () => {
+      if (!evidence.current().resultPresent) return false
+      if (!window.slots[0]) throw error('server result slot disagrees with the crafting window', true)
+      await bot.clickWindow(0, 0, 0)
+      await bot.putSelectedItemRange(window.inventoryStart, window.inventoryEnd, window)
+      return true
+    }
+    // Some servers leave the last result in slot 0 when the shift-click stops
+    // early. Collect that concrete item before closing; exact output evidence
+    // below decides whether the batch completed or needs recovery.
+    await collectResultResidual()
+    // Recipe container returns can remain in input cells after shift-click.
+    for (let slot = 1; slot <= gridSize; slot++) {
+      if (!window.slots[slot]) continue
+      await bot.clickWindow(slot, 0, 0)
+      await bot.putSelectedItemRange(window.inventoryStart, window.inventoryEnd, window)
+    }
+    if (window.selectedItem || window.slots.slice(0, gridSize + 1).some(Boolean)) {
+      throw error('proportional craft left a result, crafting grid item or cursor item', true)
+    }
+    return { window, collectResultResidual }
+  }
+
   // Read-only intent used by the controller's durable pre-mutation journal.
   // Supplying the configured coordinate to recipesAll includes 3x3 candidates;
   // execute still navigates and validates the actual block before calling craft.
@@ -192,7 +347,11 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
     const clickWindow = async function (slot, ...args) {
       check()
       const window = bot.currentWindow || bot.inventory
-      if (!Number.isInteger(slot) || slot < 0 || slot >= window.slots.length || args[1] !== 0 || ![0, 1].includes(args[0])) {
+      const mouseButton = args[0]
+      const mode = args[1]
+      const supportedClick = (mode === 0 && [0, 1].includes(mouseButton)) ||
+        (mode === 1 && slot === 0 && mouseButton === 0)
+      if (!Number.isInteger(slot) || slot < 0 || slot >= window.slots.length || !supportedClick) {
         throw error('craft cannot drop items or use an unsupported click', true)
       }
       operation.clickEpoch++
@@ -243,6 +402,7 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
       if (value) shadow.set(slot - 9, catalog.fromPrismarineItem(value))
     }
     let resultObserved = false
+    let resultPresent = false
     let updateEpoch = -1
     let version = 0
     let invalid = false
@@ -265,8 +425,11 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
       let value
       try { value = Item.fromNotch(raw) } catch { invalid = true; return }
       if (index === 0 && resultWindows.has(windowId) && value) {
+        resultPresent = true
         const normalized = catalog.fromPrismarineItem(value)
         if (normalized.itemKey === expectedResult.itemKey && value.count === recipe.result.count) resultObserved = true
+      } else if (index === 0 && resultWindows.has(windowId)) {
+        resultPresent = false
       }
       if (index < range.start || index >= range.end) return
       if (value) shadow.set(index - range.start, catalog.fromPrismarineItem(value))
@@ -316,7 +479,7 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
           if (previous) previous.amount += entry.amount
           else byKey.set(entry.itemKey, { ...entry })
         }
-        return { items: [...byKey.values()], resultObserved, updateEpoch, version, invalid, cursorKnown, cursor, cursorEpoch }
+        return { items: [...byKey.values()], resultObserved, resultPresent, updateEpoch, version, invalid, cursorKnown, cursor, cursorEpoch }
       },
       markResultObserved,
       acceptSnapshot: serverSnapshot => {
@@ -336,7 +499,7 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
     }
   }
 
-  async function confirmServerInventory (operation, evidence, expected, check) {
+  async function confirmServerInventory (operation, evidence, expected, check, { requireEmptyResult = false, collectResultResidual } = {}) {
     const confirmationMs = Math.max(1, Number(config?.craft?.confirmTimeoutMs) || 5000)
     const settleMs = Math.max(1, Number(config?.craft?.settleMs) || 150)
     const expires = Date.now() + confirmationMs
@@ -344,8 +507,15 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
     let lastVersion = -1
     while (true) {
       check()
-      const current = evidence.current()
+      let current = evidence.current()
+      if (requireEmptyResult && current.resultPresent && collectResultResidual) {
+        await collectResultResidual()
+        stableSince = null
+        lastVersion = -1
+        current = evidence.current()
+      }
       const confirmed = !current.invalid && current.resultObserved && current.updateEpoch === operation.clickEpoch &&
+        (!requireEmptyResult || !current.resultPresent) &&
         current.cursorKnown && !current.cursor && current.cursorEpoch === operation.clickEpoch &&
         sameAmounts(current.items, expected, entry => entry.itemKey) && sameAmounts(snapshot(), expected, entry => entry.itemKey)
       if (!confirmed || lastVersion !== current.version) stableSince = confirmed ? Date.now() : null
@@ -357,6 +527,7 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
 
     const current = evidence.current()
     if (!current.resultObserved) throw error('authoritative crafting result slot was not confirmed', true)
+    if (requireEmptyResult && current.resultPresent) throw error('proportional craft result slot still contains an item', true)
     if (current.cursorKnown && current.cursor) throw error('server craft cursor still holds an item', true)
     const chests = warehouse?.db?.listChests?.() || []
     if (!chests.length) throw error('authoritative server craft inventory and cursor were not confirmed', true)
@@ -380,6 +551,7 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
       check()
       const latest = evidence.current()
       if (latest.invalid || !latest.resultObserved || !latest.cursorKnown || latest.cursor ||
+        (requireEmptyResult && latest.resultPresent) ||
         !sameAmounts(latest.items, expected, entry => entry.itemKey) ||
         !sameAmounts(snapshot(), expected, entry => entry.itemKey)) {
         throw error('server craft inventory or cursor changed after the final snapshot', true)
@@ -525,14 +697,21 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
       // Mineflayer has no abortable craft API. Cancellation requests stop/close
       // immediately, but this await must drain before finally releases busy.
       // A permanently pending craft intentionally keeps this executor busy.
-      // count = triggers: the window is opened once and worked count times.
-      await bot.craft(recipe, triggers, table)
+      // Fill the 2x2 or 3x3 grid proportionally and take the result once when
+      // the concrete input stacks can satisfy every grid cell. If a batch is
+      // split across undersized stacks, retain Mineflayer's safe fallback.
+      const proportional = await craftProportionally(recipe, triggers, table, check, evidence)
+      if (!proportional) await bot.craft(recipe, triggers, table)
       check()
-      // Every trigger's result packet re-confirms the result slot at the
-      // current click epoch, so the last observation after the final trigger
-      // suffices; the batch total is validated against backpack totals.
-      evidence.markResultObserved()
-      await confirmServerInventory(operation, evidence, batchExpected, check)
+      // The proportional path must receive a real result-slot packet. The
+      // native fallback uses Mineflayer's completed call as its existing
+      // compatibility signal.
+      if (!proportional) evidence.markResultObserved()
+      await confirmServerInventory(operation, evidence, batchExpected, check, {
+        requireEmptyResult: Boolean(proportional),
+        collectResultResidual: proportional?.collectResultResidual
+      })
+      if (proportional?.window && bot.currentWindow === proportional.window) bot.closeWindow(proportional.window)
       const after = snapshot()
       if (!sameAmounts(after, batchExpected, entry => entry.itemKey)) throw error('unexpected physical craft inventory delta', true)
       if (bot.currentWindow || bot.inventory.selectedItem || bot.inventory.slots?.slice(0, 5).some(Boolean)) {
