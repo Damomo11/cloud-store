@@ -9,6 +9,7 @@ const registry = require('minecraft-data')('1.21.11')
 const Recipe = require('prismarine-recipe')(registry).Recipe
 const Item = require('prismarine-item')(registry)
 const { createInventoryExecutor } = require('../../src/craft/inventory-executor')
+const { withStandardRecipeOutputs } = require('../../src/craft/recipe-outputs')
 
 function item (name, count, customName) {
   const value = new Item(registry.itemsByName[name].id, count, null)
@@ -64,6 +65,109 @@ function fixture (before, after, options = {}) {
   return { bot, calls, table, warehouse, catalog, config, executor, setInventory: value => { inventory = value } }
 }
 
+function proportionalFixture (before, after, step, { triggers = 1, noResultPacket = false, residualResult = false, serverResidual = false } = {}) {
+  const f = fixture(before, after)
+  const gridWidth = step.requiresTable ? 3 : 2
+  const craftingWindow = (id, type, inventoryStart) => {
+    const slots = new Array(46).fill(null)
+    before.forEach((value, index) => { slots[inventoryStart + index] = new Item(value.type, value.count, value.metadata) })
+    return {
+      id,
+      type,
+      inventoryStart,
+      inventoryEnd: 46,
+      slots,
+      selectedItem: null,
+      findInventoryItem (type, metadata) {
+        for (let slot = inventoryStart; slot < 46; slot++) {
+          const value = slots[slot]
+          if (value && value.type === type && (metadata == null || value.metadata === metadata)) return { ...value, slot }
+        }
+        return null
+      }
+    }
+  }
+  const playerWindow = craftingWindow(0, 'minecraft:inventory', 9)
+  playerWindow.items = () => playerWindow.slots.slice(9, 45).flatMap((value, index) => value ? [{ ...value, slot: 9 + index }] : [])
+  f.bot.inventory = playerWindow
+  const clicks = []
+  const emitState = window => {
+    const windowId = window.id
+    const slots = window.slots.map(value => Item.toNotch(value))
+    f.bot._client.emit('window_items', { windowId, items: slots, carriedItem: Item.toNotch(window.selectedItem) })
+    f.bot._client.emit('set_cursor_item', { contents: Item.toNotch(window.selectedItem) })
+  }
+  const setAfter = () => {
+    f.setInventory(after)
+    for (const window of [playerWindow, f.bot.currentWindow].filter(Boolean)) {
+      window.slots[0] = null
+      const start = window.inventoryStart
+      for (let slot = start; slot < 46; slot++) window.slots[slot] = null
+      after.forEach((value, index) => { window.slots[start + index] = new Item(value.type, value.count, value.metadata) })
+    }
+  }
+  f.bot.activateBlock = async () => {
+    const window = craftingWindow(3, 'minecraft:crafting', 10)
+    f.bot.currentWindow = window
+    f.bot.emit('windowOpen', window)
+  }
+  f.bot.clickWindow = async (slot, mouseButton = 0, mode = 0) => {
+    const window = f.bot.currentWindow || playerWindow
+    clicks.push({ slot, mouseButton, mode, grid: window.slots.slice(1, 1 + gridWidth * gridWidth).map(value => value?.count || 0) })
+    if (mode === 1 && slot === 0) {
+      let recipe
+      if (!noResultPacket) {
+        recipe = f.bot.recipesAll(registry.itemsByName[step.result.name].id, null, step.requiresTable ? f.table : undefined)
+          .find(value => value.requiresTable === step.requiresTable && value.result.count === step.result.count)
+        recipe = withStandardRecipeOutputs(registry, recipe)
+        f.bot._client.emit('set_slot', { windowId: window.id, slot: 0, item: Item.toNotch(new Item(recipe.result.id, recipe.result.count, recipe.result.metadata)) })
+      }
+      for (let cell = 1; cell < 1 + gridWidth * gridWidth; cell++) window.slots[cell] = null
+      setAfter()
+      if (residualResult) window.slots[0] = new Item(recipe?.result?.id || registry.itemsByName[step.result.name].id, recipe?.result?.count || step.result.count, recipe?.result?.metadata || null)
+      if (recipe?.outShape) {
+        recipe.outShape.forEach((row, y) => row.forEach((remainder, x) => {
+          if (remainder?.id >= 0) window.slots[1 + x + gridWidth * y] = new Item(remainder.id, remainder.count * triggers, remainder.metadata)
+        }))
+      }
+    } else if (mode === 0) {
+      const current = window.slots[slot]
+      if (mouseButton === 0) {
+        if (!window.selectedItem) {
+          window.selectedItem = current
+          window.slots[slot] = null
+        } else if (!current) {
+          window.slots[slot] = window.selectedItem
+          window.selectedItem = null
+        } else if (current.type === window.selectedItem.type && current.metadata === window.selectedItem.metadata && current.count + window.selectedItem.count <= current.stackSize) {
+          current.count += window.selectedItem.count
+          window.selectedItem = null
+        } else {
+          window.slots[slot] = window.selectedItem
+          window.selectedItem = current
+        }
+      } else if (!window.selectedItem && current) {
+        const count = Math.ceil(current.count / 2)
+        window.selectedItem = new Item(current.type, count, current.metadata)
+        current.count -= count
+        if (current.count === 0) window.slots[slot] = null
+      } else if (window.selectedItem && (!current || (current.type === window.selectedItem.type && current.metadata === window.selectedItem.metadata))) {
+        if (!current) window.slots[slot] = new Item(window.selectedItem.type, 1, window.selectedItem.metadata)
+        else current.count++
+        window.selectedItem.count--
+        if (window.selectedItem.count === 0) window.selectedItem = null
+      }
+    }
+    emitState(window)
+    if (serverResidual && mode === 1 && slot === 0) {
+      const recipe = f.bot.recipesAll(registry.itemsByName[step.result.name].id, null, step.requiresTable ? f.table : undefined)
+        .find(value => value.requiresTable === step.requiresTable && value.result.count === step.result.count)
+      f.bot._client.emit('set_slot', { windowId: window.id, slot: 0, item: Item.toNotch(new Item(recipe.result.id, recipe.result.count, recipe.result.metadata)) })
+    }
+  }
+  return { ...f, clicks }
+}
+
 const stickStep = {
   recipeId: 'sticks', requiresTable: false,
   result: { name: 'stick', count: 4 },
@@ -113,6 +217,95 @@ test('batch crafting matches a real 3x3 recipe', async () => {
   const result = await f.executor.execute({ step, triggers: 2 })
   assert.deepEqual(amounts(result.produced), [['minecraft:chest', 2]])
   assert.equal(f.calls.find(call => Array.isArray(call) && call[0] === 'craft')[3], f.table)
+})
+
+test('2x2 batch crafting fills proportional inputs and collects the result with one shift-click', async () => {
+  const step = { ...stickStep, requiresTable: false }
+  const f = proportionalFixture([item('oak_planks', 2), item('oak_planks', 2)], [item('stick', 8)], step, { triggers: 2 })
+  const result = await f.executor.execute({ step, triggers: 2 })
+  assert.deepEqual(amounts(result.produced), [['minecraft:stick', 8]])
+  assert.equal(f.calls.some(call => Array.isArray(call) && call[0] === 'craft'), false)
+  assert.equal(f.clicks.filter(click => click.slot === 0 && click.mouseButton === 0 && click.mode === 1).length, 1)
+  assert.deepEqual(f.clicks.find(click => click.slot === 0 && click.mode === 1).grid, [2, 0, 2, 0])
+})
+
+test('2x2 proportional placement can split one input cell across matching stacks', async () => {
+  const step = { ...stickStep, requiresTable: false }
+  const f = proportionalFixture([item('oak_planks', 2), item('oak_planks', 1), item('oak_planks', 3)], [item('stick', 12)], step, { triggers: 3 })
+  const result = await f.executor.execute({ step, triggers: 3 })
+  assert.deepEqual(amounts(result.produced), [['minecraft:stick', 12]])
+  assert.equal(f.calls.some(call => Array.isArray(call) && call[0] === 'craft'), false)
+  assert.equal(f.clicks.filter(click => click.slot === 0 && click.mouseButton === 0 && click.mode === 1).length, 1)
+})
+
+test('2x2 proportional placement maps shapeless ingredients to separate grid cells', async () => {
+  const plankId = registry.itemsByName.oak_planks.id
+  const stickId = registry.itemsByName.stick.id
+  const step = { requiresTable: false, result: { name: 'stick', count: 1 }, inputs: [{ names: ['oak_planks'], count: 2 }] }
+  const f = proportionalFixture([item('oak_planks', 4)], [item('stick', 2)], step, { triggers: 2 })
+  f.bot.recipesAll = () => [{
+    result: { id: stickId, metadata: null, count: 1 },
+    inShape: null,
+    ingredients: [{ id: plankId, metadata: null, count: -1 }, { id: plankId, metadata: null, count: -1 }],
+    requiresTable: false,
+    outShape: null,
+    delta: [{ id: plankId, metadata: null, count: -2 }, { id: stickId, metadata: null, count: 1 }]
+  }]
+  const result = await f.executor.execute({ step, triggers: 2 })
+  assert.deepEqual(amounts(result.produced), [['minecraft:stick', 2]])
+  assert.deepEqual(f.clicks.find(click => click.slot === 0 && click.mode === 1).grid, [2, 2, 0, 0])
+})
+
+test('3x3 table batch crafting fills the shaped grid proportionally and shift-clicks once', async () => {
+  const step = { requiresTable: true, result: { name: 'chest', count: 1 }, inputs: [{ names: ['oak_planks'], count: 8 }] }
+  const f = proportionalFixture([item('oak_planks', 16)], [item('chest', 2)], step, { triggers: 2 })
+  const result = await f.executor.execute({ step, triggers: 2 })
+  assert.deepEqual(amounts(result.produced), [['minecraft:chest', 2]])
+  assert.equal(f.calls.some(call => Array.isArray(call) && call[0] === 'craft'), false)
+  assert.equal(f.clicks.filter(click => click.slot === 0 && click.mouseButton === 0 && click.mode === 1).length, 1)
+  assert.deepEqual(f.clicks.find(click => click.slot === 0 && click.mode === 1).grid, [2, 2, 2, 2, 0, 2, 2, 2, 2])
+})
+
+test('2x2 proportional batches collect recipe remainders before returning', async () => {
+  const step = { requiresTable: false, result: { name: 'honey_block', count: 1 }, inputs: [{ names: ['honey_bottle'], count: 4 }] }
+  const f = proportionalFixture([item('honey_bottle', 8)], [item('honey_block', 2)], step, { triggers: 2 })
+  const result = await f.executor.execute({ step, triggers: 2 })
+  assert.deepEqual(amounts(result.produced), [['minecraft:glass_bottle', 8], ['minecraft:honey_block', 2]])
+  assert.equal(f.clicks.filter(click => click.slot === 0 && click.mouseButton === 0 && click.mode === 1).length, 1)
+  assert.ok(f.clicks.some(click => click.slot > 0 && click.slot <= 4 && click.mode === 0))
+})
+
+test('proportional batch execution requires an independent server result-slot packet', async () => {
+  const step = { ...stickStep, requiresTable: false }
+  const f = proportionalFixture([item('oak_planks', 2), item('oak_planks', 2)], [item('stick', 8)], step, {
+    triggers: 2,
+    noResultPacket: true
+  })
+  await assert.rejects(f.executor.execute({ step, triggers: 2 }), error =>
+    error.recoveryRequired === true && /result slot/.test(error.message))
+  assert.equal(f.calls.some(call => Array.isArray(call) && call[0] === 'craft'), false)
+})
+
+test('proportional batch execution collects a final result left in the result slot', async () => {
+  const step = { ...stickStep, requiresTable: false }
+  const f = proportionalFixture([item('oak_planks', 2), item('oak_planks', 2)], [item('stick', 4)], step, {
+    triggers: 2,
+    residualResult: true
+  })
+  const result = await f.executor.execute({ step, triggers: 2 })
+  assert.deepEqual(amounts(result.produced), [['minecraft:stick', 8]])
+  assert.equal(f.clicks.filter(click => click.slot === 0 && click.mouseButton === 0 && click.mode === 1).length, 1)
+  assert.equal(f.clicks.filter(click => click.slot === 0 && click.mouseButton === 0 && click.mode === 0).length, 1)
+})
+
+test('proportional batch execution rejects a late server result-slot residual', async () => {
+  const step = { ...stickStep, requiresTable: false }
+  const f = proportionalFixture([item('oak_planks', 2), item('oak_planks', 2)], [item('stick', 8)], step, {
+    triggers: 2,
+    serverResidual: true
+  })
+  await assert.rejects(f.executor.execute({ step, triggers: 2 }), error =>
+    error.recoveryRequired === true && /result slot/.test(error.message))
 })
 
 test('batch crafting requires enough metadata-specific inputs for every trigger', () => {
