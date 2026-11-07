@@ -204,7 +204,7 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
       for (const source of matching) {
         if (needed <= 0) break
         const count = Math.min(needed, source.count)
-        sources.push({ slot: source.slot, count, sourceCount: source.count })
+        sources.push({ slot: source.slot, count, sourceCount: source.count, itemKey: source.itemKey })
         remaining.set(source.slot, { ...remaining.get(source.slot), count: source.count - count })
         needed -= count
       }
@@ -268,6 +268,38 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
     const cells = proportionalCells(recipe)
     const plan = cells && proportionalPlacementPlan(window, cells, triggers)
     if (!plan) return fallback()
+    const gridSize = recipe.requiresTable ? 9 : 4
+    const describeItem = item => item ? {
+      name: item.name || registry.items[item.type]?.name || `item:${item.type}`,
+      metadata: item.metadata ?? null,
+      count: item.count
+    } : null
+    const describeWindow = () => {
+      const current = evidence.current()
+      return {
+        windowId: window.id,
+        windowType: window.type,
+        cursor: describeItem(window.selectedItem),
+        result: describeItem(window.slots[0]),
+        grid: window.slots.slice(1, gridSize + 1).flatMap((item, index) => item ? [{ slot: index + 1, ...describeItem(item) }] : []),
+        server: {
+          resultObserved: current.resultObserved,
+          resultPresent: current.resultPresent,
+          cursorKnown: current.cursorKnown,
+          cursor: describeItem(current.cursor),
+          slots: Array.from({ length: gridSize + 1 }, (_, slot) => {
+            const item = current.windowSlot(window.id, slot)
+            return { slot, version: current.slotVersion(window.id, slot), item: item && {
+              itemKey: item.itemKey,
+              itemId: item.itemId,
+              amount: item.amount
+            } }
+          })
+        }
+      }
+    }
+    const placementSlots = plan.map(placement => placement.slot)
+    const placementBaselines = new Map(placementSlots.map(slot => [slot, evidence.current().slotVersion(window.id, slot)]))
     for (const placement of plan) {
       for (const source of placement.sources) {
         check()
@@ -281,12 +313,36 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
       }
     }
     check()
+    const expectedPlacement = new Map(plan.map(placement => {
+      const item = window.slots[placement.slot]
+      return [placement.slot, item ? catalog.fromPrismarineItem(item) : null]
+    }))
+    try {
+      await evidence.waitForSlots(window.id, placementSlots, placementBaselines, check,
+        'server did not confirm the proportional crafting grid', expectedPlacement)
+    } catch (cause) {
+      warehouse?.debug?.(`craft window placement update timeout item=${registry.items[recipe.result.id]?.name || recipe.result.id} triggers=${triggers} ${JSON.stringify(describeWindow())}`)
+      throw cause
+    }
+    const activeGridSlots = window.slots.slice(1, gridSize + 1)
+      .flatMap((item, index) => item ? [index + 1] : [])
+    const watchedSlots = [0, ...activeGridSlots]
+    const updateBaselines = new Map(watchedSlots.map(slot => [slot, evidence.current().slotVersion(window.id, slot)]))
+    warehouse?.debug?.(`craft window shift-click start item=${registry.items[recipe.result.id]?.name || recipe.result.id} triggers=${triggers} ${JSON.stringify(describeWindow())}`)
     await bot.clickWindow(0, 0, 1)
-    const gridSize = recipe.requiresTable ? 9 : 4
+    try {
+      await evidence.waitForSlots(window.id, watchedSlots, updateBaselines, check, 'server did not confirm the crafting window after shift-click')
+    } catch (cause) {
+      warehouse?.debug?.(`craft window shift-click update timeout item=${registry.items[recipe.result.id]?.name || recipe.result.id} triggers=${triggers} ${JSON.stringify(describeWindow())}`)
+      throw cause
+    }
+    warehouse?.debug?.(`craft window shift-click confirmed item=${registry.items[recipe.result.id]?.name || recipe.result.id} triggers=${triggers} ${JSON.stringify(describeWindow())}`)
     const collectResultResidual = async () => {
       if (!evidence.current().resultPresent) return false
       if (!window.slots[0]) throw error('server result slot disagrees with the crafting window', true)
+      const baselines = new Map([[0, evidence.current().slotVersion(window.id, 0)]])
       await bot.clickWindow(0, 0, 0)
+      await evidence.waitForSlots(window.id, [0], baselines, check, 'server did not confirm collection of the residual crafting result')
       await bot.putSelectedItemRange(window.inventoryStart, window.inventoryEnd, window)
       return true
     }
@@ -297,11 +353,20 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
     // Recipe container returns can remain in input cells after shift-click.
     for (let slot = 1; slot <= gridSize; slot++) {
       if (!window.slots[slot]) continue
+      const baselines = new Map([[slot, evidence.current().slotVersion(window.id, slot)]])
       await bot.clickWindow(slot, 0, 0)
+      await evidence.waitForSlots(window.id, [slot], baselines, check, `server did not confirm clearing crafting grid slot ${slot}`)
       await bot.putSelectedItemRange(window.inventoryStart, window.inventoryEnd, window)
     }
     if (window.selectedItem || window.slots.slice(0, gridSize + 1).some(Boolean)) {
-      throw error('proportional craft left a result, crafting grid item or cursor item', true)
+      const current = describeWindow()
+      const residual = [
+        window.slots[0] && 'result slot',
+        current.grid.length && 'crafting grid',
+        window.selectedItem && 'cursor'
+      ].filter(Boolean)
+      warehouse?.debug?.(`craft window cleanup residual item=${registry.items[recipe.result.id]?.name || recipe.result.id} triggers=${triggers} residual=${residual.join('+')} ${JSON.stringify(current)}`)
+      throw error(`proportional craft left ${residual.join(', ') || 'unknown'} residual`, true)
     }
     return { window, collectResultResidual }
   }
@@ -409,6 +474,8 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
     let cursorKnown = false
     let cursor = null
     let cursorEpoch = -1
+    const slotVersions = new Map()
+    const windowSlots = new Map()
     const resultWindows = new Set(table ? [] : [0])
     const expectedResult = catalog.fromPrismarineItem(new Item(recipe.result.id, recipe.result.count, recipe.result.metadata))
     const open = window => {
@@ -424,6 +491,14 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
       if (!range) return
       let value
       try { value = Item.fromNotch(raw) } catch { invalid = true; return }
+      const slotKey = `${windowId}:${index}`
+      slotVersions.set(slotKey, (slotVersions.get(slotKey) || 0) + 1)
+      if (resultWindows.has(windowId) && index >= 0 && index < range.start) {
+        const slots = windowSlots.get(windowId) || new Map()
+        if (value) slots.set(index, catalog.fromPrismarineItem(value))
+        else slots.delete(index)
+        windowSlots.set(windowId, slots)
+      }
       if (index === 0 && resultWindows.has(windowId) && value) {
         resultPresent = true
         const normalized = catalog.fromPrismarineItem(value)
@@ -479,7 +554,32 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
           if (previous) previous.amount += entry.amount
           else byKey.set(entry.itemKey, { ...entry })
         }
-        return { items: [...byKey.values()], resultObserved, resultPresent, updateEpoch, version, invalid, cursorKnown, cursor, cursorEpoch }
+        return {
+          items: [...byKey.values()], resultObserved, resultPresent, updateEpoch, version, invalid,
+          cursorKnown, cursor, cursorEpoch,
+          slotVersion: (windowId, slot) => slotVersions.get(`${windowId}:${slot}`) || 0,
+          windowSlot: (windowId, slot) => {
+            const item = windowSlots.get(windowId)?.get(slot)
+            return item ? { ...item } : null
+          }
+        }
+      },
+      waitForSlots: async (windowId, slots, baselines, check, message, expectedSlots = null) => {
+        const expires = Date.now() + Math.max(1, Number(config?.craft?.confirmTimeoutMs) || 5000)
+        while (true) {
+          check()
+          const ready = slots.every(slot => {
+            if ((slotVersions.get(`${windowId}:${slot}`) || 0) <= (baselines.get(slot) || 0)) return false
+            if (!expectedSlots) return true
+            const expected = expectedSlots.get(slot)
+            const current = windowSlots.get(windowId)?.get(slot)
+            if (!expected) return !current
+            return current?.itemKey === expected.itemKey && current.amount === expected.amount
+          })
+          if (ready) return
+          if (Date.now() >= expires) throw error(message, true)
+          await new Promise(resolve => setTimeout(resolve, Math.min(25, Math.max(1, expires - Date.now()))))
+        }
       },
       markResultObserved,
       acceptSnapshot: serverSnapshot => {
