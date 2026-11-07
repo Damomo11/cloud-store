@@ -3,10 +3,11 @@
 const Vec3 = require('vec3')
 const { standardRecipeOutputs, withStandardRecipeOutputs } = require('./recipe-outputs')
 const { readServerContainer } = require('./server-container-evidence')
+const { shortKey } = require('../traceLog')
 
 // This boundary performs no warehouse accounting or material withdrawal. The
 // controller supplies the batch's concrete inputs in an empty bag.
-function createInventoryExecutor (bot, catalog, config, warehouse) {
+function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = () => {}) {
   let active = null
   const registry = bot.registry || catalog.mcData
   const Item = require('prismarine-item')(registry)
@@ -16,6 +17,30 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
     const result = new Error(message, cause ? { cause } : undefined)
     result.recoveryRequired = recoveryRequired
     return result
+  }
+
+  function itemSummary (item) {
+    if (!item) return null
+    const normalized = item.itemId ? item : catalog.fromPrismarineItem(item)
+    return {
+      itemId: normalized.itemId,
+      amount: normalized.amount ?? item.count,
+      fingerprint: shortKey(normalized.itemKey)
+    }
+  }
+
+  function amountSummary (items) {
+    return (items || []).map(item => [item.itemId, item.amount]).sort((a, b) => a[0].localeCompare(b[0]))
+  }
+
+  function emitDebug (event, details = {}) {
+    try {
+      debugCraft(event, {
+        ...(active?.operationId ? { operationId: active.operationId } : {}),
+        ...(active?.stepId ? { stepId: active.stepId } : {}),
+        ...details
+      })
+    } catch { /* Diagnostics must never interrupt a live craft operation. */ }
   }
 
   function stop (window = bot.currentWindow) {
@@ -299,6 +324,22 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
       }
     }
     const placementSlots = plan.map(placement => placement.slot)
+    emitDebug('executor.grid_placement_plan', {
+      windowId: window.id,
+      windowType: window.type,
+      gridSize,
+      triggers,
+      placements: plan.map(placement => ({
+        slot: placement.slot,
+        item: itemSummary(window.slots[placement.sources[0]?.slot]),
+        amount: placement.count,
+        sources: placement.sources.map(source => ({
+          slot: source.slot,
+          amount: source.count,
+          availableBefore: source.sourceCount
+        }))
+      }))
+    })
     const placementBaselines = new Map(placementSlots.map(slot => [slot, evidence.current().slotVersion(window.id, slot)]))
     for (const placement of plan) {
       for (const source of placement.sources) {
@@ -420,7 +461,16 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
         throw error('craft cannot drop items or use an unsupported click', true)
       }
       operation.clickEpoch++
-      return original.clickWindow.call(bot, slot, ...args)
+      const click = { windowId: window.id, slot, mouseButton, mode, epoch: operation.clickEpoch }
+      emitDebug('executor.window_click_start', click)
+      try {
+        const result = await original.clickWindow.call(bot, slot, ...args)
+        emitDebug('executor.window_click_complete', click)
+        return result
+      } catch (cause) {
+        emitDebug('executor.window_click_failure', { ...click, message: cause?.message || String(cause) })
+        throw cause
+      }
     }
     const park = async window => {
       const start = window.inventoryStart
@@ -484,6 +534,13 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
       if (Number.isInteger(window?.id) && Number.isInteger(window.inventoryStart) && Number.isInteger(window.inventoryEnd)) {
         ranges.set(window.id, { start: window.inventoryStart ?? 10, end: window.inventoryEnd ?? 46 })
         if (table && window.type?.startsWith('minecraft:crafting')) resultWindows.add(window.id)
+        emitDebug('executor.window_opened', {
+          windowId: window.id,
+          windowType: window.type,
+          inventoryStart: window.inventoryStart,
+          inventoryEnd: window.inventoryEnd,
+          craftingTable: Boolean(table)
+        })
       }
     }
     const slot = (windowId, index, raw) => {
@@ -492,10 +549,17 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
       let value
       try { value = Item.fromNotch(raw) } catch { invalid = true; return }
       const slotKey = `${windowId}:${index}`
+      const craftSlot = resultWindows.has(windowId) && index >= 0 && index < range.start
+      const previous = craftSlot
+        ? windowSlots.get(windowId)?.get(index)
+        : (index >= range.start && index < range.end ? shadow.get(index - range.start) : null)
+      const normalized = value && catalog.fromPrismarineItem(value)
+      const changed = (!previous && normalized) || (previous && !normalized) ||
+        (previous && normalized && (previous.itemKey !== normalized.itemKey || previous.amount !== normalized.amount))
       slotVersions.set(slotKey, (slotVersions.get(slotKey) || 0) + 1)
-      if (resultWindows.has(windowId) && index >= 0 && index < range.start) {
+      if (craftSlot) {
         const slots = windowSlots.get(windowId) || new Map()
-        if (value) slots.set(index, catalog.fromPrismarineItem(value))
+        if (normalized) slots.set(index, normalized)
         else slots.delete(index)
         windowSlots.set(windowId, slots)
       }
@@ -506,11 +570,21 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
       } else if (index === 0 && resultWindows.has(windowId)) {
         resultPresent = false
       }
-      if (index < range.start || index >= range.end) return
-      if (value) shadow.set(index - range.start, catalog.fromPrismarineItem(value))
-      else shadow.delete(index - range.start)
-      updateEpoch = operation.clickEpoch
-      version++
+      const inventorySlot = index >= range.start && index < range.end
+      if (inventorySlot) {
+        if (normalized) shadow.set(index - range.start, normalized)
+        else shadow.delete(index - range.start)
+        updateEpoch = operation.clickEpoch
+        version++
+      }
+      if (changed && (craftSlot || inventorySlot)) {
+        emitDebug('executor.server_slot_update', {
+          windowId,
+          slot: index,
+          area: craftSlot ? 'crafting' : 'inventory',
+          item: itemSummary(normalized)
+        })
+      }
     }
     const onSlot = packet => slot(packet.windowId, packet.slot, packet.item)
     const markResultObserved = () => {
@@ -534,6 +608,7 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
         cursorKnown = true
         cursorEpoch = operation.clickEpoch
         version++
+        emitDebug('executor.server_cursor_update', { item: itemSummary(cursor && catalog.fromPrismarineItem(cursor)) })
       } catch { invalid = true }
     }
     const onCursor = packet => setCursor(Object.hasOwn(packet, 'contents') ? packet.contents :
@@ -620,7 +695,17 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
         sameAmounts(current.items, expected, entry => entry.itemKey) && sameAmounts(snapshot(), expected, entry => entry.itemKey)
       if (!confirmed || lastVersion !== current.version) stableSince = confirmed ? Date.now() : null
       lastVersion = current.version
-      if (stableSince != null && Date.now() - stableSince >= settleMs) return
+      if (stableSince != null && Date.now() - stableSince >= settleMs) {
+        current = evidence.current()
+        emitDebug('executor.inventory_confirmed', {
+          expected: amountSummary(expected),
+          observed: amountSummary(snapshot()),
+          serverObserved: amountSummary(current.items),
+          resultPresent: current.resultPresent,
+          cursor: itemSummary(current.cursor && catalog.fromPrismarineItem(current.cursor))
+        })
+        return
+      }
       if (Date.now() >= expires) break
       await new Promise(resolve => setTimeout(resolve, Math.min(25, Math.max(1, expires - Date.now()), settleMs)))
     }
@@ -643,8 +728,24 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
     check()
     const matched = sameAmounts(serverSnapshot.playerItems, expected, entry => entry.itemKey) &&
       sameAmounts(snapshot(), expected, entry => entry.itemKey)
-    if (!matched) throw error('authoritative server craft inventory snapshot does not match the expected output', true)
+    if (!matched) {
+      emitDebug('executor.inventory_mismatch', {
+        expected: amountSummary(expected),
+        observed: amountSummary(snapshot()),
+        serverObserved: amountSummary(serverSnapshot.playerItems),
+        serverCursor: itemSummary(evidence.current().cursor && catalog.fromPrismarineItem(evidence.current().cursor)),
+        resultPresent: evidence.current().resultPresent
+      })
+      throw error('authoritative server craft inventory snapshot does not match the expected output', true)
+    }
     evidence.acceptSnapshot(serverSnapshot)
+    emitDebug('executor.inventory_confirmed', {
+      expected: amountSummary(expected),
+      observed: amountSummary(snapshot()),
+      serverObserved: amountSummary(serverSnapshot.playerItems),
+      resultPresent: evidence.current().resultPresent,
+      cursor: itemSummary(evidence.current().cursor && catalog.fromPrismarineItem(evidence.current().cursor))
+    })
 
     const fallbackExpires = Date.now() + settleMs
     while (true) {
@@ -757,9 +858,9 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
     return block
   }
 
-  async function execute ({ step, triggers = 1, signal, deadline } = {}) {
+  async function execute ({ step, triggers = 1, signal, deadline, operationId, stepId } = {}) {
     if (active) throw error('inventory executor is busy')
-    const operation = { reason: null, craftStarted: false, before: null, clickEpoch: 0 }
+    const operation = { reason: null, craftStarted: false, before: null, clickEpoch: 0, operationId, stepId }
     active = operation
     let timer
     let restoreFence
@@ -790,6 +891,15 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
       if (!sameAmounts(before, operation.before, entry => entry.itemKey)) throw error('inventory changed before crafting', true)
       const { recipe, expected } = selectRecipe(step, declared, table, bot.inventory.items())
       const batchExpected = expected.map(item => ({ ...item, amount: item.amount * triggers }))
+      operation.expected = batchExpected
+      emitDebug('executor.start', {
+        result: `minecraft:${step.result.name}`,
+        triggers,
+        requiresTable: step.requiresTable,
+        recipeType: recipe.type || null,
+        inputs: amountSummary(before),
+        expected: amountSummary(batchExpected)
+      })
       check()
       evidence = observeServerInventory(operation, recipe, table)
       restoreFence = installCraftFence(operation, check)
@@ -817,12 +927,19 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
       if (bot.currentWindow || bot.inventory.selectedItem || bot.inventory.slots?.slice(0, 5).some(Boolean)) {
         throw error('craft left an open window, cursor item or crafting-grid residue', true)
       }
+      emitDebug('executor.complete', {
+        consumed: amountSummary(before),
+        produced: amountSummary(after),
+        triggers
+      })
       // These are gross input/output movements, including returned containers.
       // Every item in before was an input and every item in after is an output.
       return { before, after, consumed: before, produced: after }
     } catch (cause) {
       const rejection = operation.reason || cause
       const failure = rejection instanceof Error ? rejection : error(String(rejection || 'craft failed'))
+      const serverEvidence = evidence?.current()
+      let snapshotError = null
       if (operation.craftStarted || failure.recoveryRequired) {
         stop()
         failure.recoveryRequired = true
@@ -848,8 +965,22 @@ function createInventoryExecutor (bot, catalog, config, warehouse) {
           failure.consumed = [...consumedTotals.values()]
           failure.produced = [...producedTotals.values()]
           if (failure.consumed.length || failure.produced.length) failure.partial = true
-        } catch {}
+        } catch (cause) { snapshotError = cause }
       }
+      emitDebug('executor.failure', {
+        message: failure.message,
+        recoveryRequired: Boolean(failure.recoveryRequired),
+        partial: Boolean(failure.partial),
+        expected: amountSummary(operation.expected),
+        before: amountSummary(operation.before),
+        observedInventory: amountSummary(failure.after || serverEvidence?.items || []),
+        consumed: amountSummary(failure.consumed),
+        produced: amountSummary(failure.produced),
+        serverCursor: itemSummary(serverEvidence?.cursor && catalog.fromPrismarineItem(serverEvidence.cursor)),
+        localCursor: itemSummary(bot.inventory.selectedItem && catalog.fromPrismarineItem(bot.inventory.selectedItem)),
+        resultPresent: serverEvidence?.resultPresent ?? null,
+        snapshotError: snapshotError?.message || null
+      })
       throw failure
     } finally {
       clearTimeout(timer)

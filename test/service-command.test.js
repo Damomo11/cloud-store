@@ -80,3 +80,45 @@ test('non-admin bot game command is rejected', async () => {
   assert.deepEqual(fixture.sent, ['/msg Admin 你没有权限让机器人发送游戏内指令。'])
   assert.equal(fixture.replies[0].message, '你没有权限让机器人发送游戏内指令。')
 })
+
+test('admin can toggle detailed craft logs for this bot at runtime', () => {
+  const fixture = createService()
+  const lines = []
+  fixture.service.craftDebugWriter = line => lines.push(line)
+
+  fixture.service.handleIncoming('Admin', '！调试 合成日志 开', 'whisper', { channel: 'private' })
+  assert.equal(fixture.service.craftDebugEnabled, true)
+  fixture.service.debugCraft('batch_start', { operationId: 'craft:test', triggers: 10 })
+
+  fixture.service.handleIncoming('Admin', '!调试 合成日志 关', 'whisper', { channel: 'private' })
+  fixture.service.debugCraft('batch_end', { operationId: 'craft:test' })
+
+  assert.equal(fixture.service.craftDebugEnabled, false)
+  assert.equal(lines.length, 1)
+  assert.match(lines[0], /craft-debug/)
+  assert.match(lines[0], /"botId":"bota"/)
+  assert.match(lines[0], /"event":"batch_start"/)
+  assert.match(lines[0], /"triggers":10/)
+  assert.equal(fixture.taskPool.accepted, 0)
+  assert.ok(fixture.sent.some(message => message.includes('合成日志已开启')))
+  assert.ok(fixture.sent.some(message => message.includes('合成日志已关闭')))
+})
+
+test('private admins can toggle craft logs without the command prefix', () => {
+  const fixture = createService()
+
+  fixture.service.handleIncoming('Admin', '调试 合成日志 开', 'whisper', { channel: 'private' })
+
+  assert.equal(fixture.service.craftDebugEnabled, true)
+  assert.ok(fixture.sent.some(message => message.includes('合成日志已开启')))
+})
+
+test('non-admin craft debug commands are silently ignored', () => {
+  const fixture = createService({ admin: false })
+
+  fixture.service.handleIncoming('Admin', '!调试 合成日志 开', 'whisper', { channel: 'private' })
+
+  assert.notEqual(fixture.service.craftDebugEnabled, true)
+  assert.equal(fixture.taskPool.accepted, 0)
+  assert.deepEqual(fixture.sent, [])
+})

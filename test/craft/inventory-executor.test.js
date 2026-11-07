@@ -61,12 +61,14 @@ function fixture (before, after, options = {}) {
   const warehouse = { gotoNear: async (...position) => calls.push(['goto', ...position]) }
   const catalog = new ItemCatalog('1.21.11', {}, { serverEnchantmentsFile: '/missing-test-mappings.json' })
   const config = { craft: { table: { x: 10, y: 64, z: 10 }, timeoutMs: 5000, confirmTimeoutMs: 60, settleMs: 5 } }
-  const executor = createInventoryExecutor(bot, catalog, config, warehouse)
-  return { bot, calls, table, warehouse, catalog, config, executor, setInventory: value => { inventory = value } }
+  const debugEvents = []
+  const debugCraft = options.debugCraft || ((event, details) => debugEvents.push({ event, details }))
+  const executor = createInventoryExecutor(bot, catalog, config, warehouse, debugCraft)
+  return { bot, calls, table, warehouse, catalog, config, executor, debugEvents, setInventory: value => { inventory = value } }
 }
 
-function proportionalFixture (before, after, step, { triggers = 1, noResultPacket = false, residualResult = false, serverResidual = false, delayedShiftUpdate = false, delayedPlacementUpdate = false } = {}) {
-  const f = fixture(before, after)
+function proportionalFixture (before, after, step, { triggers = 1, noResultPacket = false, residualResult = false, serverResidual = false, delayedShiftUpdate = false, delayedPlacementUpdate = false, debugCraft } = {}) {
+  const f = fixture(before, after, { debugCraft })
   const gridWidth = step.requiresTable ? 3 : 2
   const craftingWindow = (id, type, inventoryStart) => {
     const slots = new Array(46).fill(null)
@@ -257,6 +259,26 @@ test('2x2 batch crafting fills proportional inputs and collects the result with 
   assert.equal(f.calls.some(call => Array.isArray(call) && call[0] === 'craft'), false)
   assert.equal(f.clicks.filter(click => click.slot === 0 && click.mouseButton === 0 && click.mode === 1).length, 1)
   assert.deepEqual(f.clicks.find(click => click.slot === 0 && click.mode === 1).grid, [2, 0, 2, 0])
+})
+
+test('proportional execution logs click intent, server slot/cursor updates and exact output evidence', async () => {
+  const step = { ...stickStep, requiresTable: false }
+  const f = proportionalFixture([item('oak_planks', 2), item('oak_planks', 2)], [item('stick', 8)], step, { triggers: 2 })
+
+  const result = await f.executor.execute({ step, triggers: 2, operationId: 'craft:debug', stepId: '0:0+2' })
+
+  assert.deepEqual(amounts(result.produced), [['minecraft:stick', 8]])
+  const shiftClick = f.debugEvents.find(event => event.event === 'executor.window_click_start' && event.details.slot === 0 && event.details.mode === 1)
+  assert.ok(shiftClick)
+  assert.equal(shiftClick.details.operationId, 'craft:debug')
+  assert.ok(f.debugEvents.some(event => event.event === 'executor.server_slot_update' &&
+    event.details.slot === 0 && event.details.item?.itemId === 'minecraft:stick'))
+  assert.ok(f.debugEvents.some(event => event.event === 'executor.server_cursor_update' && event.details.item === null))
+  const placement = f.debugEvents.find(event => event.event === 'executor.grid_placement_plan')
+  assert.ok(placement.details.placements.every(cell => cell.sources[0].amount === 2 && cell.sources[0].availableBefore === 2))
+  const confirmation = f.debugEvents.find(event => event.event === 'executor.inventory_confirmed')
+  assert.deepEqual(confirmation.details.expected, [['minecraft:stick', 8]])
+  assert.deepEqual(confirmation.details.observed, [['minecraft:stick', 8]])
 })
 
 test('2x2 proportional placement can split one input cell across matching stacks', async () => {
@@ -575,6 +597,20 @@ test('locally predicted output without authoritative server updates requires rec
   await assert.rejects(f.executor.execute({ step: stickStep }), error => error.recoveryRequired === true && /server|authoritative/.test(error.message))
 })
 
+test('failure diagnostics preserve the original craft error when inventory snapshots also fail', async () => {
+  const f = fixture([item('oak_planks', 2)], [item('stick', 4)])
+  f.bot.craft = async () => {
+    f.bot.inventory.items = () => { throw new Error('inventory snapshot unavailable') }
+    throw new Error('server rejected craft')
+  }
+
+  await assert.rejects(f.executor.execute({ step: stickStep }), error => error.message === 'server rejected craft')
+
+  const failure = f.debugEvents.find(event => event.event === 'executor.failure')
+  assert.equal(failure.details.message, 'server rejected craft')
+  assert.equal(failure.details.snapshotError, 'inventory snapshot unavailable')
+})
+
 test('a nonempty server cursor after crafting requires recovery even when local cursor is empty', async () => {
   const f = fixture([item('oak_planks', 2)], [item('stick', 4)])
   const craft = f.bot.craft
@@ -583,6 +619,10 @@ test('a nonempty server cursor after crafting requires recovery even when local 
     f.bot._client.emit('set_cursor_item', { contents: Item.toNotch(item('stick', 1)) })
   }
   await assert.rejects(f.executor.execute({ step: stickStep }), error => error.recoveryRequired === true && /cursor|光标/.test(error.message))
+  const failure = f.debugEvents.find(event => event.event === 'executor.failure')
+  assert.equal(failure.details.serverCursor.itemId, 'minecraft:stick')
+  assert.equal(failure.details.serverCursor.amount, 1)
+  assert.deepEqual(failure.details.observedInventory, [['minecraft:stick', 4]])
   assert.equal(f.bot.inventory.selectedItem, null)
 })
 

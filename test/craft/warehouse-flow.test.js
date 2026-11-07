@@ -143,18 +143,28 @@ test('batch budget fits ten pistons in one crafting transaction', async () => {
     f.seed('alice', 'iron_ingot', 10)
     f.seed('alice', 'redstone', 10)
     const calls = []
+    const debugEvents = []
     const execute = f.executor.execute
     f.executor.execute = async args => {
-      calls.push({ item: args.step.result.name, triggers: args.triggers })
+      calls.push({ item: args.step.result.name, triggers: args.triggers, operationId: args.operationId, stepId: args.stepId })
       return execute(args)
     }
-    const controller = new CraftController({ ...f, botId: 'bot-a' })
+    const controller = new CraftController({ ...f, botId: 'bot-a', debugCraft: (event, details) => debugEvents.push({ event, details }) })
 
     const result = await controller.run({ actor: 'Alice', owner: { uuid: 'alice', username: 'Alice', scope: 'personal' }, item: 'piston', quantity: 10 })
 
     assert.equal(result.status, 'complete')
-    assert.deepEqual(calls, [{ item: 'piston', triggers: 10 }])
+    assert.equal(calls.length, 1)
+    assert.equal(calls[0].item, 'piston')
+    assert.equal(calls[0].triggers, 10)
+    assert.match(calls[0].operationId, /^craft:/)
+    assert.equal(calls[0].stepId, '0:0+10')
     assert.equal(f.db.getOwnerItemsByItemId('alice', 'minecraft:piston')[0].amount, 10)
+    assert.ok(debugEvents.some(event => event.event === 'controller.plan_ready' && event.details.target.quantity === 10))
+    assert.ok(debugEvents.some(event => event.event === 'controller.batch_budget' && event.details.triggers === 10))
+    assert.ok(debugEvents.some(event => event.event === 'controller.withdraw_confirmed' && event.details.items.length > 0))
+    assert.ok(debugEvents.some(event => event.event === 'controller.batch_confirmed' && event.details.produced[0][1] === 10))
+    assert.ok(debugEvents.some(event => event.event === 'controller.return_complete'))
   } finally { f.db.close() }
 })
 

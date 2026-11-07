@@ -294,7 +294,8 @@ function launchBot (state) {
       attachCraftingExecutor(bot, {
         config: launchConfig,
         catalog,
-        warehouse
+        warehouse,
+        debugCraft: (event, details) => service.debugCraft(event, details)
       })
     } catch (error) {
       console.warn(`[craft] executor attach failed: ${error.message}`)
