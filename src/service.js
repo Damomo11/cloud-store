@@ -32,6 +32,8 @@ class CloudStoreService {
     this.recoveringFromDeath = false
     this.emergencyRescueActive = false
     this.seenMessages = new Map()
+    this.craftDebugEnabled = false
+    this.craftDebugWriter = line => console.log(line)
     this.webAuth = null
     this.accountedResidual = new Map()
     this.hotReloadRunning = false
@@ -429,6 +431,11 @@ class CloudStoreService {
     const normalizedCommand = this.normalizeCommandText(commandMessage)
     if (!normalizedCommand.startsWith('!')) return
 
+    if (/^!调试(?:\s|$)/.test(normalizedCommand)) {
+      this.handleCraftDebugCommand(username, normalizedCommand)
+      return
+    }
+
     // 急救必须绕过普通任务队列：它需要立即打断当前 bot 的任务。
     if (normalizedCommand === '!急救') {
       if (context.channel !== 'private' && !this.isPrivateSource(context.source || source)) {
@@ -495,6 +502,35 @@ class CloudStoreService {
     })
     this.db.runWithCommandContext(commandLogId, () => this.withBotContext(() => this.handleChat(username, normalizedCommand, { ...context, source })))
       .catch(error => this.db.runWithCommandContext(commandLogId, () => this.withBotContext(() => this.handleCommandError(username, error))))
+  }
+
+  handleCraftDebugCommand (username, text) {
+    if (!this.isAdmin(username)) return
+
+    const match = String(text || '').trim().match(/^!调试\s+合成日志\s+(开|关)$/)
+    if (!match) {
+      this.msg(username, '格式：!调试 合成日志 开|关')
+      return
+    }
+
+    this.craftDebugEnabled = match[1] === '开'
+    const state = this.craftDebugEnabled ? '开启' : '关闭'
+    this.msg(username, `机器人 ${this.bot.username || this.botId} 的合成日志已${state}，重启后自动关闭。`)
+  }
+
+  debugCraft (event, details = {}) {
+    if (!this.craftDebugEnabled) return
+    const record = {
+      ...details,
+      timestamp: new Date().toISOString(),
+      botId: this.botId,
+      event: String(event || 'unknown')
+    }
+    try {
+      this.craftDebugWriter(`[craft-debug] ${JSON.stringify(record)}`)
+    } catch (error) {
+      console.warn(`[craft-debug:${this.botId}] failed to write event=${record.event}: ${error.message}`)
+    }
   }
 
   isDuplicateCommand (username, message, source) {
@@ -2085,6 +2121,7 @@ class CloudStoreService {
         bot: this.bot, db: this.db, catalog: this.catalog, config: this.config,
         warehouse: this.warehouse, executor: this.bot._craftingExecutor,
         botId: this.botId, ledger: this.craftLedger(),
+        debugCraft: (event, details) => this.debugCraft(event, details),
         validateOwner: (owner, actor) => this.validateCraftOwner(owner, actor),
         quota: owner => this.getStorageQuota(owner.uuid, owner.scope)
       })
@@ -2109,6 +2146,10 @@ class CloudStoreService {
     }
     const parsed = this.parseCraftRequest(String(text).replace(/^!合成\s*/, ''))
     if (!parsed.ok) { this.msg(username, parsed.error); return }
+    this.debugCraft('service.request_received', {
+      actor: username,
+      target: { name: parsed.itemName, quantity: parsed.quantity }
+    })
     const player = this.getPlayer(username)
     const owner = storageOwner || { ...player, scope: 'personal' }
     this.validateCraftOwner(owner, username)
@@ -2121,7 +2162,22 @@ class CloudStoreService {
       item: resolved.name, quantity: parsed.quantity,
       available: this.availableCraftStock(owner.uuid), config: this.config, forceCraft: true
     })
-    if (!planned.ok) { this.msg(username, this.describeCraftRejection(planned, parsed)); return }
+    if (!planned.ok) {
+      this.debugCraft('service.plan_rejected', { target: { name: resolved.name, quantity: parsed.quantity }, reason: planned.reason || 'unknown' })
+      this.msg(username, this.describeCraftRejection(planned, parsed))
+      return
+    }
+    this.debugCraft('service.plan_ready', {
+      target: planned.command.target,
+      steps: planned.command.craftSteps.map((step, index) => ({
+        index,
+        result: `minecraft:${step.result.name}`,
+        resultPerTrigger: step.result.count,
+        triggers: step.times,
+        requiresTable: step.requiresTable,
+        inputs: step.inputs.map(input => ({ itemId: `minecraft:${input.names[0]}`, amountPerTrigger: input.count }))
+      }))
+    })
     // Capture request intent and explicit owner. The selected worker replans and
     // reserves current stock under the warehouse lock when execution begins.
     const request = {
@@ -2175,27 +2231,53 @@ class CloudStoreService {
 
   async runCraftCommand (command) {
     const notify = command.notify || (message => this.msg(command.player, message))
+    this.debugCraft('service.command_start', {
+      target: command.target,
+      ownerScope: command.owner?.scope || null
+    })
     // 开工前先清背包实物残留（复用每次存入前的同一套 flushResidual 归属回库）：
     // 机器人平时开着自动捡拾，玩家掉的零散物会进背包，实物残留会让合成独占
     // 背包的清洁检查直接失败（2026-11-05 22:38 矿车合成被"背包 潜影盒×1"打挂）。
     // 必须在控制器取仓库锁之前执行：flushResidual 的入库封装自己会拿同一把
     // 不可重入锁，锁内再调会死锁。窗口/光标/合成格异常不再拦截（所有者拍板）：
     // 直接关窗归位（settleResidue 幂等），关窗退回的物品随本次清理一并回仓。
-    if (this.bot.inventory.items().length) {
-      await this.getCraftController().settleResidue()
-      if (this.isActiveCancelled()) return
-      notify('检测到机器人背包残留物品，正在按归属回仓清理，随后自动开工合成。')
-      await this.warehouse.goHomeIfAway()
-      if (this.isActiveCancelled()) return
-      await this.flushResidual()
-      if (this.isActiveCancelled()) return
+    try {
+      const residue = this.bot.inventory.items()
+      if (residue.length) {
+        this.debugCraft('service.residual_cleanup_start', { items: residue.map(item => {
+          const normalized = this.catalog.fromPrismarineItem(item)
+          return { itemId: normalized.itemId, amount: normalized.amount, fingerprint: shortKey(normalized.itemKey) }
+        }) })
+        await this.getCraftController().settleResidue()
+        if (this.isActiveCancelled()) return
+        notify('检测到机器人背包残留物品，正在按归属回仓清理，随后自动开工合成。')
+        await this.warehouse.goHomeIfAway()
+        if (this.isActiveCancelled()) return
+        const beforeReturn = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
+        await this.flushResidual()
+        this.debugCraft('service.residual_cleanup_complete', {
+          beforeReturn: beforeReturn.map(item => ({ itemId: item.itemId, amount: item.amount, fingerprint: shortKey(item.itemKey) })),
+          remaining: this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
+            .map(item => ({ itemId: item.itemId, amount: item.amount, fingerprint: shortKey(item.itemKey) }))
+        })
+        if (this.isActiveCancelled()) return
+      }
+      this.debugCraft('service.controller_start', { target: command.target })
+      const result = await this.getCraftController().run({
+        actor: command.player, owner: command.owner, item: command.target.name, quantity: command.target.quantity
+      })
+      this.debugCraft('service.command_complete', {
+        status: result.status,
+        operationId: result.operationId || null,
+        target: result.target || command.target
+      })
+      if (result.status === 'complete') notify('合成完成：' + command.target.name + ' ×' + command.target.quantity + '，产物与余料已回云仓并记账。')
+      else if (result.status === 'already_sufficient') notify('仓库里已有足够目标物品，无需继续合成。')
+      return result
+    } catch (error) {
+      this.debugCraft('service.command_failure', { message: error.message, target: command.target })
+      throw error
     }
-    const result = await this.getCraftController().run({
-      actor: command.player, owner: command.owner, item: command.target.name, quantity: command.target.quantity
-    })
-    if (result.status === 'complete') notify('合成完成：' + command.target.name + ' ×' + command.target.quantity + '，产物与余料已回云仓并记账。')
-    else if (result.status === 'already_sufficient') notify('仓库里已有足够目标物品，无需继续合成。')
-    return result
   }
 
   async handleCraftRecovery (username) {
@@ -4374,6 +4456,7 @@ class CloudStoreService {
     if (text === '修装备' || text.startsWith('修装备 ')) return `!${text}`
 
     const commandNames = [
+      '调试',
       '创建仓库',
       '我的仓库',
       '默认仓库',

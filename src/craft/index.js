@@ -47,9 +47,9 @@ function planToCraftCommand ({ item, quantity, available, config, forceCraft = f
     }
   }
 }
-function attachCraftingExecutor (bot, { config, catalog, warehouse }) {
+function attachCraftingExecutor (bot, { config, catalog, warehouse, debugCraft }) {
   const { createInventoryExecutor } = require('./inventory-executor')
-  bot._craftingExecutor = createInventoryExecutor(bot, catalog, config, warehouse)
+  bot._craftingExecutor = createInventoryExecutor(bot, catalog, config, warehouse, debugCraft)
   return bot._craftingExecutor
 }
 module.exports = {

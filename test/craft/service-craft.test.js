@@ -187,6 +187,25 @@ test('runCraftCommand reports success only after the warehouse controller settle
   }
 })
 
+test('runCraftCommand writes detailed craft lifecycle events through the gated service logger', async () => {
+  const fixture = createFixture()
+  try {
+    const lines = []
+    fixture.service.craftDebugEnabled = true
+    fixture.service.craftDebugWriter = line => lines.push(line)
+    fixture.service.craftController = { run: async () => ({ status: 'complete', operationId: 'craft:debug', target: { name: 'stick', quantity: 8 } }) }
+
+    await fixture.service.runCraftCommand({ player: 'Alice', owner: { uuid: 'uuid-alice', scope: 'personal' }, target: { name: 'stick', quantity: 8 } })
+
+    const events = lines.map(line => JSON.parse(line.replace(/^\[craft-debug\] /, '')).event)
+    assert.ok(events.includes('service.command_start'))
+    assert.ok(events.includes('service.controller_start'))
+    assert.ok(events.includes('service.command_complete'))
+  } finally {
+    fixture.close()
+  }
+})
+
 test('runCraftCommand propagates an unsettled failure without a success message', async () => {
   const fixture = createFixture()
   try {
