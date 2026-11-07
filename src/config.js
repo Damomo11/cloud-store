@@ -39,6 +39,10 @@ const DEFAULT_CONFIG = {
     home: '/home ck',
     tpa: '/tpa {player}',
     tpaccept: '/tpaccept {player}',
+    // 传送请求 15 秒超时后主动撤回：不撤回的话玩家侧会一直挂着过期请求，
+    // 手滑接受会把机器人传送到不合适的时机（比如正跑着别人的单）。
+    // 默认语法跟随服务端插件（/tpa cancel），插件不同可在 config 覆盖。
+    tpacancel: '/tpa cancel',
     msg: '/msg {player} {message}',
     publicFallback: false
   },
