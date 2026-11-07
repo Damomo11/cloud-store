@@ -343,6 +343,21 @@ test('proportional batch waits for server grid updates before cleanup after shif
   assert.equal(f.clicks.slice(shiftIndex + 1).some(click => click.slot > 0 && click.slot <= 4), false)
 })
 
+test('3x3 proportional batch waits for server grid updates before cleanup after shift-click', async () => {
+  const step = { requiresTable: true, result: { name: 'chest', count: 1 }, inputs: [{ names: ['oak_planks'], count: 8 }] }
+  const f = proportionalFixture([item('oak_planks', 16)], [item('chest', 2)], step, {
+    triggers: 2,
+    delayedShiftUpdate: true
+  })
+
+  const result = await f.executor.execute({ step, triggers: 2 })
+
+  assert.deepEqual(amounts(result.produced), [['minecraft:chest', 2]])
+  const shiftIndex = f.clicks.findIndex(click => click.slot === 0 && click.mode === 1)
+  assert.ok(shiftIndex >= 0)
+  assert.equal(f.clicks.slice(shiftIndex + 1).some(click => click.slot > 0 && click.slot <= 9), false)
+})
+
 test('proportional batch confirms the placed grid before shift-clicking', async () => {
   const step = { ...stickStep, requiresTable: false }
   const f = proportionalFixture([item('oak_planks', 2), item('oak_planks', 2)], [item('stick', 8)], step, {
