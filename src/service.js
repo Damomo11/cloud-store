@@ -4284,7 +4284,11 @@ class CloudStoreService {
     const resolvedDistance = resolvedPos && botPos ? resolvedPos.distanceTo(botPos) : null
     console.warn(`[teleport] /tpa ${username} timed out after ${timeoutMs}ms` +
       ` (resolve=${resolved.source || 'none'}, distance=${resolvedDistance === null ? 'unknown' : Math.round(resolvedDistance)}, bot=${this.describePosition(botPos)})`)
-    this.msg(username, '15秒内没有检测到你在附近，本次操作已取消；如果稍后看到这条传送请求，请不要再接受。')
+    // 服务端不会主动撤回超时的 tpa 请求：玩家屏幕上会一直挂着过期请求，手滑接受
+    // 会把机器人传送到不合适的时机。超时即补发撤回；插件可能已过期/语法不通用
+    // 导致撤回静默失败，故下方提示仍保留兜底告诫。
+    this.bot.chat((this.config.commands.tpacancel || '/tpa cancel').replace('{player}', username))
+    this.msg(username, '15秒内没有检测到你在附近，本次操作已取消，传送请求已撤回；若之后仍看到该请求，请不要再接受。')
     return false
   }
 
