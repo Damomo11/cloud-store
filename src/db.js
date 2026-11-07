@@ -3546,7 +3546,7 @@ class StoreDb {
     `).get(String(ownerUuid || ''), String(itemKey || '')))
   }
 
-  addInventoryMismatch (kind, ownerUuid, username, item, amount, note = '', balanceAdjusted = 0) {
+  addInventoryMismatch (kind, ownerUuid, username, item, amount, note = '', balanceAdjusted = 0, status = 'open') {
     if (!amount || amount <= 0 || !item?.itemKey) return
     const adjusted = Number(balanceAdjusted)
     if (!Number.isSafeInteger(adjusted) || adjusted < 0 || adjusted > amount) throw new Error('inventory mismatch balance adjustment is invalid')
@@ -3556,9 +3556,10 @@ class StoreDb {
         kind, status, owner_uuid, username, item_key, item_id, display_name,
         nbt_json, meta_json, amount, note, balance_adjusted
       )
-      VALUES (?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       kind,
+      status,
       ownerUuid || '',
       username || '',
       item.itemKey,
@@ -3570,6 +3571,51 @@ class StoreDb {
       note,
       adjusted
     )
+  }
+
+  // 潜影盒拆装重打包会让同一只盒子的 NBT 指纹变化（内容相同、格位排列/打包
+  // 时序不同）：账上旧指纹消失 → 走 missing 扣原主账；实物新指纹出现 → 走
+  // extra 划入 momo。同一只盒子被拆成"一件消失 + 一件多出"，归属错位
+  // （2026-11-04 椰汁橙 音符盒×1645 案例：旧 dfcbeb 缺失扣账、新 fff0c0
+  // 划入 momo，实物完好躺在桶里）。对账主循环前先做同内容配对：盒内
+  // 清单完全一致的 missing/extra 判定为同盒重打包，把新指纹的账直接
+  // 记回原主，两侧各减配对量后主循环不再产生这对假异常。内容不一致或
+  // 归属不唯一的（同一指纹被多个 owner 持有）不自动配对，仍走原流程留人工。
+  pairShulkerFingerprintDrift (reference, actual) {
+    const isShulker = row => String(row?.itemId || '').includes('shulker')
+    const missingBoxes = []
+    const extraBoxes = []
+    for (const [key, row] of reference) {
+      if (!actual.has(key) && isShulker(row) && Number(row.amount) > 0) missingBoxes.push([key, row])
+    }
+    for (const [key, row] of actual) {
+      if (!reference.has(key) && isShulker(row) && Number(row.amount) > 0) extraBoxes.push([key, row])
+    }
+    if (!missingBoxes.length || !extraBoxes.length) return []
+    const contents = this.getShulkerContentsByBox([...missingBoxes.map(box => box[0]), ...extraBoxes.map(box => box[0])])
+    const signature = key => (contents.get(key) || [])
+      .map(item => `${item.itemKey}:${item.amount}`)
+      .sort()
+      .join('|')
+    const pairs = []
+    for (const [missingKey, missingRow] of missingBoxes) {
+      const holders = this.db.prepare('SELECT owner_uuid AS ownerUuid FROM balances WHERE item_key = ? AND amount > 0').all(missingKey)
+        .filter(row => row.ownerUuid && row.ownerUuid !== this.momoOwner)
+      if (holders.length !== 1) continue
+      const missingSign = signature(missingKey)
+      for (let index = 0; index < extraBoxes.length; index++) {
+        const [extraKey, extraRow] = extraBoxes[index]
+        if (signature(extraKey) !== missingSign) continue
+        const pairAmount = Math.min(Number(missingRow.amount), Number(extraRow.amount))
+        if (pairAmount <= 0) continue
+        pairs.push({ missingKey, missingRow, extraKey, extraRow, ownerUuid: holders[0].ownerUuid, pairAmount })
+        extraBoxes.splice(index, 1)
+        missingRow.amount = Number(missingRow.amount) - pairAmount
+        extraRow.amount = Number(extraRow.amount) - pairAmount
+        break
+      }
+    }
+    return pairs
   }
 
   resolveOpenInventoryMismatches (note = '') {
@@ -3618,6 +3664,38 @@ class StoreDb {
 
     this.transaction(() => {
       if (!baseline) this.resolveOpenInventoryMismatches('新的同步已刷新库存异常状态。')
+
+      // 指纹漂移配对：同内容的 missing/extra 潜影盒判定为同一只盒子的新旧两代
+      // 指纹（拆盒重打包），把新指纹的账记回原主并留转移流水；两侧 Map 已在
+      // 配对器里减掉配对量，主循环不会再对这两只盒子产生 missing/extra。
+      const pairs = this.pairShulkerFingerprintDrift(reference, actual)
+      for (const pair of pairs) {
+        const extraItem = this.rowToItem(pair.extraRow)
+        this.upsertItem(extraItem)
+        // 换指纹的完整账务：旧指纹扣原主 xN + 新指纹记回原主 xN，净持盒量不变；
+        // 只加不扣会让原主凭空多出一盒账（实物侧只有一只盒子）。
+        this.adjustBalance(pair.ownerUuid, pair.missingKey, -pair.pairAmount)
+        this.adjustBalance(pair.ownerUuid, pair.extraKey, pair.pairAmount)
+        const username = this.getOwnerLabelForMismatch(pair.ownerUuid)
+        this.addTransaction(
+          'sync_pair_transfer',
+          'ok',
+          pair.ownerUuid,
+          username,
+          [{ ...extraItem, amount: pair.pairAmount }],
+          `潜影盒重打包指纹配对：账面旧指纹 ${pair.missingKey.slice(-16)}、实物新指纹 ${pair.extraKey.slice(-16)}，盒内内容一致，新指纹 x${pair.pairAmount} 已记回原主，不再扣账/划兜底。`
+        )
+        this.addInventoryMismatch(
+          'missing',
+          pair.ownerUuid,
+          username,
+          this.rowToItem(pair.missingRow),
+          pair.pairAmount,
+          `对账配对成功：旧指纹与实物新指纹 ${pair.extraKey.slice(-16)} 盒内内容一致，判定为拆盒重打包产生的两代指纹；账面已按新指纹转移（记回原主），本条留痕闭环，无需人工处理。`,
+          pair.pairAmount,
+          'resolved'
+        )
+      }
 
       for (const key of keys) {
         const actualRow = actual.get(key)
