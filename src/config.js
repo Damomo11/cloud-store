@@ -139,7 +139,7 @@ const DEFAULT_CONFIG = {
     // Autodiscovery search radius (blocks) around home when table is unset
     // or unreachable. Only loaded chunks are scanned.
     tableSearchRadius: 64,
-    // Optional command timeout override for a single craft order.
+    // Timeout budget for one craft batch; a confirmed and stored batch resets it.
     timeoutMs: 1200000
   }
 }
