@@ -15,6 +15,28 @@ const WHOLE_SHULKER_WITHDRAW_THRESHOLD = 1728
 // 盐在进程生命周期内保持稳定：同进程内同批次键不变（就地重试/崩溃恢复防双扣语义不变），跨进程必然不同。
 const DEDUCTION_KEY_SALT = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
 
+async function recoverAndResumeCraft (service, controller) {
+  const recovered = await controller.recover()
+  if (recovered?.status !== 'resumable') return recovered
+  if (!recovered.operationId || typeof controller.resume !== 'function') {
+    throw new Error('合成恢复确认可以续跑，但缺少原订单续跑入口；恢复记录已保留。')
+  }
+  const operation = controller.ledger?.get?.(recovered.operationId)
+  service.debugCraft?.('service.resume_start', {
+    operationId: recovered.operationId,
+    stepIndex: recovered.stepIndex ?? null,
+    nextTrigger: recovered.nextTrigger ?? null
+  })
+  const resumed = await controller.resume(recovered.operationId)
+  if (resumed?.status === 'complete' && operation?.actor) {
+    const target = operation.target || {}
+    const name = target.name || target.item || target.itemId || '目标物品'
+    const quantity = Number(target.quantity || target.amount || 0)
+    service.msg?.(operation.actor, `机器人已恢复并继续完成原合成订单：${name}${quantity > 0 ? ` ×${quantity}` : ''}。`)
+  }
+  return { ...resumed, resumedFromRecovery: true, recoveredOperationId: recovered.operationId }
+}
+
 class CloudStoreService {
   constructor (bot, db, catalog, warehouse, config, taskPool = null, subscriptions = null) {
     this.bot = bot
@@ -148,7 +170,7 @@ class CloudStoreService {
         }
         if (this.connectionInvalidated) throw new Error('连接已失效，合成恢复留待新连接。')
         if (this.craftController?.isBusy() || this.bot._craftingExecutor?.isBusy()) return
-        await this.getCraftController().recover()
+        await recoverAndResumeCraft(this, this.getCraftController())
       } finally {
         this.recoveringFromDeath = false
         this.taskPool?.dispatch()
@@ -224,6 +246,10 @@ class CloudStoreService {
       this.detachWarehouseTrace()
       this.recoveringFromDeath = false
     }
+  }
+
+  async recoverAndResumeCraft (controller = this.getCraftController()) {
+    return recoverAndResumeCraft(this, controller)
   }
 
   saveRecoveryTask (type, actorUsername, owner, targetUsername, phase = '', items = [], deductionKey = '') {
@@ -303,7 +329,7 @@ class CloudStoreService {
         await this.taskPool.waitForCraftDrain?.(this.botId)
       }
       if (this.connectionInvalidated) throw new Error('连接已失效，合成恢复留待新连接。')
-      await this.getCraftController().recover()
+      await recoverAndResumeCraft(this, this.getCraftController())
       return
     }
     const task = this.db.getRecoveryTask(this.botId)
@@ -992,7 +1018,7 @@ class CloudStoreService {
     // on this very task. Other bots' journals retain the upstream global guard.
     if (type === 'craft' && this.db.hasPendingCraft?.(this.botId)) {
       if (this.connectionInvalidated) throw new Error('连接已失效，合成恢复留待原机器人重连。')
-      await this.withBotContext(() => this.getCraftController().recover())
+      await this.withBotContext(() => recoverAndResumeCraft(this, this.getCraftController()))
     }
     if (type !== 'craft_recovery') this.db.assertNoPendingCraft?.()
     const migration = this.db.runDeferredMigrations?.()
@@ -2300,10 +2326,14 @@ class CloudStoreService {
       const stickyWorker = owner || { botId }
       const canStart = !this.taskPool || Boolean(this.taskPool.eligibleWorkerForTask({ type: 'craft_recovery', stickyWorker }))
       const task = Promise.resolve(this.enqueueTask(username, 'craft_recovery', async worker => {
-        const result = await worker.getCraftController().recover()
+        const result = await recoverAndResumeCraft(worker, worker.getCraftController())
         this.msg(username, result.status === 'empty'
           ? `机器人 ${botId} 没有待恢复的合成任务。`
-          : result.diffRegistered
+          : result.resumedFromRecovery
+            ? '已核对中断时的物品，并从上次确认位置继续完成原合成订单。'
+            : result.status === 'recovery_required'
+              ? `机器人 ${botId} 的合成状态无法唯一确认，订单和库存预留仍保留，请核对实物后再处理。`
+            : result.diffRegistered
             ? '合成中断状态已核验，物品已回云仓；对账差异已登记库存异常，请在 Web 管理页复核；可重新提交合成。'
             : '合成中断状态已核验，物品已回云仓；可重新提交合成。')
         return result
@@ -2331,12 +2361,14 @@ class CloudStoreService {
         const admin = this.db.listAdmins().find(row => row.username)?.username || ''
         console.log(`[craft:auto-recover] ${this.bot.username} has a pending craft journal; recovering automatically`)
         const result = await this.enqueueTask(admin, 'craft_recovery', async worker => {
-          const outcome = await worker.getCraftController().recover()
+          const outcome = await recoverAndResumeCraft(worker, worker.getCraftController())
           return outcome
         }, { exclusive: true, stickyWorker: this })
         // recover() 重试失败会按库存差异登记销账（不再锁库），status recovered
         // 含 diffRegistered=true 时要提示管理员有差异登记待复核。
-        const notice = result?.status === 'recovered'
+        const notice = result?.resumedFromRecovery
+          ? `机器人 ${this.bot.username} 已核对中断时的物品，并从上次确认位置继续完成原合成订单。`
+          : result?.status === 'recovered'
           ? (result?.diffRegistered
               ? `机器人 ${this.bot.username} 启动时自动恢复了一笔中断的合成，物品已回云仓；对账差异已登记库存异常，请管理员在 Web 管理页复核。`
               : `机器人 ${this.bot.username} 启动时自动恢复了一笔中断的合成，物品已回云仓；可重新提交合成。`)

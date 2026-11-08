@@ -5,6 +5,11 @@ const { standardRecipeOutputs, withStandardRecipeOutputs } = require('./recipe-o
 const { readServerContainer } = require('./server-container-evidence')
 const { shortKey } = require('../traceLog')
 
+// A fragmented source stack can be split with right-clicks, but each click is
+// a separate server window action.  Keep small legacy batches compatible while
+// refusing the unbounded click storm seen in the 36-piston wave (142 clicks).
+const MAX_SAFE_FRAGMENTED_PLACEMENT_CLICKS = 96
+
 // This boundary performs no warehouse accounting or material withdrawal. The
 // controller supplies the batch's concrete inputs in an empty bag.
 function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = () => {}) {
@@ -204,6 +209,139 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
     return cells.length ? cells : null
   }
 
+  function inventoryWindowSnapshot (window) {
+    const items = []
+    for (let slot = window.inventoryStart; slot < window.inventoryEnd; slot++) {
+      const value = window.slots[slot]
+      if (value) items.push(value)
+    }
+    return catalog.aggregatePrismarineItems(items)
+  }
+
+  function itemKeyAmount (window, itemKey) {
+    let amount = 0
+    for (let slot = window.inventoryStart; slot < window.inventoryEnd; slot++) {
+      const value = window.slots[slot]
+      if (value && catalog.fromPrismarineItem(value).itemKey === itemKey) amount += Number(value.count) || 0
+    }
+    return amount
+  }
+
+  async function waitForCompactionMove (window, move, beforeAmount, check) {
+    const timeout = Math.max(500, Number(config?.craft?.confirmTimeoutMs) || 5000)
+    const deadline = Date.now() + timeout
+    while (Date.now() < deadline) {
+      check()
+      const source = window.slots[move.sourceSlot]
+      const target = window.slots[move.targetSlot]
+      const sourceReady = move.sourceAfter === 0
+        ? !source
+        : Boolean(source && catalog.fromPrismarineItem(source).itemKey === move.itemKey && Number(source.count) === move.sourceAfter)
+      const targetReady = Boolean(target && catalog.fromPrismarineItem(target).itemKey === move.itemKey && Number(target.count) === move.targetAfter)
+      if (sourceReady && targetReady && itemKeyAmount(window, move.itemKey) === beforeAmount) return
+      await new Promise(resolve => setTimeout(resolve, 25))
+    }
+    throw error('server did not confirm inventory stack compaction', true)
+  }
+
+  function compactNeedsMove (entries) {
+    if (!entries.length) return false
+    const stackSize = entries[0].stackSize
+    const total = entries.reduce((sum, entry) => sum + entry.count, 0)
+    return entries.length > Math.ceil(total / stackSize)
+  }
+
+  // Consolidates only identical, stackable items in the current crafting
+  // inventory. The operation is deliberately bounded and preserves the total
+  // amount for every itemKey; it never touches warehouse state or non-stackable
+  // items. This runs before a crafting window opens so moveSlotItem uses the
+  // normal player inventory window and its server transaction confirmation.
+  async function compactInventoryStacks (window = bot.inventory, check = () => {}) {
+    if (!window || !Array.isArray(window.slots) || !Number.isInteger(window.inventoryStart) || !Number.isInteger(window.inventoryEnd)) {
+      throw error('craft inventory stack compaction requires a complete inventory window', true)
+    }
+    if (window !== bot.inventory) throw error('craft inventory stack compaction requires the player inventory window', true)
+    if (window.selectedItem || bot.inventory.selectedItem) throw error('craft inventory stack compaction requires an empty cursor', true)
+    const before = inventoryWindowSnapshot(window)
+    if (typeof bot.moveSlotItem !== 'function' || bot.currentWindow) {
+      return { changed: false, moves: 0, before, after: before, skipped: true }
+    }
+    const assertSafeWindow = () => {
+      if (window !== bot.inventory || bot.currentWindow) {
+        throw error('craft inventory stack compaction lost the player inventory window', true)
+      }
+      if (window.selectedItem || bot.inventory.selectedItem) {
+        throw error('craft inventory stack compaction requires an empty cursor', true)
+      }
+    }
+    let moves = 0
+    const maxMoves = Math.max(1, window.inventoryEnd - window.inventoryStart) ** 2
+    while (moves < maxMoves) {
+      check()
+      assertSafeWindow()
+      const groups = new Map()
+      for (let slot = window.inventoryStart; slot < window.inventoryEnd; slot++) {
+        const value = window.slots[slot]
+        if (!value) continue
+        const normalized = catalog.fromPrismarineItem(value)
+        const stackSize = Math.max(1, Number(value.stackSize || catalog.getStackSize(normalized.itemId) || 1))
+        if (stackSize <= 1) continue
+        const entries = groups.get(normalized.itemKey) || []
+        entries.push({ slot, count: Number(value.count) || 0, stackSize, itemKey: normalized.itemKey })
+        groups.set(normalized.itemKey, entries)
+      }
+      let selected = null
+      for (const entries of groups.values()) {
+        if (!compactNeedsMove(entries)) continue
+        const targets = entries.filter(entry => entry.count > 0 && entry.count < entry.stackSize)
+        if (!targets.length || entries.length < 2) continue
+        targets.sort((a, b) => b.count - a.count)
+        const target = targets[0]
+        const free = target.stackSize - target.count
+        const sources = entries.filter(entry => entry.slot !== target.slot && entry.count > 0)
+        sources.sort((a, b) => {
+          const aFits = a.count <= free
+          const bFits = b.count <= free
+          if (aFits !== bFits) return Number(bFits) - Number(aFits)
+          return b.count - a.count
+        })
+        if (!sources.length) continue
+        selected = { source: sources[0], target }
+        break
+      }
+      if (!selected) break
+      const { source, target } = selected
+      const moved = Math.min(source.count, target.stackSize - target.count)
+      if (moved <= 0) break
+      const move = {
+        sourceSlot: source.slot,
+        targetSlot: target.slot,
+        itemKey: source.itemKey,
+        sourceAfter: source.count - moved,
+        targetAfter: target.count + moved
+      }
+      const beforeAmount = itemKeyAmount(window, move.itemKey)
+      try {
+        emitDebug('executor.inventory_compaction_start', { itemKey: move.itemKey, sourceSlot: move.sourceSlot, targetSlot: move.targetSlot,
+          sourceBefore: source.count, targetBefore: target.count, sourceAfter: move.sourceAfter, targetAfter: move.targetAfter })
+        await bot.moveSlotItem(move.sourceSlot, move.targetSlot)
+        assertSafeWindow()
+        await waitForCompactionMove(window, move, beforeAmount, check)
+        emitDebug('executor.inventory_compaction_complete', { itemKey: move.itemKey, sourceSlot: move.sourceSlot, targetSlot: move.targetSlot,
+          sourceAfter: move.sourceAfter, targetAfter: move.targetAfter })
+      } catch (cause) {
+        if (cause?.recoveryRequired) throw cause
+        throw error('inventory stack compaction was not server-confirmed', true, cause)
+      }
+      moves++
+    }
+    if (moves >= maxMoves) throw error('inventory stack compaction exceeded its safety bound', true)
+    assertSafeWindow()
+    const after = inventoryWindowSnapshot(window)
+    if (!sameAmounts(before, after, entry => entry.itemKey)) throw error('inventory stack compaction changed item totals', true)
+    return { changed: moves > 0, moves, before, after }
+  }
+
   function proportionalPlacementPlan (window, cells, triggers) {
     const remaining = new Map()
     for (let slot = window.inventoryStart; slot < window.inventoryEnd; slot++) {
@@ -211,31 +349,158 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
       if (value) remaining.set(slot, { count: Number(value.count) || 0, itemKey: catalog.fromPrismarineItem(value).itemKey })
     }
     const plan = []
-    for (const cell of cells) {
-      const groups = new Map()
+    const groups = new Map()
+    for (const [index, cell] of cells.entries()) {
+      const signature = `${cell.ingredient.id}|${cell.ingredient.metadata ?? '*'}`
+      const entries = groups.get(signature) || { cells: [], ingredient: cell.ingredient }
+      entries.cells.push(index)
+      groups.set(signature, entries)
+    }
+    const orderedGroups = [...groups.values()].sort((left, right) =>
+      Number(right.ingredient.metadata != null) - Number(left.ingredient.metadata != null))
+    for (const group of orderedGroups) {
+      const candidatesByKey = new Map()
       for (const [slot, source] of remaining) {
         const value = window.slots[slot]
-        if (!value || source.count <= 0 || value.type !== cell.ingredient.id ||
-          (cell.ingredient.metadata != null && value.metadata !== cell.ingredient.metadata)) continue
-        const entries = groups.get(source.itemKey) || []
-        entries.push({ slot, count: source.count, stackSize: value.stackSize })
-        groups.set(source.itemKey, entries)
+        if (!value || source.count <= 0 || value.type !== group.ingredient.id ||
+          (group.ingredient.metadata != null && value.metadata !== group.ingredient.metadata)) continue
+        const candidate = candidatesByKey.get(source.itemKey) || { total: 0, maxStack: 0, entries: [] }
+        candidate.total += source.count
+        candidate.maxStack = Math.max(candidate.maxStack, Number(value.stackSize || 1))
+        candidate.entries.push({ slot, count: source.count, stackSize: Number(value.stackSize || 1) })
+        candidatesByKey.set(source.itemKey, candidate)
       }
-      const matching = [...groups.values()].find(entries => entries[0].stackSize >= triggers &&
-        entries.reduce((sum, entry) => sum + entry.count, 0) >= triggers)
-      if (!matching) return null
-      let needed = triggers
-      const sources = []
-      for (const source of matching) {
-        if (needed <= 0) break
-        const count = Math.min(needed, source.count)
-        sources.push({ slot: source.slot, count, sourceCount: source.count, itemKey: source.itemKey })
-        remaining.set(source.slot, { ...remaining.get(source.slot), count: source.count - count })
-        needed -= count
+      const selectedKeys = []
+      const candidates = [...candidatesByKey.entries()]
+        .filter(([, candidate]) => candidate.maxStack >= triggers && candidate.total >= triggers)
+        .sort((left, right) => right[1].total - left[1].total)
+      for (const [itemKey, candidate] of candidates) {
+        const availableCells = Math.floor(candidate.total / triggers)
+        for (let index = 0; index < availableCells && selectedKeys.length < group.cells.length; index++) {
+          selectedKeys.push(itemKey)
+        }
       }
-      plan.push({ ...cell, sources })
+      if (selectedKeys.length < group.cells.length) return null
+      for (const [index, cellIndex] of group.cells.entries()) {
+        const cell = cells[cellIndex]
+        const selectedKey = selectedKeys[index]
+        const matching = candidatesByKey.get(selectedKey)?.entries || []
+        let needed = triggers
+        const sources = []
+        for (const source of matching) {
+          if (needed <= 0) break
+          const current = remaining.get(source.slot)
+          if (!current || current.count <= 0) continue
+          const count = Math.min(needed, current.count)
+          sources.push({ slot: source.slot, count, sourceCount: current.count, itemKey: selectedKey })
+          remaining.set(source.slot, { ...current, count: current.count - count })
+          needed -= count
+        }
+        if (needed > 0) return null
+        plan.push({ ...cell, sources })
+      }
     }
     return plan
+  }
+
+  function placementClickCount (plan) {
+    const transferCount = (sourceCount, amount) => {
+      let available = sourceCount
+      let remaining = amount
+      let clicks = 0
+      while (remaining > 0) {
+        if (available === remaining) return clicks + 2
+        const picked = Math.ceil(available / 2)
+        clicks++ // split the source stack with a right click
+        if (picked <= remaining) {
+          clicks++ // place the selected half into the grid cell
+          remaining -= picked
+          available -= picked
+        } else {
+          // The target receives one item per right click, then the cursor is
+          // returned to the source slot with a final left click.
+          return clicks + remaining + 1
+        }
+      }
+      return clicks
+    }
+    return plan.reduce((total, placement) => total + placement.sources.reduce((count, source) => {
+      return count + transferCount(source.sourceCount, source.count)
+    }, 0), 0)
+  }
+
+  function cloneInventoryWindow (window) {
+    return {
+      ...window,
+      slots: window.slots.map(value => {
+        if (!value) return null
+        const copy = new Item(value.type, value.count, value.metadata, value.nbt)
+        if (value.components) copy.components = structuredClone(value.components)
+        if (value.removedComponents) copy.removedComponents = structuredClone(value.removedComponents)
+        return copy
+      })
+    }
+  }
+
+  function placeVirtualOutputs (window, outputs, triggers) {
+    for (const output of outputs) {
+      const name = registry.items[output.type]?.name
+      if (!name) throw error(`craft output item id ${output.type} is unknown`, true)
+      const itemKey = catalog.fromPrismarineItem(output).itemKey
+      const stackSize = Math.max(1, Number(output.stackSize || catalog.getStackSize(`minecraft:${name}`) || 1))
+      let remaining = output.count * triggers
+      for (let slot = window.inventoryStart; slot < window.inventoryEnd && remaining > 0; slot++) {
+        const current = window.slots[slot]
+        if (!current || catalog.fromPrismarineItem(current).itemKey !== itemKey || current.count >= stackSize) continue
+        const moved = Math.min(stackSize - current.count, remaining)
+        current.count += moved
+        remaining -= moved
+      }
+      while (remaining > 0) {
+        const slot = window.slots.findIndex((current, index) => index >= window.inventoryStart && index < window.inventoryEnd && !current)
+        if (slot < 0) throw error('craft batch outputs cannot fit in the simulated inventory', true)
+        const moved = Math.min(stackSize, remaining)
+        window.slots[slot] = new Item(output.type, moved, output.metadata, output.nbt)
+        remaining -= moved
+      }
+    }
+  }
+
+  function simulatePlacementWaves (window, cells, triggers, waveLimit, outputs) {
+    const simulated = cloneInventoryWindow(window)
+    const waves = []
+    for (let completed = 0; completed < triggers;) {
+      let waveTriggers
+      let plan
+      let clickCount
+      for (let candidate = Math.min(waveLimit, triggers - completed); candidate >= 1; candidate--) {
+        const candidatePlan = proportionalPlacementPlan(simulated, cells, candidate)
+        if (!candidatePlan) continue
+        const candidateClicks = placementClickCount(candidatePlan)
+        if (candidateClicks > MAX_SAFE_FRAGMENTED_PLACEMENT_CLICKS) continue
+        waveTriggers = candidate
+        plan = candidatePlan
+        clickCount = candidateClicks
+        break
+      }
+      if (!plan) {
+        const rejection = error('craft batch cannot be staged as safe proportional grid waves', true)
+        rejection.fragmentedClickCount = clickCount ?? null
+        throw rejection
+      }
+      for (const placement of plan) {
+        for (const source of placement.sources) {
+          const item = simulated.slots[source.slot]
+          if (!item || item.count < source.count) throw error('craft wave simulation lost an input stack', true)
+          item.count -= source.count
+          if (!item.count) simulated.slots[source.slot] = null
+        }
+      }
+      placeVirtualOutputs(simulated, outputs, waveTriggers)
+      waves.push({ start: completed, triggers: waveTriggers, clickCount })
+      completed += waveTriggers
+    }
+    return waves
   }
 
   async function openCraftingWindow (table, check) {
@@ -289,11 +554,39 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
     // every source stack can be planned before the first click. Lightweight
     // callers and legacy adapters continue through bot.craft unchanged.
     if (typeof window.findInventoryItem !== 'function') return fallback()
-    if (!proportionalOutputsFit(recipe, triggers, window.inventoryEnd - window.inventoryStart)) return fallback()
     const cells = proportionalCells(recipe)
-    const plan = cells && proportionalPlacementPlan(window, cells, triggers)
-    if (!plan) return fallback()
+    if (!cells) return fallback()
+    // A crafting cell can hold only one stack. Split a warehouse batch into
+    // waves whose trigger count fits every ingredient stack. The window stays
+    // open and each wave is collected with one result shift-click.
+    const waveLimit = Math.min(...cells.map(cell => {
+      const name = registry.items[cell.ingredient.id]?.name
+      return Math.max(1, Number(catalog.getStackSize(`minecraft:${name}`) || 1))
+    }))
     const gridSize = recipe.requiresTable ? 9 : 4
+    if (!proportionalOutputsFit(recipe, triggers, window.inventoryEnd - window.inventoryStart)) {
+      throw error('craft batch outputs do not fit in the open inventory', true)
+    }
+    const outputItems = standardRecipeOutputs(registry, recipe)
+      .map(output => new Item(output.id, output.count, output.metadata))
+    let preflightWaves
+    try {
+      preflightWaves = simulatePlacementWaves(window, cells, triggers, waveLimit, outputItems)
+    } catch (cause) {
+      emitDebug('executor.grid_placement_rejected', {
+        reason: cause?.message || 'unsafe proportional placement',
+        fragmentedClickCount: cause?.fragmentedClickCount ?? null,
+        maxSafeFragmentedPlacementClicks: MAX_SAFE_FRAGMENTED_PLACEMENT_CLICKS
+      })
+      throw cause
+    }
+    if (!preflightWaves) throw error('craft batch cannot be staged as safe proportional grid waves', true)
+    emitDebug('executor.grid_waves_planned', {
+      windowId: window.id,
+      triggers,
+      waveCount: preflightWaves.length,
+      waves: preflightWaves
+    })
     const describeItem = item => item ? {
       name: item.name || registry.items[item.type]?.name || `item:${item.type}`,
       metadata: item.metadata ?? null,
@@ -323,91 +616,153 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
         }
       }
     }
-    const placementSlots = plan.map(placement => placement.slot)
-    emitDebug('executor.grid_placement_plan', {
-      windowId: window.id,
-      windowType: window.type,
-      gridSize,
-      triggers,
-      placements: plan.map(placement => ({
-        slot: placement.slot,
-        item: itemSummary(window.slots[placement.sources[0]?.slot]),
-        amount: placement.count,
-        sources: placement.sources.map(source => ({
-          slot: source.slot,
-          amount: source.count,
-          availableBefore: source.sourceCount
+    let completed = 0
+    let waveIndex = 0
+    let collectResultResidual
+    while (completed < triggers) {
+      check()
+      const plannedWave = preflightWaves[waveIndex]
+      const waveTriggers = plannedWave?.triggers
+      if (!Number.isSafeInteger(waveTriggers) || waveTriggers <= 0) {
+        throw error('craft batch wave plan became invalid before execution', true)
+      }
+      if (!proportionalOutputsFit(recipe, waveTriggers, window.inventoryEnd - window.inventoryStart)) {
+        throw error('craft wave outputs no longer fit in the open inventory', true)
+      }
+      const plan = proportionalPlacementPlan(window, cells, waveTriggers)
+      if (!plan) {
+        throw error(`craft wave ${completed}+${waveTriggers} cannot be placed from confirmed inventory stacks`, true)
+      }
+      const placementSlots = plan.map(placement => placement.slot)
+      const fragmentedClickCount = placementClickCount(plan)
+      emitDebug('executor.grid_placement_plan', {
+        windowId: window.id,
+        windowType: window.type,
+        gridSize,
+        triggers,
+        waveStart: completed,
+        waveTriggers,
+        placements: plan.map(placement => ({
+          slot: placement.slot,
+          item: itemSummary(window.slots[placement.sources[0]?.slot]),
+          amount: placement.count,
+          sources: placement.sources.map(source => ({
+            slot: source.slot,
+            amount: source.count,
+            availableBefore: source.sourceCount
+          }))
         }))
-      }))
-    })
-    const placementBaselines = new Map(placementSlots.map(slot => [slot, evidence.current().slotVersion(window.id, slot)]))
-    for (const placement of plan) {
-      for (const source of placement.sources) {
-        check()
-        await bot.clickWindow(source.slot, 0, 0)
-        if (source.count === source.sourceCount) {
-          await bot.clickWindow(placement.slot, 0, 0)
-        } else {
-          for (let count = 0; count < source.count; count++) await bot.clickWindow(placement.slot, 1, 0)
-          await bot.clickWindow(source.slot, 0, 0)
+      })
+      if (fragmentedClickCount > MAX_SAFE_FRAGMENTED_PLACEMENT_CLICKS) {
+        emitDebug('executor.grid_placement_rejected', {
+          reason: 'fragmented proportional placement',
+          fragmentedClickCount,
+          maxSafeFragmentedPlacementClicks: MAX_SAFE_FRAGMENTED_PLACEMENT_CLICKS,
+          waveStart: completed,
+          waveTriggers
+        })
+        throw error(`fragmented proportional placement requires ${fragmentedClickCount} clicks`, true)
+      }
+      const placementBaselines = new Map(placementSlots.map(slot => [slot, evidence.current().slotVersion(window.id, slot)]))
+      const transferPartial = async (sourceSlot, targetSlot, amount) => {
+        let remaining = amount
+        while (remaining > 0) {
+          check()
+          const source = window.slots[sourceSlot]
+          const available = Number(source?.count || 0)
+          if (!available) throw error('craft wave source stack disappeared', true)
+          if (available === remaining) {
+            await bot.clickWindow(sourceSlot, 0, 0)
+            await bot.clickWindow(targetSlot, 0, 0)
+            return
+          }
+          await bot.clickWindow(sourceSlot, 1, 0)
+          const picked = Number(window.selectedItem?.count || 0)
+          if (!picked) throw error('craft wave source split was not confirmed', true)
+          if (picked <= remaining) {
+            await bot.clickWindow(targetSlot, 0, 0)
+            remaining -= picked
+          } else {
+            for (let count = 0; count < remaining; count++) await bot.clickWindow(targetSlot, 1, 0)
+            await bot.clickWindow(sourceSlot, 0, 0)
+            return
+          }
         }
       }
-    }
-    check()
-    const expectedPlacement = new Map(plan.map(placement => {
-      const item = window.slots[placement.slot]
-      return [placement.slot, item ? catalog.fromPrismarineItem(item) : null]
-    }))
-    try {
-      await evidence.waitForSlots(window.id, placementSlots, placementBaselines, check,
-        'server did not confirm the proportional crafting grid', expectedPlacement)
-    } catch (cause) {
-      warehouse?.debug?.(`craft window placement update timeout item=${registry.items[recipe.result.id]?.name || recipe.result.id} triggers=${triggers} ${JSON.stringify(describeWindow())}`)
-      throw cause
-    }
-    const activeGridSlots = window.slots.slice(1, gridSize + 1)
-      .flatMap((item, index) => item ? [index + 1] : [])
-    const watchedSlots = [0, ...activeGridSlots]
-    const updateBaselines = new Map(watchedSlots.map(slot => [slot, evidence.current().slotVersion(window.id, slot)]))
-    warehouse?.debug?.(`craft window shift-click start item=${registry.items[recipe.result.id]?.name || recipe.result.id} triggers=${triggers} ${JSON.stringify(describeWindow())}`)
-    await bot.clickWindow(0, 0, 1)
-    try {
-      await evidence.waitForSlots(window.id, watchedSlots, updateBaselines, check, 'server did not confirm the crafting window after shift-click')
-    } catch (cause) {
-      warehouse?.debug?.(`craft window shift-click update timeout item=${registry.items[recipe.result.id]?.name || recipe.result.id} triggers=${triggers} ${JSON.stringify(describeWindow())}`)
-      throw cause
-    }
-    warehouse?.debug?.(`craft window shift-click confirmed item=${registry.items[recipe.result.id]?.name || recipe.result.id} triggers=${triggers} ${JSON.stringify(describeWindow())}`)
-    const collectResultResidual = async () => {
-      if (!evidence.current().resultPresent) return false
-      if (!window.slots[0]) throw error('server result slot disagrees with the crafting window', true)
-      const baselines = new Map([[0, evidence.current().slotVersion(window.id, 0)]])
-      await bot.clickWindow(0, 0, 0)
-      await evidence.waitForSlots(window.id, [0], baselines, check, 'server did not confirm collection of the residual crafting result')
-      await bot.putSelectedItemRange(window.inventoryStart, window.inventoryEnd, window)
-      return true
-    }
-    // Some servers leave the last result in slot 0 when the shift-click stops
-    // early. Collect that concrete item before closing; exact output evidence
-    // below decides whether the batch completed or needs recovery.
-    await collectResultResidual()
-    // Recipe container returns can remain in input cells after shift-click.
-    for (let slot = 1; slot <= gridSize; slot++) {
-      if (!window.slots[slot]) continue
-      const baselines = new Map([[slot, evidence.current().slotVersion(window.id, slot)]])
-      await bot.clickWindow(slot, 0, 0)
-      await evidence.waitForSlots(window.id, [slot], baselines, check, `server did not confirm clearing crafting grid slot ${slot}`)
-      await bot.putSelectedItemRange(window.inventoryStart, window.inventoryEnd, window)
-    }
-    if (window.selectedItem || window.slots.slice(0, gridSize + 1).some(Boolean)) {
-      const current = describeWindow()
-      const residual = [
-        window.slots[0] && 'result slot',
-        current.grid.length && 'crafting grid',
-        window.selectedItem && 'cursor'
-      ].filter(Boolean)
-      warehouse?.debug?.(`craft window cleanup residual item=${registry.items[recipe.result.id]?.name || recipe.result.id} triggers=${triggers} residual=${residual.join('+')} ${JSON.stringify(current)}`)
-      throw error(`proportional craft left ${residual.join(', ') || 'unknown'} residual`, true)
+      for (const placement of plan) {
+        for (const source of placement.sources) {
+          check()
+          if (source.count === source.sourceCount) {
+            await bot.clickWindow(source.slot, 0, 0)
+            await bot.clickWindow(placement.slot, 0, 0)
+          } else {
+            await transferPartial(source.slot, placement.slot, source.count)
+          }
+        }
+      }
+      check()
+      const expectedPlacement = new Map(plan.map(placement => {
+        const item = window.slots[placement.slot]
+        return [placement.slot, item ? catalog.fromPrismarineItem(item) : null]
+      }))
+      try {
+        await evidence.waitForSlots(window.id, placementSlots, placementBaselines, check,
+          'server did not confirm the proportional crafting grid', expectedPlacement)
+      } catch (cause) {
+        warehouse?.debug?.(`craft window placement update timeout item=${registry.items[recipe.result.id]?.name || recipe.result.id} wave=${completed}+${waveTriggers} ${JSON.stringify(describeWindow())}`)
+        throw cause
+      }
+      const activeGridSlots = window.slots.slice(1, gridSize + 1)
+        .flatMap((item, index) => item ? [index + 1] : [])
+      const watchedSlots = [0, ...activeGridSlots]
+      const updateBaselines = new Map(watchedSlots.map(slot => [slot, evidence.current().slotVersion(window.id, slot)]))
+      warehouse?.debug?.(`craft window shift-click start item=${registry.items[recipe.result.id]?.name || recipe.result.id} wave=${completed}+${waveTriggers} ${JSON.stringify(describeWindow())}`)
+      await bot.clickWindow(0, 0, 1)
+      try {
+        await evidence.waitForSlots(window.id, watchedSlots, updateBaselines, check, 'server did not confirm the crafting window after shift-click')
+      } catch (cause) {
+        warehouse?.debug?.(`craft window shift-click update timeout item=${registry.items[recipe.result.id]?.name || recipe.result.id} wave=${completed}+${waveTriggers} ${JSON.stringify(describeWindow())}`)
+        throw cause
+      }
+      warehouse?.debug?.(`craft window shift-click confirmed item=${registry.items[recipe.result.id]?.name || recipe.result.id} wave=${completed}+${waveTriggers} ${JSON.stringify(describeWindow())}`)
+      collectResultResidual = async () => {
+        if (!evidence.current().resultPresent) return false
+        if (!window.slots[0]) throw error('server result slot disagrees with the crafting window', true)
+        const baselines = new Map([[0, evidence.current().slotVersion(window.id, 0)]])
+        await bot.clickWindow(0, 0, 0)
+        await evidence.waitForSlots(window.id, [0], baselines, check, 'server did not confirm collection of the residual crafting result')
+        await bot.putSelectedItemRange(window.inventoryStart, window.inventoryEnd, window)
+        return true
+      }
+      // Some servers leave the last result in slot 0 when the shift-click stops
+      // early. Collect that concrete item before clearing the next wave.
+      await collectResultResidual()
+      const maxCleanupPasses = gridSize + 2
+      let cleanupPass = 0
+      while (cleanupPass++ < maxCleanupPasses) {
+        for (let slot = 1; slot <= gridSize; slot++) {
+          if (!window.slots[slot]) continue
+          const baselines = new Map([[slot, evidence.current().slotVersion(window.id, slot)]])
+          await bot.clickWindow(slot, 0, 0)
+          await evidence.waitForSlots(window.id, [slot], baselines, check, `server did not confirm clearing crafting grid slot ${slot}`)
+          await bot.putSelectedItemRange(window.inventoryStart, window.inventoryEnd, window)
+        }
+        if (await collectResultResidual()) continue
+        if (!window.selectedItem && !window.slots.slice(0, gridSize + 1).some(Boolean)) break
+      }
+      if (window.selectedItem || window.slots.slice(0, gridSize + 1).some(Boolean)) {
+        const current = describeWindow()
+        const residual = [
+          window.slots[0] && 'result slot',
+          current.grid.length && 'crafting grid',
+          window.selectedItem && 'cursor'
+        ].filter(Boolean)
+        warehouse?.debug?.(`craft window cleanup residual item=${registry.items[recipe.result.id]?.name || recipe.result.id} wave=${completed}+${waveTriggers} residual=${residual.join('+')} ${JSON.stringify(current)}`)
+        throw error(`proportional craft left ${residual.join(', ') || 'unknown'} residual`, true)
+      }
+      completed += waveTriggers
+      waveIndex++
+      emitDebug('executor.grid_wave_complete', { waveStart: completed - waveTriggers, waveTriggers, completed, total: triggers })
     }
     return { window, collectResultResidual }
   }
@@ -461,6 +816,7 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
         throw error('craft cannot drop items or use an unsupported click', true)
       }
       operation.clickEpoch++
+      operation.craftStarted = true
       const click = { windowId: window.id, slot, mouseButton, mode, epoch: operation.clickEpoch }
       emitDebug('executor.window_click_start', click)
       try {
@@ -883,6 +1239,10 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
       const declared = batchDeclaration(step, triggers)
       operation.before = ensureBaseline(declared)
       restoreMovement = installMovementFence(check)
+      // Consolidate only craft inputs in the player's inventory before opening
+      // the table. This frees no warehouse state and preserves item totals,
+      // while turning fragmented stacks into whole-stack wave sources.
+      await compactInventoryStacks(bot.inventory, check)
       let table
       if (step.requiresTable) {
         table = await resolveTable(check)
@@ -903,15 +1263,21 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
       check()
       evidence = observeServerInventory(operation, recipe, table)
       restoreFence = installCraftFence(operation, check)
-      operation.craftStarted = true
       // Mineflayer has no abortable craft API. Cancellation requests stop/close
       // immediately, but this await must drain before finally releases busy.
       // A permanently pending craft intentionally keeps this executor busy.
       // Fill the 2x2 or 3x3 grid proportionally and take the result once when
       // the concrete input stacks can satisfy every grid cell. If a batch is
       // split across undersized stacks, retain Mineflayer's safe fallback.
+      const craftWindowModel = table ? bot.currentWindow : bot.inventory
       const proportional = await craftProportionally(recipe, triggers, table, check, evidence)
-      if (!proportional) await bot.craft(recipe, triggers, table)
+      if (!proportional) {
+        if (triggers > 1 && typeof craftWindowModel?.findInventoryItem === 'function') {
+          throw error('multi-trigger craft could not be staged as a confirmed grid wave', true)
+        }
+        operation.craftStarted = true
+        await bot.craft(recipe, triggers, table)
+      }
       check()
       // The proportional path must receive a real result-slot packet. The
       // native fallback uses Mineflayer's completed call as its existing
@@ -993,7 +1359,7 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
     }
   }
 
-  return { execute, preview, cancel, isBusy: () => active !== null }
+  return { execute, preview, cancel, compactInventoryStacks, isBusy: () => active !== null }
 }
 
 module.exports = { createInventoryExecutor }

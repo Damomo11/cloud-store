@@ -33,6 +33,63 @@ function converted (before, consumed, produced) {
   return merge([...result.values(), ...produced])
 }
 
+function scaledProducedItems (values, totalTriggers, completedTriggers) {
+  if (!Number.isSafeInteger(totalTriggers) || totalTriggers <= 0 ||
+    !Number.isSafeInteger(completedTriggers) || completedTriggers < 0 || completedTriggers > totalTriggers) return null
+  const result = []
+  for (const value of values || []) {
+    if (!value?.itemKey || !value.itemId || !Number.isSafeInteger(value.amount) || value.amount <= 0 || value.amount % totalTriggers !== 0) return null
+    const amount = (value.amount / totalTriggers) * completedTriggers
+    if (amount > 0) result.push({ ...value, amount })
+  }
+  return result
+}
+
+// Input variants are allocated by concrete itemKey, so their counts do not
+// necessarily divide evenly across a batch. Derive gross consumption from the
+// observed inventory equation instead of inventing a proportional split.
+function deriveObservedConsumption (before, observed, produced, expectedConsumed, totalTriggers, completedTriggers) {
+  if (!Number.isSafeInteger(totalTriggers) || totalTriggers <= 0 ||
+    !Number.isSafeInteger(completedTriggers) || completedTriggers < 0 || completedTriggers > totalTriggers) return null
+  const beforeByKey = new Map(merge(before).map(item => [item.itemKey, item]))
+  const observedByKey = new Map(merge(observed).map(item => [item.itemKey, item]))
+  const producedByKey = new Map(merge(produced).map(item => [item.itemKey, item]))
+  const expectedByKey = new Map(merge(expectedConsumed).map(item => [item.itemKey, item]))
+  const consumed = []
+  const keys = new Set([...beforeByKey.keys(), ...observedByKey.keys(), ...producedByKey.keys()])
+  for (const itemKey of keys) {
+    const baseline = beforeByKey.get(itemKey)
+    const output = producedByKey.get(itemKey)
+    const current = observedByKey.get(itemKey)
+    const amount = (baseline?.amount || 0) + (output?.amount || 0) - (current?.amount || 0)
+    if (!Number.isSafeInteger(amount) || amount < 0) return null
+    if (!amount) continue
+    const expected = expectedByKey.get(itemKey)
+    if (!baseline || !expected || amount > baseline.amount || amount > expected.amount ||
+      (expected.itemId && baseline.itemId && expected.itemId !== baseline.itemId)) return null
+    consumed.push({ ...baseline, amount })
+  }
+
+  const expectedById = new Map()
+  for (const item of expectedConsumed || []) {
+    if (!item?.itemKey || !item.itemId || !Number.isSafeInteger(item.amount) || item.amount <= 0) return null
+    const total = (expectedById.get(item.itemId) || 0) + item.amount
+    if (!Number.isSafeInteger(total)) return null
+    expectedById.set(item.itemId, total)
+  }
+  const consumedById = new Map()
+  for (const item of consumed) {
+    const total = (consumedById.get(item.itemId) || 0) + item.amount
+    if (!Number.isSafeInteger(total)) return null
+    consumedById.set(item.itemId, total)
+  }
+  for (const [itemId, total] of expectedById) {
+    if (total % totalTriggers !== 0 || (consumedById.get(itemId) || 0) !== (total / totalTriggers) * completedTriggers) return null
+  }
+  for (const itemId of consumedById.keys()) if (!expectedById.has(itemId)) return null
+  return consumed
+}
+
 // 合成失败自动恢复的兜底时限：断线后底层网络调用可能不再返回，与其无限
 // 挂住合成任务（死亡钩子也在等它 drain），不如放弃本轮，把恢复记录留给
 // 重连/spawn 钩子或人工。放弃后后台的 recover 若最终跑完，同样是一笔经
@@ -252,17 +309,25 @@ class CraftController {
     }))).filter(item => item.amount > 0).sort((a, b) => a.itemKey.localeCompare(b.itemKey))
     const availableByItemId = new Map()
     for (const item of pool) availableByItemId.set(item.itemId, (availableByItemId.get(item.itemId) || 0) + item.amount)
-    let supplyLimit = Math.min(gridStackLimit, requestedLimit)
+    let supplyLimit = requestedLimit
     for (const input of requirements) {
-      supplyLimit = Math.min(supplyLimit, Math.floor((availableByItemId.get(input.itemId) || 0) / input.count))
+      const stackSize = Math.max(1, this.catalog.getStackSize(input.itemId))
+      supplyLimit = Math.min(
+        supplyLimit,
+        Math.floor((availableByItemId.get(input.itemId) || 0) / input.count),
+        Math.floor((maxUsedSlots * stackSize) / input.count)
+      )
     }
 
-    const outputTotals = new Map()
+    const outputPerTrigger = new Map()
+    const Item = require('prismarine-item')(this.catalog.mcData)
     for (const output of step.outputs?.length ? step.outputs : [step.result]) {
-      const itemId = `minecraft:${output.name}`
-      const key = `${itemId}|${output.metadata ?? ''}`
-      const previous = outputTotals.get(key)
-      outputTotals.set(key, { itemId, metadata: output.metadata, amount: (previous?.amount || 0) + output.count })
+      const resolved = this.catalog.resolveName(output.name)
+      const item = this.catalog.fromPrismarineItem(new Item(resolved.type, output.count, output.metadata))
+      const previous = outputPerTrigger.get(item.itemKey)
+      outputPerTrigger.set(item.itemKey, { ...item, amount: (previous?.amount || 0) + output.count })
+      const stackSize = Math.max(1, this.catalog.getStackSize(item.itemId))
+      supplyLimit = Math.min(supplyLimit, Math.floor((maxUsedSlots * stackSize) / (outputPerTrigger.get(item.itemKey).amount)))
     }
 
     const layoutSlots = entries => {
@@ -295,12 +360,55 @@ class CraftController {
         allocatedInputs = this.allocate(requirements.map(input => ({ name: input.name, quantity: input.count * triggers })), pool)
       } catch { continue }
       const inputSlots = layoutSlots(allocatedInputs)
-      const outputs = [...outputTotals.values()].map(output => ({ ...output, amount: output.amount * triggers }))
-      const outputSlots = layoutSlots(outputs)
-      if (inputSlots === null || outputSlots === null) continue
-      // The native fallback crafts one trigger at a time, leaving unconsumed
-      // inputs in the backpack while prior outputs accumulate there.
-      const usedSlots = inputSlots + outputSlots
+      const remainingInputs = new Map(allocatedInputs.map(item => [item.itemKey, { ...item }]))
+      const produced = new Map()
+      let usedSlots = inputSlots
+      let fits = inputSlots !== null
+
+      // The grid holds at most one stack per recipe cell. Simulate complete
+      // grid waves, releasing confirmed inputs before reserving their outputs.
+      for (let completed = 0; fits && completed < triggers;) {
+        const wave = Math.min(gridStackLimit, triggers - completed)
+        for (const input of requirements) {
+          let needed = input.count * wave
+          for (const item of allocatedInputs) {
+            if (item.itemId !== input.itemId || needed <= 0) continue
+            const remaining = remainingInputs.get(item.itemKey)
+            if (!remaining?.amount) continue
+            const consumed = Math.min(needed, remaining.amount)
+            remaining.amount -= consumed
+            needed -= consumed
+            if (!remaining.amount) remainingInputs.delete(item.itemKey)
+          }
+          if (needed) {
+            fits = false
+            break
+          }
+        }
+        if (!fits) break
+
+        const afterPlacement = layoutSlots([...remainingInputs.values(), ...produced.values()])
+        if (afterPlacement === null) {
+          fits = false
+          break
+        }
+        usedSlots = Math.max(usedSlots, afterPlacement)
+
+        for (const output of outputPerTrigger.values()) {
+          const previous = produced.get(output.itemKey)
+          produced.set(output.itemKey, { ...output, amount: (previous?.amount || 0) + output.amount * wave })
+        }
+        const afterOutput = layoutSlots([...remainingInputs.values(), ...produced.values()])
+        if (afterOutput === null) {
+          fits = false
+          break
+        }
+        usedSlots = Math.max(usedSlots, afterOutput)
+        completed += wave
+      }
+
+      const outputSlots = layoutSlots([...produced.values()])
+      if (!fits || outputSlots === null) continue
       if (usedSlots <= maxUsedSlots) {
         return {
           triggers,
@@ -382,7 +490,8 @@ class CraftController {
         const allocations = this.allocate(planned.plan.inventoryUses, rows)
         const id = `craft:${randomUUID()}`
         let operation = this.ledger.begin({ id, botId: this.botId, owner: request.owner, actor: request.actor, target: planned.command.target, allocations,
-          data: { held: [], pending: null, physicalTotals: this.physicalTotals(), stepIndex: 0, plan: planned.command } })
+          data: { held: [], pending: null, physicalTotals: this.physicalTotals(), stepIndex: 0,
+            progress: { stepIndex: 0, nextTrigger: 0 }, plan: planned.command } })
         this.debug('controller.operation_started', {
           operationId: id,
           target: planned.command.target,
@@ -424,7 +533,12 @@ class CraftController {
                 gridStackLimit: budget.gridStackLimit,
                 inputs: this.summarizeItems(inputs)
               })
-              const data = { ...operation.data, held: [], pending: null, physicalTotals: this.physicalTotals(), inputs, stepIndex: index, trigger }
+              const progressBefore = { stepIndex: index, nextTrigger: trigger }
+              const progressAfter = trigger + triggers >= step.times
+                ? { stepIndex: index + 1, nextTrigger: 0 }
+                : { stepIndex: index, nextTrigger: trigger + triggers }
+              const data = { ...operation.data, held: [], pending: null, physicalTotals: this.physicalTotals(), inputs,
+                stepIndex: index, trigger, progress: progressBefore }
               operation = this.ledger.checkpoint(id, 'withdrawing', data)
               this.debug('controller.withdraw_start', { operationId: id, stepId, items: this.summarizeItems(inputs) })
               const withdrawal = await this.warehouse.withdrawAllocationsLocked(inputs, { requireServerEvidence: true })
@@ -443,7 +557,8 @@ class CraftController {
                 expectedProduced: [{ itemId: `minecraft:${step.result.name}`, amount: step.result.count * triggers }]
               }
               operation = this.ledger.checkpoint(id, 'crafting', { ...data, held: before,
-                physicalTotals: this.physicalTotals(), pending: { stepId, before, ...intent } })
+                physicalTotals: this.physicalTotals(), pending: { stepId, before, ...intent, triggers,
+                  progressBefore, progressAfter } })
               this.debug('controller.batch_start', {
                 operationId: id,
                 stepId,
@@ -463,7 +578,7 @@ class CraftController {
               })
               operation = this.ledger.confirm(id, stepId, result.consumed, result.produced, {
                 ...operation.data, before: result.before, after: result.after, held: result.after, pending: null,
-                physicalTotals: this.physicalTotals()
+                progress: progressAfter, physicalTotals: this.physicalTotals()
               })
               operation = await this.store(operation)
               request.onProgress?.({ index, trigger: trigger + triggers, steps: planned.command.craftSteps.length })
@@ -494,40 +609,44 @@ class CraftController {
             inventory: this.summarizeItems(this.inventory())
           })
           operation = this.ledger.get(id)
+          const interrupted = abort.signal.aborted &&
+            (error === abort.signal.reason || error?.message === abort.signal.reason?.message)
           // Only a provably unchanged transfer can be cleaned up automatically.
           // A prepared craft may already have consumed items: retain its journal.
           try {
-            if (operation.phase === 'withdrawing' && !error.uncertainTransfer && same(this.physicalTotals(), operation.data.physicalTotals)) {
+            if (operation.phase === 'withdrawing' && !interrupted && !error.uncertainTransfer &&
+              same(this.physicalTotals(), operation.data.physicalTotals)) {
               operation = this.ledger.checkpoint(id, 'storing', { ...operation.data, held: this.inventory(), pending: null, physicalTotals: this.physicalTotals() })
               operation = await this.store(operation)
               this.ledger.finish(id, 'failed', error.message)
               this.debug('controller.failed_operation_returned', { operationId: id, status: 'unchanged_inputs_returned' })
-            } else if (error.partial && operation.data.pending) {
-              // Batched craft failed midway but the executor captured concrete
-              // before/after inventories: settle what actually happened right
-              // now instead of leaving a recovery journal behind.
-              const pending = operation.data.pending
-              const consumed = error.consumed
-              // The executor's after snapshot IS the live backpack (it stopped
-              // right before rethrowing), so physicalTotals already includes
-              // these items; store() then deposits them into the warehouse.
-              operation = this.ledger.confirmPartial(id, pending.stepId, consumed, error.produced, {
-                ...operation.data, before: pending.before, after: error.after, held: error.after, pending: null,
-                physicalTotals: this.physicalTotals()
+            } else if (error.partial && operation.data.pending && !interrupted) {
+              // Keep the concrete pending journal until recovery can return
+              // the live backpack and prove the exact trigger delta. Settling
+              // here before store() is durable would leave a stale cursor if
+              // the return fails after the partial conversion was booked.
+              this.ledger.markRecovery(id, error.message, {
+                ...operation.data, recoveryPhase: operation.phase, held: this.inventory()
               })
-              operation = await this.store(operation)
-              this.ledger.finish(id, 'failed', `部分批次已按实际消耗产出销账：${error.message}`)
-              this.debug('controller.partial_batch_settled', {
+              this.debug('controller.partial_batch_pending_recovery', {
                 operationId: id,
-                consumed: this.summarizeAmounts(consumed),
-                produced: this.summarizeAmounts(error.produced)
+                stepId: operation.data.pending.stepId,
+                consumed: this.summarizeAmounts(error.consumed),
+                produced: this.summarizeAmounts(error.produced),
+                progressBefore: operation.data.pending.progressBefore,
+                progressAfter: operation.data.pending.progressAfter
               })
             } else if (operation.phase === 'ready' && !this.hasInventoryResidue()) {
               this.ledger.finish(id, 'failed', error.message)
-            } else this.ledger.markRecovery(id, error.message, { ...operation.data, held: this.inventory() })
+            } else this.ledger.markRecovery(id, error.message, {
+              ...operation.data, recoveryPhase: operation.phase, held: this.inventory()
+            })
           } catch (cleanupError) {
             this.debug('controller.failure_cleanup_error', { operationId: id, message: cleanupError.message })
-            this.ledger.markRecovery(id, `${error.message}; ${cleanupError.message}`, this.ledger.get(id).data)
+            const current = this.ledger.get(id)
+            this.ledger.markRecovery(id, `${error.message}; ${cleanupError.message}`, {
+              ...current.data, recoveryPhase: current.data.recoveryPhase || current.phase
+            })
           }
           throw error
         }
@@ -552,6 +671,17 @@ class CraftController {
             operationId: recovered.operationId || null,
             diffRegistered: Boolean(recovered.diffRegistered)
           })
+            // A normal craft error is terminal for this request. Recovery has
+            // already reconciled the physical items, so release the old
+            // reservation instead of leaving a resumable journal that blocks
+            // the warehouse. Death/disconnect cancellations bypass this branch
+            // and are resumed by the service lifecycle hooks.
+            if (recovered.status === 'resumable' && recovered.operationId) {
+              const reconciled = this.ledger.get(recovered.operationId)
+              if (reconciled && !['completed', 'complete', 'failed'].includes(reconciled.state)) {
+                this.ledger.finish(recovered.operationId, 'failed', `合成失败后已完成实物恢复：${error.message}`)
+              }
+            }
         } catch (recoverError) {
           this.debug('controller.auto_recovery_failure', { message: recoverError.message })
           if (recoverError?.cancelled || abort.signal.aborted) {
@@ -562,6 +692,143 @@ class CraftController {
             // 记录保留但恢复已尽力，spawn/重连钩子会再试。给调用方完整链路。
             error.message = `${error.message}；自动恢复未完成（留待重连或人工执行 !合成恢复）：${recoverError.message}`
           }
+        }
+      }
+      throw error
+    } finally {
+      if (this.active === lease) this.active = null
+    }
+  }
+
+  // Continue a journal that recovery proved safe to resume. The operation id
+  // and its reservations are reused; no new planning or warehouse reservation
+  // is created, so a confirmed batch cannot be charged twice.
+  async resume (operationId, onProgress) {
+    if (this.active) throw new Error('合成任务尚未结束。')
+    const id = String(operationId || '')
+    let operation = this.ledger.get(id)
+    if (!operation || operation.botId !== this.botId) throw new Error('找不到可续跑的原合成订单。')
+    if (operation.state === 'completed' || operation.state === 'complete') return { status: 'complete', operationId: id, target: operation.target }
+    const plan = operation.data?.plan
+    if (!plan || !Array.isArray(plan.craftSteps)) throw new Error('原合成订单缺少可续跑的合成计划。')
+    const saved = operation.data.progress
+    if (operation.phase !== 'ready' || operation.data.pending || operation.data.held?.length) {
+      throw new Error('原合成订单尚未完成安全恢复，不能继续执行。')
+    }
+    if (!saved || !Number.isSafeInteger(saved.stepIndex) || !Number.isSafeInteger(saved.nextTrigger) ||
+      saved.stepIndex > plan.craftSteps.length ||
+      (saved.stepIndex < plan.craftSteps.length && saved.nextTrigger > plan.craftSteps[saved.stepIndex].times)) {
+      throw new Error('原合成订单缺少有效的续跑位置，不能继续执行。')
+    }
+    const start = saved
+    const abort = new AbortController()
+    const lease = { abort }
+    this.active = lease
+    const deadline = Date.now() + (Number(plan.budgetMs) || Number(this.config?.craft?.timeoutMs) || 1200000)
+    const check = () => {
+      if (abort.signal.aborted) throw abort.signal.reason
+      if (Date.now() >= deadline) throw new Error('合成任务超时。')
+    }
+    const request = { owner: operation.owner, actor: operation.actor, onProgress }
+    try {
+      return await this.warehouse.withWarehouseLock(async () => {
+        const resumeData = { ...operation.data }
+        delete resumeData.recoveryIntent
+        delete resumeData.recoveryBaseline
+        delete resumeData.recoveryPhase
+        delete resumeData.recoveryReconciled
+        operation = this.ledger.checkpoint(id, 'ready', resumeData)
+        await this.validateOwner?.(operation.owner, operation.actor)
+        await this.settleResidue(check)
+        this.assertCleanInventory()
+        await this.warehouse.goHomeIfAway()
+        for (let index = start.stepIndex; index < plan.craftSteps.length; index++) {
+          const step = plan.craftSteps[index]
+          let trigger = index === start.stepIndex ? start.nextTrigger : 0
+          while (trigger < step.times) {
+            check()
+            this.assertCleanInventory()
+            const remaining = step.times - trigger
+            const heldAllocations = this.ledger.listCraftReservations(id)
+              .map(row => ({ ...this.db.getItemByKey(row.itemKey), amount: row.amount }))
+              .sort((a, b) => a.itemKey.localeCompare(b.itemKey))
+            const triggers = Math.min(this.maxTriggersPerBatch(step, heldAllocations, remaining), remaining)
+            const inputs = this.allocate(step.inputs.map(input => ({ name: input.names[0], quantity: input.count * triggers })), heldAllocations)
+            const stepId = `${index}:${trigger}+${triggers}`
+            const progressBefore = { stepIndex: index, nextTrigger: trigger }
+            const progressAfter = trigger + triggers >= step.times
+              ? { stepIndex: index + 1, nextTrigger: 0 }
+              : { stepIndex: index, nextTrigger: trigger + triggers }
+            const data = { ...operation.data, held: [], pending: null, physicalTotals: this.physicalTotals(), inputs,
+              stepIndex: index, trigger, progress: progressBefore }
+            operation = this.ledger.checkpoint(id, 'withdrawing', data)
+            await this.warehouse.withdrawAllocationsLocked(inputs, { requireServerEvidence: true })
+            const before = this.inventory()
+            if (!same(before, inputs)) throw new Error('仓库原料取出失败或不足。')
+            check()
+            const intent = this.executor.preview ? this.executor.preview(step, triggers) : {
+              expectedConsumed: before,
+              expectedProduced: [{ itemId: `minecraft:${step.result.name}`, amount: step.result.count * triggers }]
+            }
+            operation = this.ledger.checkpoint(id, 'crafting', { ...data, held: before,
+              physicalTotals: this.physicalTotals(), pending: { stepId, before, ...intent, triggers, progressBefore, progressAfter } })
+            try {
+              const result = await this.executor.execute({ step, triggers, signal: abort.signal, deadline, operationId: id, stepId })
+              if (!same(result.before, before) || !same(result.after, this.inventory())) throw new Error('合成前后物品证据不一致。')
+              operation = this.ledger.confirm(id, stepId, result.consumed, result.produced, {
+                ...operation.data, before: result.before, after: result.after, held: result.after, pending: null,
+                progress: progressAfter, physicalTotals: this.physicalTotals()
+              })
+              operation = await this.store(operation)
+              onProgress?.({ index, trigger: trigger + triggers, steps: plan.craftSteps.length })
+              trigger += triggers
+            } catch (error) {
+              operation = this.ledger.get(id)
+              const interrupted = abort.signal.aborted &&
+                (error === abort.signal.reason || error?.message === abort.signal.reason?.message)
+              if (error.partial && operation?.data?.pending && !interrupted) {
+                this.debug('controller.resume_partial_pending_reconciliation', {
+                  operationId: id,
+                  stepId: operation.data.pending.stepId,
+                  consumed: this.summarizeAmounts(error.consumed),
+                  produced: this.summarizeAmounts(error.produced),
+                  progressBefore: operation.data.pending.progressBefore,
+                  progressAfter: operation.data.pending.progressAfter
+                })
+              }
+              this.ledger.markRecovery(id, error.message, {
+                ...operation.data, recoveryPhase: operation.phase, held: this.inventory()
+              })
+              throw error
+            }
+          }
+        }
+        this.assertCleanInventory()
+        const targetId = `minecraft:${plan.target.name}`
+        const ownerTarget = this.db.getOwnerBalances(operation.owner.uuid).filter(item => item.itemId === targetId).reduce((sum, item) => sum + item.amount, 0)
+        const physicalTarget = this.physicalTotals().filter(item => item.itemId === targetId).reduce((sum, item) => sum + item.amount, 0)
+        if (ownerTarget < plan.target.quantity || physicalTarget < plan.target.quantity) throw new Error('合成结束时目标库存未达到请求数量。')
+        operation = this.ledger.finish(id, 'complete')
+        return { status: 'complete', operationId: id, target: operation.target }
+      })
+    } catch (error) {
+      // Resume has already passed recovery's evidence checks, but navigation,
+      // withdrawal, preview or the final return can still fail transiently.
+      // Keep the original reservation and cursor durable so the next spawn or
+      // explicit recovery can retry from the last confirmed batch.
+      const current = this.ledger.get(id)
+      if (current && !['completed', 'complete', 'failed'].includes(current.state)) {
+        try {
+          this.ledger.markRecovery(id, error.message, {
+            ...current.data,
+            recoveryPhase: current.data.recoveryPhase || current.phase,
+            held: this.inventory()
+          })
+        } catch (journalError) {
+          this.debug('controller.resume_recovery_journal_failure', {
+            operationId: id,
+            message: journalError.message
+          })
         }
       }
       throw error
@@ -702,7 +969,8 @@ class CraftController {
     if (!saved) {
       operation = this.ledger.checkpoint(operation.id, operation.phase, { ...operation.data, recoveryIntent: {
         phase: operation.data.recoveryPhase || operation.phase,
-        baseline, pending: operation.data.pending || null, observed: this.inventory()
+        baseline, pending: operation.data.pending || null, observed: this.inventory(),
+        progress: operation.data.progress || null
       } })
     }
     const intent = operation.data.recoveryIntent
@@ -727,14 +995,71 @@ class CraftController {
     if (!same(actual, depositBaseline)) throw mismatch('合成回库实物总量校验失败。')
     const pending = intent.pending
     let conversion = false
+    let partialConversion = false
+    let completedTriggers = 0
     if (intent.phase === 'crafting' || pending) {
       if (!pending) throw new Error('恢复记录缺少合成意图。')
-      if (same(actual, baseline)) {
-        // The inputs were returned unchanged: no conversion to book.
-      } else if (pending.expectedProduced.every(item => item.itemKey) &&
-        same(actual, converted(baseline, pending.expectedConsumed, pending.expectedProduced)) &&
-        same(intent.observed, pending.expectedProduced)) conversion = true
-      else {
+      const triggers = Number(pending.triggers)
+      let provenProgress = null
+      let stateProven = false
+      const canScale = Number.isSafeInteger(triggers) && triggers > 0 &&
+        Array.isArray(pending.expectedConsumed) && Array.isArray(pending.expectedProduced) &&
+        pending.expectedConsumed.every(item => item?.itemKey && item.itemId && Number.isSafeInteger(item.amount) && item.amount > 0) &&
+        pending.expectedProduced.every(item => item?.itemKey && item.itemId && Number.isSafeInteger(item.amount) && item.amount > 0 && item.amount % triggers === 0) &&
+        pending.progressBefore && Number.isSafeInteger(pending.progressBefore.stepIndex) &&
+        Number.isSafeInteger(pending.progressBefore.nextTrigger)
+      if (canScale) {
+        const matches = []
+        for (let done = 0; done <= triggers; done++) {
+          const produced = scaledProducedItems(pending.expectedProduced, triggers, done)
+          const consumed = deriveObservedConsumption(pending.before, intent.observed, produced,
+            pending.expectedConsumed, triggers, done)
+          if (!consumed || !produced) continue
+          const expectedInventory = converted(pending.before, consumed, produced)
+          if (!same(actual, converted(baseline, consumed, produced)) || !same(intent.observed, expectedInventory)) continue
+          const absoluteTrigger = pending.progressBefore.nextTrigger + done
+          const step = operation.data.plan?.craftSteps?.[pending.progressBefore.stepIndex]
+          const progress = step && absoluteTrigger >= step.times
+            ? { stepIndex: pending.progressBefore.stepIndex + 1, nextTrigger: 0 }
+            : { stepIndex: pending.progressBefore.stepIndex, nextTrigger: absoluteTrigger }
+          matches.push({ done, consumed, produced, progress })
+        }
+        if (matches.length === 1) {
+          const match = matches[0]
+          stateProven = true
+          completedTriggers = match.done
+          provenProgress = match.progress
+          conversion = match.done === triggers
+          partialConversion = match.done > 0 && match.done < triggers
+          pending.recoveryConsumed = match.consumed
+          pending.recoveryProduced = match.produced
+        }
+        this.debug('controller.recovery_progress_match', {
+          operationId: operation.id,
+          candidateCount: matches.length,
+          completedTriggers: matches.length === 1 ? matches[0].done : null
+        })
+      } else {
+        this.debug('controller.recovery_candidate_rejected', {
+          operationId: operation.id,
+          triggers,
+          expectedConsumed: this.summarizeItems(pending.expectedConsumed || []),
+          expectedProduced: this.summarizeItems(pending.expectedProduced || [])
+        })
+      }
+      if (!stateProven && same(actual, baseline) && same(intent.observed, pending.before)) {
+        stateProven = true
+        completedTriggers = 0
+        provenProgress = pending.progressBefore || intent.progress || operation.data.progress || null
+      }
+      if (!stateProven && same(actual, converted(baseline, pending.expectedConsumed, pending.expectedProduced)) &&
+        same(intent.observed, pending.expectedProduced)) {
+        stateProven = true
+        conversion = true
+        completedTriggers = Number.isSafeInteger(triggers) ? triggers : 0
+        provenProgress = pending.progressAfter || intent.progress || operation.data.progress || null
+      }
+      if (!stateProven) {
         this.debug('controller.recovery_mismatch', {
           operationId: operation.id,
           baseline: this.summarizeItems(baseline),
@@ -745,8 +1070,46 @@ class CraftController {
         })
         throw mismatch('无法确认中断合成的实际消耗和产出；已回库，需要同步核对。')
       }
+      pending.recoveryProgress = provenProgress
     } else if (!same(actual, baseline)) throw mismatch('中断取存的实物与记录不一致，需要同步核对。')
     check()
+    const resumable = Array.isArray(operation.data.plan?.craftSteps) &&
+      operation.data.progress && Number.isSafeInteger(operation.data.progress.stepIndex) &&
+      Number.isSafeInteger(operation.data.progress.nextTrigger)
+    if (resumable && (intent.phase === 'withdrawing' || intent.phase === 'crafting' || !pending)) {
+      // Keep the journal open. A safe unchanged withdrawal is retried from its
+      // original cursor; a proven conversion is committed above and resumes
+      // from the cursor after that batch. Unknown deltas never reach here.
+      const nextProgress = pending?.recoveryProgress ||
+        (conversion ? (pending.progressAfter || operation.data.progress) : (pending?.progressBefore || operation.data.progress))
+      this.ledger.transaction(() => {
+        if (conversion || partialConversion) {
+          operation = this.ledger.checkpoint(operation.id, 'crafting', { ...operation.data, held: pending.before, pending })
+          if (partialConversion) {
+            operation = this.ledger.confirmPartial(operation.id, pending.stepId,
+              pending.recoveryConsumed, pending.recoveryProduced, {
+                ...operation.data, before: pending.before, after: intent.observed, held: intent.observed,
+                pending: null, progress: nextProgress, physicalTotals: actual
+              })
+          } else {
+            operation = this.ledger.confirm(operation.id, pending.stepId, pending.expectedConsumed, intent.observed, {
+              ...operation.data, before: pending.before, after: intent.observed, held: [], pending: null,
+              progress: nextProgress, physicalTotals: actual, recovery: true
+            })
+          }
+        }
+        operation = this.ledger.checkpoint(operation.id, 'ready', { ...operation.data, held: [], pending: null,
+          progress: nextProgress, physicalTotals: actual, recoveryReconciled: true })
+      })
+      this.debug('controller.recovery_resumable', {
+        operationId: operation.id,
+        conversionConfirmed: conversion,
+        partialConversion,
+        completedTriggers,
+        progress: nextProgress
+      })
+      return { status: 'resumable', operationId: operation.id, ...nextProgress, conversionConfirmed: conversion }
+    }
     // A crash/finish failure must not leave a committed conversion with the old
     // pre-conversion recovery intent. Roll back all ledger changes together.
     this.ledger.transaction(() => {

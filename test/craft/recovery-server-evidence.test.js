@@ -18,11 +18,14 @@ function fixture (options = {}) {
   const config = structuredClone(DEFAULT_CONFIG)
   const catalog = new ItemCatalog(config.server.version, {}, { serverEnchantmentsFile: '/missing-test-mappings.json' })
   const Item = require('prismarine-item')(catalog.mcData)
-  const make = (name, count) => new Item(catalog.mcData.itemsByName[name].id, count)
-  const before = catalog.aggregatePrismarineItems([make('oak_planks', 2)])
-  const products = catalog.aggregatePrismarineItems([make('stick', 4)])
-  let inventory = options.ready ? [] : (options.held ? options.held.map(value => make(value.name, value.count)) : [make('stick', 4)])
-  let stored = options.ready ? [make('oak_planks', 2)] : []
+  const make = (name, count, nbt = null) => new Item(catalog.mcData.itemsByName[name].id, count, 0, nbt)
+  const inputItems = options.inputItems || [{ name: 'oak_planks', count: 2 }]
+  const productItems = options.productItems || [{ name: 'stick', count: 4 }]
+  const toItems = values => values.map(value => make(value.name, value.count, value.nbt || null))
+  const before = catalog.aggregatePrismarineItems(toItems(inputItems))
+  const products = catalog.aggregatePrismarineItems(toItems(productItems))
+  let inventory = options.ready ? [] : toItems(options.observedItems || options.held || productItems)
+  let stored = options.ready ? toItems(inputItems) : []
   const db = new StoreDb(':memory:', config)
   const chest = { chestId: '0,64,0', x: 0, y: 64, z: 0, blockName: 'barrel' }
   db.upsertChest(chest)
@@ -32,8 +35,21 @@ function fixture (options = {}) {
   ledger.begin({ id, botId: 'bot-a', owner: { uuid: 'alice', username: 'Alice' }, actor: 'Alice', allocations: before,
     data: options.ready ? { held: [], pending: null, physicalTotals: before, stepIndex: 0 } : undefined })
   const data = {
-    held: products, pending: { stepId: '0:0', before, expectedConsumed: before, expectedProduced: products },
-    physicalTotals: options.physicalTotals || before, stepIndex: 0
+    held: products,
+    pending: {
+      stepId: options.stepId || '0:0',
+      before,
+      expectedConsumed: options.expectedConsumed || before,
+      expectedProduced: options.expectedProduced || products,
+      ...(options.triggers ? { triggers: options.triggers } : {}),
+      ...(options.progressBefore ? { progressBefore: options.progressBefore } : {}),
+      ...(options.progressAfter ? { progressAfter: options.progressAfter } : {})
+    },
+    physicalTotals: options.physicalTotals || before,
+    stepIndex: 0,
+    ...(options.recoveryPhase ? { recoveryPhase: options.recoveryPhase } : {}),
+    ...(options.progress ? { progress: options.progress } : {}),
+    ...(options.plan ? { plan: options.plan } : {})
   }
   if (!options.ready) {
     ledger.checkpoint(id, 'crafting', { ...data, held: before })
@@ -67,7 +83,7 @@ function fixture (options = {}) {
       return { deposited: stored, leftover: [], stopReason: '' }
     }
   }
-  const controller = new CraftController({ bot, db, catalog, config, warehouse, ledger, executor: { isBusy: () => false, cancel: () => {} }, botId: 'bot-a' })
+  const controller = new CraftController({ bot, db, catalog, config, warehouse, ledger, executor: { isBusy: () => false, cancel: () => {} }, botId: 'bot-a', debugCraft: options.debugCraft })
   return {
     db, bot, ledger, controller, before, products, chest, warehouse,
     deposits: () => deposits,
@@ -140,6 +156,98 @@ test('recovery returns unchanged inputs without a conversion when nothing reache
     assert.equal(f.confirmed(), 0)
     assert.equal(f.db.getBalance('alice', f.before[0].itemKey), 2)
     assert.equal(f.ledger.pending().length, 0)
+  } finally { f.close() }
+})
+
+test('recovery keeps the original reservation and resumes an unchanged interrupted batch', async () => {
+  const f = fixture({ held: [{ name: 'oak_planks', count: 2 }] })
+  try {
+    const progressBefore = { stepIndex: 0, nextTrigger: 0 }
+    const progressAfter = { stepIndex: 1, nextTrigger: 0 }
+    const plan = { target: { name: 'stick', quantity: 4 }, craftSteps: [{ times: 1 }] }
+    f.ledger.checkpoint('craft:server-evidence', 'crafting', {
+      held: f.before,
+      pending: { stepId: '0:0+1', before: f.before, expectedConsumed: f.before,
+        expectedProduced: f.products, triggers: 1, progressBefore, progressAfter },
+      physicalTotals: f.before,
+      stepIndex: 0,
+      trigger: 0,
+      progress: progressBefore,
+      plan
+    })
+    const reservationsBefore = f.ledger.listCraftReservations('craft:server-evidence')
+
+    const result = await f.controller.recover()
+
+    assert.equal(result.status, 'resumable')
+    assert.equal(result.operationId, 'craft:server-evidence')
+    assert.deepEqual(f.ledger.getCraftProgress('craft:server-evidence'), progressBefore)
+    assert.deepEqual(f.ledger.listCraftReservations('craft:server-evidence'), reservationsBefore)
+    assert.equal(f.confirmed(), 0)
+    assert.equal(f.ledger.pending().length, 1)
+  } finally { f.close() }
+})
+
+test('recovery atomically confirms a proven batch and resumes after it', async () => {
+  const f = fixture({})
+  try {
+    const progressBefore = { stepIndex: 0, nextTrigger: 0 }
+    const progressAfter = { stepIndex: 1, nextTrigger: 0 }
+    const plan = { target: { name: 'stick', quantity: 4 }, craftSteps: [{ times: 1 }] }
+    f.ledger.checkpoint('craft:server-evidence', 'crafting', {
+      held: f.before,
+      pending: { stepId: '0:0+1', before: f.before, expectedConsumed: f.before,
+        expectedProduced: f.products, triggers: 1, progressBefore, progressAfter },
+      physicalTotals: f.before,
+      stepIndex: 0,
+      trigger: 0,
+      progress: progressBefore,
+      plan
+    })
+
+    const result = await f.controller.recover()
+
+    assert.equal(result.status, 'resumable')
+    assert.equal(result.operationId, 'craft:server-evidence')
+    assert.deepEqual(f.ledger.getCraftProgress('craft:server-evidence'), progressAfter)
+    assert.equal(f.confirmed(), 1)
+    assert.equal(f.db.getBalance('alice', f.before[0].itemKey), 0)
+    assert.equal(f.db.getBalance('alice', f.products[0].itemKey), 4)
+    assert.equal(f.ledger.pending().length, 1)
+  } finally { f.close() }
+})
+
+test('recovery resumes a proven partial batch when NBT variants were consumed unevenly', async () => {
+  const nbtA = { display: { Name: 'variant A' } }
+  const nbtB = { display: { Name: 'variant B' } }
+  const inputItems = [
+    { name: 'oak_planks', count: 15, nbt: nbtA },
+    { name: 'oak_planks', count: 5, nbt: nbtB }
+  ]
+  const productItems = [{ name: 'stick', count: 40 }]
+  const observedItems = [
+    { name: 'oak_planks', count: 1, nbt: nbtA },
+    { name: 'oak_planks', count: 5, nbt: nbtB },
+    { name: 'stick', count: 28 }
+  ]
+  const progressBefore = { stepIndex: 0, nextTrigger: 0 }
+  const plan = {
+    target: { name: 'stick', quantity: 40 },
+    craftSteps: [{ times: 10, result: { name: 'stick', count: 4 }, inputs: [{ names: ['oak_planks'], count: 2 }] }]
+  }
+  const events = []
+  const f = fixture({ inputItems, productItems, observedItems, triggers: 10, recoveryPhase: 'crafting',
+    stepId: '0:0+10', progressBefore, progress: progressBefore, plan,
+    debugCraft: (event, details) => events.push({ event, details }) })
+  try {
+    const result = await f.controller.recover()
+
+    assert.equal(result.status, 'resumable', JSON.stringify(events))
+    assert.equal(result.nextTrigger, 7)
+    const batch = f.db.db.prepare('SELECT consumed_json AS consumed, produced_json AS produced FROM craft_batches').get()
+    assert.deepEqual(JSON.parse(batch.consumed).map(item => [item.itemKey, item.amount]).sort(), [[f.before[0].itemKey, 14]].sort())
+    assert.equal(JSON.parse(batch.produced)[0].amount, 28)
+    assert.equal(f.ledger.pending().length, 1)
   } finally { f.close() }
 })
 

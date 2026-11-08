@@ -124,6 +124,18 @@ class CraftLedger {
     const stepIndex = Number(next.stepIndex)
     if (strict && (!Number.isSafeInteger(stepIndex) || stepIndex < 0)) throw new Error('craft operation stepIndex must be a nonnegative safe integer')
     next.stepIndex = Number.isSafeInteger(stepIndex) && stepIndex >= 0 ? stepIndex : 0
+    if (Object.hasOwn(next, 'progress') && next.progress != null) {
+      if (!next.progress || typeof next.progress !== 'object' || Array.isArray(next.progress)) {
+        throw new Error('craft operation progress must be an object or null')
+      }
+      const progressStep = Number(next.progress.stepIndex)
+      const nextTrigger = Number(next.progress.nextTrigger)
+      if (!Number.isSafeInteger(progressStep) || progressStep < 0 ||
+        !Number.isSafeInteger(nextTrigger) || nextTrigger < 0) {
+        throw new Error('craft operation progress must contain nonnegative safe integers')
+      }
+      next.progress = { ...next.progress, stepIndex: progressStep, nextTrigger }
+    }
     return next
   }
 
@@ -226,6 +238,10 @@ class CraftLedger {
         FROM inventory_reservations r WHERE r.owner_uuid = b.owner_uuid AND r.item_key = b.item_key), 0) > 0
       ORDER BY i.item_id, i.created_at
     `).all(String(ownerUuid || ''))
+  }
+
+  getCraftProgress (id) {
+    return clone(this.getCraftOperation(id)?.data?.progress || null)
   }
 
   checkpointCraftOperation (id, phase, data) {
