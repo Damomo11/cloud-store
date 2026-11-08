@@ -33,16 +33,61 @@ function converted (before, consumed, produced) {
   return merge([...result.values(), ...produced])
 }
 
-function scaledItems (values, totalTriggers, completedTriggers) {
+function scaledProducedItems (values, totalTriggers, completedTriggers) {
   if (!Number.isSafeInteger(totalTriggers) || totalTriggers <= 0 ||
     !Number.isSafeInteger(completedTriggers) || completedTriggers < 0 || completedTriggers > totalTriggers) return null
   const result = []
   for (const value of values || []) {
-    if (!Number.isSafeInteger(value.amount) || value.amount % totalTriggers !== 0) return null
+    if (!value?.itemKey || !value.itemId || !Number.isSafeInteger(value.amount) || value.amount <= 0 || value.amount % totalTriggers !== 0) return null
     const amount = (value.amount / totalTriggers) * completedTriggers
     if (amount > 0) result.push({ ...value, amount })
   }
   return result
+}
+
+// Input variants are allocated by concrete itemKey, so their counts do not
+// necessarily divide evenly across a batch. Derive gross consumption from the
+// observed inventory equation instead of inventing a proportional split.
+function deriveObservedConsumption (before, observed, produced, expectedConsumed, totalTriggers, completedTriggers) {
+  if (!Number.isSafeInteger(totalTriggers) || totalTriggers <= 0 ||
+    !Number.isSafeInteger(completedTriggers) || completedTriggers < 0 || completedTriggers > totalTriggers) return null
+  const beforeByKey = new Map(merge(before).map(item => [item.itemKey, item]))
+  const observedByKey = new Map(merge(observed).map(item => [item.itemKey, item]))
+  const producedByKey = new Map(merge(produced).map(item => [item.itemKey, item]))
+  const expectedByKey = new Map(merge(expectedConsumed).map(item => [item.itemKey, item]))
+  const consumed = []
+  const keys = new Set([...beforeByKey.keys(), ...observedByKey.keys(), ...producedByKey.keys()])
+  for (const itemKey of keys) {
+    const baseline = beforeByKey.get(itemKey)
+    const output = producedByKey.get(itemKey)
+    const current = observedByKey.get(itemKey)
+    const amount = (baseline?.amount || 0) + (output?.amount || 0) - (current?.amount || 0)
+    if (!Number.isSafeInteger(amount) || amount < 0) return null
+    if (!amount) continue
+    const expected = expectedByKey.get(itemKey)
+    if (!baseline || !expected || amount > baseline.amount || amount > expected.amount ||
+      (expected.itemId && baseline.itemId && expected.itemId !== baseline.itemId)) return null
+    consumed.push({ ...baseline, amount })
+  }
+
+  const expectedById = new Map()
+  for (const item of expectedConsumed || []) {
+    if (!item?.itemKey || !item.itemId || !Number.isSafeInteger(item.amount) || item.amount <= 0) return null
+    const total = (expectedById.get(item.itemId) || 0) + item.amount
+    if (!Number.isSafeInteger(total)) return null
+    expectedById.set(item.itemId, total)
+  }
+  const consumedById = new Map()
+  for (const item of consumed) {
+    const total = (consumedById.get(item.itemId) || 0) + item.amount
+    if (!Number.isSafeInteger(total)) return null
+    consumedById.set(item.itemId, total)
+  }
+  for (const [itemId, total] of expectedById) {
+    if (total % totalTriggers !== 0 || (consumedById.get(itemId) || 0) !== (total / totalTriggers) * completedTriggers) return null
+  }
+  for (const itemId of consumedById.keys()) if (!expectedById.has(itemId)) return null
+  return consumed
 }
 
 // 合成失败自动恢复的兜底时限：断线后底层网络调用可能不再返回，与其无限
@@ -959,15 +1004,17 @@ class CraftController {
       let stateProven = false
       const canScale = Number.isSafeInteger(triggers) && triggers > 0 &&
         Array.isArray(pending.expectedConsumed) && Array.isArray(pending.expectedProduced) &&
-        pending.expectedConsumed.every(item => Number.isSafeInteger(item.amount) && item.amount % triggers === 0) &&
-        pending.expectedProduced.every(item => item.itemKey && Number.isSafeInteger(item.amount) && item.amount % triggers === 0) &&
+        pending.expectedConsumed.every(item => item?.itemKey && item.itemId && Number.isSafeInteger(item.amount) && item.amount > 0) &&
+        pending.expectedProduced.every(item => item?.itemKey && item.itemId && Number.isSafeInteger(item.amount) && item.amount > 0 && item.amount % triggers === 0) &&
         pending.progressBefore && Number.isSafeInteger(pending.progressBefore.stepIndex) &&
         Number.isSafeInteger(pending.progressBefore.nextTrigger)
       if (canScale) {
         const matches = []
         for (let done = 0; done <= triggers; done++) {
-          const consumed = scaledItems(pending.expectedConsumed, triggers, done)
-          const produced = scaledItems(pending.expectedProduced, triggers, done)
+          const produced = scaledProducedItems(pending.expectedProduced, triggers, done)
+          const consumed = deriveObservedConsumption(pending.before, intent.observed, produced,
+            pending.expectedConsumed, triggers, done)
+          if (!consumed || !produced) continue
           const expectedInventory = converted(pending.before, consumed, produced)
           if (!same(actual, converted(baseline, consumed, produced)) || !same(intent.observed, expectedInventory)) continue
           const absoluteTrigger = pending.progressBefore.nextTrigger + done
@@ -987,6 +1034,18 @@ class CraftController {
           pending.recoveryConsumed = match.consumed
           pending.recoveryProduced = match.produced
         }
+        this.debug('controller.recovery_progress_match', {
+          operationId: operation.id,
+          candidateCount: matches.length,
+          completedTriggers: matches.length === 1 ? matches[0].done : null
+        })
+      } else {
+        this.debug('controller.recovery_candidate_rejected', {
+          operationId: operation.id,
+          triggers,
+          expectedConsumed: this.summarizeItems(pending.expectedConsumed || []),
+          expectedProduced: this.summarizeItems(pending.expectedProduced || [])
+        })
       }
       if (!stateProven && same(actual, baseline) && same(intent.observed, pending.before)) {
         stateProven = true
