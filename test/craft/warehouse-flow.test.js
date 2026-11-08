@@ -203,6 +203,152 @@ test('100 pistons use one warehouse batch and one return while the executor rece
   } finally { f.db.close() }
 })
 
+test('resets the craft timeout after each confirmed batch so long orders can continue', async () => {
+  const { CraftController } = require('../../src/craft/controller')
+  const f = fixture()
+  const originalNow = Date.now
+  let now = 1000
+  Date.now = () => now
+  try {
+    f.config.craft.timeoutMs = 50
+    f.seed('alice', 'oak_planks', 6)
+    const controller = new CraftController({ ...f, botId: 'bot-a' })
+    const originalBudget = controller.maxTriggersPerBatch.bind(controller)
+    controller.maxTriggersPerBatch = (...args) => Math.min(1, originalBudget(...args))
+    const execute = f.executor.execute
+    f.executor.execute = async args => {
+      now += 30
+      return execute(args)
+    }
+
+    const result = await controller.run({
+      actor: 'Alice',
+      owner: { uuid: 'alice', username: 'Alice', scope: 'personal' },
+      item: 'stick',
+      quantity: 12
+    })
+
+    assert.equal(result.status, 'complete')
+    assert.equal(f.db.getOwnerItemsByItemId('alice', 'minecraft:stick')[0].amount, 12)
+  } finally {
+    Date.now = originalNow
+    f.db.close()
+  }
+})
+
+test('does not start another batch when returning the confirmed batch exceeds its timeout', async () => {
+  const { CraftController } = require('../../src/craft/controller')
+  const f = fixture()
+  const originalNow = Date.now
+  let now = 1000
+  Date.now = () => now
+  try {
+    f.config.craft.timeoutMs = 50
+    f.seed('alice', 'oak_planks', 6)
+    const controller = new CraftController({ ...f, botId: 'bot-a' })
+    controller.maxTriggersPerBatch = () => 1
+    const deposit = f.warehouse.depositAllPossible
+    f.warehouse.depositAllPossible = async (...args) => {
+      const result = await deposit(...args)
+      now += 51
+      return result
+    }
+
+    await assert.rejects(controller.run({
+      actor: 'Alice',
+      owner: { uuid: 'alice', username: 'Alice', scope: 'personal' },
+      item: 'stick',
+      quantity: 12
+    }), /合成任务超时/)
+
+    assert.equal(f.db.getBalance('alice', f.db.getOwnerItemsByItemId('alice', 'minecraft:stick')[0]?.itemKey || ''), 4)
+    assert.equal(f.db.getOwnerItemsByItemId('alice', 'minecraft:stick').reduce((sum, item) => sum + item.amount, 0), 4)
+    assert.equal(f.db.getOwnerItemsByItemId('alice', 'minecraft:oak_planks').reduce((sum, item) => sum + item.amount, 0), 4)
+    assert.equal(f.counts().withdrawCalls, 1)
+  } finally {
+    Date.now = originalNow
+    f.db.close()
+  }
+})
+
+test('resets the craft timeout between resumed batches', async () => {
+  const { CraftController } = require('../../src/craft/controller')
+  const f = fixture()
+  const originalNow = Date.now
+  let now = 1000
+  Date.now = () => now
+  try {
+    f.config.craft.timeoutMs = 50
+    f.seed('alice', 'oak_planks', 6)
+    let controller
+    const execute = f.executor.execute
+    f.executor.execute = async args => {
+      now += 30
+      return execute(args)
+    }
+    controller = new CraftController({ ...f, botId: 'bot-a' })
+    controller.maxTriggersPerBatch = () => 1
+
+    await assert.rejects(controller.run({
+      actor: 'Alice',
+      owner: { uuid: 'alice', username: 'Alice', scope: 'personal' },
+      item: 'stick',
+      quantity: 12,
+      onProgress: () => controller.cancel('death between batches')
+    }), /death between batches/)
+    const recovered = await controller.recover()
+    assert.equal(recovered.status, 'resumable')
+    assert.deepEqual(controller.ledger.get(recovered.operationId).data.progress, { stepIndex: 0, nextTrigger: 1 })
+
+    f.executor.execute = async args => {
+      now += 30
+      return execute(args)
+    }
+    const result = await controller.resume(recovered.operationId)
+
+    assert.equal(result.status, 'complete')
+    assert.equal(result.operationId, recovered.operationId)
+    assert.equal(f.db.getOwnerItemsByItemId('alice', 'minecraft:stick')[0].amount, 12)
+    assert.equal(controller.ledger.pending('bot-a').length, 0)
+  } finally {
+    Date.now = originalNow
+    f.db.close()
+  }
+})
+
+test('does not commit a late executor result after cancellation', async () => {
+  const { CraftController } = require('../../src/craft/controller')
+  const f = fixture()
+  let entered
+  let release
+  const started = new Promise(resolve => { entered = resolve })
+  const gate = new Promise(resolve => { release = resolve })
+  try {
+    f.seed('alice', 'oak_planks', 2)
+    let controller
+    const execute = f.executor.execute
+    f.executor.execute = async args => {
+      entered()
+      await gate
+      return execute(args)
+    }
+    controller = new CraftController({ ...f, botId: 'bot-a' })
+    const running = controller.run({
+      actor: 'Alice',
+      owner: { uuid: 'alice', username: 'Alice', scope: 'personal' },
+      item: 'stick',
+      quantity: 4
+    })
+    await started
+    controller.cancel('断线取消')
+    release()
+
+    await assert.rejects(running, /断线取消/)
+    assert.equal(f.db.getOwnerItemsByItemId('alice', 'minecraft:stick').length, 0)
+    assert.equal(controller.ledger.pending('bot-a').length, 1)
+  } finally { f.db.close() }
+})
+
 test('death recovery resumes the same order from its confirmed cursor without duplicate reservation', async () => {
   const { CraftController } = require('../../src/craft/controller')
   const f = fixture()
@@ -729,12 +875,11 @@ test('cancel after a confirmed batch returns that output and releases only safel
   try {
     f.seed('alice', 'oak_planks', 8)
     const controller = new CraftController({ ...f, botId: 'bot-a' })
-    const run = f.executor.execute
-    f.executor.execute = async args => { const result = await run(args); controller.cancel('cancel test'); return result }
     // 8 sticks = 2 triggers = one batch (4 planks withdrawn at once).
     // The cancel fires after the only batch confirmed and stored, so the run
     // has no remaining work to abort: it completes with the full output.
-    const result = await controller.run({ actor: 'Alice', owner: { uuid: 'alice' }, item: 'stick', quantity: 8 })
+    const result = await controller.run({ actor: 'Alice', owner: { uuid: 'alice' }, item: 'stick', quantity: 8,
+      onProgress: () => controller.cancel('cancel test') })
     assert.equal(result.status, 'complete')
     assert.equal(f.db.getOwnerItemsByItemId('alice', 'minecraft:stick')[0].amount, 8)
     // 8 planks seeded, 4 consumed by the single batch: 4 remain in stock.
@@ -744,24 +889,36 @@ test('cancel after a confirmed batch returns that output and releases only safel
   } finally { f.db.close() }
 })
 
-test('cancel between batches aborts the queued batch and returns already-crafted output', async () => {
+test('cancel between batches keeps confirmed progress resumable', async () => {
   const { CraftController } = require('../../src/craft/controller')
   const f = fixture()
   try {
     f.seed('alice', 'oak_planks', 4)
-    const controller = new CraftController({ ...f, botId: 'bot-a' })
-    const run = f.executor.execute
-    f.executor.execute = async args => { const result = await run(args); controller.cancel('cancel test'); return result }
-    // Quantity 8 needs 2 triggers of 2 planks; capacity allows 18 triggers per
-    // batch, so force a second batch by capping capacity through a crafted step.
-    const step = { inputs: [{ names: ['oak_planks'], count: 2 }], result: { name: 'stick', count: 4 }, requiresTable: false }
+    let controller
+    let cancelAfterDeposit = true
+    const deposit = f.warehouse.depositAllPossible
+    f.warehouse.depositAllPossible = async (...args) => {
+      const result = await deposit(...args)
+      if (cancelAfterDeposit) {
+        cancelAfterDeposit = false
+        controller.cancel('cancel test')
+      }
+      return result
+    }
+    controller = new CraftController({ ...f, botId: 'bot-a' })
+    // Force one trigger per batch so cancellation lands between two batches.
     const original = controller.maxTriggersPerBatch.bind(controller)
     controller.maxTriggersPerBatch = () => 1
     try {
       await assert.rejects(controller.run({ actor: 'Alice', owner: { uuid: 'alice' }, item: 'stick', quantity: 8 }), /cancel test/)
-      assert.equal(f.db.getOwnerItemsByItemId('alice', 'minecraft:stick')[0].amount, 4)
-      assert.equal(f.db.getOwnerItemsByItemId('alice', 'minecraft:oak_planks')[0].amount, 2)
       assert.deepEqual(f.getInventory(), [])
+      const recovered = await controller.recover()
+      assert.equal(recovered.status, 'resumable')
+      assert.deepEqual(controller.ledger.get(recovered.operationId).data.progress, { stepIndex: 0, nextTrigger: 1 })
+      const result = await controller.resume(recovered.operationId)
+      assert.equal(result.status, 'complete')
+      assert.equal(result.operationId, recovered.operationId)
+      assert.equal(f.db.getOwnerItemsByItemId('alice', 'minecraft:stick')[0].amount, 8)
       assert.deepEqual(controller.ledger.pending(), [])
     } finally {
       controller.maxTriggersPerBatch = original

@@ -69,7 +69,7 @@ copy config.example.json config.json
 - `language.file`: 官方中文语言文件路径，默认 `data/zh_cn.json`
 - `craft.enabled`: 仓库合成功能开关，默认开启；仅管理员可以发起合成
 - `craft.table`: 一个可到达的工作台方块坐标 `{ "x": 10, "y": 64, "z": 10 }`；默认各轴为 `null`，此时只允许 2×2 范围内的配方
-- `craft.timeoutMs`: 每张合成订单的最长执行时间，默认 1200000 毫秒（20 分钟）
+- `craft.timeoutMs`: 单个合成批次的执行时限，默认 1200000 毫秒（20 分钟）；每批确认并安全回库后重新计时，因此大订单总耗时可以超过 20 分钟
 
 ## 启动
 

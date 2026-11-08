@@ -237,6 +237,7 @@ class Warehouse {
   }
 
   async depositAllPossible (options = {}) {
+    options.check?.()
     const chests = this.db.listChests()
     if (!chests.length) {
       this.trace('error', 'deposit_no_registered_chests', {
@@ -314,6 +315,7 @@ class Warehouse {
       }
 
       if (options.requireServerEvidence) await this.verifyCraftContainer(chest)
+      options.check?.()
 
       if (movedInChest <= 0) {
         skippedNoProgress.add(chest.chestId)
