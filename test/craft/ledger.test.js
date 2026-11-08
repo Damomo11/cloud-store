@@ -92,6 +92,20 @@ test('confirm is idempotent and reserves exact output keys until physical return
   } finally { f.close() }
 })
 
+test('confirm stores resumable craft progress in the same operation update', () => {
+  const f = fixture()
+  try {
+    f.ledger.begin(input())
+    prepare(f)
+    f.ledger.confirm('craft:1', 'step-1', [qty(plank, 2)], [qty(stick, 4)], {
+      ...stepData(),
+      progress: { stepIndex: 0, nextTrigger: 4 }
+    })
+    assert.deepEqual(f.ledger.getCraftProgress('craft:1'), { stepIndex: 0, nextTrigger: 4 })
+    assert.deepEqual(f.ledger.get('craft:1').data.progress, { stepIndex: 0, nextTrigger: 4 })
+  } finally { f.close() }
+})
+
 test('partial batches settle independently and finishing records one summary', () => {
   const f = fixture()
   try {

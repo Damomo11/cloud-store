@@ -17,6 +17,14 @@ function item (name, count, customName) {
   return value
 }
 
+function copyItem (value) {
+  if (!value) return null
+  const copy = new Item(value.type, value.count, value.metadata, value.nbt)
+  if (value.components) copy.components = structuredClone(value.components)
+  if (value.removedComponents) copy.removedComponents = structuredClone(value.removedComponents)
+  return copy
+}
+
 function fixture (before, after, options = {}) {
   const bot = new EventEmitter()
   let inventory = before
@@ -67,12 +75,12 @@ function fixture (before, after, options = {}) {
   return { bot, calls, table, warehouse, catalog, config, executor, debugEvents, setInventory: value => { inventory = value } }
 }
 
-function proportionalFixture (before, after, step, { triggers = 1, noResultPacket = false, residualResult = false, serverResidual = false, delayedShiftUpdate = false, delayedPlacementUpdate = false, debugCraft } = {}) {
+function proportionalFixture (before, after, step, { triggers = 1, waveAfter = null, noResultPacket = false, residualResult = false, serverResidual = false, residualAfterCleanup = false, resultReappearsAfterFirstCleanupCollection = false, delayedShiftUpdate = false, delayedPlacementUpdate = false, debugCraft } = {}) {
   const f = fixture(before, after, { debugCraft })
   const gridWidth = step.requiresTable ? 3 : 2
   const craftingWindow = (id, type, inventoryStart) => {
     const slots = new Array(46).fill(null)
-    before.forEach((value, index) => { slots[inventoryStart + index] = new Item(value.type, value.count, value.metadata) })
+    before.forEach((value, index) => { slots[inventoryStart + index] = copyItem(value) })
     return {
       id,
       type,
@@ -99,13 +107,22 @@ function proportionalFixture (before, after, step, { triggers = 1, noResultPacke
     f.bot._client.emit('window_items', { windowId, items: slots, carriedItem: Item.toNotch(window.selectedItem) })
     f.bot._client.emit('set_cursor_item', { contents: Item.toNotch(window.selectedItem) })
   }
+  let shiftCount = 0
+  let shifted = false
+  let cleanupResultCount = 0
+  let cleanupResultCollectionCount = 0
+  let refillResultAfterParking = false
   const setAfter = () => {
-    f.setInventory(after)
+    const state = Array.isArray(waveAfter) && waveAfter.length
+      ? waveAfter[Math.min(shiftCount, waveAfter.length - 1)]
+      : after
+    shiftCount++
+    f.setInventory(state)
     for (const window of [playerWindow, f.bot.currentWindow].filter(Boolean)) {
       window.slots[0] = null
       const start = window.inventoryStart
       for (let slot = start; slot < 46; slot++) window.slots[slot] = null
-      after.forEach((value, index) => { window.slots[start + index] = new Item(value.type, value.count, value.metadata) })
+      state.forEach((value, index) => { window.slots[start + index] = copyItem(value) })
     }
   }
   f.bot.activateBlock = async () => {
@@ -118,8 +135,9 @@ function proportionalFixture (before, after, step, { triggers = 1, noResultPacke
   let shiftUpdatePending = false
   f.bot.clickWindow = async (slot, mouseButton = 0, mode = 0) => {
     const window = f.bot.currentWindow || playerWindow
-    clicks.push({ slot, mouseButton, mode, grid: window.slots.slice(1, 1 + gridWidth * gridWidth).map(value => value?.count || 0) })
+    clicks.push({ windowId: window.id, slot, mouseButton, mode, grid: window.slots.slice(1, 1 + gridWidth * gridWidth).map(value => value?.count || 0) })
     if (mode === 1 && slot === 0) {
+      shifted = true
       if (placementAckPending) throw new Error('shift-click started before the server confirmed the crafting grid')
       let recipe
       if (!noResultPacket && !delayedShiftUpdate) {
@@ -142,12 +160,14 @@ function proportionalFixture (before, after, step, { triggers = 1, noResultPacke
         }, 20)
         return
       }
+      const placed = window.slots.slice(1, 1 + gridWidth * gridWidth).filter(Boolean)
+      const waveTriggers = placed.length ? Math.min(...placed.map(value => value.count)) : triggers
       for (let cell = 1; cell < 1 + gridWidth * gridWidth; cell++) window.slots[cell] = null
       setAfter()
       if (residualResult) window.slots[0] = new Item(recipe?.result?.id || registry.itemsByName[step.result.name].id, recipe?.result?.count || step.result.count, recipe?.result?.metadata || null)
       if (recipe?.outShape) {
         recipe.outShape.forEach((row, y) => row.forEach((remainder, x) => {
-          if (remainder?.id >= 0) window.slots[1 + x + gridWidth * y] = new Item(remainder.id, remainder.count * triggers, remainder.metadata)
+          if (remainder?.id >= 0) window.slots[1 + x + gridWidth * y] = new Item(remainder.id, remainder.count * waveTriggers, remainder.metadata)
         }))
       }
     } else if (mode === 0) {
@@ -191,6 +211,25 @@ function proportionalFixture (before, after, step, { triggers = 1, noResultPacke
     } else {
       emitState(window)
     }
+    if (window !== playerWindow) {
+      const offset = window.inventoryStart - playerWindow.inventoryStart
+      for (let sourceSlot = window.inventoryStart; sourceSlot < window.inventoryEnd; sourceSlot++) {
+        playerWindow.slots[sourceSlot - offset] = copyItem(window.slots[sourceSlot])
+      }
+    }
+    if (resultReappearsAfterFirstCleanupCollection && shifted && cleanupResultCount > 0 &&
+      slot === 0 && mouseButton === 0 && mode === 0 && cleanupResultCollectionCount++ === 0) {
+      refillResultAfterParking = true
+    }
+    if (refillResultAfterParking && slot >= window.inventoryStart && slot < window.inventoryEnd && !window.selectedItem) {
+      refillResultAfterParking = false
+      window.slots[0] = new Item(registry.itemsByName[step.result.name].id, step.result.count)
+      emitState(window)
+    }
+    if (residualAfterCleanup && shifted && mode === 0 && slot > 0 && slot < 1 + gridWidth * gridWidth && cleanupResultCount++ === 0) {
+      window.slots[0] = new Item(registry.itemsByName[step.result.name].id, step.result.count)
+      emitState(window)
+    }
     if (serverResidual && mode === 1 && slot === 0) {
       const recipe = f.bot.recipesAll(registry.itemsByName[step.result.name].id, null, step.requiresTable ? f.table : undefined)
         .find(value => value.requiresTable === step.requiresTable && value.result.count === step.result.count)
@@ -199,6 +238,82 @@ function proportionalFixture (before, after, step, { triggers = 1, noResultPacke
   }
   return { ...f, clicks }
 }
+
+test('compacts only identical stackable inventory items before crafting', async () => {
+  const first = item('cherry_planks', 40)
+  const second = item('cherry_planks', 40)
+  const third = item('cherry_planks', 40)
+  const unique = item('cherry_planks', 1, 'kept-separate')
+  const nonStackable = item('minecart', 1)
+  const f = fixture([first, second, third, unique, nonStackable], [])
+  const inventory = f.bot.inventory
+  inventory.items = () => inventory.slots.slice(inventory.inventoryStart, inventory.inventoryEnd)
+    .flatMap((value, index) => value ? [{ ...value, slot: inventory.inventoryStart + index }] : [])
+  const moves = []
+  f.bot.moveSlotItem = async (sourceSlot, targetSlot) => {
+    moves.push([sourceSlot, targetSlot])
+    const source = inventory.slots[sourceSlot]
+    const target = inventory.slots[targetSlot]
+    assert.ok(source)
+    assert.ok(target)
+    assert.equal(f.catalog.fromPrismarineItem(source).itemKey, f.catalog.fromPrismarineItem(target).itemKey)
+    const moved = Math.min(source.count, target.stackSize - target.count)
+    target.count += moved
+    source.count -= moved
+    if (!source.count) inventory.slots[sourceSlot] = null
+  }
+
+  const result = await f.executor.compactInventoryStacks(inventory, () => {})
+
+  assert.equal(result.changed, true)
+  assert.equal(moves.length, 2)
+  const commonKey = f.catalog.fromPrismarineItem(first).itemKey
+  assert.deepEqual(inventory.items().filter(value => f.catalog.fromPrismarineItem(value).itemKey === commonKey)
+    .map(value => value.count).sort((a, b) => a - b), [56, 64])
+  assert.equal(inventory.slots[12].components?.[0]?.data, 'kept-separate')
+  assert.equal(inventory.slots[13].name, 'minecart')
+  assert.equal(result.before.find(value => value.itemKey === commonKey).amount, 120)
+  assert.equal(result.after.find(value => value.itemKey === commonKey).amount, 120)
+})
+
+test('stack compaction skips when the moveSlotItem API is absent', async () => {
+  const f = fixture([item('cherry_planks', 40), item('cherry_planks', 40), item('cherry_planks', 40)], [])
+  const before = f.bot.inventory.slots.slice(9, 12).map(value => value?.count || 0)
+
+  const result = await f.executor.compactInventoryStacks(f.bot.inventory, () => {})
+
+  assert.equal(result.skipped, true)
+  assert.deepEqual(f.bot.inventory.slots.slice(9, 12).map(value => value?.count || 0), before)
+})
+
+test('stack compaction refuses to run while the cursor holds an item', async () => {
+  const f = fixture([item('cherry_planks', 40), item('cherry_planks', 40), item('cherry_planks', 40)], [])
+  f.bot.moveSlotItem = async () => assert.fail('must not move items with a nonempty cursor')
+  f.bot.inventory.selectedItem = item('oak_planks', 1)
+
+  await assert.rejects(f.executor.compactInventoryStacks(f.bot.inventory, () => {}), error =>
+    error.recoveryRequired === true && /empty cursor/.test(error.message))
+})
+
+test('stack compaction stops if another window opens between confirmed moves', async () => {
+  const f = fixture([item('cherry_planks', 40), item('cherry_planks', 40), item('cherry_planks', 40)], [])
+  const inventory = f.bot.inventory
+  inventory.items = () => inventory.slots.slice(9, 45).flatMap((value, index) => value ? [{ ...value, slot: 9 + index }] : [])
+  let moves = 0
+  f.bot.moveSlotItem = async (sourceSlot, targetSlot) => {
+    moves++
+    const source = inventory.slots[sourceSlot]
+    const target = inventory.slots[targetSlot]
+    const moved = Math.min(source.count, target.stackSize - target.count)
+    target.count += moved
+    source.count -= moved
+    if (!source.count) inventory.slots[sourceSlot] = null
+    if (moves === 1) f.bot.currentWindow = { id: 2 }
+  }
+
+  await assert.rejects(f.executor.compactInventoryStacks(inventory, () => {}), error => error.recoveryRequired === true)
+  assert.equal(moves, 1)
+})
 
 const stickStep = {
   recipeId: 'sticks', requiresTable: false,
@@ -318,6 +433,132 @@ test('3x3 table batch crafting fills the shaped grid proportionally and shift-cl
   assert.deepEqual(f.clicks.find(click => click.slot === 0 && click.mode === 1).grid, [2, 2, 2, 2, 0, 2, 2, 2, 2])
 })
 
+test('100-trigger 3x3 batch uses 64 and 36 grid waves in one window', async () => {
+  const step = { requiresTable: true, result: { name: 'furnace', count: 1 }, inputs: [{ names: ['cobblestone'], count: 8 }] }
+  const waveAfter = [
+    [...Array.from({ length: 8 }, () => item('cobblestone', 36)), item('furnace', 64)],
+    [item('furnace', 64), item('furnace', 36)]
+  ]
+  const f = proportionalFixture([
+    ...Array.from({ length: 8 }, () => item('cobblestone', 64)),
+    ...Array.from({ length: 8 }, () => item('cobblestone', 36))
+  ], waveAfter.at(-1), step, { triggers: 100, waveAfter })
+
+  const result = await f.executor.execute({ step, triggers: 100 })
+
+  assert.deepEqual(amounts(result.produced), [['minecraft:furnace', 100]])
+  assert.equal(f.calls.some(call => Array.isArray(call) && call[0] === 'craft'), false)
+  const shifts = f.clicks.filter(click => click.slot === 0 && click.mouseButton === 0 && click.mode === 1)
+  assert.equal(shifts.length, 2)
+  assert.deepEqual(shifts.map(click => click.grid), [
+    [64, 64, 64, 64, 0, 64, 64, 64, 64],
+    [36, 36, 36, 36, 0, 36, 36, 36, 36]
+  ])
+  assert.equal(f.clicks.length, 34)
+})
+
+test('16 hopper minecarts use one crafting window with one wave per unstackable output', async () => {
+  const step = {
+    requiresTable: false,
+    result: { name: 'hopper_minecart', count: 1 },
+    inputs: [{ names: ['hopper'], count: 1 }, { names: ['minecart'], count: 1 }]
+  }
+  const waveAfter = Array.from({ length: 16 }, (_, index) => {
+    const completed = index + 1
+    return [
+      ...(completed < 16 ? [item('hopper', 16 - completed)] : []),
+      ...Array.from({ length: 16 - completed }, () => item('minecart', 1)),
+      ...Array.from({ length: completed }, () => item('hopper_minecart', 1))
+    ]
+  })
+  const f = proportionalFixture([
+    item('hopper', 16),
+    ...Array.from({ length: 16 }, () => item('minecart', 1))
+  ], waveAfter.at(-1), step, { triggers: 16, waveAfter })
+
+  const result = await f.executor.execute({ step, triggers: 16 })
+
+  assert.deepEqual(amounts(result.produced), [['minecraft:hopper_minecart', 16]])
+  assert.equal(f.calls.some(call => Array.isArray(call) && call[0] === 'craft'), false)
+  const plan = f.debugEvents.find(event => event.event === 'executor.grid_waves_planned')
+  assert.equal(plan.details.waveCount, 16)
+  assert.deepEqual(plan.details.waves.map(wave => wave.triggers), Array(16).fill(1))
+  const shifts = f.clicks.filter(click => click.slot === 0 && click.mouseButton === 0 && click.mode === 1)
+  assert.equal(shifts.length, 16)
+  assert.equal(new Set(shifts.map(click => click.windowId)).size, 1)
+  assert.equal(f.clicks.filter(click => click.mode === 0).length,
+    plan.details.waves.reduce((sum, wave) => sum + wave.clickCount, 0))
+})
+
+test('repeated wildcard ingredient cells can use different concrete item variants in later waves', async () => {
+  const step = { ...stickStep, requiresTable: false }
+  const first = item('oak_planks', 15, 'first variant')
+  const second = item('oak_planks', 5, 'second variant')
+  const f = proportionalFixture([first, second], [item('stick', 40)], step, {
+    triggers: 10,
+    waveAfter: [
+      [item('oak_planks', 1, 'first variant'), second, item('stick', 28)],
+      [item('oak_planks', 1, 'first variant'), item('oak_planks', 1, 'second variant'), item('stick', 36)],
+      [item('stick', 40)]
+    ]
+  })
+
+  const result = await f.executor.execute({ step, triggers: 10 })
+
+  assert.deepEqual(amounts(result.produced), [['minecraft:stick', 40]])
+  assert.equal(f.calls.some(call => Array.isArray(call) && call[0] === 'craft'), false)
+  const plan = f.debugEvents.find(event => event.event === 'executor.grid_waves_planned')
+  assert.deepEqual(plan.details.waves.map(wave => wave.triggers), [7, 2, 1])
+  assert.equal(f.clicks.filter(click => click.slot === 0 && click.mode === 1).length, 3)
+})
+
+test('3x3 proportional crafting safely splits fragmented stacks without a per-item click storm', async () => {
+  const step = {
+    requiresTable: true,
+    result: { name: 'piston', count: 1 },
+    inputs: [
+      { names: ['oak_planks'], count: 3 },
+      { names: ['cobblestone'], count: 4 },
+      { names: ['iron_ingot'], count: 1 },
+      { names: ['redstone'], count: 1 }
+    ]
+  }
+  const f = proportionalFixture([
+    item('oak_planks', 46), item('oak_planks', 62),
+    item('cobblestone', 64), item('cobblestone', 64), item('cobblestone', 16),
+    item('iron_ingot', 36), item('redstone', 36)
+  ], [item('piston', 36)], step, { triggers: 36 })
+
+  const result = await f.executor.execute({ step, triggers: 36 })
+
+  assert.deepEqual(amounts(result.produced), [['minecraft:piston', 36]])
+  assert.ok(f.clicks.length < 142, `expected fewer than 142 clicks, received ${f.clicks.length}`)
+  assert.equal(f.calls.some(call => Array.isArray(call) && call[0] === 'craft'), false)
+  const firstShiftIndex = f.clicks.findIndex(click => click.slot === 0 && click.mode === 1)
+  assert.ok(firstShiftIndex >= 0)
+  assert.equal(f.clicks.filter(click => click.slot === 0 && click.mode === 1).length, 1)
+  const plan = f.debugEvents.find(event => event.event === 'executor.grid_waves_planned')
+  assert.equal(plan.details.waveCount, 1)
+  assert.equal(plan.details.waves[0].clickCount, firstShiftIndex)
+})
+
+test('proportional batches split same-item variants into the largest safe waves', async () => {
+  const first = item('oak_planks', 10, 'first variant')
+  const second = item('oak_planks', 10, 'second variant')
+  const step = { ...stickStep, requiresTable: false }
+  const f = proportionalFixture([first, second], [item('stick', 40)], step, {
+    triggers: 10,
+    waveAfter: [[item('stick', 40)]]
+  })
+
+  const result = await f.executor.execute({ step, triggers: 10 })
+
+  assert.deepEqual(amounts(result.produced), [['minecraft:stick', 40]])
+  assert.equal(f.calls.some(call => Array.isArray(call) && call[0] === 'craft'), false)
+  assert.equal(f.clicks.filter(click => click.slot === 0 && click.mouseButton === 0 && click.mode === 1).length, 1)
+  assert.deepEqual(f.debugEvents.find(event => event.event === 'executor.grid_waves_planned').details.waves.map(wave => wave.triggers), [10])
+})
+
 test('2x2 proportional batches collect recipe remainders before returning', async () => {
   const step = { requiresTable: false, result: { name: 'honey_block', count: 1 }, inputs: [{ names: ['honey_bottle'], count: 4 }] }
   const f = proportionalFixture([item('honey_bottle', 8)], [item('honey_block', 2)], step, { triggers: 2 })
@@ -363,6 +604,65 @@ test('proportional batch waits for server grid updates before cleanup after shif
   const shiftIndex = f.clicks.findIndex(click => click.slot === 0 && click.mode === 1)
   assert.ok(shiftIndex >= 0)
   assert.equal(f.clicks.slice(shiftIndex + 1).some(click => click.slot > 0 && click.slot <= 4), false)
+})
+
+test('proportional batch collects a result that reappears while clearing recipe remainders', async () => {
+  const step = {
+    requiresTable: true,
+    result: { name: 'cake', count: 1 },
+    inputs: [
+      { names: ['milk_bucket'], count: 3 },
+      { names: ['sugar'], count: 2 },
+      { names: ['egg'], count: 1 },
+      { names: ['wheat'], count: 3 }
+    ]
+  }
+  const f = proportionalFixture([
+    item('milk_bucket', 6), item('sugar', 4), item('egg', 2), item('wheat', 6)
+  ], [item('cake', 1), item('bucket', 6)], step, {
+    triggers: 2,
+    waveAfter: [
+      [item('milk_bucket', 3), item('sugar', 2), item('egg', 1), item('wheat', 3)],
+      [item('cake', 2), item('bucket', 3)]
+    ],
+    residualAfterCleanup: true
+  })
+
+  const result = await f.executor.execute({ step, triggers: 2 })
+
+  assert.deepEqual(amounts(result.produced), [['minecraft:bucket', 6], ['minecraft:cake', 2]])
+  assert.equal(f.clicks.filter(click => click.slot === 0 && click.mouseButton === 0 && click.mode === 1).length, 2)
+  assert.equal(f.clicks.filter(click => click.slot === 0 && click.mouseButton === 0 && click.mode === 0).length, 1)
+  assert.ok(f.clicks.some(click => click.slot > 0 && click.slot <= 9 && click.mouseButton === 0 && click.mode === 0))
+})
+
+test('proportional batch keeps collecting when the result reappears after its first cleanup collection', async () => {
+  const step = {
+    requiresTable: true,
+    result: { name: 'cake', count: 1 },
+    inputs: [
+      { names: ['milk_bucket'], count: 3 },
+      { names: ['sugar'], count: 2 },
+      { names: ['egg'], count: 1 },
+      { names: ['wheat'], count: 3 }
+    ]
+  }
+  const f = proportionalFixture([
+    item('milk_bucket', 6), item('sugar', 4), item('egg', 2), item('wheat', 6)
+  ], [item('cake', 2), item('bucket', 6)], step, {
+    triggers: 2,
+    waveAfter: [
+      [item('milk_bucket', 3), item('sugar', 2), item('egg', 1), item('wheat', 3)],
+      [item('cake', 2), item('bucket', 3)]
+    ],
+    residualAfterCleanup: true,
+    resultReappearsAfterFirstCleanupCollection: true
+  })
+
+  const result = await f.executor.execute({ step, triggers: 2 })
+
+  assert.deepEqual(amounts(result.produced), [['minecraft:bucket', 6], ['minecraft:cake', 2]])
+  assert.equal(f.clicks.filter(click => click.slot === 0 && click.mouseButton === 0 && click.mode === 0).length, 2)
 })
 
 test('3x3 proportional batch waits for server grid updates before cleanup after shift-click', async () => {

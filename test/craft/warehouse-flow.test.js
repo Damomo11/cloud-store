@@ -57,6 +57,8 @@ function fixture () {
   const db = new StoreDb(':memory:', config)
   let inventory = []
   const stored = new Map()
+  let withdrawCalls = 0
+  let depositCalls = 0
   const chest = { chestId: '0,64,0', x: 0, y: 64, z: 0, blockName: 'barrel' }
   db.upsertChest(chest)
   function refresh () {
@@ -70,6 +72,7 @@ function fixture () {
     withWarehouseLock: fn => fn(),
     goHomeIfAway: async () => {},
     withdrawAllocationsLocked: async allocations => {
+      withdrawCalls++
       const withdrawn = []
       for (const a of allocations) {
         const count = Math.min(a.amount, stored.get(a.itemKey)?.count || 0)
@@ -84,6 +87,7 @@ function fixture () {
       return { withdrawn, missing: allocations.filter(a => !withdrawn.some(w => w.itemKey === a.itemKey && w.amount === a.amount)) }
     },
     depositAllPossible: async () => {
+      depositCalls++
       for (const item of inventory) {
         const key = catalog.fromPrismarineItem(item).itemKey
         if (!stored.has(key)) stored.set(key, make(item.name, 0))
@@ -131,7 +135,8 @@ function fixture () {
     isBusy: () => false
   }
   return { db, config, catalog, bot, warehouse, executor, seed, stored, make, refresh,
-    getInventory: () => inventory, setInventory: items => { inventory = items } }
+    getInventory: () => inventory, setInventory: items => { inventory = items },
+    counts: () => ({ withdrawCalls, depositCalls }) }
 }
 
 test('batch budget fits ten pistons in one crafting transaction', async () => {
@@ -168,6 +173,209 @@ test('batch budget fits ten pistons in one crafting transaction', async () => {
   } finally { f.db.close() }
 })
 
+test('100 pistons use one warehouse batch and one return while the executor receives all triggers', async () => {
+  const { CraftController } = require('../../src/craft/controller')
+  const f = fixture()
+  try {
+    f.seed('alice', 'oak_planks', 300)
+    f.seed('alice', 'cobblestone', 400)
+    f.seed('alice', 'iron_ingot', 100)
+    f.seed('alice', 'redstone', 100)
+    const waves = []
+    const execute = f.executor.execute
+    f.executor.execute = async args => {
+      waves.push(args.triggers)
+      return execute(args)
+    }
+    const controller = new CraftController({ ...f, botId: 'bot-a' })
+
+    const result = await controller.run({
+      actor: 'Alice',
+      owner: { uuid: 'alice', username: 'Alice', scope: 'personal' },
+      item: 'piston',
+      quantity: 100
+    })
+
+    assert.equal(result.status, 'complete')
+    assert.deepEqual(waves, [100])
+    assert.deepEqual(f.counts(), { withdrawCalls: 1, depositCalls: 1 })
+    assert.equal(f.db.getOwnerItemsByItemId('alice', 'minecraft:piston')[0].amount, 100)
+  } finally { f.db.close() }
+})
+
+test('death recovery resumes the same order from its confirmed cursor without duplicate reservation', async () => {
+  const { CraftController } = require('../../src/craft/controller')
+  const f = fixture()
+  try {
+    f.seed('alice', 'oak_planks', 2)
+    let controller
+    let interrupt = true
+    const execute = f.executor.execute
+    const operationIds = []
+    f.executor.execute = async args => {
+      operationIds.push(args.operationId)
+      if (interrupt) {
+        interrupt = false
+        controller.cancel('death during crafting')
+        throw controller.active.abort.signal.reason
+      }
+      return execute(args)
+    }
+    controller = new CraftController({ ...f, botId: 'bot-a' })
+    const request = { actor: 'Alice', owner: { uuid: 'alice', username: 'Alice', scope: 'personal' }, item: 'stick', quantity: 4 }
+
+    await assert.rejects(controller.run(request), /death during crafting/)
+    const interrupted = controller.ledger.pending('bot-a')[0]
+    assert.ok(interrupted)
+    const recovered = await controller.recover()
+    assert.equal(recovered.status, 'resumable')
+
+    const result = await controller.resume(recovered.operationId)
+
+    assert.equal(result.status, 'complete')
+    assert.equal(result.operationId, interrupted.id)
+    assert.deepEqual(operationIds, [interrupted.id, interrupted.id])
+    assert.equal(f.db.getOwnerItemsByItemId('alice', 'minecraft:stick')[0].amount, 4)
+    assert.equal(controller.ledger.pending('bot-a').length, 0)
+    assert.equal(controller.ledger.listCraftReservations(interrupted.id).length, 0)
+  } finally { f.db.close() }
+})
+
+test('partial failure during resumed batch recovers from the proven trigger cursor', async () => {
+  const { CraftController } = require('../../src/craft/controller')
+  const f = fixture()
+  try {
+    f.seed('alice', 'oak_planks', 4)
+    let controller
+    let executions = 0
+    const execute = f.executor.execute
+    f.executor.execute = async args => {
+      executions++
+      if (executions === 1) {
+        controller.cancel('death before crafting')
+        throw controller.active.abort.signal.reason
+      }
+      if (executions === 2) {
+        const before = f.catalog.aggregatePrismarineItems(f.getInventory())
+        const consumed = f.catalog.aggregatePrismarineItems([f.make('oak_planks', 2)])
+        const produced = f.catalog.aggregatePrismarineItems([f.make('stick', 4)])
+        f.setInventory([f.make('oak_planks', 2), f.make('stick', 4)])
+        const after = f.catalog.aggregatePrismarineItems(f.getInventory())
+        throw Object.assign(new Error('partial resumed craft failure'), {
+          recoveryRequired: true,
+          partial: true,
+          before,
+          after,
+          consumed,
+          produced
+        })
+      }
+      return execute(args)
+    }
+    controller = new CraftController({ ...f, botId: 'bot-a' })
+    const request = { actor: 'Alice', owner: { uuid: 'alice', username: 'Alice', scope: 'personal' }, item: 'stick', quantity: 8 }
+
+    await assert.rejects(controller.run(request), /death before crafting/)
+    let recovered = await controller.recover()
+    assert.equal(recovered.status, 'resumable')
+    await assert.rejects(controller.resume(recovered.operationId), /partial resumed craft failure/)
+
+    recovered = await controller.recover()
+    assert.equal(recovered.status, 'resumable')
+    assert.equal(recovered.stepIndex, 0)
+    assert.equal(recovered.nextTrigger, 1)
+    const result = await controller.resume(recovered.operationId)
+
+    assert.equal(result.status, 'complete')
+    assert.equal(f.db.getOwnerItemsByItemId('alice', 'minecraft:stick')[0].amount, 8)
+    assert.equal(controller.ledger.pending('bot-a').length, 0)
+  } finally { f.db.close() }
+})
+
+test('recovery after a resumed craft is interrupted again uses the latest confirmed cursor', async () => {
+  const { CraftController } = require('../../src/craft/controller')
+  const f = fixture()
+  try {
+    f.seed('alice', 'oak_planks', 4)
+    let controller
+    let execution = 0
+    let deaths = 0
+    const execute = f.executor.execute
+    const operationIds = []
+    f.executor.execute = async args => {
+      execution++
+      operationIds.push(args.operationId)
+      if (execution === 2 || execution === 3) {
+        deaths++
+        controller.cancel(`death ${deaths}`)
+        throw controller.active.abort.signal.reason
+      }
+      return execute(args)
+    }
+    controller = new CraftController({ ...f, botId: 'bot-a' })
+    const maxTriggersPerBatch = controller.maxTriggersPerBatch.bind(controller)
+    controller.maxTriggersPerBatch = (...args) => Math.min(1, maxTriggersPerBatch(...args))
+    const request = { actor: 'Alice', owner: { uuid: 'alice', username: 'Alice', scope: 'personal' }, item: 'stick', quantity: 8 }
+
+    await assert.rejects(controller.run(request), /death 1/)
+    let recovered = await controller.recover()
+    assert.equal(recovered.status, 'resumable')
+    await assert.rejects(controller.resume(recovered.operationId), /death 2/)
+
+    const interrupted = controller.ledger.get(recovered.operationId)
+    assert.deepEqual(interrupted.data.progress, { stepIndex: 0, nextTrigger: 1 })
+    assert.equal(interrupted.data.recoveryIntent, undefined)
+    recovered = await controller.recover()
+    assert.equal(recovered.status, 'resumable')
+    assert.equal(recovered.stepIndex, 0)
+    assert.equal(recovered.nextTrigger, 1)
+    assert.equal(controller.ledger.get(interrupted.id).data.recoveryIntent.pending.stepId, '0:1+1')
+    const result = await controller.resume(recovered.operationId)
+
+    assert.equal(result.status, 'complete')
+    assert.deepEqual(operationIds, [interrupted.id, interrupted.id, interrupted.id, interrupted.id])
+    assert.equal(f.db.getOwnerItemsByItemId('alice', 'minecraft:stick')[0].amount, 8)
+    assert.equal(controller.ledger.pending('bot-a').length, 0)
+    assert.equal(controller.ledger.listCraftReservations(interrupted.id).length, 0)
+  } finally { f.db.close() }
+})
+
+test('resume clears stale recovery evidence and journals pre-craft failures for another recovery attempt', async () => {
+  const { CraftController } = require('../../src/craft/controller')
+  const f = fixture()
+  try {
+    const input = f.seed('alice', 'oak_planks', 2)
+    const owner = { uuid: 'alice', username: 'Alice', scope: 'personal' }
+    const controller = new CraftController({ ...f, botId: 'bot-a' })
+    const planned = planToCraftCommand({ item: 'stick', quantity: 4, available: controller.availableStock(owner.uuid), config: f.config, forceCraft: true })
+    const id = 'craft:resume-navigation-failure'
+    const allocations = controller.allocate(planned.plan.inventoryUses, controller.availableItems(owner.uuid))
+    const data = {
+      held: [],
+      pending: null,
+      physicalTotals: controller.physicalTotals(),
+      progress: { stepIndex: 0, nextTrigger: 0 },
+      plan: planned.command,
+      recoveryPhase: 'crafting',
+      recoveryBaseline: controller.physicalTotals(),
+      recoveryIntent: { phase: 'crafting', baseline: controller.physicalTotals(), pending: { stepId: 'old-batch' } }
+    }
+    controller.ledger.begin({ id, botId: 'bot-a', owner, actor: 'Alice', target: planned.command.target, allocations, data })
+    controller.ledger.checkpoint(id, 'ready', data)
+    f.warehouse.goHomeIfAway = async () => { throw new Error('temporary navigation failure') }
+
+    await assert.rejects(controller.resume(id), /temporary navigation failure/)
+
+    const pending = controller.ledger.get(id)
+    assert.equal(pending.phase, 'recovery_required')
+    assert.equal(pending.data.recoveryPhase, 'ready')
+    assert.equal(pending.data.recoveryIntent, undefined)
+    assert.equal(pending.data.recoveryBaseline, undefined)
+    assert.deepEqual(pending.data.progress, { stepIndex: 0, nextTrigger: 0 })
+    assert.equal(controller.ledger.listCraftReservations(id).find(row => row.itemKey === input.itemKey).amount, 2)
+  } finally { f.db.close() }
+})
+
 test('batch budget respects input and output stack limits while reserving one slot', () => {
   const { CraftController } = require('../../src/craft/controller')
   const f = fixture()
@@ -183,10 +391,62 @@ test('batch budget respects input and output stack limits while reserving one sl
 
     assert.equal(controller.maxTriggersPerBatch(step('oak_log', 'ender_pearl'), pool('oak_log', 64)), 64)
     assert.equal(controller.maxTriggersPerBatch(step('oak_log', 'stick'), pool('oak_log', 64)), 64)
-    assert.equal(controller.maxTriggersPerBatch(step('ender_pearl', 'stick'), pool('ender_pearl', 64)), 16)
-    assert.equal(controller.maxTriggersPerBatch(step('iron_pickaxe', 'stick'), pool('iron_pickaxe', 64)), 1)
+    // Stack limits cap each workbench wave; they no longer cap the whole
+    // warehouse withdrawal. The executor will split this into four waves.
+    assert.equal(controller.maxTriggersPerBatch(step('ender_pearl', 'stick'), pool('ender_pearl', 64)), 64)
+    assert.equal(controller.maxTriggersPerBatch(step('iron_pickaxe', 'stick'), pool('iron_pickaxe', 64)), 35)
     assert.equal(controller.batchBudget(step('oak_log', 'ender_pearl'), pool('oak_log', 64)).outputSlots, 4)
-    assert.equal(controller.maxTriggersPerBatch(step('oak_log', 'iron_pickaxe'), pool('oak_log', 64)), 34)
+    assert.equal(controller.maxTriggersPerBatch(step('oak_log', 'iron_pickaxe'), pool('oak_log', 64)), 35)
+  } finally { f.db.close() }
+})
+
+test('batch budget keeps 100 pistons in one withdrawal when the 36-slot inventory fits', () => {
+  const { CraftController } = require('../../src/craft/controller')
+  const f = fixture()
+  try {
+    const controller = new CraftController({ ...f, botId: 'bot-a' })
+    const pool = (name, amount) => [{ ...f.catalog.fromItemIdAmount(`minecraft:${name}`, amount), amount }]
+    const inputs = [
+      { names: ['oak_planks'], count: 3 },
+      { names: ['cobblestone'], count: 4 },
+      { names: ['iron_ingot'], count: 1 },
+      { names: ['redstone'], count: 1 }
+    ]
+    const sourceRows = [
+      ...pool('oak_planks', 300),
+      ...pool('cobblestone', 400),
+      ...pool('iron_ingot', 100),
+      ...pool('redstone', 100)
+    ]
+    const budget = controller.batchBudget({
+      times: 100,
+      inputs,
+      outputs: [{ name: 'piston', count: 1 }],
+      result: { name: 'piston', count: 1 }
+    }, sourceRows, 100)
+
+    assert.equal(budget.triggers, 100)
+    assert.equal(budget.gridStackLimit, 64)
+    assert.ok(budget.usedSlots + budget.reserveSlots <= 36)
+  } finally { f.db.close() }
+})
+
+test('batch budget fits 16 hopper minecarts despite the unstackable minecart input', () => {
+  const { CraftController } = require('../../src/craft/controller')
+  const f = fixture()
+  try {
+    const controller = new CraftController({ ...f, botId: 'bot-a' })
+    const pool = (name, amount) => [{ ...f.catalog.fromItemIdAmount(`minecraft:${name}`, amount), amount }]
+    const budget = controller.batchBudget({
+      times: 16,
+      inputs: [{ names: ['hopper'], count: 1 }, { names: ['minecart'], count: 1 }],
+      outputs: [{ name: 'hopper_minecart', count: 1 }],
+      result: { name: 'hopper_minecart', count: 1 }
+    }, [...pool('hopper', 16), ...pool('minecart', 16)], 16)
+
+    assert.equal(budget.triggers, 16)
+    assert.equal(budget.gridStackLimit, 1)
+    assert.ok(budget.usedSlots + budget.reserveSlots <= 36)
   } finally { f.db.close() }
 })
 
@@ -203,9 +463,9 @@ test('batch budget keeps input and accumulated output stacks plus one empty slot
     }
     const budget = controller.batchBudget(step, [{ ...f.catalog.fromItemIdAmount('minecraft:oak_log', 64), amount: 64 }])
 
-    assert.equal(budget.triggers, 34)
+    assert.equal(budget.triggers, 35)
     assert.equal(budget.inputSlots, 1)
-    assert.equal(budget.outputSlots, 34)
+    assert.equal(budget.outputSlots, 35)
     assert.equal(budget.usedSlots, 35)
     assert.equal(budget.freeSlots, 0)
   } finally { f.db.close() }
@@ -542,7 +802,9 @@ test('partial return resumes from server snapshots without crediting settled pro
     const controller = new CraftController({ ...f, botId: 'bot-a' })
     await assert.rejects(controller.run({ actor: 'Alice', owner: { uuid: 'alice' }, item: 'stick', quantity: 4 }), /空间不足/)
     f.warehouse.depositAllPossible = deposit
-    assert.equal((await controller.recover()).status, 'recovered')
+    const recovery = await controller.recover()
+    assert.equal(recovery.status, 'resumable')
+    await controller.resume(recovery.operationId)
     assert.equal((await controller.recover()).status, 'empty')
     const sticks = f.db.getOwnerBalances('alice').find(item => item.itemId === 'minecraft:stick')
     assert.equal(sticks.amount, 4)

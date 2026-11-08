@@ -86,10 +86,48 @@ function fixture () {
   const request = () => ({ actor: 'Alice', owner: { uuid: 'alice', username: 'Alice', scope: 'personal' }, item: 'stick', quantity: 4 })
   return {
     db, bot, warehouse, executor, controller, seed, stored, make, request,
+    setInventory: items => { inventory = items },
     deposits: () => deposits,
     close: () => db.close()
   }
 }
+
+test('ordinary partial failure keeps pending evidence until recovery settles a failed return', async () => {
+  const f = fixture()
+  try {
+    const plank = f.seed('alice', 'oak_planks', 4)
+    const catalog = f.controller.catalog
+    const before = catalog.aggregatePrismarineItems([f.make('oak_planks', 4)])
+    const consumed = catalog.aggregatePrismarineItems([f.make('oak_planks', 2)])
+    const produced = catalog.aggregatePrismarineItems([f.make('stick', 4)])
+    const after = catalog.aggregatePrismarineItems([f.make('oak_planks', 2), f.make('stick', 4)])
+    let operationId
+    f.executor.execute = async args => {
+      operationId = args.operationId
+      f.setInventory([f.make('oak_planks', 2), f.make('stick', 4)])
+      throw Object.assign(new Error('partial craft failure'), {
+        recoveryRequired: true, partial: true, before, after, consumed, produced
+      })
+    }
+    const deposit = f.warehouse.depositAllPossible
+    let firstDeposit = true
+    f.warehouse.depositAllPossible = async (...args) => {
+      if (firstDeposit) {
+        firstDeposit = false
+        throw new Error('first return failed')
+      }
+      return deposit(...args)
+    }
+
+    await assert.rejects(f.controller.run({ ...f.request(), quantity: 8 }), /partial craft failure/)
+
+    assert.equal(f.controller.ledger.pending('bot-a').length, 0, 'recovery must reconcile the failed partial batch')
+    const failed = f.controller.ledger.get(operationId)
+    assert.equal(f.db.getBalance('alice', plank.itemKey), 2)
+    assert.equal(f.db.getBalance('alice', catalog.fromPrismarineItem(f.make('stick', 1)).itemKey), 4)
+    assert.deepEqual(failed.data.progress, { stepIndex: 0, nextTrigger: 1 })
+  } finally { f.close() }
+})
 
 test('a natural craft failure left in recovery_required is auto-recovered immediately while the bot is alive', async () => {
   const f = fixture()

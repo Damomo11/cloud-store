@@ -143,6 +143,64 @@ test('recovery returns unchanged inputs without a conversion when nothing reache
   } finally { f.close() }
 })
 
+test('recovery keeps the original reservation and resumes an unchanged interrupted batch', async () => {
+  const f = fixture({ held: [{ name: 'oak_planks', count: 2 }] })
+  try {
+    const progressBefore = { stepIndex: 0, nextTrigger: 0 }
+    const progressAfter = { stepIndex: 1, nextTrigger: 0 }
+    const plan = { target: { name: 'stick', quantity: 4 }, craftSteps: [{ times: 1 }] }
+    f.ledger.checkpoint('craft:server-evidence', 'crafting', {
+      held: f.before,
+      pending: { stepId: '0:0+1', before: f.before, expectedConsumed: f.before,
+        expectedProduced: f.products, triggers: 1, progressBefore, progressAfter },
+      physicalTotals: f.before,
+      stepIndex: 0,
+      trigger: 0,
+      progress: progressBefore,
+      plan
+    })
+    const reservationsBefore = f.ledger.listCraftReservations('craft:server-evidence')
+
+    const result = await f.controller.recover()
+
+    assert.equal(result.status, 'resumable')
+    assert.equal(result.operationId, 'craft:server-evidence')
+    assert.deepEqual(f.ledger.getCraftProgress('craft:server-evidence'), progressBefore)
+    assert.deepEqual(f.ledger.listCraftReservations('craft:server-evidence'), reservationsBefore)
+    assert.equal(f.confirmed(), 0)
+    assert.equal(f.ledger.pending().length, 1)
+  } finally { f.close() }
+})
+
+test('recovery atomically confirms a proven batch and resumes after it', async () => {
+  const f = fixture({})
+  try {
+    const progressBefore = { stepIndex: 0, nextTrigger: 0 }
+    const progressAfter = { stepIndex: 1, nextTrigger: 0 }
+    const plan = { target: { name: 'stick', quantity: 4 }, craftSteps: [{ times: 1 }] }
+    f.ledger.checkpoint('craft:server-evidence', 'crafting', {
+      held: f.before,
+      pending: { stepId: '0:0+1', before: f.before, expectedConsumed: f.before,
+        expectedProduced: f.products, triggers: 1, progressBefore, progressAfter },
+      physicalTotals: f.before,
+      stepIndex: 0,
+      trigger: 0,
+      progress: progressBefore,
+      plan
+    })
+
+    const result = await f.controller.recover()
+
+    assert.equal(result.status, 'resumable')
+    assert.equal(result.operationId, 'craft:server-evidence')
+    assert.deepEqual(f.ledger.getCraftProgress('craft:server-evidence'), progressAfter)
+    assert.equal(f.confirmed(), 1)
+    assert.equal(f.db.getBalance('alice', f.before[0].itemKey), 0)
+    assert.equal(f.db.getBalance('alice', f.products[0].itemKey), 4)
+    assert.equal(f.ledger.pending().length, 1)
+  } finally { f.close() }
+})
+
 test('a mismatched backpack settles through registered diff instead of locking the whole store', async () => {
   // Backpack holds sticks x1: neither the raw inputs nor the full conversion.
   // 旧行为：对账失败 → 抛错 + 保留记录锁全库等人工（2026-11-05 生产事故路径）。
