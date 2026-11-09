@@ -657,7 +657,11 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
       if (!plan) {
         throw error(`craft wave ${completed}+${waveTriggers} cannot be placed from confirmed inventory stacks`, true)
       }
-      const placementSlots = Array.from({ length: gridSize }, (_, index) => index + 1)
+      // Modern confirmed clicks request a full snapshot; legacy transactions
+      // may report only changed slots, leaving unused recipe cells untouched.
+      const placementSlots = confirmedClick
+        ? Array.from({ length: gridSize }, (_, index) => index + 1)
+        : plan.map(placement => placement.slot)
       // Capture intent before clicks: a late correction may overwrite the live
       // grid with an earlier state, which must never become the expected state.
       const expectedPlacement = new Map(Array.from({ length: gridSize }, (_, index) => [index + 1, null]))
@@ -763,7 +767,7 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
       // transaction. Wait for the concrete post-craft grid state, rather than
       // treating any slot update as permission to start cleanup.
       const expectedGrid = new Map()
-      for (let slot = 1; slot <= gridSize; slot++) expectedGrid.set(slot, null)
+      for (const slot of activeGridSlots) expectedGrid.set(slot, null)
       const gridWidth = recipe.requiresTable ? 3 : 2
       for (let y = 0; y < gridWidth; y++) {
         for (let x = 0; x < gridWidth; x++) {

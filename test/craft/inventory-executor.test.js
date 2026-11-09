@@ -413,6 +413,46 @@ test('2x2 batch crafting fills proportional inputs and collects the result with 
   assert.deepEqual(f.clicks.find(click => click.slot === 0 && click.mode === 1).grid, [2, 0, 2, 0])
 })
 
+test('native proportional crafting accepts sparse updates for empty recipe cells', async t => {
+  for (const scenario of [
+    { name: '2x2 sticks', requiresTable: false, inputCount: 4, result: 'stick', resultCount: 4, produced: 8 },
+    { name: '3x3 chests', requiresTable: true, inputCount: 16, result: 'chest', resultCount: 1, produced: 2 }
+  ]) {
+    await t.test(scenario.name, async () => {
+      const step = {
+        requiresTable: scenario.requiresTable,
+        result: { name: scenario.result, count: scenario.resultCount },
+        inputs: [{ names: ['oak_planks'], count: scenario.inputCount / 2 }]
+      }
+      const f = proportionalFixture([item('oak_planks', scenario.inputCount)],
+        [item(scenario.result, scenario.produced)], step, { triggers: 2 })
+      // Legacy servers acknowledge transactions and emit only changed slots.
+      // In particular, empty recipe cells receive no new slot packet.
+      let previousSlots
+      const nativeClick = f.bot.clickWindow
+      f.bot.clickWindow = async (...args) => {
+        previousSlots = (f.bot.currentWindow || f.bot.inventory).slots.map(value => JSON.stringify(Item.toNotch(value)))
+        return nativeClick(...args)
+      }
+      const emit = f.bot._client.emit.bind(f.bot._client)
+      f.bot._client.emit = (name, packet) => {
+        if (name === 'set_cursor_item') return emit('set_slot', { windowId: -1, slot: -1, item: packet.contents })
+        if (name !== 'window_items') return emit(name, packet)
+        packet.items.forEach((value, slot) => {
+          if (JSON.stringify(value) !== previousSlots[slot]) emit('set_slot', { windowId: packet.windowId, slot, item: value })
+        })
+        return true
+      }
+
+      const result = await f.executor.execute({ step, triggers: 2 })
+
+      assert.deepEqual(amounts(result.produced), [[`minecraft:${scenario.result}`, scenario.produced]])
+      assert.equal(f.clicks.filter(click => click.slot === 0 && click.mode === 1).length, 1)
+      assert.equal(f.executor.isBusy(), false)
+    })
+  }
+})
+
 test('proportional execution logs click intent, server slot/cursor updates and exact output evidence', async () => {
   const step = { ...stickStep, requiresTable: false }
   const f = proportionalFixture([item('oak_planks', 2), item('oak_planks', 2)], [item('stick', 8)], step, { triggers: 2 })
