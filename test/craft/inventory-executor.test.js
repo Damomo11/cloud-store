@@ -75,7 +75,7 @@ function fixture (before, after, options = {}) {
   return { bot, calls, table, warehouse, catalog, config, executor, debugEvents, setInventory: value => { inventory = value } }
 }
 
-function proportionalFixture (before, after, step, { triggers = 1, waveAfter = null, noResultPacket = false, residualResult = false, serverResidual = false, residualAfterCleanup = false, resultReappearsAfterFirstCleanupCollection = false, delayedShiftUpdate = false, delayedPlacementUpdate = false, debugCraft } = {}) {
+function proportionalFixture (before, after, step, { triggers = 1, waveAfter = null, noResultPacket = false, residualResult = false, serverResidual = false, residualAfterCleanup = false, resultReappearsAfterFirstCleanupCollection = false, delayedShiftUpdate = false, staleShiftUpdate = false, delayedPlacementUpdate = false, debugCraft } = {}) {
   const f = fixture(before, after, { debugCraft })
   const gridWidth = step.requiresTable ? 3 : 2
   const craftingWindow = (id, type, inventoryStart) => {
@@ -152,6 +152,7 @@ function proportionalFixture (before, after, step, { triggers = 1, waveAfter = n
         recipe = withStandardRecipeOutputs(registry, recipe)
         f.bot._client.emit('set_slot', { windowId: window.id, slot: 0, item: Item.toNotch(new Item(recipe.result.id, recipe.result.count, recipe.result.metadata)) })
         shiftUpdatePending = true
+        if (staleShiftUpdate) emitState(window)
         setTimeout(() => {
           for (let cell = 1; cell < 1 + gridWidth * gridWidth; cell++) window.slots[cell] = null
           setAfter()
@@ -171,6 +172,9 @@ function proportionalFixture (before, after, step, { triggers = 1, waveAfter = n
         }))
       }
     } else if (mode === 0) {
+      if (delayedShiftUpdate && shifted && shiftUpdatePending && slot === 0) {
+        throw new Error('craft result collected before the server confirmed grid consumption')
+      }
       if (shiftUpdatePending && slot > 0 && slot < 1 + gridWidth * gridWidth) {
         throw new Error('craft grid clicked before the server confirmed the shift-click')
       }
@@ -604,6 +608,20 @@ test('proportional batch waits for server grid updates before cleanup after shif
   const shiftIndex = f.clicks.findIndex(click => click.slot === 0 && click.mode === 1)
   assert.ok(shiftIndex >= 0)
   assert.equal(f.clicks.slice(shiftIndex + 1).some(click => click.slot > 0 && click.slot <= 4), false)
+})
+
+test('proportional batch ignores stale grid updates until the server confirms consumed inputs', async () => {
+  const step = { ...stickStep, requiresTable: false }
+  const f = proportionalFixture([item('oak_planks', 2), item('oak_planks', 2)], [item('stick', 8)], step, {
+    triggers: 2,
+    delayedShiftUpdate: true,
+    staleShiftUpdate: true
+  })
+
+  const result = await f.executor.execute({ step, triggers: 2 })
+
+  assert.deepEqual(amounts(result.produced), [['minecraft:stick', 8]])
+  assert.equal(f.clicks.filter(click => click.slot === 0 && click.mode === 1).length, 1)
 })
 
 test('proportional batch collects a result that reappears while clearing recipe remainders', async () => {
