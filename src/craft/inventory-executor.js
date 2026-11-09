@@ -714,12 +714,29 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
       }
       const activeGridSlots = window.slots.slice(1, gridSize + 1)
         .flatMap((item, index) => item ? [index + 1] : [])
-      const watchedSlots = [0, ...activeGridSlots]
+      // A result-slot update can arrive before the server applies the grid
+      // transaction. Wait for the concrete post-craft grid state, rather than
+      // treating any slot update as permission to start cleanup.
+      const expectedGrid = new Map()
+      for (const slot of activeGridSlots) expectedGrid.set(slot, null)
+      const gridWidth = recipe.requiresTable ? 3 : 2
+      for (let y = 0; y < gridWidth; y++) {
+        for (let x = 0; x < gridWidth; x++) {
+          const remainder = recipe.outShape?.[y]?.[x]
+          if (!remainder || remainder.id === -1) continue
+          expectedGrid.set(1 + x + gridWidth * y, catalog.fromPrismarineItem(new Item(
+            remainder.id, remainder.count * waveTriggers, remainder.metadata
+          )))
+        }
+      }
+      const watchedGridSlots = [...new Set([...activeGridSlots, ...expectedGrid.keys()])]
+      const watchedSlots = [0, ...watchedGridSlots]
       const updateBaselines = new Map(watchedSlots.map(slot => [slot, evidence.current().slotVersion(window.id, slot)]))
       warehouse?.debug?.(`craft window shift-click start item=${registry.items[recipe.result.id]?.name || recipe.result.id} wave=${completed}+${waveTriggers} ${JSON.stringify(describeWindow())}`)
       await bot.clickWindow(0, 0, 1)
       try {
-        await evidence.waitForSlots(window.id, watchedSlots, updateBaselines, check, 'server did not confirm the crafting window after shift-click')
+        await evidence.waitForSlots(window.id, watchedSlots, updateBaselines, check,
+          'server did not confirm the crafting window after shift-click', expectedGrid)
       } catch (cause) {
         warehouse?.debug?.(`craft window shift-click update timeout item=${registry.items[recipe.result.id]?.name || recipe.result.id} wave=${completed}+${waveTriggers} ${JSON.stringify(describeWindow())}`)
         throw cause
@@ -1002,6 +1019,7 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
           const ready = slots.every(slot => {
             if ((slotVersions.get(`${windowId}:${slot}`) || 0) <= (baselines.get(slot) || 0)) return false
             if (!expectedSlots) return true
+            if (!expectedSlots.has(slot)) return true
             const expected = expectedSlots.get(slot)
             const current = windowSlots.get(windowId)?.get(slot)
             if (!expected) return !current
