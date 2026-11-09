@@ -203,6 +203,34 @@ test('100 pistons use one warehouse batch and one return while the executor rece
   } finally { f.db.close() }
 })
 
+test('1000 pistons finish across capacity-limited batches with exact owner balances', async () => {
+  const { CraftController } = require('../../src/craft/controller')
+  const f = fixture()
+  try {
+    for (const [name, amount] of [['oak_planks', 3000], ['cobblestone', 4000], ['iron_ingot', 1000], ['redstone', 1000]]) {
+      f.seed('alice', name, amount)
+    }
+    const batches = []
+    const execute = f.executor.execute
+    f.executor.execute = async args => {
+      batches.push(args.triggers)
+      return execute(args)
+    }
+    const controller = new CraftController({ ...f, botId: 'bot-a' })
+    const result = await controller.run({ actor: 'Alice', owner: { uuid: 'alice', username: 'Alice', scope: 'personal' },
+      item: 'piston', quantity: 1000 })
+    assert.equal(result.status, 'complete')
+    assert.ok(batches.length > 1)
+    assert.equal(batches.reduce((sum, value) => sum + value, 0), 1000)
+    assert.deepEqual(f.counts(), { withdrawCalls: batches.length, depositCalls: batches.length })
+    assert.equal(f.db.getOwnerItemsByItemId('alice', 'minecraft:piston')[0].amount, 1000)
+    for (const name of ['oak_planks', 'cobblestone', 'iron_ingot', 'redstone']) {
+      assert.equal(f.db.getOwnerItemsByItemId('alice', `minecraft:${name}`).reduce((sum, entry) => sum + entry.amount, 0), 0)
+    }
+    assert.deepEqual(f.getInventory(), [])
+  } finally { f.db.close() }
+})
+
 test('resets the craft timeout after each confirmed batch so long orders can continue', async () => {
   const { CraftController } = require('../../src/craft/controller')
   const f = fixture()

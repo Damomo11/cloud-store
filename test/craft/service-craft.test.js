@@ -217,6 +217,36 @@ test('runCraftCommand propagates an unsettled failure without a success message'
   }
 })
 
+test('craft logging follows the order to another worker and can be disabled during execution', async () => {
+  const sender = createFixture()
+  const worker = createFixture()
+  try {
+    giveStock(sender, 'uuid-alice', 'minecraft:oak_planks', 16)
+    sender.service.craftDebugWriter = () => {}
+    sender.service.handleCraftDebugCommand('Alice', '!调试 合成日志 开')
+    const lines = []
+    worker.service.craftDebugWriter = line => lines.push(JSON.parse(line.replace(/^\[craft-debug\] /, '')))
+    worker.service.craftController = { run: async () => {
+      worker.service.debugCraft('executor.test_before_disable')
+      sender.service.handleCraftDebugCommand('Alice', '!调试 合成日志 关')
+      worker.service.debugCraft('executor.test_after_disable')
+      return { status: 'complete' }
+    } }
+    await sender.service.handleCraft('Alice', '!合成 stick 8', { uuid: 'uuid-alice', scope: 'personal' })
+    await sender.tasks[0].run(worker.service)
+    assert.ok(lines.some(line => line.event === 'service.command_start'))
+    assert.ok(lines.some(line => line.event === 'executor.test_before_disable'))
+    assert.equal(lines.some(line => line.event === 'executor.test_after_disable'), false)
+    assert.equal(worker.service.craftDebugEnabled, false)
+    const count = lines.length
+    worker.service.debugCraft('outside_order')
+    assert.equal(lines.length, count)
+  } finally {
+    sender.close()
+    worker.close()
+  }
+})
+
 test('Chinese targets normalize through the cloud catalog before entering the queue', async () => {
   const fixture = createFixture()
   try {

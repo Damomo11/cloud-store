@@ -545,7 +545,7 @@ class CloudStoreService {
   }
 
   debugCraft (event, details = {}) {
-    if (!this.craftDebugEnabled) return
+    if (!this.craftDebugEnabled && !this.craftRequestDebugEnabled?.()) return
     const record = {
       ...details,
       timestamp: new Date().toISOString(),
@@ -2208,6 +2208,7 @@ class CloudStoreService {
     // reserves current stock under the warehouse lock when execution begins.
     const request = {
       player: username, owner: { ...owner }, target: { name: resolved.name, quantity: parsed.quantity },
+      craftDebugEnabled: () => this.craftDebugEnabled,
       notify: message => this.msg(username, message)
     }
     this.msg(username, '合成请求已提交：' + parsed.itemName + ' ×' + parsed.quantity + '；开工时重新核对库存。')
@@ -2256,6 +2257,8 @@ class CloudStoreService {
   }
 
   async runCraftCommand (command) {
+    const previousDebug = this.craftRequestDebugEnabled
+    this.craftRequestDebugEnabled = command.craftDebugEnabled
     const notify = command.notify || (message => this.msg(command.player, message))
     this.debugCraft('service.command_start', {
       target: command.target,
@@ -2303,6 +2306,8 @@ class CloudStoreService {
     } catch (error) {
       this.debugCraft('service.command_failure', { message: error.message, target: command.target })
       throw error
+    } finally {
+      this.craftRequestDebugEnabled = previousDebug
     }
   }
 

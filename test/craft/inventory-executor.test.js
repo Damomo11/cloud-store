@@ -75,7 +75,7 @@ function fixture (before, after, options = {}) {
   return { bot, calls, table, warehouse, catalog, config, executor, debugEvents, setInventory: value => { inventory = value } }
 }
 
-function proportionalFixture (before, after, step, { triggers = 1, waveAfter = null, noResultPacket = false, residualResult = false, serverResidual = false, residualAfterCleanup = false, resultReappearsAfterFirstCleanupCollection = false, delayedShiftUpdate = false, staleShiftUpdate = false, delayedPlacementUpdate = false, debugCraft } = {}) {
+function proportionalFixture (before, after, step, { triggers = 1, waveAfter = null, noResultPacket = false, residualResult = false, serverResidual = false, residualAfterCleanup = false, resultReappearsAfterFirstCleanupCollection = false, delayedShiftUpdate = false, staleShiftUpdate = false, delayedPlacementUpdate = false, stalePlacementUpdate = false, debugCraft } = {}) {
   const f = fixture(before, after, { debugCraft })
   const gridWidth = step.requiresTable ? 3 : 2
   const craftingWindow = (id, type, inventoryStart) => {
@@ -85,7 +85,7 @@ function proportionalFixture (before, after, step, { triggers = 1, waveAfter = n
       id,
       type,
       inventoryStart,
-      inventoryEnd: 46,
+      inventoryEnd: id === 0 ? 45 : 46,
       slots,
       selectedItem: null,
       findInventoryItem (type, metadata) {
@@ -133,6 +133,7 @@ function proportionalFixture (before, after, step, { triggers = 1, waveAfter = n
   let placementAckPending = false
   let placementAckTimer
   let shiftUpdatePending = false
+  let stalePlacementSent = false
   f.bot.clickWindow = async (slot, mouseButton = 0, mode = 0) => {
     const window = f.bot.currentWindow || playerWindow
     clicks.push({ windowId: window.id, slot, mouseButton, mode, grid: window.slots.slice(1, 1 + gridWidth * gridWidth).map(value => value?.count || 0) })
@@ -168,7 +169,13 @@ function proportionalFixture (before, after, step, { triggers = 1, waveAfter = n
       if (residualResult) window.slots[0] = new Item(recipe?.result?.id || registry.itemsByName[step.result.name].id, recipe?.result?.count || step.result.count, recipe?.result?.metadata || null)
       if (recipe?.outShape) {
         recipe.outShape.forEach((row, y) => row.forEach((remainder, x) => {
-          if (remainder?.id >= 0) window.slots[1 + x + gridWidth * y] = new Item(remainder.id, remainder.count * waveTriggers, remainder.metadata)
+          if (remainder?.id >= 0) {
+            window.slots[1 + x + gridWidth * y] = new Item(remainder.id, remainder.count, remainder.metadata)
+            if (waveTriggers > 1) {
+              const free = window.slots.findIndex((value, slot) => slot >= window.inventoryStart && slot < window.inventoryEnd && !value)
+              window.slots[free] = new Item(remainder.id, remainder.count * (waveTriggers - 1), remainder.metadata)
+            }
+          }
         }))
       }
     } else if (mode === 0) {
@@ -195,14 +202,40 @@ function proportionalFixture (before, after, step, { triggers = 1, waveAfter = n
         }
       } else if (!window.selectedItem && current) {
         const count = Math.ceil(current.count / 2)
-        window.selectedItem = new Item(current.type, count, current.metadata)
+        window.selectedItem = copyItem(current)
+        window.selectedItem.count = count
         current.count -= count
         if (current.count === 0) window.slots[slot] = null
       } else if (window.selectedItem && (!current || (current.type === window.selectedItem.type && current.metadata === window.selectedItem.metadata))) {
-        if (!current) window.slots[slot] = new Item(window.selectedItem.type, 1, window.selectedItem.metadata)
+        if (!current) {
+          window.slots[slot] = copyItem(window.selectedItem)
+          window.slots[slot].count = 1
+        }
         else current.count++
         window.selectedItem.count--
         if (window.selectedItem.count === 0) window.selectedItem = null
+      }
+    }
+    if (!noResultPacket && mode === 0 && slot > 0 && slot <= gridWidth * gridWidth) {
+      const recipe = f.bot.recipesAll(registry.itemsByName[step.result.name].id, null, step.requiresTable ? f.table : undefined)
+        .find(value => value.requiresTable === step.requiresTable && value.result.count === step.result.count)
+      const ingredients = recipe.inShape?.flat().filter(value => value.id >= 0) || recipe.ingredients
+      const placed = window.slots.slice(1, 1 + gridWidth * gridWidth).filter(Boolean)
+      if (placed.length === ingredients.length) {
+        window.slots[0] = new Item(recipe.result.id, recipe.result.count, recipe.result.metadata)
+        if (stalePlacementUpdate && !stalePlacementSent) {
+          stalePlacementSent = true
+          const correct = window.slots.slice(0, 1 + gridWidth * gridWidth).map(copyItem)
+          window.slots[5] = null
+          window.slots[8] = null
+          window.slots[0] = item('crimson_button', 1)
+          placementAckPending = true
+          setTimeout(() => {
+            correct.forEach((value, slot) => { window.slots[slot] = value })
+            placementAckPending = false
+            emitState(window)
+          }, 20)
+        }
       }
     }
     if (mode === 0 && slot > 0 && slot < 1 + gridWidth * gridWidth && delayedPlacementUpdate) {
@@ -424,7 +457,7 @@ test('2x2 proportional placement maps shapeless ingredients to separate grid cel
   }]
   const result = await f.executor.execute({ step, triggers: 2 })
   assert.deepEqual(amounts(result.produced), [['minecraft:stick', 2]])
-  assert.deepEqual(f.clicks.find(click => click.slot === 0 && click.mode === 1).grid, [2, 2, 0, 0])
+  assert.deepEqual(f.clicks.find(click => click.slot === 0 && click.mode === 1).grid, [0, 0, 2, 2])
 })
 
 test('3x3 table batch crafting fills the shaped grid proportionally and shift-clicks once', async () => {
@@ -654,7 +687,7 @@ test('proportional batch collects a result that reappears while clearing recipe 
   assert.ok(f.clicks.some(click => click.slot > 0 && click.slot <= 9 && click.mouseButton === 0 && click.mode === 0))
 })
 
-test('proportional batch keeps collecting when the result reappears after its first cleanup collection', async () => {
+test('proportional batch rejects repeated residual output without matching material consumption', async () => {
   const step = {
     requiresTable: true,
     result: { name: 'cake', count: 1 },
@@ -677,10 +710,25 @@ test('proportional batch keeps collecting when the result reappears after its fi
     resultReappearsAfterFirstCleanupCollection: true
   })
 
-  const result = await f.executor.execute({ step, triggers: 2 })
-
-  assert.deepEqual(amounts(result.produced), [['minecraft:bucket', 6], ['minecraft:cake', 2]])
+  // This fixture consumes one recipe but invents two residual cakes. Do not
+  // let a later wave overwrite that impossible first-wave inventory.
+  await assert.rejects(f.executor.execute({ step, triggers: 2 }), /wave inventory/)
+  assert.equal(f.clicks.filter(click => click.slot === 0 && click.mode === 1).length, 1)
   assert.equal(f.clicks.filter(click => click.slot === 0 && click.mouseButton === 0 && click.mode === 0).length, 2)
+})
+
+test('a late grid correction cannot redefine the planned piston recipe as missing iron and redstone', async () => {
+  const step = {
+    requiresTable: true, result: { name: 'piston', count: 1 },
+    inputs: [{ names: ['oak_planks'], count: 3 }, { names: ['cobblestone'], count: 4 },
+      { names: ['iron_ingot'], count: 1 }, { names: ['redstone'], count: 1 }]
+  }
+  const f = proportionalFixture([item('oak_planks', 30), item('cobblestone', 40), item('iron_ingot', 10), item('redstone', 10)],
+    [item('piston', 10)], step, { triggers: 10, stalePlacementUpdate: true })
+  const result = await f.executor.execute({ step, triggers: 10 })
+  assert.deepEqual(amounts(result.produced), [['minecraft:piston', 10]])
+  const shift = f.clicks.find(click => click.mode === 1)
+  assert.deepEqual(shift.grid, Array(9).fill(10))
 })
 
 test('3x3 proportional batch waits for server grid updates before cleanup after shift-click', async () => {
