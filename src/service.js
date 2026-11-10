@@ -35,7 +35,8 @@ async function recoverAndResumeCraft (service, controller) {
   const resumed = await controller.resume(recovered.operationId)
   if (resumed?.status === 'complete' && operation?.actor) {
     const target = operation.target || {}
-    const name = target.name || target.item || target.itemId || '目标物品'
+    const item = target.name || target.item || target.itemId || '目标物品'
+    const name = service.catalog?.getDisplayName?.(item) || item
     const quantity = Number(target.quantity || target.amount || 0)
     service.msg?.(operation.actor, `机器人已恢复并继续完成原合成订单：${name}${quantity > 0 ? ` ×${quantity}` : ''}。`)
   }
@@ -2303,7 +2304,7 @@ class CloudStoreService {
         operationId: result.operationId || null,
         target: result.target || command.target
       })
-      if (result.status === 'complete') notify('合成完成：' + command.target.name + ' ×' + command.target.quantity + '，产物与余料已回云仓并记账。')
+      if (result.status === 'complete') notify('合成完成：' + this.catalog.getDisplayName(command.target.name) + ' ×' + command.target.quantity + '，产物与余料已回云仓并记账。')
       else if (result.status === 'already_sufficient') notify('仓库里已有足够目标物品，无需继续合成。')
       return result
     } catch (error) {

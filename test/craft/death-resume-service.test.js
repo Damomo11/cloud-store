@@ -3,6 +3,8 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const Service = require('../../src/service')
+const ItemCatalog = require('../../src/itemCatalog')
+const { DEFAULT_CONFIG } = require('../../src/config')
 
 function context () {
   const events = []
@@ -17,6 +19,7 @@ function context () {
 
 test('craft recovery resumes the same operation only when recovery proves it resumable', async () => {
   const service = context()
+  service.catalog = new ItemCatalog(DEFAULT_CONFIG.server.version, DEFAULT_CONFIG.aliases, DEFAULT_CONFIG.language)
   const calls = []
   const controller = {
     ledger: { get: () => ({ actor: 'Alice', target: { name: 'piston', quantity: 12 } }) },
@@ -32,7 +35,7 @@ test('craft recovery resumes the same operation only when recovery proves it res
   assert.deepEqual(calls, ['craft:resume-me'])
   assert.equal(result.status, 'complete')
   assert.ok(service.events.some(event => event.event === 'service.resume_start' && event.data.operationId === 'craft:resume-me'))
-  assert.deepEqual(service.messages, [{ username: 'Alice', message: '机器人已恢复并继续完成原合成订单：piston ×12。' }])
+  assert.deepEqual(service.messages, [{ username: 'Alice', message: '机器人已恢复并继续完成原合成订单：活塞 ×12。' }])
 })
 
 test('craft recovery does not resume an unknown or manually recoverable operation', async () => {
