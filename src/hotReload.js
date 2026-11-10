@@ -1,17 +1,65 @@
+const fs = require('node:fs')
 const path = require('node:path')
 const { spawn } = require('node:child_process')
+const { sanitizeChatText } = require('./utils')
 
 // 管理员命令 !热重载 的执行模块：
 // 1. git pull 更新代码；2. 等所有 bot 空闲；3. 拉起新代码进程并让旧进程退出。
 // 重启通过“新进程先启动、旧进程再退出”实现，不依赖 pm2/systemd 等外部守护。
 // 各步骤都提供依赖注入口，测试里不跑真实 git、不真的退出进程。
+//
+// 多 bot 多进程共用同一个仓库目录：git pull 用文件锁互斥（同一时刻只允许一个进程拉取，
+// 其余进程排队等待后各自再拉一次），避免并发 fetch 抢 ref 锁互相失败。
+// git pull 使用 --ff-only：只允许快进，遇到本地与远端分叉时明确报错，不自动合并。
 
 const DEFAULT_IDLE_TIMEOUT_MS = 10 * 60 * 1000
 const DEFAULT_IDLE_POLL_MS = 500
 const RESTART_START_DELAY_MS = 3000
+const PULL_LOCK_FILE = '.hotreload-pull.lock'
+const PULL_LOCK_STALE_MS = 15 * 60 * 1000
+const PULL_LOCK_WAIT_TIMEOUT_MS = 60 * 1000
+const PULL_LOCK_POLL_MS = 500
 
 function defaultGitExec () {
-  return process.platform === 'win32' ? ['git', 'pull'] : ['git', 'pull']
+  return process.platform === 'win32' ? ['git', 'pull', '--ff-only'] : ['git', 'pull', '--ff-only']
+}
+
+// 尝试创建 pull 锁（O_EXCL 原子创建）。锁文件写入进程号与时间：
+// 超过 staleMs 的残锁（进程被强杀留下）允许抢占后重建。返回 true 表示拿到锁。
+function tryCreatePullLock (lockPath, staleMs = PULL_LOCK_STALE_MS) {
+  const create = () => {
+    const fd = fs.openSync(lockPath, 'wx')
+    try {
+      fs.writeSync(fd, JSON.stringify({ pid: process.pid, startedAt: Date.now() }))
+    } finally {
+      fs.closeSync(fd)
+    }
+    return true
+  }
+  try {
+    return create()
+  } catch (error) {
+    if (error?.code !== 'EEXIST') throw error
+    let info = null
+    try {
+      info = JSON.parse(fs.readFileSync(lockPath, 'utf8') || '{}')
+    } catch {}
+    if (!info?.startedAt || Date.now() - info.startedAt > staleMs) {
+      try { fs.unlinkSync(lockPath) } catch {}
+      try {
+        return create()
+      } catch {}
+    }
+    return false
+  }
+}
+
+// 释放 pull 锁：只删除自己进程创建的锁（校验 pid），避免误删别人抢占后重建的新锁。
+function releasePullLock (lockPath) {
+  try {
+    const info = JSON.parse(fs.readFileSync(lockPath, 'utf8') || '{}')
+    if (info?.pid === process.pid) fs.unlinkSync(lockPath)
+  } catch {}
 }
 
 function gitPull ({ exec = defaultGitExec, cwd = process.cwd() } = {}) {
@@ -45,7 +93,7 @@ function gitPull ({ exec = defaultGitExec, cwd = process.cwd() } = {}) {
       if (settled) return
       settled = true
       if (code === 0) resolve({ updated: true, output: output.trim() })
-      else reject(new Error(`git pull 失败（退出码 ${code}）：${output.trim().slice(-400)}`))
+      else reject(new Error(`git pull 失败（退出码 ${code}）：${output.trim().slice(-200)}`))
     })
   })
 }
@@ -132,10 +180,10 @@ async function runHotReload ({
   notify,
   taskPool,
   gitExec,
-  cwd,
+  cwd = process.cwd(),
   idleTimeoutMs,
   pollMs,
-  sleep,
+  sleep = defaultSleep,
   now,
   spawnSuccessor = false,
   entryFile,
@@ -144,22 +192,48 @@ async function runHotReload ({
   exitProcess,
   gitPull: runGitPull = gitPull,
   waitForIdle: runWaitForIdle = waitForIdle,
-  scheduleSuccessorProcess: startSuccessor = scheduleSuccessorProcess
+  scheduleSuccessorProcess: startSuccessor = scheduleSuccessorProcess,
+  pullLockPath = path.join(cwd, PULL_LOCK_FILE),
+  pullLockStaleMs = PULL_LOCK_STALE_MS,
+  pullLockWaitTimeoutMs = PULL_LOCK_WAIT_TIMEOUT_MS,
+  pullLockPollMs = PULL_LOCK_POLL_MS
 }) {
-  notify('开始热重载：先 git pull 更新代码，然后等所有机器人空闲后重启程序。')
+  // 所有进度通知先过聊天字符白名单清洗，git 输出里的特殊符号不会再触发服务器踢人。
+  const safeNotify = message => notify(sanitizeChatText(message))
+
+  safeNotify('开始热重载：先 git pull 更新代码，然后等所有机器人空闲后重启程序。')
+
+  // 跨进程文件锁互斥：同一时刻只允许一个进程执行 git pull，
+  // 其余进程排队等待后各自再拉一次（多进程部署下每个进程都要完成自己的 pull+重启）。
+  let locked = tryCreatePullLock(pullLockPath, pullLockStaleMs)
+  if (!locked) {
+    safeNotify('检测到其他机器人进程正在更新代码，排队等待中……')
+    const waitStartedAt = Date.now()
+    while (!locked) {
+      await sleep(pullLockPollMs)
+      locked = tryCreatePullLock(pullLockPath, pullLockStaleMs)
+      if (!locked && Date.now() - waitStartedAt >= pullLockWaitTimeoutMs) break
+    }
+    if (!locked) {
+      safeNotify('等待其他进程更新代码超时，本次热重载中止，请稍后重试。')
+      return { status: 'pull_lock_timeout' }
+    }
+  }
 
   let pullResult
   try {
     pullResult = await runGitPull({ exec: gitExec, cwd })
   } catch (error) {
-    notify(`热重载中止：${error.message}`)
+    safeNotify(`热重载中止：${error.message}`)
     return { status: 'pull_failed' }
+  } finally {
+    releasePullLock(pullLockPath)
   }
 
-  notify('代码更新完成，等待机器人空闲……如果一直有任务在跑，超时后会直接重启（进行中的任务会在重启后自动恢复）。')
+  safeNotify('代码更新完成，等待机器人空闲……如果一直有任务在跑，超时后会直接重启（进行中的任务会在重启后自动恢复）。')
   const idle = await runWaitForIdle({ taskPool, timeoutMs: idleTimeoutMs, pollMs, sleep, now })
   if (!idle) {
-    notify('等待超时：仍有任务未结束，现在直接重启（进行中的任务会在重启后自动恢复）。')
+    safeNotify('等待超时：仍有任务未结束，现在直接重启（进行中的任务会在重启后自动恢复）。')
   }
 
   // 内部拉继任者时，新进程延迟几秒启动再退旧进程，让新进程完成初始化（绑端口等），
@@ -167,16 +241,16 @@ async function runHotReload ({
   let successor = null
   if (spawnSuccessor) {
     successor = startSuccessor({ entryFile, spawnImplementation })
-    notify('机器人已空闲，程序将在几秒后用新代码重启；如果几分钟后机器人没上线，请手动启动一次。')
+    safeNotify('机器人已空闲，程序将在几秒后用新代码重启；如果几分钟后机器人没上线，请手动启动一次。')
   } else {
-    notify('机器人已空闲，程序即将退出并由外层守护用新代码重新拉起。')
+    safeNotify('机器人已空闲，程序即将退出并由外层守护用新代码重新拉起。')
   }
 
   try {
     await shutdown?.()
   } catch (error) {
     successor?.cancel()
-    notify(`热重载中止：退出前收尾失败（${error.message}）。本次不重启。`)
+    safeNotify(`热重载中止：退出前收尾失败（${error.message}）。本次不重启。`)
     return { status: 'shutdown_failed', error }
   }
 
@@ -187,8 +261,14 @@ module.exports = {
   DEFAULT_IDLE_TIMEOUT_MS,
   DEFAULT_IDLE_POLL_MS,
   RESTART_START_DELAY_MS,
+  PULL_LOCK_FILE,
+  PULL_LOCK_STALE_MS,
+  PULL_LOCK_WAIT_TIMEOUT_MS,
+  PULL_LOCK_POLL_MS,
   defaultGitExec,
   gitPull,
+  tryCreatePullLock,
+  releasePullLock,
   isTaskPoolIdle,
   waitForIdle,
   scheduleSuccessorProcess,

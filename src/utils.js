@@ -37,9 +37,20 @@ function sumBy (items, getKey) {
   return result
 }
 
+// 聊天消息出口清洗：只保留白名单字符（中文/假名/全角数字与常用标点/ASCII 常用字符），
+// 其余字符（git 输出里的特殊符号、控制字符等）一律替换为空格，避免服务器聊天过滤器
+// 判定"非法字符"把 bot 踢下线。在 service.msg 发送出口统一调用，任何模块的报错文本都安全。
+function sanitizeChatText (value) {
+  return String(value ?? '')
+    .replace(/[^\u4e00-\u9fa5\u3040-\u30ff\uff10-\uff19a-zA-Z0-9 .,:;!?\[\]()\-_\/%+*=<>@#'，。：；！？（）【】、～×…]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
 module.exports = {
   clampInt,
   formatItemList,
+  sanitizeChatText,
   sha1,
   sleep,
   stableStringify,

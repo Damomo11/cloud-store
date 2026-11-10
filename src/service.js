@@ -1,4 +1,4 @@
-const { clampInt, sleep, sumBy } = require('./utils')
+const { clampInt, sanitizeChatText, sleep, sumBy } = require('./utils')
 const { startTrace, traceEvent, traceSummary, traceStandalone, shortKey } = require('./traceLog')
 const { runHotReload } = require('./hotReload')
 const { planShortages, normalizeItemId } = require('./shortagePlanner')
@@ -4432,7 +4432,8 @@ class CloudStoreService {
 
   msg (username, message) {
     const template = this.config.commands.msg
-    const chunks = this.splitMessage(String(message), 80)
+    // 出口统一清洗：任何来源的文本（含 git 报错、异常堆栈）只保留聊天过滤器认可的字符，防 bot 被踢
+    const chunks = this.splitMessage(sanitizeChatText(message), 80)
     for (let index = 0; index < chunks.length; index++) {
       const chunk = chunks[index]
       const privateCommand = template.replace('{player}', username).replace('{message}', chunk)
