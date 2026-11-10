@@ -17,7 +17,7 @@ const DEFAULT_IDLE_POLL_MS = 500
 const RESTART_START_DELAY_MS = 3000
 const PULL_LOCK_FILE = '.hotreload-pull.lock'
 const PULL_LOCK_STALE_MS = 5 * 60 * 1000
-const PULL_LOCK_WAIT_TIMEOUT_MS = 60 * 1000
+const PULL_LOCK_WAIT_TIMEOUT_MS = 3 * 60 * 1000
 const PULL_LOCK_POLL_MS = 500
 
 function defaultGitExec () {

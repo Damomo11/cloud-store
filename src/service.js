@@ -15,6 +15,11 @@ const WHOLE_SHULKER_WITHDRAW_THRESHOLD = 1728
 // 盐在进程生命周期内保持稳定：同进程内同批次键不变（就地重试/崩溃恢复防双扣语义不变），跨进程必然不同。
 const DEDUCTION_KEY_SALT = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
 
+// 热重载的进程级运行标志：群聊命令会被同进程的每只 bot 同时听到，
+// 若按 bot 实例各自判重，N 只 bot 会各跑一遍 pull+排队。这里进程级去重，
+// 第一只受理，其余直接回复"已在进行中"。
+const hotReloadProcessState = { running: false }
+
 async function recoverAndResumeCraft (service, controller) {
   const recovered = await controller.recover()
   if (recovered?.status !== 'resumable') return recovered
@@ -58,7 +63,6 @@ class CloudStoreService {
     this.craftDebugWriter = line => console.log(line)
     this.webAuth = null
     this.accountedResidual = new Map()
-    this.hotReloadRunning = false
     // index.js 注入：重启前的全局收尾（断开所有 bot、关订阅/DB）与进程退出。
     this.hotReloadShutdownHook = null
     this.hotReloadExitHook = null
@@ -969,17 +973,15 @@ class CloudStoreService {
 
   // 管理员命令 !热重载：git pull 更新代码 → 等所有 bot 空闲 → 拉起新代码进程并退出旧进程。
   // 不占任务队列：流程在后台等待，管理员下达后可以继续干别的；重启前会把进度私聊给管理员。
-  // 管理员命令 !热重载：git pull 更新代码 → 等所有 bot 空闲 → 拉起新代码进程并退出旧进程。
-  // 不占任务队列：流程在后台等待，管理员下达后可以继续干别的；重启前会把进度私聊给管理员。
   // 重启通过“新进程先启动、旧进程再退出”实现，不依赖 pm2/systemd 等外部守护；
-  // 多 bot 在线时每只都能受理该命令，但 hotReloadRunning 标志保证只有一个流程在跑。
+  // 群聊命令会被同进程每只 bot 听到，靠进程级 hotReloadProcessState 去重，只有一个流程在跑。
   handleHotReload (username) {
-    if (this.hotReloadRunning) {
+    if (hotReloadProcessState.running) {
       this.msg(username, '热重载已在进行中，请等待完成。')
       return Promise.resolve({ status: 'already_running' })
     }
-    this.hotReloadRunning = true
-    const finish = () => { this.hotReloadRunning = false }
+    hotReloadProcessState.running = true
+    const finish = () => { hotReloadProcessState.running = false }
     const stubs = this.hotReloadStubs || {}
     return runHotReload({
       notify: message => this.msg(username, message),
@@ -4559,10 +4561,17 @@ class CloudStoreService {
 
   splitMessage (message, maxLength) {
     const chunks = []
-    let text = message
+    let text = String(message ?? '')
     while (text.length > maxLength) {
-      chunks.push(text.slice(0, maxLength))
-      text = text.slice(maxLength)
+      // 优先在空格或句读处断行，避免把英文单词、文件名（如 .hotreload-pull.lock）切成两半
+      const window = text.slice(0, maxLength)
+      let cut = window.lastIndexOf(' ')
+      for (const mark of ['，', '。', '；', '、', '：', '！', '？']) {
+        cut = Math.max(cut, window.lastIndexOf(mark) + 1)
+      }
+      if (cut < Math.floor(maxLength / 2)) cut = maxLength
+      chunks.push(text.slice(0, cut))
+      text = text.slice(cut).replace(/^\s+/, '')
     }
     chunks.push(text)
     return chunks
