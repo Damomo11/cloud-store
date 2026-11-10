@@ -3378,7 +3378,6 @@ class Warehouse {
         .filter(entry => entry.amount > 0)
       if (!pending.length) break
 
-      await this.lookAtPlayer(username)
       let plannedThisRound = 0
       for (const entry of pending) {
         let remaining = entry.amount
@@ -3396,6 +3395,12 @@ class Warehouse {
           const amount = Math.min(remaining, item.count)
           const startedAt = Date.now()
           this.debug(`drop batch ${normalized.displayName} x${amount} slot=${item.slot} round=${round + 1}/${maxRounds}`)
+          // 每堆丢出前都重新对准玩家：一轮可以连丢多堆，堆与堆之间隔着几百毫秒
+          // 冷却，期间玩家走动会让后续堆全部沿旧视线丢出，落点散得到处都是
+          // （地狱取货时最明显：玩家几乎总在移动，地形起伏还会放大散落）。
+          // 与 dropInventoryToPlayer 的逐堆 lookAtPlayer 语义对齐；
+          // lookAtPlayer 内部自带等区块就绪与瞬间转头，丢歪前会先对准。
+          await this.lookAtPlayer(username)
           await this.dropSlotAmountFast(item, amount)
           droppedSlots.add(item.slot)
           remaining -= amount
