@@ -47,9 +47,20 @@ function sanitizeChatText (value) {
     .trim()
 }
 
+// mineflayer 弧度朝向 → 游戏 F3 显示角度：yaw 归一化到 0~360，pitch 为 -90~90（抬头为负）。
+function notchYawDeg (yaw) {
+  return ((180 - yaw * 180 / Math.PI) % 360 + 360) % 360
+}
+
+function notchPitchDeg (pitch) {
+  return -pitch * 180 / Math.PI
+}
+
 module.exports = {
   clampInt,
   formatItemList,
+  notchPitchDeg,
+  notchYawDeg,
   sanitizeChatText,
   sha1,
   sleep,
