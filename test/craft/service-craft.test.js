@@ -181,7 +181,7 @@ test('runCraftCommand reports success only after the warehouse controller settle
       fixture.sent.push({ user: 'Alice', text })
     } })
     const last = fixture.sent[fixture.sent.length - 1].text
-    assert.match(last, /合成完成：stick/)
+    assert.equal(last, '合成完成：木棍 ×8，产物与余料已回云仓并记账。')
   } finally {
     fixture.close()
   }
