@@ -3528,6 +3528,21 @@ class Warehouse {
     return Math.max(0, before - this.inventoryCountByItemKey(itemKey))
   }
 
+  // 等 bot 自身区块就绪。跨维度传送后区块数据未到时，mineflayer 的 physics
+  // tick 会因 blockAt 为空而整体跳过：force look 只改本地朝向，转头包靠
+  // physics tick 补发；区块未就绪时包根本发不出去，服务器仍按落地旧朝向
+  // 处理丢物品（落地朝向恰好朝玩家只是传送插件的巧合）。判断条件与
+  // physics tick 的拦截条件保持一致：blockAt(自身位置) 非空。
+  async waitForOwnChunkReadyForAim (timeoutMs) {
+    const startedAt = Date.now()
+    while (Date.now() - startedAt < timeoutMs) {
+      const pos = this.bot.entity?.position
+      if (pos && this.bot.blockAt(pos) != null) return true
+      await sleep(100)
+    }
+    return false
+  }
+
   // 丢前瞄准默认对准玩家身体底部中心（脚底坐标）。高瞄点会让丢出方向偏上，
   // 玩家站在台阶、半砖、船等矮位时物品落点会漂。
   async lookAtPlayer (username, yOffset = 0) {
@@ -3536,8 +3551,14 @@ class Warehouse {
       // 不能静默返回：调用方会按上一次视线丢出物品，等于丢歪。
       throw new Error(`丢前瞄准失败：找不到玩家 ${username} 的实体（区块可能尚未加载）`)
     }
+    const chunkTimeoutMs = Number(this.config.timing?.dropAimChunkTimeoutMs ?? 5000)
+    if (!await this.waitForOwnChunkReadyForAim(chunkTimeoutMs)) {
+      throw new Error(`丢前瞄准失败：bot 所在区块 ${chunkTimeoutMs}ms 内未就绪，转向无法同步，为避免丢歪已中止`)
+    }
     const target = entity.position.offset(0, yOffset, 0)
-    await this.bot.lookAt(target, true)
+    // 非 force：等 physics tick 把转向真正同步到服务器后再返回；
+    // withTimeout 兜底，防止 physics 异常停摆时永久挂起。
+    await this.withTimeout(this.bot.lookAt(target, false), 5000, `丢前瞄准转头超时（${username}）`)
     await sleep(100)
   }
 
