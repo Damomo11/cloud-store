@@ -27,3 +27,5 @@ cloud-store-mod/run/
 logs/errors.jsonl
 logs/withdraw-trace-*.jsonl
 .hotreload-pull.lock
+.hotreload-notify.json
+.hotreload-notify.json.sending
