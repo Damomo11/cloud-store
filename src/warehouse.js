@@ -3405,6 +3405,7 @@ class Warehouse {
       }
       if (!plannedThisRound) break
       await this.waitForInventoryIdle(beforeByKey.keys())
+      await this.logDropTossEvidence(`round${round + 1}`)
     }
 
     const dropped = []
@@ -3576,6 +3577,32 @@ class Warehouse {
     const turnedDeg = Math.abs(((afterYaw - beforeYaw) % 360 + 540) % 360 - 180)
     this.debug(`aim done ${username}: yaw ${beforeYaw.toFixed(1)}°→${afterYaw.toFixed(1)}°(转${turnedDeg.toFixed(1)}°) pitch ${beforePitch.toFixed(1)}°→${afterPitch.toFixed(1)}° 用时${Date.now() - startedAt}ms`)
     await sleep(100)
+    // 复核：缓冲后重读朝向。若与 aim done 明显不一致，说明期间服务器的
+    // position 包把朝向改回（插件拉回/传送校正），物品会按服务器朝向丢出。
+    const settleYaw = notchYawDeg(this.bot.entity.yaw)
+    const settlePitch = notchPitchDeg(this.bot.entity.pitch)
+    const settleDriftDeg = Math.abs(((settleYaw - afterYaw) % 360 + 540) % 360 - 180)
+    if (settleDriftDeg > 1 || Math.abs(settlePitch - afterPitch) > 1) {
+      this.debug(`aim settle ${username}: 警告-朝向被服务器改回 yaw=${settleYaw.toFixed(1)}° pitch=${settlePitch.toFixed(1)}°（本地转完后是 ${afterYaw.toFixed(1)}°/${afterPitch.toFixed(1)}°）`)
+    }
+  }
+
+  // 铁证日志：读刚丢出物品实体的速度方向。投掷初速度由服务器按"它认为的
+  // bot 朝向"计算——速度朝下=服务器视角 bot 确实低头了；水平飞出=服务器
+  // 没应用转向。与 aim 日志互相印证，一锤定音。
+  async logDropTossEvidence (label) {
+    await sleep(150)
+    const item = this.nearestDroppedItem()
+    if (!item?.position) {
+      this.debug(`toss ${label}: 150ms 内未观察到附近掉落物（可能已被拾取）`)
+      return
+    }
+    const vel = item.velocity
+    const horizontal = Math.sqrt(vel.x * vel.x + vel.z * vel.z)
+    const speed = Math.sqrt(vel.x * vel.x + vel.y * vel.y + vel.z * vel.z)
+    const velYaw = notchYawDeg(Math.atan2(-vel.x, -vel.z))
+    const velPitch = horizontal === 0 && vel.y === 0 ? 0 : Math.atan2(vel.y, horizontal) * 180 / Math.PI
+    this.debug(`toss ${label}: item@${this.describePosition(item.position)} speed=${speed.toFixed(2)} 方向 yaw=${velYaw.toFixed(1)}° pitch=${velPitch.toFixed(1)}°（pitch≈-90=竖直向下=服务器已应用低头）`)
   }
 
   // bot.players[name].entity 跨维度传送后会失效；先直查，再按大小写变体，
