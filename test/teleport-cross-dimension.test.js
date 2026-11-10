@@ -178,6 +178,7 @@ test('warehouse lookAtPlayer resolves entity via fallback and throws when absent
     selfPos: new Vec3(2, 66, 2)
   })
   bot.lookAt = async () => {}
+  bot.blockAt = () => ({ name: 'air' })
   const db = { prepare: () => ({ run () {}, all () { return [] }, get () { return null } }) }
   const warehouse = Object.create(Warehouse.prototype)
   warehouse.bot = bot
