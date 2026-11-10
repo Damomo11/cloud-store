@@ -1,6 +1,6 @@
 const fs = require('node:fs')
 const path = require('node:path')
-const { spawn } = require('node:child_process')
+const { spawn, execSync } = require('node:child_process')
 const { sanitizeChatText } = require('./utils')
 
 // 管理员命令 !热重载 的执行模块：
@@ -19,9 +19,21 @@ const PULL_LOCK_FILE = '.hotreload-pull.lock'
 const PULL_LOCK_STALE_MS = 5 * 60 * 1000
 const PULL_LOCK_WAIT_TIMEOUT_MS = 3 * 60 * 1000
 const PULL_LOCK_POLL_MS = 500
+// 重启完成提醒的接力文件：旧进程 pull 成功后把发起人写进去，
+// 新进程第一只 bot 上线后读它私聊"热重载完成"，发完即删（防重复）。
+const PENDING_NOTIFY_FILE = '.hotreload-notify.json'
 
 function defaultGitExec () {
   return process.platform === 'win32' ? ['git', 'pull', '--ff-only'] : ['git', 'pull', '--ff-only']
+}
+
+// 当前 HEAD 短哈希（版本标识）；git 不可用时返回空串，调用方按无版本处理。
+function gitHeadShort (cwd = process.cwd()) {
+  try {
+    return String(execSync('git rev-parse --short HEAD', { cwd, windowsHide: true })).trim()
+  } catch {
+    return ''
+  }
 }
 
 // 尝试创建 pull 锁（O_EXCL 原子创建）。锁文件写入进程号与时间（供排查用）。
@@ -185,6 +197,7 @@ function scheduleSuccessorProcess ({
 // 新进程留在原会话里、日志可见。只有裸跑（无任何守护）时才需要置 true。
 async function runHotReload ({
   notify,
+  notifyTarget,
   taskPool,
   gitExec,
   cwd = process.cwd(),
@@ -203,7 +216,8 @@ async function runHotReload ({
   pullLockPath = path.join(cwd, PULL_LOCK_FILE),
   pullLockStaleMs = PULL_LOCK_STALE_MS,
   pullLockWaitTimeoutMs = PULL_LOCK_WAIT_TIMEOUT_MS,
-  pullLockPollMs = PULL_LOCK_POLL_MS
+  pullLockPollMs = PULL_LOCK_POLL_MS,
+  pendingNotifyPath = path.join(cwd, PENDING_NOTIFY_FILE)
 }) {
   // 所有进度通知先过聊天字符白名单清洗，git 输出里的特殊符号不会再触发服务器踢人。
   const safeNotify = message => notify(sanitizeChatText(message))
@@ -237,7 +251,8 @@ async function runHotReload ({
     releasePullLock(pullLockPath)
   }
 
-  safeNotify('代码更新完成，等待机器人空闲……如果一直有任务在跑，超时后会直接重启（进行中的任务会在重启后自动恢复）。')
+  const headShort = gitHeadShort(cwd)
+  safeNotify(`代码更新完成${headShort ? `（版本 ${headShort}）` : ''}，等待机器人空闲……如果一直有任务在跑，超时后会直接重启（进行中的任务会在重启后自动恢复）。`)
   const idle = await runWaitForIdle({ taskPool, timeoutMs: idleTimeoutMs, pollMs, sleep, now })
   if (!idle) {
     safeNotify('等待超时：仍有任务未结束，现在直接重启（进行中的任务会在重启后自动恢复）。')
@@ -253,10 +268,19 @@ async function runHotReload ({
     safeNotify('机器人已空闲，程序即将退出并由外层守护用新代码重新拉起。')
   }
 
+  // 重启已不可逆：写入接力文件，新进程上线后由它私聊发起人"热重载完成"。
+  // 只在有发起人时写；失败不阻断重启（提醒是锦上添花，不能拖垮主流程）。
+  if (notifyTarget) {
+    try {
+      fs.writeFileSync(pendingNotifyPath, JSON.stringify({ target: notifyTarget, version: headShort, at: Date.now() }))
+    } catch {}
+  }
+
   try {
     await shutdown?.()
   } catch (error) {
     successor?.cancel()
+    try { fs.unlinkSync(pendingNotifyPath) } catch {} // 不重启了，撤回接力文件，避免下次误报"热重载完成"
     safeNotify(`热重载中止：退出前收尾失败（${error.message}）。本次不重启。`)
     return { status: 'shutdown_failed', error }
   }
@@ -272,7 +296,9 @@ module.exports = {
   PULL_LOCK_STALE_MS,
   PULL_LOCK_WAIT_TIMEOUT_MS,
   PULL_LOCK_POLL_MS,
+  PENDING_NOTIFY_FILE,
   defaultGitExec,
+  gitHeadShort,
   gitPull,
   tryCreatePullLock,
   releasePullLock,

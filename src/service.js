@@ -985,6 +985,7 @@ class CloudStoreService {
     const stubs = this.hotReloadStubs || {}
     return runHotReload({
       notify: message => this.msg(username, message),
+      notifyTarget: username,
       taskPool: this.taskPool,
       idleTimeoutMs: this.config.timing?.hotReloadIdleTimeoutMs,
       spawnSuccessor: this.config.timing?.hotReloadSpawnSuccessor === true,
