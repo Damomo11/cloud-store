@@ -21,6 +21,7 @@ const {
 } = require('./authCache')
 const { installFatalProtocolPacketCapture, isFatalProtocolReadError, releaseBotConnection, terminateBotTransport } = require('./botConnection')
 const { installClientTickEndPatch } = require('./tickEndPatch')
+const { installPlayerLoadedReport } = require('./playerLoaded')
 const { logLocalError } = require('./localErrorLog')
 const { configureTraceLog } = require('./traceLog')
 const { installConsoleLogBuffer } = require('./consoleLogBuffer')
@@ -309,6 +310,7 @@ function launchBot (state) {
     directory: path.resolve(process.cwd(), 'logs')
   })
   const uninstallTickEndPatch = installClientTickEndPatch(bot)
+  installPlayerLoadedReport(bot)
   let loggedIn = false
   let spawned = false
   let lastDisconnectReason = ''
