@@ -3555,7 +3555,6 @@ class Warehouse {
     if (!await this.waitForOwnChunkReadyForAim(chunkTimeoutMs)) {
       throw new Error(`丢前瞄准失败：bot 所在区块 ${chunkTimeoutMs}ms 内未就绪，转向无法同步，为避免丢歪已中止`)
     }
-    this.patchLookPacketLog()
     const target = entity.position.offset(0, yOffset, 0)
     const botBefore = this.bot.entity
     const beforeYaw = notchYawDeg(botBefore.yaw)
@@ -3563,8 +3562,8 @@ class Warehouse {
     this.debug(`aim ${username}: bot=${this.describePosition(botBefore.position)} 视角 yaw=${beforeYaw.toFixed(1)}° pitch=${beforePitch.toFixed(1)}°` +
       ` 玩家=${this.describePosition(entity.position)} 碰撞箱=${entity.width ?? '?'}x${entity.height ?? '?'} 目标=${this.describePosition(target)}(yOffset=${yOffset})`)
     const startedAt = Date.now()
-    // force：本地朝向一步设到位（不做逐 tick 逼近，瞬间转头）；转头包由
-    // 物理心跳在下一个 50ms 补发，实际发出的朝向见 look packet 日志。
+    // force：本地朝向一步设到位（不做逐 tick 逼近，瞬间转头）；
+    // 转头包由物理心跳在下一个 50ms 补发。
     await this.bot.lookAt(target, true)
     const afterYaw = notchYawDeg(this.bot.entity.yaw)
     const afterPitch = notchPitchDeg(this.bot.entity.pitch)
@@ -3572,40 +3571,6 @@ class Warehouse {
     const turnedDeg = Math.abs(((afterYaw - beforeYaw) % 360 + 540) % 360 - 180)
     this.debug(`aim done ${username}: yaw ${beforeYaw.toFixed(1)}°→${afterYaw.toFixed(1)}°(转${turnedDeg.toFixed(1)}°) pitch ${beforePitch.toFixed(1)}°→${afterPitch.toFixed(1)}° 用时${Date.now() - startedAt}ms`)
     await sleep(100)
-  }
-
-  // 包级日志：拦截协议层写包，凡转向包（look / position_look）打出实际发往
-  // 服务器的 yaw/pitch——转头包离开进程那一刻的真实值，不靠本地朝向推断。
-  // 同时监听服务器下发的朝向改写（position = 传送设朝向 / player_rotation =
-  // 强制转头）：转头包发出后 bot 视角若被服务器改回，入站日志直接可见，
-  // 与出站日志构成完整因果链。params 里的 yaw/pitch 已是 notchian 度数。
-  patchLookPacketLog () {
-    const client = this.bot._client
-    if (!client || client.__aimLookLogPatched) return
-    client.__aimLookLogPatched = true
-    const origWrite = client.write.bind(client)
-    client.write = (name, params) => {
-      try {
-        if (params && Number.isFinite(params.yaw) && Number.isFinite(params.pitch) && String(name).includes('look')) {
-          const yawDeg = (((Number(params.yaw) % 360) + 360) % 360).toFixed(1)
-          this.debug(`look packet ${name} 发出 yaw=${yawDeg}° pitch=${Number(params.pitch).toFixed(1)}°`)
-        }
-      } catch {}
-      return origWrite(name, params)
-    }
-    // 入站：服务器改写 bot 视角。yaw/pitch 为包内原始值（flags 相对模式下是增量，
-    // 会标注）。teleportId 存在时一并打出，用于识别是哪次传送摆的朝向。
-    const logServerRotation = (source, packet) => {
-      try {
-        if (!packet || !Number.isFinite(packet.yaw) || !Number.isFinite(packet.pitch)) return
-        const yawDeg = (((Number(packet.yaw) % 360) + 360) % 360).toFixed(1)
-        const relative = packet.flags && (packet.flags.yaw || packet.flags.pitch || ((packet.flags & 24) !== 0))
-        const teleport = packet.teleportId != null ? ` teleport=${packet.teleportId}` : ''
-        this.debug(`rotation in ${source} 服务器改写视角 yaw=${yawDeg}° pitch=${Number(packet.pitch).toFixed(1)}°${relative ? '（相对增量）' : ''}${teleport}`)
-      } catch {}
-    }
-    client.on('position', packet => logServerRotation('position', packet))
-    client.on('player_rotation', packet => logServerRotation('player_rotation', packet))
   }
 
   // bot.players[name].entity 跨维度传送后会失效；先直查，再按大小写变体，
