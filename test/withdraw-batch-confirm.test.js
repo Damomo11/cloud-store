@@ -126,6 +126,9 @@ function createDropBot () {
   const bot = {
     // 丢前瞄准需要玩家实体；默认摆在脚底坐标 (10, 64, 10)。
     players: { Player: { entity: { position: new Vec3(10, 64, 10) } } },
+    entity: { position: new Vec3(8, 64, 10), yaw: 0, pitch: 0 },
+    // 自身所在区块已加载，物理心跳可以同步转向。
+    blockAt: position => ({ name: 'air', position: position.floored() }),
     currentWindow: null,
     inventory: { items: () => Object.values(slots).filter(Boolean) },
     clickWindow: async () => {},
@@ -246,5 +249,24 @@ test('dropItemsToPlayer fails loudly instead of dropping at a stale angle', asyn
     /找不到玩家 Player 的实体/
   )
   assert.equal(clicks, 0, '瞄准失败时不能丢出任何物品')
+  assert.equal(slots[36].count, 10)
+})
+
+test('dropItemsToPlayer does not drop before its own chunk is loaded', async () => {
+  const { bot, slots } = createDropBot()
+  slots[36] = { name: 'stone', count: 10, slot: 36, itemKey: 'k' }
+  const warehouse = createWarehouse(bot)
+  warehouse.config.timing.dropAimChunkTimeoutMs = 1
+  bot.blockAt = () => null
+  wireDropClicks(bot, slots)
+
+  await assert.rejects(
+    warehouse.dropItemsToPlayer('Player', [
+      { itemKey: 'k', itemId: 'minecraft:stone', displayName: '石头', amount: 5 }
+    ]),
+    /bot 所在区块 1ms 内未就绪/
+  )
+  assert.equal(bot.lookAtCalls.length, 0)
+  assert.equal(bot.dropClickCount(), 0, '自身区块未就绪时不能丢出任何物品')
   assert.equal(slots[36].count, 10)
 })
