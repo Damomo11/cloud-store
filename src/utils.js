@@ -42,7 +42,7 @@ function sumBy (items, getKey) {
 // 判定"非法字符"把 bot 踢下线。在 service.msg 发送出口统一调用，任何模块的报错文本都安全。
 function sanitizeChatText (value) {
   return String(value ?? '')
-    .replace(/[^\u4e00-\u9fa5\u3040-\u30ff\uff10-\uff19a-zA-Z0-9 .,:;!?\[\]()\-_\/%+*=<>@#'，。：；！？（）【】、～×…]/g, ' ')
+    .replace(/[^\u4e00-\u9fa5\u3040-\u30ff\uff10-\uff19a-zA-Z0-9 .,:;!?\[\]()\-_\/%+*=<>@#'"“”‘’–—，。：；！？（）【】、～×…]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
 }

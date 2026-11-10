@@ -16,7 +16,7 @@ const DEFAULT_IDLE_TIMEOUT_MS = 10 * 60 * 1000
 const DEFAULT_IDLE_POLL_MS = 500
 const RESTART_START_DELAY_MS = 3000
 const PULL_LOCK_FILE = '.hotreload-pull.lock'
-const PULL_LOCK_STALE_MS = 15 * 60 * 1000
+const PULL_LOCK_STALE_MS = 5 * 60 * 1000
 const PULL_LOCK_WAIT_TIMEOUT_MS = 60 * 1000
 const PULL_LOCK_POLL_MS = 500
 
@@ -24,8 +24,11 @@ function defaultGitExec () {
   return process.platform === 'win32' ? ['git', 'pull', '--ff-only'] : ['git', 'pull', '--ff-only']
 }
 
-// 尝试创建 pull 锁（O_EXCL 原子创建）。锁文件写入进程号与时间：
-// 超过 staleMs 的残锁（进程被强杀留下）允许抢占后重建。返回 true 表示拿到锁。
+// 尝试创建 pull 锁（O_EXCL 原子创建）。锁文件写入进程号与时间（供排查用）。
+// 陈旧判定基于文件系统 mtime 而非文件内容：创建即有 mtime，
+// 不存在“进程在写入内容前崩溃留下空锁被误判陈旧”的窗口。
+// 超过 staleMs 的残锁（进程被强杀留下）允许抢占重建：unlink 前二次校验 mtime 仍过期，
+// 把误删他人新锁的竞态窗口压缩到毫秒级（且后果只是回到并发 pull，不会更糟）。
 function tryCreatePullLock (lockPath, staleMs = PULL_LOCK_STALE_MS) {
   const create = () => {
     const fd = fs.openSync(lockPath, 'wx')
@@ -36,21 +39,25 @@ function tryCreatePullLock (lockPath, staleMs = PULL_LOCK_STALE_MS) {
     }
     return true
   }
+  const lockAgeMs = () => {
+    try {
+      return Date.now() - fs.statSync(lockPath).mtimeMs
+    } catch {
+      return Infinity // 锁刚被别人删掉，视为可立即重建
+    }
+  }
   try {
     return create()
   } catch (error) {
     if (error?.code !== 'EEXIST') throw error
-    let info = null
+    if (lockAgeMs() < staleMs) return false
+    if (lockAgeMs() < staleMs) return false // 复核：两次 stat 之间若他人已重建新锁（mtime 变新），放弃抢占
+    try { fs.unlinkSync(lockPath) } catch {}
     try {
-      info = JSON.parse(fs.readFileSync(lockPath, 'utf8') || '{}')
-    } catch {}
-    if (!info?.startedAt || Date.now() - info.startedAt > staleMs) {
-      try { fs.unlinkSync(lockPath) } catch {}
-      try {
-        return create()
-      } catch {}
+      return create()
+    } catch {
+      return false
     }
-    return false
   }
 }
 
@@ -215,7 +222,7 @@ async function runHotReload ({
       if (!locked && Date.now() - waitStartedAt >= pullLockWaitTimeoutMs) break
     }
     if (!locked) {
-      safeNotify('等待其他进程更新代码超时，本次热重载中止，请稍后重试。')
+      safeNotify('等待其他进程更新代码超时，本次热重载中止。若刚才的热重载进程异常退出，残锁约 5 分钟后自动失效可再试；紧急时可删除仓库目录下的 .hotreload-pull.lock 后重试。')
       return { status: 'pull_lock_timeout' }
     }
   }
