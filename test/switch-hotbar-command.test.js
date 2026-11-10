@@ -68,14 +68,14 @@ test('public !切换 also executes directly like other bot control commands', as
   assert.equal(taskPool.accepted, 0)
 })
 
-test('切换 rejects invalid slot numbers', async () => {
+test('切换 rejects invalid slot numbers with a readable range in the sanitized reply', async () => {
   const { service, bot, sent } = createFixture()
   service.handleIncoming('Admin', '切换 10', 'whisper', { channel: 'private' })
   await settle()
 
   assert.deepEqual(bot.setQuickBarSlotCalls, [])
   assert.equal(sent.length, 1)
-  assert.match(sent[0], /格式：切换 1~9/)
+  assert.equal(sent[0], '/msg Admin 格式：切换 1～9，把机器人主手切到快捷栏第 n 格。')
 })
 
 test('切换 is admin-only', async () => {
