@@ -1,7 +1,7 @@
 const { GoalBlock, GoalNear } = require('mineflayer-pathfinder').goals
 const warehouseMovements = require('./warehouseMovements')
 const Vec3 = require('vec3')
-const { sleep, sumBy } = require('./utils')
+const { sleep, sumBy, notchYawDeg, notchPitchDeg } = require('./utils')
 const { logLocalError } = require('./localErrorLog')
 const { isFatalProtocolReadError } = require('./botConnection')
 const { traceEvent, shortKey } = require('./traceLog')
@@ -3556,9 +3556,25 @@ class Warehouse {
       throw new Error(`丢前瞄准失败：bot 所在区块 ${chunkTimeoutMs}ms 内未就绪，转向无法同步，为避免丢歪已中止`)
     }
     const target = entity.position.offset(0, yOffset, 0)
+    const botBefore = this.bot.entity
+    const beforeYaw = notchYawDeg(botBefore.yaw)
+    const beforePitch = notchPitchDeg(botBefore.pitch)
+    this.debug(`aim ${username}: bot=${this.describePosition(botBefore.position)} 视角 yaw=${beforeYaw.toFixed(1)}° pitch=${beforePitch.toFixed(1)}°` +
+      ` 玩家=${this.describePosition(entity.position)} 碰撞箱=${entity.width ?? '?'}x${entity.height ?? '?'} 目标=${this.describePosition(target)}(yOffset=${yOffset})`)
+    const startedAt = Date.now()
     // 非 force：等 physics tick 把转向真正同步到服务器后再返回；
     // withTimeout 兜底，防止 physics 异常停摆时永久挂起。
-    await this.withTimeout(this.bot.lookAt(target, false), 5000, `丢前瞄准转头超时（${username}）`)
+    try {
+      await this.withTimeout(this.bot.lookAt(target, false), 5000, `丢前瞄准转头超时（${username}）`)
+    } catch (error) {
+      this.debug(`aim fail ${username}: 转向未完成，当前 yaw=${notchYawDeg(this.bot.entity.yaw).toFixed(1)}° 用时${Date.now() - startedAt}ms：${error.message}`)
+      throw error
+    }
+    const afterYaw = notchYawDeg(this.bot.entity.yaw)
+    const afterPitch = notchPitchDeg(this.bot.entity.pitch)
+    // 环形差值：0~180°，表示实际转过的角度
+    const turnedDeg = Math.abs(((afterYaw - beforeYaw) % 360 + 540) % 360 - 180)
+    this.debug(`aim done ${username}: yaw ${beforeYaw.toFixed(1)}°→${afterYaw.toFixed(1)}°(转${turnedDeg.toFixed(1)}°) pitch ${beforePitch.toFixed(1)}°→${afterPitch.toFixed(1)}° 用时${Date.now() - startedAt}ms`)
     await sleep(100)
   }
 

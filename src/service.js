@@ -1,4 +1,4 @@
-const { clampInt, sanitizeChatText, sleep, sumBy } = require('./utils')
+const { clampInt, sanitizeChatText, sleep, sumBy, notchYawDeg, notchPitchDeg } = require('./utils')
 const { startTrace, traceEvent, traceSummary, traceStandalone, shortKey } = require('./traceLog')
 const { runHotReload } = require('./hotReload')
 const { planShortages, normalizeItemId } = require('./shortagePlanner')
@@ -4310,7 +4310,14 @@ class CloudStoreService {
 
     const ok = await this.waitForPlayerNearby(username, timeoutMs, radius, options)
     if (ok) {
-      if (this.config.debug) console.log(`[teleport] arrived near ${username}`)
+      if (this.config.debug) {
+        const arrivedEntity = this.resolvePlayerEntity(username).entity
+        const botEntity = this.bot.entity
+        const playerPart = arrivedEntity
+          ? `玩家=${this.describePosition(arrivedEntity.position)} 碰撞箱=${arrivedEntity.width ?? '?'}x${arrivedEntity.height ?? '?'}`
+          : '玩家实体未解析到'
+        console.log(`[teleport] arrived near ${username} bot=${this.describePosition(botEntity?.position)} 视角 yaw=${notchYawDeg(botEntity?.yaw ?? 0).toFixed(1)}° pitch=${notchPitchDeg(botEntity?.pitch ?? 0).toFixed(1)}° ${playerPart}`)
+      }
       await this.waitForTeleportChunksReady(username, { ignoreCancellation: options.ignoreCancellation })
       return true
     }
