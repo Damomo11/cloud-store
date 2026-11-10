@@ -29,3 +29,5 @@ logs/withdraw-trace-*.jsonl
 .hotreload-pull.lock
 .hotreload-notify.json
 .hotreload-notify.json.sending
+.hotreload-notify.json.lock
+.hotreload-notify.json.lock-*
