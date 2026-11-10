@@ -3576,7 +3576,9 @@ class Warehouse {
 
   // 包级日志：拦截协议层写包，凡转向包（look / position_look）打出实际发往
   // 服务器的 yaw/pitch——转头包离开进程那一刻的真实值，不靠本地朝向推断。
-  // params 里的 yaw/pitch 已是 notchian 度数（physics 层转换后写入）。
+  // 同时监听服务器下发的朝向改写（position = 传送设朝向 / player_rotation =
+  // 强制转头）：转头包发出后 bot 视角若被服务器改回，入站日志直接可见，
+  // 与出站日志构成完整因果链。params 里的 yaw/pitch 已是 notchian 度数。
   patchLookPacketLog () {
     const client = this.bot._client
     if (!client || client.__aimLookLogPatched) return
@@ -3591,6 +3593,19 @@ class Warehouse {
       } catch {}
       return origWrite(name, params)
     }
+    // 入站：服务器改写 bot 视角。yaw/pitch 为包内原始值（flags 相对模式下是增量，
+    // 会标注）。teleportId 存在时一并打出，用于识别是哪次传送摆的朝向。
+    const logServerRotation = (source, packet) => {
+      try {
+        if (!packet || !Number.isFinite(packet.yaw) || !Number.isFinite(packet.pitch)) return
+        const yawDeg = (((Number(packet.yaw) % 360) + 360) % 360).toFixed(1)
+        const relative = packet.flags && (packet.flags.yaw || packet.flags.pitch || ((packet.flags & 24) !== 0))
+        const teleport = packet.teleportId != null ? ` teleport=${packet.teleportId}` : ''
+        this.debug(`rotation in ${source} 服务器改写视角 yaw=${yawDeg}° pitch=${Number(packet.pitch).toFixed(1)}°${relative ? '（相对增量）' : ''}${teleport}`)
+      } catch {}
+    }
+    client.on('position', packet => logServerRotation('position', packet))
+    client.on('player_rotation', packet => logServerRotation('player_rotation', packet))
   }
 
   // bot.players[name].entity 跨维度传送后会失效；先直查，再按大小写变体，
