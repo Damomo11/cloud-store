@@ -4322,9 +4322,6 @@ class CloudStoreService {
           : '玩家实体未解析到'
         console.log(`[teleport] arrived near ${username} bot=${this.describePosition(botEntity?.position)} 视角 yaw=${notchYawDeg(botEntity?.yaw ?? 0).toFixed(1)}° pitch=${notchPitchDeg(botEntity?.pitch ?? 0).toFixed(1)}° ${playerPart}`)
       }
-      // 落地后先稳 3 秒再让上层找玩家/转头：跨维度落地后玩家实体与自身视角
-      // 可能还在刷新（服务端还可能补发改写视角的包），立刻解析容易瞄到旧坐标。
-      await sleep(3000)
       await this.waitForTeleportChunksReady(username, { ignoreCancellation: options.ignoreCancellation })
       return true
     }
