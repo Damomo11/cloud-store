@@ -2734,7 +2734,7 @@ class CloudStoreService {
     }
     const slot = Number(String(text || '').replace(/^!切换(?:\s+)?/, '').trim())
     if (!Number.isInteger(slot) || slot < 1 || slot > 9) {
-      if (privateSource) this.msg(username, '格式：切换 1~9，把机器人主手切到快捷栏第 n 格。')
+      if (privateSource) this.msg(username, '格式：切换 1～9，把机器人主手切到快捷栏第 n 格。')
       return
     }
     if (this.active?.type === 'deposit' || this.active?.type === 'withdraw') {
