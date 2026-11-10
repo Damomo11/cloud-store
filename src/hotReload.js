@@ -1,6 +1,7 @@
 const fs = require('node:fs')
 const path = require('node:path')
 const { spawn, execSync } = require('node:child_process')
+const { randomUUID } = require('node:crypto')
 const { sanitizeChatText } = require('./utils')
 
 // 管理员命令 !热重载 的执行模块：
@@ -20,8 +21,9 @@ const PULL_LOCK_STALE_MS = 5 * 60 * 1000
 const PULL_LOCK_WAIT_TIMEOUT_MS = 3 * 60 * 1000
 const PULL_LOCK_POLL_MS = 500
 // 重启完成提醒的接力文件：旧进程 pull 成功后把发起人写进去，
-// 新进程第一只 bot 上线后读它私聊"热重载完成"，发完即删（防重复）。
+// 新进程上线后认领并私聊"热重载完成"；保留回执，防止较晚重启的进程重复写入。
 const PENDING_NOTIFY_FILE = '.hotreload-notify.json'
+const NOTIFY_FRESH_MS = 10 * 60 * 1000
 
 function defaultGitExec () {
   return process.platform === 'win32' ? ['git', 'pull', '--ff-only'] : ['git', 'pull', '--ff-only']
@@ -79,6 +81,109 @@ function releasePullLock (lockPath) {
     const info = JSON.parse(fs.readFileSync(lockPath, 'utf8') || '{}')
     if (info?.pid === process.pid) fs.unlinkSync(lockPath)
   } catch {}
+}
+
+// 只互斥提醒文件的短读写，不占用 pull 锁或仓库任务锁。
+// 最多等 1 秒；提醒失败不能阻止重启或 bot 上线。
+async function withNotifyLock (pendingNotifyPath, action) {
+  const lockPath = `${pendingNotifyPath}.lock`
+  const owner = `${process.pid}-${randomUUID()}`
+  const candidatePath = `${lockPath}-${owner}`
+  const deadline = Date.now() + 1000
+  let acquired = false
+  fs.mkdirSync(candidatePath)
+  try {
+    fs.writeFileSync(path.join(candidatePath, owner), '')
+    while (!acquired) {
+      try {
+        // 带唯一 owner 标记的非空目录整体改名，不能替换其他持有者的非空目录。
+        fs.renameSync(candidatePath, lockPath)
+        acquired = true
+      } catch (error) {
+        if (!fs.existsSync(lockPath)) throw error
+        recoverNotifyLock(lockPath)
+        if (Date.now() >= deadline) return null
+        await defaultSleep(25)
+      }
+    }
+    return action()
+  } finally {
+    removeNotifyOwner(acquired ? lockPath : candidatePath, owner)
+  }
+}
+
+function removeNotifyOwner (directory, owner) {
+  try { fs.unlinkSync(path.join(directory, owner)) } catch {}
+  // 另一进程已放入新 owner 时，非递归 rmdir 会拒绝删除它的非空目录。
+  try { fs.rmdirSync(directory) } catch {}
+}
+
+function recoverNotifyLock (lockPath) {
+  try {
+    for (const owner of fs.readdirSync(lockPath)) {
+      const match = /^(\d+)-/.exec(owner)
+      const pid = Number(match?.[1])
+      if (!Number.isSafeInteger(pid) || pid <= 0) continue
+      try {
+        process.kill(pid, 0)
+      } catch (error) {
+        // 只清理已退出进程的唯一标记；活进程、无权限或未知状态都不抢占。
+        if (error.code === 'ESRCH') removeNotifyOwner(lockPath, owner)
+      }
+    }
+    try { fs.rmdirSync(lockPath) } catch {}
+  } catch {}
+}
+
+function readNotify (pendingNotifyPath) {
+  try {
+    return JSON.parse(fs.readFileSync(pendingNotifyPath, 'utf8'))
+  } catch {
+    return null
+  }
+}
+
+function isFreshNotify (info, now) {
+  return typeof info?.target === 'string' && info.target.trim() &&
+    Number.isFinite(info.at) && info.at <= now && now - info.at <= NOTIFY_FRESH_MS
+}
+
+async function stageHotReloadNotify ({ pendingNotifyPath, target, version, requestedAt, now }) {
+  try {
+    await withNotifyLock(pendingNotifyPath, () => {
+      const info = readNotify(pendingNotifyPath)
+      // 同一批命令中，有进程已完成提醒；等待空闲较久的进程沿用该回执。
+      if (Number.isFinite(info?.deliveredAt) && info.deliveredAt >= requestedAt) return
+      const at = now()
+      if (!info?.deliveredAt && isFreshNotify(info, at)) return
+      fs.writeFileSync(pendingNotifyPath, JSON.stringify({ target, version, at }))
+    })
+  } catch {} // 提醒是尽力而为，不影响重启。
+}
+
+async function deliverHotReloadNotify (service, {
+  cwd = process.cwd(),
+  pendingNotifyPath = path.join(cwd, PENDING_NOTIFY_FILE),
+  now = Date.now,
+  log = console.log
+} = {}) {
+  try {
+    const info = await withNotifyLock(pendingNotifyPath, () => {
+      const pending = readNotify(pendingNotifyPath)
+      const deliveredAt = now()
+      if (Number.isFinite(pending?.deliveredAt) || !isFreshNotify(pending, deliveredAt)) return null
+      // 先记回执再私聊，保证多个 bot/进程上线时至多认领一次。
+      fs.writeFileSync(pendingNotifyPath, JSON.stringify({ ...pending, deliveredAt }))
+      return pending
+    })
+    if (!info) return false
+    const version = gitHeadShort(cwd) || (typeof info.version === 'string' ? info.version : '')
+    service.msg(info.target, `热重载完成：机器人已用新代码上线${version ? `，当前版本 ${version}` : ''}。`)
+    log(`[hotreload] 完成提醒已发送给 ${info.target}${version ? `（版本 ${version}）` : ''}`)
+    return true
+  } catch {
+    return false
+  }
 }
 
 function gitPull ({ exec = defaultGitExec, cwd = process.cwd() } = {}) {
@@ -204,7 +309,7 @@ async function runHotReload ({
   idleTimeoutMs,
   pollMs,
   sleep = defaultSleep,
-  now,
+  now = Date.now,
   spawnSuccessor = false,
   entryFile,
   spawnImplementation,
@@ -219,6 +324,7 @@ async function runHotReload ({
   pullLockPollMs = PULL_LOCK_POLL_MS,
   pendingNotifyPath = path.join(cwd, PENDING_NOTIFY_FILE)
 }) {
+  const requestedAt = now()
   // 所有进度通知先过聊天字符白名单清洗，git 输出里的特殊符号不会再触发服务器踢人。
   const safeNotify = message => notify(sanitizeChatText(message))
 
@@ -258,33 +364,26 @@ async function runHotReload ({
     safeNotify('等待超时：仍有任务未结束，现在直接重启（进行中的任务会在重启后自动恢复）。')
   }
 
-  // 内部拉继任者时，新进程延迟几秒启动再退旧进程，让新进程完成初始化（绑端口等），
-  // 避免热重载期间 Web 面板长时间不可用。
-  let successor = null
+  // 退出前先告知管理员；继任进程在收尾成功且提醒准备好后安排启动。
   if (spawnSuccessor) {
-    successor = startSuccessor({ entryFile, spawnImplementation })
     safeNotify('机器人已空闲，程序将在几秒后用新代码重启；如果几分钟后机器人没上线，请手动启动一次。')
   } else {
     safeNotify('机器人已空闲，程序即将退出并由外层守护用新代码重新拉起。')
   }
 
-  // 重启已不可逆：写入接力文件，新进程上线后由它私聊发起人"热重载完成"。
-  // 只在有发起人时写；失败不阻断重启（提醒是锦上添花，不能拖垮主流程）。
-  if (notifyTarget) {
-    try {
-      fs.writeFileSync(pendingNotifyPath, JSON.stringify({ target: notifyTarget, version: headShort, at: Date.now() }))
-    } catch {}
-  }
-
   try {
     await shutdown?.()
   } catch (error) {
-    successor?.cancel()
-    try { fs.unlinkSync(pendingNotifyPath) } catch {} // 不重启了，撤回接力文件，避免下次误报"热重载完成"
     safeNotify(`热重载中止：退出前收尾失败（${error.message}）。本次不重启。`)
     return { status: 'shutdown_failed', error }
   }
 
+  // 收尾成功才写提醒；失败时不覆盖或删除其他进程的提醒。
+  if (notifyTarget) {
+    await stageHotReloadNotify({ pendingNotifyPath, target: notifyTarget, version: headShort, requestedAt, now })
+  }
+  // 提醒准备好后再拉起继任者，避免其在收尾等待期间上线却读不到提醒。
+  const successor = spawnSuccessor ? startSuccessor({ entryFile, spawnImplementation }) : null
   await exitProcess?.()
   return { status: 'restarting', pullResult, successor }
 }
@@ -305,5 +404,6 @@ module.exports = {
   isTaskPoolIdle,
   waitForIdle,
   scheduleSuccessorProcess,
+  deliverHotReloadNotify,
   runHotReload
 }

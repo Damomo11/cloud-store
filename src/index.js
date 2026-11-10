@@ -12,7 +12,7 @@ const CloudStoreService = require('./service')
 const CloudStoreWebServer = require('./webServer')
 const SubscriptionManager = require('./subscriptions')
 const { BotTaskPool } = require('./taskPool')
-const { PENDING_NOTIFY_FILE, gitHeadShort } = require('./hotReload')
+const { deliverHotReloadNotify } = require('./hotReload')
 const {
   invalidateMinecraftAccessTokenCache,
   isMinecraftProfileAuthError,
@@ -88,35 +88,8 @@ function isSocketDisconnectError (error) {
 const config = loadConfig(path.resolve(process.cwd(), 'config.json'), { autoUpdate: true })
 installConsoleLogBuffer({ limit: config.web?.consoleLogLimit })
 configureTraceLog(config.traceLog)
-// 热重载完成提醒：旧进程在重启前把发起人写入接力文件（PENDING_NOTIFY_FILE），
-// 新进程第一只 bot 上线后在此认领并私聊"热重载完成 + 当前版本"。
-// 防重复/防误发三道闸：
-// 1. 进程内标志：同进程后续 bot 上线不再发；
-// 2. 原子改名认领：多进程同时重启时，rename 只有一个能成功，全局只发一次；
-// 3. 新鲜度窗口 10 分钟：中断重启/陈年残文件不会在无关重启时误报。
-// 发完即删，任何失败静默跳过——提醒不能拖垮启动主流程。
-const HOTRELOAD_NOTIFY_FRESH_MS = 10 * 60 * 1000
-let hotReloadNotifyDelivered = false
-function deliverHotReloadNotify (service) {
-  if (hotReloadNotifyDelivered) return
-  hotReloadNotifyDelivered = true
-  try {
-    const pendingPath = path.join(process.cwd(), PENDING_NOTIFY_FILE)
-    const claimedPath = `${pendingPath}.sending`
-    fs.renameSync(pendingPath, claimedPath)
-    let info = null
-    try {
-      info = JSON.parse(fs.readFileSync(claimedPath, 'utf8') || 'null')
-    } catch {}
-    try { fs.unlinkSync(claimedPath) } catch {}
-    if (!info?.target || typeof info.target !== 'string') return
-    if (Date.now() - Number(info.at || 0) > HOTRELOAD_NOTIFY_FRESH_MS) return
-    const version = gitHeadShort() || (typeof info.version === 'string' ? info.version : '')
-    service.msg(info.target, `热重载完成：机器人已用新代码上线${version ? `，当前版本 ${version}` : ''}。`)
-    console.log(`[hotreload] 完成提醒已发送给 ${info.target}${version ? `（版本 ${version}）` : ''}`)
-  } catch {}
-}
-
+// 每个进程只在第一只 bot 上线时检查，旧进程重连时不能认领新进程的完成提醒。
+let hotReloadNotifyChecked = false
 const db = new StoreDb(path.resolve(process.cwd(), 'data', 'cloud-store.sqlite'), config)
 const subscriptions = new SubscriptionManager(db, config)
 const catalog = createCatalogForVersion(config.server.version)
@@ -384,7 +357,10 @@ function launchBot (state) {
     state.service = service
     taskPool.register(service)
     service.start()
-    deliverHotReloadNotify(service)
+    if (!hotReloadNotifyChecked) {
+      hotReloadNotifyChecked = true
+      deliverHotReloadNotify(service)
+    }
   })
 
   bot.on('resourcePack', (url, hashOrUuid) => {
