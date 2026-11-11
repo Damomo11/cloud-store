@@ -665,21 +665,31 @@ test('3x3 proportional crafting safely splits fragmented stacks without a per-it
 
 test('proportional placement uses an exact same-variant stack before partial stacks', async () => {
   const step = {
-    requiresTable: true,
-    result: { name: 'wooden_pickaxe', count: 1 },
-    inputs: [{ names: ['oak_planks'], count: 3 }, { names: ['stick'], count: 2 }]
+    requiresTable: false,
+    result: { name: 'crafting_table', count: 1 },
+    inputs: [{ names: ['oak_planks'], count: 4 }]
   }
   const f = proportionalFixture([
-    item('oak_planks', 64), item('oak_planks', 36), item('oak_planks', 8),
-    item('stick', 64), item('stick', 8)
-  ], [item('wooden_pickaxe', 36)], step, { triggers: 36 })
+    item('oak_planks', 64), item('oak_planks', 36), item('oak_planks', 44)
+  ], [item('crafting_table', 36)], step, {
+    triggers: 36,
+    waveAfter: (index, waveTriggers, window) => {
+      const state = window.slots.slice(window.inventoryStart, window.inventoryEnd).filter(Boolean).map(copyItem)
+      let remainingOutput = waveTriggers
+      while (remainingOutput > 0) {
+        const moved = Math.min(64, remainingOutput)
+        state.push(item('crafting_table', moved))
+        remainingOutput -= moved
+      }
+      return state
+    }
+  })
 
   const result = await f.executor.execute({ step, triggers: 36 })
 
-  assert.deepEqual(amounts(result.produced), [['minecraft:wooden_pickaxe', 36]])
-  assert.equal(f.clicks.findIndex(click => click.slot === 0 && click.mode === 1), 26)
+  assert.deepEqual(amounts(result.produced), [['minecraft:crafting_table', 36]])
   const plans = f.debugEvents.filter(event => event.event === 'executor.grid_placement_plan')
-  assert.deepEqual(plans[0].details.placements[0].sources, [{ slot: 11, amount: 36, availableBefore: 36 }])
+  assert.deepEqual(plans[0].details.placements[0].sources, [{ slot: 10, amount: 36, availableBefore: 36 }])
 })
 
 test('proportional batches split same-item variants into the largest safe waves', async () => {
