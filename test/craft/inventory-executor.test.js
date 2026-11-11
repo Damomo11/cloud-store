@@ -112,9 +112,11 @@ function proportionalFixture (before, after, step, { triggers = 1, waveAfter = n
   let cleanupResultCount = 0
   let cleanupResultCollectionCount = 0
   let refillResultAfterParking = false
-  const setAfter = () => {
-    const state = Array.isArray(waveAfter) && waveAfter.length
-      ? waveAfter[Math.min(shiftCount, waveAfter.length - 1)]
+  const setAfter = (waveTriggers, window) => {
+    const state = typeof waveAfter === 'function'
+      ? waveAfter(shiftCount, waveTriggers, window)
+      : Array.isArray(waveAfter) && waveAfter.length
+        ? waveAfter[Math.min(shiftCount, waveAfter.length - 1)]
       : after
     shiftCount++
     f.setInventory(state)
@@ -165,7 +167,7 @@ function proportionalFixture (before, after, step, { triggers = 1, waveAfter = n
       const placed = window.slots.slice(1, 1 + gridWidth * gridWidth).filter(Boolean)
       const waveTriggers = placed.length ? Math.min(...placed.map(value => value.count)) : triggers
       for (let cell = 1; cell < 1 + gridWidth * gridWidth; cell++) window.slots[cell] = null
-      setAfter()
+      setAfter(waveTriggers, window)
       if (residualResult) window.slots[0] = new Item(recipe?.result?.id || registry.itemsByName[step.result.name].id, recipe?.result?.count || step.result.count, recipe?.result?.metadata || null)
       if (recipe?.outShape) {
         recipe.outShape.forEach((row, y) => row.forEach((remainder, x) => {
@@ -534,6 +536,36 @@ test('100-trigger 3x3 batch uses 64 and 36 grid waves in one window', async () =
   assert.equal(f.clicks.length, 34)
 })
 
+test('wave planning minimizes placement clicks plus result shifts across nearby safe waves', async () => {
+  const step = { ...stickStep, requiresTable: false }
+  const waveAfter = (index, waveTriggers, window) => {
+    const state = window.slots.slice(window.inventoryStart, window.inventoryEnd).filter(Boolean).map(copyItem)
+    let remainingOutput = waveTriggers * 4
+    for (const stack of state.filter(value => value.name === 'stick' && value.count < value.stackSize)) {
+      const moved = Math.min(stack.stackSize - stack.count, remainingOutput)
+      stack.count += moved
+      remainingOutput -= moved
+    }
+    while (remainingOutput > 0) {
+      const moved = Math.min(64, remainingOutput)
+      state.push(item('stick', moved))
+      remainingOutput -= moved
+    }
+    return state
+  }
+  const f = proportionalFixture([
+    item('oak_planks', 61), item('oak_planks', 17),
+    item('oak_planks', 41), item('oak_planks', 11)
+  ], [item('stick', 260)], step, { triggers: 65, waveAfter })
+
+  const result = await f.executor.execute({ step, triggers: 65 })
+
+  assert.deepEqual(amounts(result.produced), [['minecraft:stick', 260]])
+  const plan = f.debugEvents.find(event => event.event === 'executor.grid_waves_planned')
+  assert.deepEqual(plan.details.waves.map(wave => wave.triggers), [61, 4])
+  assert.equal(f.clicks.length, 17)
+})
+
 test('16 hopper minecarts use one crafting window with one wave per unstackable output', async () => {
   const step = {
     requiresTable: false,
@@ -573,11 +605,21 @@ test('repeated wildcard ingredient cells can use different concrete item variant
   const second = item('oak_planks', 5, 'second variant')
   const f = proportionalFixture([first, second], [item('stick', 40)], step, {
     triggers: 10,
-    waveAfter: [
-      [item('oak_planks', 1, 'first variant'), second, item('stick', 28)],
-      [item('oak_planks', 1, 'first variant'), item('oak_planks', 1, 'second variant'), item('stick', 36)],
-      [item('stick', 40)]
-    ]
+    waveAfter: (index, waveTriggers, window) => {
+      const state = window.slots.slice(window.inventoryStart, window.inventoryEnd).filter(Boolean).map(copyItem)
+      let remainingOutput = waveTriggers * 4
+      for (const stack of state.filter(value => value.name === 'stick' && value.count < value.stackSize)) {
+        const moved = Math.min(stack.stackSize - stack.count, remainingOutput)
+        stack.count += moved
+        remainingOutput -= moved
+      }
+      while (remainingOutput > 0) {
+        const moved = Math.min(64, remainingOutput)
+        state.push(item('stick', moved))
+        remainingOutput -= moved
+      }
+      return state
+    }
   })
 
   const result = await f.executor.execute({ step, triggers: 10 })
@@ -585,8 +627,10 @@ test('repeated wildcard ingredient cells can use different concrete item variant
   assert.deepEqual(amounts(result.produced), [['minecraft:stick', 40]])
   assert.equal(f.calls.some(call => Array.isArray(call) && call[0] === 'craft'), false)
   const plan = f.debugEvents.find(event => event.event === 'executor.grid_waves_planned')
-  assert.deepEqual(plan.details.waves.map(wave => wave.triggers), [7, 2, 1])
-  assert.equal(f.clicks.filter(click => click.slot === 0 && click.mode === 1).length, 3)
+  assert.deepEqual(plan.details.waves.map(wave => wave.triggers), [5, 5])
+  assert.equal(f.clicks.filter(click => click.slot === 0 && click.mode === 1).length, 2)
+  const laterWave = f.debugEvents.filter(event => event.event === 'executor.grid_placement_plan')[1]
+  assert.equal(new Set(laterWave.details.placements.map(placement => placement.item.fingerprint)).size, 2)
 })
 
 test('3x3 proportional crafting safely splits fragmented stacks without a per-item click storm', async () => {
