@@ -155,7 +155,11 @@ function serverFixture (target, triggers, options = {}) {
       return
     }
     if (name !== 'window_click') return
-    clicks.push(packet)
+    clicks.push({
+      ...packet,
+      grid: menu.slots.slice(1, 1 + width * width).map(value => copy(value)),
+      cursor: copy(menu.selectedItem)
+    })
     if (packet.slot >= 0) assert.equal(inFlight, 0, 'another material click was sent before the previous server response')
     inFlight++
     if (packet.slot === 0 && packet.mode === 1 && options.replayOldShift) {
@@ -256,6 +260,28 @@ for (const [target, triggers, expected, expectedShifts] of [
     assert.equal(f.bot.inventory.selectedItem, null)
   })
 }
+
+test('confirmed crafting transfers a partial 64-stack into the exact grid amount efficiently', async t => {
+  const f = serverFixture('chest', 8, { components: true, duplicateSnapshots: true })
+  t.after(f.close)
+
+  const result = await f.executor.execute({ step: f.step, triggers: 8 })
+
+  assert.deepEqual(result.produced.map(value => [value.itemId, value.amount]), [['minecraft:chest', 8]])
+  assert.deepEqual(f.totals(), [['minecraft:chest', 8]])
+  const shift = f.clicks.find(click => click.slot === 0 && click.mode === 1)
+  assert.deepEqual(shift.grid.map(value => value?.count || 0), [8, 8, 8, 8, 0, 8, 8, 8, 8])
+  assert.ok(shift.grid.filter(Boolean).every(value =>
+    JSON.stringify(value.components) === JSON.stringify([{ type: 'custom_name', data: 'preserve input identity' }]))
+  )
+
+  const firstCellFilled = f.clicks.findIndex(click => click.grid[0]?.count === 8)
+  assert.equal(firstCellFilled, 5, 'the target should be filled before the sixth click returns the excess cursor stack')
+  assert.equal(f.clicks[firstCellFilled].slot, 10)
+  assert.equal(f.clicks[firstCellFilled].mouseButton, 0)
+  assert.equal(f.clicks[firstCellFilled].cursor.count, 8)
+  assert.equal(f.bot.inventory.selectedItem, null)
+})
 
 test('confirmed crafting preserves component identity through partial-stack splits', async t => {
   const f = serverFixture('piston', 36, { components: true, duplicateSnapshots: true })
