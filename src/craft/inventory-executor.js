@@ -727,6 +727,48 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
             await bot.clickWindow(targetSlot, 0, 0)
             remaining -= picked
           } else {
+            // An empty target can hold the whole half; return its excess in halves when that saves clicks.
+            if (!window.slots[targetSlot]) {
+              let targetCount = picked
+              let excess = picked - remaining
+              let trimClicks = 0
+              while (excess > 0) {
+                const removed = Math.ceil(targetCount / 2)
+                if (removed <= excess) {
+                  trimClicks += 2
+                  targetCount -= removed
+                  excess -= removed
+                } else {
+                  trimClicks += 2 + removed - excess
+                  break
+                }
+              }
+              if (trimClicks < remaining) {
+                await bot.clickWindow(targetSlot, 0, 0)
+                excess = picked - remaining
+                while (excess > 0) {
+                  check()
+                  await bot.clickWindow(targetSlot, 1, 0)
+                  const removed = Number(window.selectedItem?.count || 0)
+                  if (!removed) throw error('craft wave target trim was not confirmed', true)
+                  if (removed <= excess) {
+                    await bot.clickWindow(sourceSlot, 0, 0)
+                    excess -= removed
+                  } else {
+                    for (let count = excess; count < removed; count++) await bot.clickWindow(targetSlot, 1, 0)
+                    if (Number(window.selectedItem?.count || 0) !== excess) {
+                      throw error('craft wave target trim did not retain the exact excess', true)
+                    }
+                    await bot.clickWindow(sourceSlot, 0, 0)
+                    excess = 0
+                  }
+                }
+                if (Number(window.slots[targetSlot]?.count || 0) !== amount || window.selectedItem) {
+                  throw error('craft wave partial transfer did not confirm the exact target amount', true)
+                }
+                return
+              }
+            }
             for (let count = 0; count < remaining; count++) await bot.clickWindow(targetSlot, 1, 0)
             await bot.clickWindow(sourceSlot, 0, 0)
             return
