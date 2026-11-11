@@ -50,6 +50,34 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
     } catch { /* Diagnostics must never interrupt a live craft operation. */ }
   }
 
+  const emptyClicks = () => ({ attempted: 0, completed: 0, failed: 0, left: 0, right: 0, shift: 0, elapsedMs: 0 })
+  const clickDelta = before => Object.fromEntries(Object.keys(before).map(key => [key, active.clicks[key] - before[key]]))
+
+  async function measurePhase (phase, action) {
+    const operation = active
+    const previousPhase = operation.phase
+    const clicksBefore = { ...operation.clicks }
+    const details = { phase, ...operation.wave }
+    operation.phase = phase
+    emitDebug('executor.phase_start', details)
+    const startedAt = performance.now()
+    const report = (status, extra = {}) => {
+      const elapsedMs = performance.now() - startedAt
+      operation.phaseElapsedMs[phase] = (operation.phaseElapsedMs[phase] || 0) + elapsedMs
+      emitDebug('executor.phase_' + status, { ...details, elapsedMs, clicks: clickDelta(clicksBefore), ...extra })
+    }
+    try {
+      const result = await action()
+      report('complete')
+      return result
+    } catch (cause) {
+      report('failure', { message: cause?.message || String(cause) })
+      throw cause
+    } finally {
+      operation.phase = previousPhase
+    }
+  }
+
   function stop (window = bot.currentWindow || active?.window) {
     try { bot.pathfinder?.stop() } catch {}
     try { bot.clearControlStates?.() } catch {}
@@ -625,7 +653,7 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
 
   async function craftProportionally (recipe, triggers, table, check, evidence) {
     if (triggers <= 1 && !confirmedClick) return false
-    const window = table ? await openCraftingWindow(table, check) : bot.inventory
+    const window = table ? await measurePhase('window_open', () => openCraftingWindow(table, check)) : bot.inventory
     if (!window || !Array.isArray(window.slots) || !Number.isInteger(window.inventoryStart) || !Number.isInteger(window.inventoryEnd)) return false
     const fallback = () => {
       if (table && bot.currentWindow === window) bot.closeWindow(window)
@@ -652,6 +680,7 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
     const outputItems = standardRecipeOutputs(registry, recipe)
       .map(output => new Item(output.id, output.count, output.metadata))
     let preflightWaves
+    const planningStartedAt = performance.now()
     try {
       preflightWaves = simulatePlacementWaves(window, cells, triggers, waveLimit, outputItems)
     } catch (cause) {
@@ -664,6 +693,7 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
     }
     if (!preflightWaves) throw error('craft batch cannot be staged as safe proportional grid waves', true)
     emitDebug('executor.grid_waves_planned', {
+      elapsedMs: performance.now() - planningStartedAt,
       windowId: window.id,
       triggers,
       waveCount: preflightWaves.length,
@@ -702,6 +732,8 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
     let waveIndex = 0
     let collectResultResidual
     while (completed < triggers) {
+      const waveStartedAt = performance.now()
+      const waveClicksBefore = { ...active.clicks }
       check()
       const plannedWave = preflightWaves[waveIndex]
       const waveTriggers = plannedWave?.triggers
@@ -737,6 +769,7 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
       placeVirtualOutputs(expectedWaveWindow, outputItems, waveTriggers)
       const expectedWaveInventory = inventoryWindowSnapshot(expectedWaveWindow)
       const fragmentedClickCount = placementClickCount(plan)
+      active.wave = { waveIndex, waveStart: completed, waveTriggers }
       emitDebug('executor.grid_placement_plan', {
         windowId: window.id,
         windowType: window.type,
@@ -744,6 +777,7 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
         triggers,
         waveStart: completed,
         waveTriggers,
+        plannedPlacementClicks: fragmentedClickCount,
         placements: plan.map(placement => ({
           slot: placement.slot,
           item: itemSummary(window.slots[placement.sources[0]?.slot]),
@@ -833,21 +867,23 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
           }
         }
       }
-      for (const placement of plan) {
-        for (const source of placement.sources) {
-          check()
-          if (source.count === source.sourceCount) {
-            await bot.clickWindow(source.slot, 0, 0)
-            await bot.clickWindow(placement.slot, 0, 0)
-          } else {
-            await transferPartial(source.slot, placement.slot, source.count)
+      await measurePhase('placement', async () => {
+        for (const placement of plan) {
+          for (const source of placement.sources) {
+            check()
+            if (source.count === source.sourceCount) {
+              await bot.clickWindow(source.slot, 0, 0)
+              await bot.clickWindow(placement.slot, 0, 0)
+            } else {
+              await transferPartial(source.slot, placement.slot, source.count)
+            }
           }
         }
-      }
+      })
       check()
       try {
-        await evidence.waitForSlots(window.id, placementSlots, placementBaselines, check,
-          'server did not confirm the proportional crafting grid', expectedPlacement, { emptyCursor: true })
+        await measurePhase('placement_confirmation', () => evidence.waitForSlots(window.id, placementSlots, placementBaselines, check,
+          'server did not confirm the proportional crafting grid', expectedPlacement, { emptyCursor: true }))
       } catch (cause) {
         warehouse?.debug?.(`craft window placement update timeout item=${registry.items[recipe.result.id]?.name || recipe.result.id} wave=${completed}+${waveTriggers} ${JSON.stringify(describeWindow())}`)
         throw cause
@@ -894,11 +930,11 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
         return sameAmounts(catalog.aggregatePrismarineItems(items), expectedWaveInventory, entry => entry.itemKey)
       }
       warehouse?.debug?.(`craft window shift-click start item=${registry.items[recipe.result.id]?.name || recipe.result.id} wave=${completed}+${waveTriggers} ${JSON.stringify(describeWindow())}`)
-      await bot.clickWindow(0, 0, 1)
+      await measurePhase('result_collection', () => bot.clickWindow(0, 0, 1))
       active.shiftConfirmation = null
       try {
-        await evidence.waitForSlots(window.id, watchedSlots, updateBaselines, check,
-          'server did not confirm the crafting window after shift-click', expectedGrid)
+        await measurePhase('shift_confirmation', () => evidence.waitForSlots(window.id, watchedSlots, updateBaselines, check,
+          'server did not confirm the crafting window after shift-click', expectedGrid))
       } catch (cause) {
         warehouse?.debug?.(`craft window shift-click update timeout item=${registry.items[recipe.result.id]?.name || recipe.result.id} wave=${completed}+${waveTriggers} ${JSON.stringify(describeWindow())}`)
         throw cause
@@ -916,36 +952,42 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
       }
       // Some servers leave the last result in slot 0 when the shift-click stops
       // early. Collect that concrete item before clearing the next wave.
-      await collectResultResidual()
-      const maxCleanupPasses = gridSize + 2
-      let cleanupPass = 0
-      while (cleanupPass++ < maxCleanupPasses) {
-        for (let slot = 1; slot <= gridSize; slot++) {
-          if (!window.slots[slot]) continue
-          const baselines = new Map([[slot, evidence.current().slotVersion(window.id, slot)]])
-          await bot.clickWindow(slot, 0, 0)
-          await evidence.waitForSlots(window.id, [slot], baselines, check, `server did not confirm clearing crafting grid slot ${slot}`)
-          await bot.putSelectedItemRange(window.inventoryStart, window.inventoryEnd, window)
+      await measurePhase('cleanup', async () => {
+        await collectResultResidual()
+        const maxCleanupPasses = gridSize + 2
+        let cleanupPass = 0
+        while (cleanupPass++ < maxCleanupPasses) {
+          for (let slot = 1; slot <= gridSize; slot++) {
+            if (!window.slots[slot]) continue
+            const baselines = new Map([[slot, evidence.current().slotVersion(window.id, slot)]])
+            await bot.clickWindow(slot, 0, 0)
+            await evidence.waitForSlots(window.id, [slot], baselines, check, `server did not confirm clearing crafting grid slot ${slot}`)
+            await bot.putSelectedItemRange(window.inventoryStart, window.inventoryEnd, window)
+          }
+          if (await collectResultResidual()) continue
+          if (!window.selectedItem && !window.slots.slice(0, gridSize + 1).some(Boolean)) break
         }
-        if (await collectResultResidual()) continue
-        if (!window.selectedItem && !window.slots.slice(0, gridSize + 1).some(Boolean)) break
-      }
-      if (window.selectedItem || window.slots.slice(0, gridSize + 1).some(Boolean)) {
-        const current = describeWindow()
-        const residual = [
-          window.slots[0] && 'result slot',
-          current.grid.length && 'crafting grid',
-          window.selectedItem && 'cursor'
-        ].filter(Boolean)
-        warehouse?.debug?.(`craft window cleanup residual item=${registry.items[recipe.result.id]?.name || recipe.result.id} wave=${completed}+${waveTriggers} residual=${residual.join('+')} ${JSON.stringify(current)}`)
-        throw error(`proportional craft left ${residual.join(', ') || 'unknown'} residual`, true)
-      }
-      if (!sameAmounts(inventoryWindowSnapshot(window), expectedWaveInventory, entry => entry.itemKey)) {
-        throw error('confirmed craft wave inventory does not match the planned output', true)
-      }
+        if (window.selectedItem || window.slots.slice(0, gridSize + 1).some(Boolean)) {
+          const current = describeWindow()
+          const residual = [
+            window.slots[0] && 'result slot',
+            current.grid.length && 'crafting grid',
+            window.selectedItem && 'cursor'
+          ].filter(Boolean)
+          warehouse?.debug?.(`craft window cleanup residual item=${registry.items[recipe.result.id]?.name || recipe.result.id} wave=${completed}+${waveTriggers} residual=${residual.join('+')} ${JSON.stringify(current)}`)
+          throw error(`proportional craft left ${residual.join(', ') || 'unknown'} residual`, true)
+        }
+        if (!sameAmounts(inventoryWindowSnapshot(window), expectedWaveInventory, entry => entry.itemKey)) {
+          throw error('confirmed craft wave inventory does not match the planned output', true)
+        }
+      })
       completed += waveTriggers
       waveIndex++
-      emitDebug('executor.grid_wave_complete', { waveStart: completed - waveTriggers, waveTriggers, completed, total: triggers })
+      active.completedWaves = waveIndex
+      active.completedTriggers = completed
+      emitDebug('executor.grid_wave_complete', { ...active.wave, completed, total: triggers,
+        elapsedMs: performance.now() - waveStartedAt, clicks: clickDelta(waveClicksBefore) })
+      active.wave = null
     }
     return { window, collectResultResidual }
   }
@@ -1002,15 +1044,25 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
       operation.clickEpoch++
       operation.craftStarted = true
       const click = { windowId: window.id, slot, mouseButton, mode, epoch: operation.clickEpoch }
-      emitDebug('executor.window_click_start', click)
+      operation.clicks.attempted++
+      operation.clicks[mode === 1 ? 'shift' : mouseButton === 1 ? 'right' : 'left']++
+      emitDebug('executor.window_click_start', { ...click, phase: operation.phase, ...operation.wave })
+      const startedAt = performance.now()
       try {
         const result = confirmedClick && operation.confirmWindowClicks
           ? await confirmedClick(window, slot, mouseButton, mode, check, operation.shiftConfirmation)
           : await original.clickWindow.call(bot, slot, ...args)
-        emitDebug('executor.window_click_complete', click)
+        operation.clicks.completed++
+        const elapsedMs = performance.now() - startedAt
+        operation.clicks.elapsedMs += elapsedMs
+        emitDebug('executor.window_click_complete', { ...click, phase: operation.phase, ...operation.wave, elapsedMs })
         return result
       } catch (cause) {
-        emitDebug('executor.window_click_failure', { ...click, message: cause?.message || String(cause) })
+        operation.clicks.failed++
+        const elapsedMs = performance.now() - startedAt
+        operation.clicks.elapsedMs += elapsedMs
+        emitDebug('executor.window_click_failure', { ...click, phase: operation.phase, ...operation.wave,
+          elapsedMs, message: cause?.message || String(cause) })
         throw cause
       }
     }
@@ -1218,6 +1270,7 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
   }
 
   async function confirmServerInventory (operation, evidence, expected, check, { requireEmptyResult = false, collectResultResidual } = {}) {
+    const startedAt = performance.now()
     const confirmationMs = Math.max(1, Number(config?.craft?.confirmTimeoutMs) || 5000)
     const settleMs = Math.max(1, Number(config?.craft?.settleMs) || 150)
     const expires = Date.now() + confirmationMs
@@ -1241,6 +1294,7 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
       if (stableSince != null && Date.now() - stableSince >= settleMs) {
         current = evidence.current()
         emitDebug('executor.inventory_confirmed', {
+          source: 'window_updates', elapsedMs: performance.now() - startedAt, settleMs,
           expected: amountSummary(expected),
           observed: amountSummary(snapshot()),
           serverObserved: amountSummary(current.items),
@@ -1263,6 +1317,8 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
       try { bot.closeWindow(bot.currentWindow) } catch {}
     }
     let serverSnapshot
+    emitDebug('executor.inventory_confirmation_fallback', { elapsedMs: performance.now() - startedAt,
+      resultObserved: current.resultObserved, cursorKnown: current.cursorKnown, updateEpoch: current.updateEpoch, clickEpoch: operation.clickEpoch })
     try {
       serverSnapshot = await readServerContainer(warehouse, chests[0], catalog, bot)
     } catch (cause) {
@@ -1283,6 +1339,7 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
     }
     evidence.acceptSnapshot(serverSnapshot)
     emitDebug('executor.inventory_confirmed', {
+      source: 'container_snapshot', elapsedMs: performance.now() - startedAt, settleMs,
       expected: amountSummary(expected),
       observed: amountSummary(snapshot()),
       serverObserved: amountSummary(serverSnapshot.playerItems),
@@ -1376,13 +1433,19 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
     let lastError = null
     for (const position of candidates) {
       check()
+      emitDebug('executor.table_candidate_start', { position: { x: position.x, y: position.y, z: position.z }, candidateCount: candidates.length })
+      const startedAt = performance.now()
       try {
         // Await the original navigation promise even after abort. Releasing the
         // lock early would allow a late path operation to overlap the next task.
         await warehouse.gotoNear(position.x, position.y, position.z)
         check()
-        return validateArrival(position)
+        const block = validateArrival(position)
+        emitDebug('executor.table_candidate_reached', { position: { x: position.x, y: position.y, z: position.z }, elapsedMs: performance.now() - startedAt })
+        return block
       } catch (navigationError) {
+        emitDebug('executor.table_candidate_failure', { position: { x: position.x, y: position.y, z: position.z },
+          elapsedMs: performance.now() - startedAt, message: navigationError?.message || String(navigationError) })
         lastError = navigationError
       }
     }
@@ -1403,7 +1466,9 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
 
   async function execute ({ step, triggers = 1, signal, deadline, operationId, stepId } = {}) {
     if (active) throw error('inventory executor is busy')
-    const operation = { reason: null, craftStarted: false, before: null, clickEpoch: 0, operationId, stepId }
+    const operation = { reason: null, craftStarted: false, before: null, clickEpoch: 0, operationId, stepId,
+      startedAt: performance.now(), phase: 'preflight', path: 'preflight', status: 'failed',
+      clicks: emptyClicks(), phaseElapsedMs: {}, completedWaves: 0, completedTriggers: 0 }
     active = operation
     let timer
     let restoreFence
@@ -1429,10 +1494,11 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
       // Consolidate only craft inputs in the player's inventory before opening
       // the table. This frees no warehouse state and preserves item totals,
       // while turning fragmented stacks into whole-stack wave sources.
-      await compactInventoryStacks(bot.inventory, check)
+      const compacted = await measurePhase('compaction', () => compactInventoryStacks(bot.inventory, check))
+      emitDebug('executor.compaction_summary', { moves: compacted.moves, changed: compacted.changed, skipped: Boolean(compacted.skipped) })
       let table
       if (step.requiresTable) {
-        table = await resolveTable(check)
+        table = await measurePhase('table_navigation', () => resolveTable(check))
       }
       const before = ensureBaseline(declared)
       if (!sameAmounts(before, operation.before, entry => entry.itemKey)) throw error('inventory changed before crafting', true)
@@ -1457,23 +1523,25 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
       // the concrete input stacks can satisfy every grid cell. If a batch is
       // split across undersized stacks, retain Mineflayer's safe fallback.
       const craftWindowModel = table ? bot.currentWindow : bot.inventory
+      operation.path = 'proportional'
       const proportional = await craftProportionally(recipe, triggers, table, check, evidence)
       if (!proportional) {
         if (triggers > 1 && typeof craftWindowModel?.findInventoryItem === 'function') {
           throw error('multi-trigger craft could not be staged as a confirmed grid wave', true)
         }
         operation.craftStarted = true
-        await bot.craft(recipe, triggers, table)
+        operation.path = 'native'
+        await measurePhase('native_craft', () => bot.craft(recipe, triggers, table))
       }
       check()
       // The proportional path must receive a real result-slot packet. The
       // native fallback uses Mineflayer's completed call as its existing
       // compatibility signal.
       if (!proportional) evidence.markResultObserved()
-      await confirmServerInventory(operation, evidence, batchExpected, check, {
+      await measurePhase('final_confirmation', () => confirmServerInventory(operation, evidence, batchExpected, check, {
         requireEmptyResult: Boolean(proportional),
         collectResultResidual: proportional?.collectResultResidual
-      })
+      }))
       if (proportional?.window && bot.currentWindow === proportional.window) bot.closeWindow(proportional.window)
       const after = snapshot()
       if (!sameAmounts(after, batchExpected, entry => entry.itemKey)) throw error('unexpected physical craft inventory delta', true)
@@ -1485,6 +1553,8 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
         produced: amountSummary(after),
         triggers
       })
+      operation.status = 'complete'
+      operation.completedTriggers = triggers
       // These are gross input/output movements, including returned containers.
       // Every item in before was an input and every item in after is an output.
       return { before, after, consumed: before, produced: after }
@@ -1543,6 +1613,9 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
       evidence?.close()
       signal?.removeEventListener('abort', onAbort)
       bot.removeListener?.('windowOpen', onWindow)
+      emitDebug('executor.timing_summary', { status: operation.status, path: operation.path,
+        elapsedMs: performance.now() - operation.startedAt, clicks: operation.clicks,
+        phaseElapsedMs: operation.phaseElapsedMs, completedWaves: operation.completedWaves, completedTriggers: operation.completedTriggers })
       active = null
     }
   }

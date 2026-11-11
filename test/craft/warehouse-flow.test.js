@@ -314,7 +314,8 @@ test('resets the craft timeout between resumed batches', async () => {
       now += 30
       return execute(args)
     }
-    controller = new CraftController({ ...f, botId: 'bot-a' })
+    const events = []
+    controller = new CraftController({ ...f, botId: 'bot-a', debugCraft: (event, details) => events.push({ event, details }) })
     controller.maxTriggersPerBatch = () => 1
 
     await assert.rejects(controller.run({
@@ -338,6 +339,9 @@ test('resets the craft timeout between resumed batches', async () => {
     assert.equal(result.operationId, recovered.operationId)
     assert.equal(f.db.getOwnerItemsByItemId('alice', 'minecraft:stick')[0].amount, 12)
     assert.equal(controller.ledger.pending('bot-a').length, 0)
+    const resumed = events.filter(entry => entry.event === 'controller.phase_complete' && entry.details.resumed)
+    assert.deepEqual(resumed.filter(entry => entry.details.phase === 'withdraw').map(entry => entry.details.stepId), ['0:1+1', '0:2+1'])
+    assert.ok(events.some(entry => entry.event === 'controller.operation_complete' && entry.details.resumed && entry.details.elapsedMs >= 0))
   } finally {
     Date.now = originalNow
     f.db.close()
@@ -712,6 +716,31 @@ test('whole warehouse craft flow converts only Alice stock and returns products 
     assert.equal(f.db.db.prepare("SELECT COUNT(*) AS n FROM transactions WHERE type='craft_consume'").get().n, 1)
     assert.equal(f.db.db.prepare("SELECT COUNT(*) AS n FROM transactions WHERE type='craft_produce'").get().n, 1)
     assert.deepEqual(controller.ledger.pending(), [])
+  } finally { f.db.close() }
+})
+
+test('controller timings separate lock wait, withdrawal, execution, ledger and return', async () => {
+  const { CraftController } = require('../../src/craft/controller')
+  const f = fixture()
+  try {
+    f.seed('alice', 'oak_planks', 2)
+    const events = []
+    const controller = new CraftController({ ...f, botId: 'bot-a', debugCraft: (event, details) => events.push({ event, details }) })
+    const result = await controller.run({ actor: 'Alice', owner: { uuid: 'alice', scope: 'personal' }, item: 'stick', quantity: 4 })
+    assert.equal(result.status, 'complete')
+    assert.ok(events.find(entry => entry.event === 'controller.lock_acquired').details.waitMs >= 0)
+    for (const phase of ['preflight', 'home', 'withdraw', 'execute', 'return']) {
+      const entry = events.find(entry => entry.event === 'controller.phase_complete' && entry.details.phase === phase)
+      assert.ok(entry?.details.elapsedMs >= 0, phase)
+      if (['withdraw', 'execute', 'return'].includes(phase)) {
+        assert.equal(entry.details.operationId, result.operationId)
+        assert.equal(entry.details.stepId, '0:0+1')
+      }
+    }
+    assert.ok(events.find(entry => entry.event === 'controller.ledger_confirmed').details.elapsedMs >= 0)
+    assert.ok(events.find(entry => entry.event === 'controller.operation_complete').details.elapsedMs >= 0)
+    assert.deepEqual(f.counts(), { withdrawCalls: 1, depositCalls: 1 })
+    assert.equal(controller.ledger.pending().length, 0)
   } finally { f.db.close() }
 })
 

@@ -66,6 +66,18 @@
 
 开启后，机器人进程控制台会用 `[craft-debug]` 标记记录计划和批次预算、原料取回、工作台窗口点击、服务端槽位与光标更新、预计和实际产物数量、回库和中断恢复。记录只包含物品 ID、数量和短指纹，不写完整 NBT。多机器人环境中每行也会包含机器人 ID、事件名和时间戳。
 
+### 耗时与点击统计
+
+`controller.phase_start / phase_complete / phase_failure` 记录预检 `preflight`、回到仓库 `home`、取料 `withdraw`、执行 `execute`、回库 `return` 和订单失败后的自动恢复 `auto_recovery`。批次事件包含 `operationId`、`stepId`，恢复续跑的取料和执行另有 `resumed: true`。恢复中的回库可能没有 `stepId`，以 `operationId` 关联。`controller.lock_acquired.waitMs` 是请求仓库锁到进入回调的等待时间，`controller.planning_complete` 是规划调用耗时，`controller.ledger_confirmed` 是转换记账阶段耗时（包含现场参数准备）。`controller.operation_complete / operation_failure.elapsedMs` 从本次运行或续跑入口计时；失败事件在进入后续自动恢复之前输出，不能当作恢复结束时间。
+
+执行器用 `executor.phase_start / phase_complete / phase_failure` 区分背包整理 `compaction`、工作台寻路 `table_navigation`、开窗 `window_open`、放配方 `placement`、放置校验 `placement_confirmation`、领取结果 `result_collection`、消耗校验 `shift_confirmation`、清理 `cleanup`、最终独立校验 `final_confirmation`，以及兼容路径的 `native_craft`。工作台候选逐个记录到达或失败耗时；最终库存校验记录 `window_updates` 或 `container_snapshot` 来源，进入原有备用容器核验时记录 `executor.inventory_confirmation_fallback`。这些事件不新增容器访问或扫描。
+
+`executor.grid_placement_plan.plannedPlacementClicks` 是当前计划的预计填料点击数。`executor.grid_wave_complete` 包含 `waveIndex`（从 0 开始）、`waveStart`、`waveTriggers`、`elapsedMs` 和实际 `clicks`；`executor.timing_summary` 在本次执行结束时记录成功/失败、执行路径、总耗时、累计阶段耗时、已完成波次和触发数。失败波次也有阶段失败记录和累计点击数，但不会输出该波次完成事件。`executor.compaction_summary` 单独记录整理的移动次数及是否跳过。
+
+`clicks.attempted / completed / failed` 分别表示受保护的合成点击调用数、正常返回数和抛错数；`left / right / shift` 是互斥的点击类型计数，`elapsedMs` 是这些调用的累计耗时。统计从合成点击保护安装后开始，包含原生兼容路径通过该保护发起的点击，**不包含之前的背包合堆、取存容器操作、关窗或恢复探针**；合堆用移动次数单独衡量。正常返回仍须通过原有波次及最终服务端证据核验，不等于每个返回都已独立确认服务端状态。
+
+耗时使用单调时钟，单位毫秒，允许小数。阶段、波次、执行器和控制器耗时存在包含关系，不能全部相加；实际点击耗时也包含在所属阶段中。阶段开始日志在阶段计时前输出，结束日志在取完时间后输出；外层总耗时仍包含日志、校验、持久化和调度等开销，并非纯网络延迟。开关关闭时这些事件不会输出，开关开启时应结合耗时与点击数定位瓶颈，避免仅凭时间戳猜测配方点击速度。
+
 ## 与原云仓问题的边界
 
 本次改动只修复影响合成的共享边界：合成期间的身份/库存写保护、独占任务占用、精确预留、合成转换记账，以及取存和合成的服务端证据。原云仓普通存取、潜影盒拆装、未知盈亏分摊、`momo` 常规策略、订阅展示等既有行为不在本次 PR 的修复范围；它们不能接管仍有合成 journal 的资产。
