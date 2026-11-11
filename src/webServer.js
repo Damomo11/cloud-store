@@ -3427,6 +3427,7 @@ const HTML = `<!doctype html>
       overflow: auto;
     }
     .log-line { display: block; }
+    .log-line.log-captured { background: rgba(224, 177, 83, 0.09); }
     .log-line .log-time { color: #7d7668; margin-right: 8px; }
     .log-line.warn .log-text { color: #e0b153; }
     .log-line.error .log-text { color: #e07a5f; }
@@ -4154,6 +4155,12 @@ const HTML = `<!doctype html>
               <h3>logs 目录文件</h3>
               <p class="muted">点击文件查看内容（默认读末尾 256KB）。</p>
               <div id="adminLogFileList" class="log-file-list"></div>
+              <div class="alias-add" style="margin-top:12px">
+                <button id="adminLogCapture" class="primary" disabled>截取日志</button>
+                <button id="adminLogCaptureCopy" class="primary hidden">复制截取的日志</button>
+                <span id="adminLogCaptureStatus" class="muted" role="status" aria-live="polite"></span>
+              </div>
+              <p class="muted">截取此后显示的新日志，仅保留在当前页面；刷新页面即清除。</p>
               <div id="adminLogViewerWrap" class="hidden">
                 <div class="alias-add" style="margin-top:12px">
                   <strong id="adminLogFileName"></strong>
@@ -6018,9 +6025,49 @@ const HTML = `<!doctype html>
       return String(tsLabel || '').slice(11) || '';
     }
 
+    function adminLogCaptureKey(row) {
+      return String(state.adminLogServerStartedAt) + ':' + row.seq;
+    }
+
+    function toggleAdminLogCapture() {
+      state.adminLogCapturing = !state.adminLogCapturing;
+      if (state.adminLogCapturing) {
+        state.adminLogCaptureLines = [];
+        state.adminLogCaptureSeen = new Set();
+        state.adminLogCaptureAfterSeq = state.adminLogLastSeq || 0;
+        state.adminLogCaptureServer = state.adminLogServerStartedAt;
+        state.adminLogPaused = false;
+        $('adminLogPause').textContent = '暂停刷新';
+      } else {
+        $('adminLogConsole').querySelectorAll('.log-captured').forEach(line => line.classList.remove('log-captured'));
+      }
+      $('adminLogPause').disabled = state.adminLogCapturing;
+      $('adminLogCapture').textContent = state.adminLogCapturing ? '停止截取' : '截取日志';
+      $('adminLogCaptureCopy').classList.toggle('hidden', state.adminLogCapturing);
+      $('adminLogCaptureCopy').disabled = !state.adminLogCaptureLines.length;
+      renderAdminLogCaptureStatus();
+    }
+
+    function renderAdminLogCaptureStatus() {
+      const count = state.adminLogCaptureLines?.length || 0;
+      $('adminLogCaptureStatus').textContent = (state.adminLogCapturing ? '截取中 · ' : '已截取 ') + count + ' 条';
+    }
+
+    function captureAdminLogRows(rows) {
+      if (!state.adminLogCapturing) return;
+      for (const row of rows) {
+        if (state.adminLogServerStartedAt === state.adminLogCaptureServer && row.seq <= state.adminLogCaptureAfterSeq) continue;
+        const key = adminLogCaptureKey(row);
+        if (state.adminLogCaptureSeen.has(key)) continue;
+        state.adminLogCaptureSeen.add(key);
+        state.adminLogCaptureLines.push(adminLogTimeLabel(row.tsLabel) + ' ' + String(row.text ?? ''));
+      }
+      renderAdminLogCaptureStatus();
+    }
+
     function renderAdminLogRows(rows) {
       return rows.map(row =>
-        '<span class="log-line ' + esc(row.level) + '"><span class="log-time">' + esc(adminLogTimeLabel(row.tsLabel)) + '</span><span class="log-text">' + esc(row.text) + '</span></span>'
+        '<span class="log-line ' + esc(row.level) + (state.adminLogCapturing && state.adminLogCaptureSeen.has(adminLogCaptureKey(row)) ? ' log-captured' : '') + '"><span class="log-time">' + esc(adminLogTimeLabel(row.tsLabel)) + '</span><span class="log-text">' + esc(row.text) + '</span></span>'
       ).join('');
     }
 
@@ -6032,6 +6079,11 @@ const HTML = `<!doctype html>
       }
       const data = await api('/api/admin/console-logs', { afterSeq: state.adminLogAfterSeq || 0 });
       state.adminLogAfterSeq = data.nextSeq || state.adminLogAfterSeq || 0;
+      if (state.adminLogServerStartedAt !== data.startedAt) state.adminLogLastSeq = 0;
+      state.adminLogServerStartedAt = data.startedAt;
+      if (data.rows.length) state.adminLogLastSeq = data.rows[data.rows.length - 1].seq;
+      captureAdminLogRows(data.rows);
+      $('adminLogCapture').disabled = false;
       const consoleEl = $('adminLogConsole');
       if (reset && !data.rows.length) consoleEl.innerHTML = '<span class="muted">暂无日志。</span>';
       if (data.rows.length) {
@@ -6061,6 +6113,7 @@ const HTML = `<!doctype html>
 
     function stopAdminLogPolling() {
       if (state.adminLogTimer) { clearInterval(state.adminLogTimer); state.adminLogTimer = null; }
+      if (state.adminLogCapturing) toggleAdminLogCapture();
     }
 
     async function loadAdminLogFiles() {
@@ -6420,6 +6473,14 @@ const HTML = `<!doctype html>
     $('adminLogClear').addEventListener('click', () => {
       state.adminLogClearedSeq = state.adminLogAfterSeq || 0;
       $('adminLogConsole').innerHTML = '<span class="muted">已清屏（不影响缓冲，新日志会继续显示）。</span>';
+    });
+    $('adminLogCapture').addEventListener('click', toggleAdminLogCapture);
+    $('adminLogCaptureCopy').addEventListener('click', async () => {
+      if (state.adminLogCapturing || !state.adminLogCaptureLines?.length) return;
+      try {
+        await copyText(state.adminLogCaptureLines.join('\\n'));
+        toast('已复制截取的日志。');
+      } catch { toast('复制失败，请允许浏览器访问剪贴板后重试。'); }
     });
     $('adminLogFileClose').addEventListener('click', () => {
       $('adminLogViewerWrap').classList.add('hidden');
