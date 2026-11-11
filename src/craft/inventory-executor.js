@@ -487,9 +487,18 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
   }
 
   function simulatePlacementWaves (window, cells, triggers, waveLimit, outputs) {
-    const simulated = cloneInventoryWindow(window)
-    const waves = []
-    for (let completed = 0; completed < triggers;) {
+    const applyWave = (simulated, plan, waveTriggers) => {
+      for (const placement of plan) {
+        for (const source of placement.sources) {
+          const item = simulated.slots[source.slot]
+          if (!item || item.count < source.count) throw error('craft wave simulation lost an input stack', true)
+          item.count -= source.count
+          if (!item.count) simulated.slots[source.slot] = null
+        }
+      }
+      placeVirtualOutputs(simulated, outputs, waveTriggers)
+    }
+    const nextWave = (simulated, completed) => {
       let waveTriggers
       let plan
       let clickCount
@@ -508,19 +517,60 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
         rejection.fragmentedClickCount = clickCount ?? null
         throw rejection
       }
-      for (const placement of plan) {
-        for (const source of placement.sources) {
-          const item = simulated.slots[source.slot]
-          if (!item || item.count < source.count) throw error('craft wave simulation lost an input stack', true)
-          item.count -= source.count
-          if (!item.count) simulated.slots[source.slot] = null
+      return { start: completed, triggers: waveTriggers, clickCount, plan }
+    }
+    const greedyTail = (simulated, completed) => {
+      const waves = []
+      for (; completed < triggers;) {
+        const wave = nextWave(simulated, completed)
+        applyWave(simulated, wave.plan, wave.triggers)
+        waves.push({ start: wave.start, triggers: wave.triggers, clickCount: wave.clickCount })
+        completed += wave.triggers
+      }
+      return waves
+    }
+
+    const initial = cloneInventoryWindow(window)
+    const baseline = greedyTail(cloneInventoryWindow(initial), 0)
+    let best = baseline
+    let bestActions = baseline.reduce((sum, wave) => sum + wave.clickCount + 1, 0)
+
+    // Try one alternate wave at each greedy boundary, then finish it greedily.
+    // Inventory and outputs are re-simulated so stack variants and capacity
+    // remain part of every candidate's cost.
+    for (let index = 0, completed = 0; index < baseline.length; index++) {
+      const prefix = baseline.slice(0, index)
+      const prefixActions = prefix.reduce((sum, wave) => sum + wave.clickCount + 1, 0)
+      const state = cloneInventoryWindow(initial)
+      for (const wave of prefix) {
+        const plan = proportionalPlacementPlan(state, cells, wave.triggers)
+        if (!plan) throw error('craft wave baseline could not be replayed', true)
+        applyWave(state, plan, wave.triggers)
+      }
+      const greedyWave = baseline[index]
+      completed = greedyWave.start
+      for (let candidate = Math.min(waveLimit, triggers - completed); candidate >= 1; candidate--) {
+        if (candidate === greedyWave.triggers) continue
+        const plan = proportionalPlacementPlan(state, cells, candidate)
+        if (!plan) continue
+        const clickCount = placementClickCount(plan)
+        if (clickCount > MAX_SAFE_FRAGMENTED_PLACEMENT_CLICKS) continue
+        const candidateState = cloneInventoryWindow(state)
+        try {
+          applyWave(candidateState, plan, candidate)
+          const tail = greedyTail(candidateState, completed + candidate)
+          const route = [...prefix, { start: completed, triggers: candidate, clickCount }, ...tail]
+          const actions = prefixActions + clickCount + 1 + tail.reduce((sum, wave) => sum + wave.clickCount + 1, 0)
+          if (actions < bestActions) {
+            best = route
+            bestActions = actions
+          }
+        } catch (cause) {
+          if (!cause?.recoveryRequired) throw cause
         }
       }
-      placeVirtualOutputs(simulated, outputs, waveTriggers)
-      waves.push({ start: completed, triggers: waveTriggers, clickCount })
-      completed += waveTriggers
     }
-    return waves
+    return best
   }
 
   async function openCraftingWindow (table, check) {
