@@ -6079,13 +6079,13 @@ const HTML = `<!doctype html>
       }
       const data = await api('/api/admin/console-logs', { afterSeq: state.adminLogAfterSeq || 0 });
       state.adminLogAfterSeq = data.nextSeq || state.adminLogAfterSeq || 0;
+      const consoleEl = $('adminLogConsole');
+      if (reset && !data.rows.length) consoleEl.innerHTML = '<span class="muted">暂无日志。</span>';
       if (state.adminLogServerStartedAt !== data.startedAt) state.adminLogLastSeq = 0;
       state.adminLogServerStartedAt = data.startedAt;
       if (data.rows.length) state.adminLogLastSeq = data.rows[data.rows.length - 1].seq;
       captureAdminLogRows(data.rows);
       $('adminLogCapture').disabled = false;
-      const consoleEl = $('adminLogConsole');
-      if (reset && !data.rows.length) consoleEl.innerHTML = '<span class="muted">暂无日志。</span>';
       if (data.rows.length) {
         if (state.adminLogClearedSeq) {
           const fresh = data.rows.filter(row => row.seq > state.adminLogClearedSeq);

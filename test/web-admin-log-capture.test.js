@@ -124,4 +124,3 @@ test('an empty capture cannot copy previous data and a restarted server can reus
   await f.click('adminLogCaptureCopy')
   assert.equal(f.clipboard[0], '14:00:00 before restart\n14:00:00 after restart')
 })
-
