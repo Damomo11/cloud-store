@@ -6024,14 +6024,21 @@ const HTML = `<!doctype html>
       ).join('');
     }
 
-    async function loadAdminConsoleLogs(reset) {
+    function loadAdminConsoleLogs(reset) {
+      // Share an in-flight poll so reset/manual refresh cannot append stale rows.
+      if (state.adminLogLoading) return state.adminLogLoading;
+      state.adminLogLoading = fetchAdminConsoleLogs(reset).finally(() => { state.adminLogLoading = null; });
+      return state.adminLogLoading;
+    }
+
+    async function fetchAdminConsoleLogs(reset) {
       if (reset) {
-        state.adminLogAfterSeq = 0;
         state.adminLogClearedSeq = 0;
         $('adminLogConsole').innerHTML = '';
       }
-      const data = await api('/api/admin/console-logs', { afterSeq: state.adminLogAfterSeq || 0 });
-      state.adminLogAfterSeq = data.nextSeq || state.adminLogAfterSeq || 0;
+      const data = await api('/api/admin/console-logs', { afterSeq: reset ? 0 : state.adminLogAfterSeq || 0 });
+      // nextSeq is the sequence to be assigned, while afterSeq is exclusive.
+      state.adminLogAfterSeq = Math.max(0, Number(data.nextSeq || 1) - 1);
       const consoleEl = $('adminLogConsole');
       if (reset && !data.rows.length) consoleEl.innerHTML = '<span class="muted">暂无日志。</span>';
       if (data.rows.length) {
