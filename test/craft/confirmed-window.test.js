@@ -43,6 +43,48 @@ for (const version of ['1.17.1', '1.20.4', '1.21.4', '1.21.5', '1.21.11']) {
   })
 }
 
+test('confirmed click wakes immediately when the authoritative menu arrives', async () => {
+  const window = windows.createWindow(0, 'minecraft:inventory', 'Inventory')
+  const value = new Item(registry.itemsByName.stick.id, 1)
+  window.updateSlot(9, value)
+  const client = new EventEmitter()
+  client.write = () => {}
+  const catalog = new ItemCatalog('1.21.11', {}, { serverEnchantmentsFile: '/missing-test-mappings.json' })
+  const bot = { registry, supportFeature: () => true, inventory: window, _client: client }
+  const click = createConfirmedWindowClicker(bot, catalog, { craft: { confirmTimeoutMs: 1000 } })
+  const realSetTimeout = global.setTimeout
+  const realClearTimeout = global.clearTimeout
+  let pollScheduled = false
+  let releasePoll
+  global.setTimeout = (callback, delay, ...args) => {
+    if (delay === 5) {
+      pollScheduled = true
+      releasePoll = () => callback(...args)
+      return { heldPoll: true }
+    }
+    return realSetTimeout(callback, delay, ...args)
+  }
+  global.clearTimeout = timer => {
+    if (!timer?.heldPoll) realClearTimeout(timer)
+  }
+
+  try {
+    let settled = false
+    const pending = click(window, 9, 0, 0, () => {}).then(() => { settled = true })
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(pollScheduled, true, 'the click is waiting for its current polling timer')
+    const slots = window.slots.map((item, slot) => Item.toNotch(slot === 9 ? null : item))
+    client.emit('window_items', { windowId: 0, stateId: 1, items: slots, carriedItem: Item.toNotch(value) })
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(settled, true, 'authoritative confirmation should wake the pending click')
+    await pending
+  } finally {
+    if (releasePoll) releasePoll()
+    global.setTimeout = realSetTimeout
+    global.clearTimeout = realClearTimeout
+  }
+})
+
 // Keep server slots and cursor separate from Mineflayer's predictions. Correct
 // modern clicks normally receive only result-slot updates; a mismatched stateId
 // requests the full menu state, including its authoritative carried item.

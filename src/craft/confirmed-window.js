@@ -56,6 +56,13 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
     }
     let confirmed = null
     let decodeError = null
+    let wakeConfirmation = null
+    const wake = () => {
+      if (!wakeConfirmation) return
+      const resolve = wakeConfirmation
+      wakeConfirmation = null
+      resolve()
+    }
     const onContent = packet => {
       if ((packet.windowId ?? packet.containerId) !== window.id) return
       const raw = packet.items ?? packet.slots
@@ -68,6 +75,7 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
           : equal(cursor, carried) && expected.every((value, index) => index === 0 || equal(value, slots[index]))
         if (matches) confirmed = { slots, carried, stateId: packet.stateId }
       } catch (cause) { decodeError = cause }
+      if (confirmed || decodeError) wake()
     }
     const listeners = ['window_items', 'container_set_content']
     for (const name of listeners) bot._client.on(name, onContent)
@@ -82,7 +90,18 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
           emitDebug('executor.window_confirmation_timeout', { windowId: window.id, slot, mouseButton, mode })
           throw failure('server did not confirm the craft window click and cursor')
         }
-        await new Promise(resolve => setTimeout(resolve, Math.min(5, Math.max(1, expires - Date.now()))))
+        await new Promise(resolve => {
+          const timer = setTimeout(() => {
+            wakeConfirmation = null
+            resolve()
+          }, Math.min(5, Math.max(1, expires - Date.now())))
+          wakeConfirmation = () => {
+            clearTimeout(timer)
+            wakeConfirmation = null
+            resolve()
+          }
+          if (confirmed || decodeError) wake()
+        })
       }
       check()
       if ((bot.currentWindow || bot.inventory) !== window) throw failure('craft window closed before server confirmation')
