@@ -475,6 +475,59 @@ test('proportional execution logs click intent, server slot/cursor updates and e
   assert.deepEqual(confirmation.details.observed, [['minecraft:stick', 8]])
 })
 
+test('phase timings account for actual grid clicks and identify the execution path', async () => {
+  const step = { ...stickStep, requiresTable: false }
+  const f = proportionalFixture([item('oak_planks', 2), item('oak_planks', 2)], [item('stick', 8)], step, { triggers: 2 })
+  await f.executor.execute({ step, triggers: 2, operationId: 'craft:timed', stepId: '0:0+2' })
+  const phases = f.debugEvents.filter(entry => entry.event === 'executor.phase_complete')
+  for (const phase of ['compaction', 'placement', 'placement_confirmation', 'result_collection', 'shift_confirmation', 'cleanup', 'final_confirmation']) {
+    assert.ok(phases.some(entry => entry.details.phase === phase && entry.details.elapsedMs >= 0), phase)
+  }
+  const summary = f.debugEvents.find(entry => entry.event === 'executor.timing_summary').details
+  assert.equal(summary.operationId, 'craft:timed')
+  assert.equal(summary.stepId, '0:0+2')
+  assert.equal(summary.status, 'complete')
+  assert.equal(summary.path, 'proportional')
+  assert.equal(summary.clicks.attempted, f.clicks.length)
+  assert.equal(summary.clicks.completed, f.clicks.length)
+  assert.equal(summary.clicks.shift, 1)
+  assert.equal(summary.clicks.failed, 0)
+  const wave = f.debugEvents.find(entry => entry.event === 'executor.grid_wave_complete').details
+  assert.equal(wave.clicks.attempted, f.clicks.length)
+  assert.ok(wave.elapsedMs >= 0)
+  assert.ok(summary.elapsedMs >= wave.elapsedMs)
+})
+
+test('failed placement logs its phase and attempted click without sending another action', async () => {
+  const step = { ...stickStep, requiresTable: false }
+  const f = proportionalFixture([item('oak_planks', 2), item('oak_planks', 2)], [item('stick', 8)], step, { triggers: 2 })
+  let calls = 0
+  const failure = new Error('connection lost during material pickup')
+  f.bot.clickWindow = async () => { calls++; throw failure }
+  await assert.rejects(f.executor.execute({ step, triggers: 2 }), error => error === failure)
+  assert.equal(calls, 1)
+  const phase = f.debugEvents.find(entry => entry.event === 'executor.phase_failure').details
+  assert.equal(phase.phase, 'placement')
+  assert.equal(phase.waveStart, 0)
+  const summary = f.debugEvents.find(entry => entry.event === 'executor.timing_summary').details
+  assert.equal(summary.status, 'failed')
+  assert.equal(summary.clicks.attempted, 1)
+  assert.equal(summary.clicks.failed, 1)
+  assert.equal(summary.clicks.completed, 0)
+  assert.equal(f.executor.isBusy(), false)
+})
+
+test('a throwing diagnostic writer preserves the successful grid action sequence', async () => {
+  const step = { ...stickStep, requiresTable: false }
+  const run = async debugCraft => {
+    const f = proportionalFixture([item('oak_planks', 2), item('oak_planks', 2)], [item('stick', 8)], step, { triggers: 2, debugCraft })
+    const result = await f.executor.execute({ step, triggers: 2 })
+    return { produced: amounts(result.produced), clicks: f.clicks.map(({ slot, mouseButton, mode }) => [slot, mouseButton, mode]) }
+  }
+  const normal = await run()
+  assert.deepEqual(await run(() => { throw new Error('log writer unavailable') }), normal)
+})
+
 test('2x2 proportional placement can split one input cell across matching stacks', async () => {
   const step = { ...stickStep, requiresTable: false }
   const f = proportionalFixture([item('oak_planks', 2), item('oak_planks', 1), item('oak_planks', 3)], [item('stick', 12)], step, { triggers: 3 })
@@ -534,6 +587,12 @@ test('100-trigger 3x3 batch uses 64 and 36 grid waves in one window', async () =
     [36, 36, 36, 36, 0, 36, 36, 36, 36]
   ])
   assert.equal(f.clicks.length, 34)
+  const waves = f.debugEvents.filter(entry => entry.event === 'executor.grid_wave_complete')
+  assert.deepEqual(waves.map(entry => entry.details.clicks.attempted), [17, 17])
+  const summary = f.debugEvents.find(entry => entry.event === 'executor.timing_summary').details
+  assert.equal(summary.clicks.attempted, 34)
+  assert.equal(summary.completedWaves, 2)
+  assert.equal(summary.completedTriggers, 100)
 })
 
 test('wave planning minimizes placement clicks plus result shifts across nearby safe waves', async () => {
