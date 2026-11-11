@@ -1,5 +1,7 @@
 'use strict'
 
+const { shortKey } = require('../traceLog')
+
 // Scoped to crafting. Modern menu clicks do not acknowledge correctly predicted
 // input/cursor changes. A mismatched stateId still applies the click, then makes
 // Vanilla/Paper send the complete authoritative menu, including carriedItem.
@@ -21,6 +23,14 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
     : a.count === b.count && catalog.fromPrismarineItem(a).itemKey === catalog.fromPrismarineItem(b).itemKey
   const sameItem = (a, b) => a && b && catalog.fromPrismarineItem(a).itemKey === catalog.fromPrismarineItem(b).itemKey
   const failure = message => Object.assign(new Error(message), { recoveryRequired: true })
+  const debug = (event, details) => {
+    try { emitDebug(event, typeof details === 'function' ? details() : details) } catch { /* Logging cannot affect window confirmation. */ }
+  }
+  const summarize = item => {
+    if (!item) return null
+    const value = catalog.fromPrismarineItem(item)
+    return { itemId: value.itemId, amount: item.count, fingerprint: shortKey(value.itemKey) }
+  }
 
   const click = async function (window, slot, mouseButton, mode, check, accept) {
     check()
@@ -54,6 +64,30 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
     } else if (mode !== 1 || !accept) {
       throw failure('confirmed craft shift-click requires an expected server state')
     }
+    const timeoutMs = Math.max(1, Number(config?.craft?.confirmTimeoutMs) || 5000)
+    debug('executor.window_confirmation_start', { windowId: window.id, slot, mouseButton, mode, timeoutMs })
+    const startedAt = performance.now()
+    let responseCount = 0
+    let incompleteResponseCount = 0
+    let rejectedResponseCount = 0
+    let firstResponseMs = null
+    let confirmationMs = null
+    let lastRejected = null
+    const diagnostics = () => {
+      let lastMismatch = null
+      if (lastRejected) {
+        if (mode === 1) lastMismatch = { reason: 'shift_state', stateId: lastRejected.stateId }
+        else if (!equal(cursor, lastRejected.carried)) {
+          lastMismatch = { reason: 'cursor', expected: summarize(cursor), observed: summarize(lastRejected.carried) }
+        } else {
+          const index = expected.findIndex((value, index) => index !== 0 && !equal(value, lastRejected.slots[index]))
+          if (index >= 0) lastMismatch = { reason: 'slot', slot: index, expected: summarize(expected[index]), observed: summarize(lastRejected.slots[index]) }
+        }
+      }
+      return { windowId: window.id, slot, mouseButton, mode, timeoutMs,
+        elapsedMs: performance.now() - startedAt, firstResponseMs, confirmationMs,
+        responseCount, incompleteResponseCount, rejectedResponseCount, lastMismatch }
+    }
     let confirmed = null
     let decodeError = null
     let wakeConfirmation = null
@@ -65,21 +99,32 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
     }
     const onContent = packet => {
       if ((packet.windowId ?? packet.containerId) !== window.id) return
+      responseCount++
+      firstResponseMs ??= performance.now() - startedAt
       const raw = packet.items ?? packet.slots
-      if (!Array.isArray(raw) || raw.length !== window.slots.length || !Object.hasOwn(packet, 'carriedItem')) return
+      if (!Array.isArray(raw) || raw.length !== window.slots.length || !Object.hasOwn(packet, 'carriedItem')) {
+        incompleteResponseCount++
+        return
+      }
       try {
         const slots = raw.map(value => Item.fromNotch(value))
         const carried = Item.fromNotch(packet.carriedItem)
         const matches = mode === 1
           ? accept(slots, carried)
           : equal(cursor, carried) && expected.every((value, index) => index === 0 || equal(value, slots[index]))
-        if (matches) confirmed = { slots, carried, stateId: packet.stateId }
+        if (matches) {
+          confirmed = { slots, carried, stateId: packet.stateId }
+          confirmationMs ??= performance.now() - startedAt
+        } else {
+          rejectedResponseCount++
+          lastRejected = { slots, carried, stateId: packet.stateId }
+        }
       } catch (cause) { decodeError = cause }
       if (confirmed || decodeError) wake()
     }
     const listeners = ['window_items', 'container_set_content']
     for (const name of listeners) bot._client.on(name, onContent)
-    const expires = Date.now() + Math.max(1, Number(config?.craft?.confirmTimeoutMs) || 5000)
+    const expires = Date.now() + timeoutMs
     try {
       bot._client.write('window_click', { windowId: window.id, stateId: -1, slot, mouseButton, mode,
         changedSlots: [], cursorItem: emptyClickCursor })
@@ -87,7 +132,7 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
         check()
         if (decodeError) throw failure(`cannot decode confirmed craft window: ${decodeError.message}`)
         if (Date.now() >= expires) {
-          emitDebug('executor.window_confirmation_timeout', { windowId: window.id, slot, mouseButton, mode })
+          debug('executor.window_confirmation_timeout', diagnostics)
           throw failure('server did not confirm the craft window click and cursor')
         }
         await new Promise(resolve => {
@@ -112,7 +157,10 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
       if (window !== bot.inventory) {
         for (let index = 0; index < 36; index++) bot.inventory.updateSlot(9 + index, copy(confirmed.slots[window.inventoryStart + index]))
       }
-      emitDebug('executor.window_click_confirmed', { windowId: window.id, slot, mouseButton, mode, stateId: confirmed.stateId })
+      debug('executor.window_click_confirmed', () => ({ ...diagnostics(), stateId: confirmed.stateId }))
+    } catch (cause) {
+      debug('executor.window_confirmation_failure', () => ({ ...diagnostics(), message: cause?.message || String(cause) }))
+      throw cause
     } finally {
       for (const name of listeners) bot._client.removeListener(name, onContent)
     }
@@ -122,6 +170,8 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
   // valid no-op, even with a carried item (-999 is the drop slot). Request a
   // full player menu after close so recovery never parks a stale local cursor.
   click.close = window => new Promise(resolve => {
+    const startedAt = performance.now()
+    let responseCount = 0
     let finished = false
     let timer
     const listeners = ['window_items', 'container_set_content']
@@ -130,11 +180,12 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
       finished = true
       clearTimeout(timer)
       for (const name of listeners) bot._client.removeListener(name, content)
-      emitDebug('executor.window_close_confirmed', { windowId: window.id, confirmed })
+      debug('executor.window_close_confirmed', { windowId: window.id, confirmed, elapsedMs: performance.now() - startedAt, responseCount })
       resolve(confirmed)
     }
     const content = packet => {
       if ((packet.windowId ?? packet.containerId) !== 0) return
+      responseCount++
       const slots = packet.items ?? packet.slots
       if (!Array.isArray(slots) || slots.length !== bot.inventory.slots.length || !Object.hasOwn(packet, 'carriedItem')) return
       try {
