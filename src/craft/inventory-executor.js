@@ -404,9 +404,17 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
       for (const [index, cellIndex] of group.cells.entries()) {
         const cell = cells[cellIndex]
         const selectedKey = selectedKeys[index]
-        const matching = candidatesByKey.get(selectedKey)?.entries || []
         let needed = triggers
         const sources = []
+        const matching = [...(candidatesByKey.get(selectedKey)?.entries || [])]
+        matching.sort((left, right) => {
+          const leftCount = remaining.get(left.slot)?.count || 0
+          const rightCount = remaining.get(right.slot)?.count || 0
+          const leftExact = leftCount === needed
+          const rightExact = rightCount === needed
+          if (leftExact !== rightExact) return Number(rightExact) - Number(leftExact)
+          return 0
+        })
         for (const source of matching) {
           if (needed <= 0) break
           const current = remaining.get(source.slot)
