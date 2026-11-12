@@ -7,6 +7,7 @@ const REPAIR_BOTTLE_ITEM_ID = 'minecraft:experience_bottle'
 const REPAIR_BOTTLE_AMOUNT = 64
 const REPAIR_MAX_DISTANCE = 4
 const WHOLE_SHULKER_WITHDRAW_THRESHOLD = 1728
+const CRAFT_DEBUG_COMMAND = /^!调试\s+合成日志\s+(开|关)$/
 
 // 扣账幂等键的进程级盐。任务序号（taskPool.sequence）是内存自增、进程重启后归零，
 // 幂等键若只由 botId+taskId+批次号组成，重启后会与重启前的任务撞键：
@@ -446,9 +447,14 @@ class CloudStoreService {
       console.log(`[packet:system_chat] actionBar=${packet.isActionBar} text=${message}`)
     }
     if (!message) return
+    const whisper = this.parsePrivateMessage(message)
+    if (whisper) {
+      this.handleIncoming(whisper.username, whisper.message, 'packet:system_chat:private', { channel: 'private' })
+      return
+    }
     const parsed = this.parseCustomCommandMessage(message, null)
     if (!parsed) return
-    this.handleIncoming(parsed.username, parsed.command, 'packet:system_chat', { channel: 'private' })
+    this.handleIncoming(parsed.username, parsed.command, 'packet:system_chat', { channel: 'public' })
   }
 
   handleIncoming (username, message, source, context = {}) {
@@ -463,7 +469,12 @@ class CloudStoreService {
     if (!normalizedCommand.startsWith('!')) return
 
     if (/^!调试(?:\s|$)/.test(normalizedCommand)) {
-      this.handleCraftDebugCommand(username, normalizedCommand)
+      const privateCommand = context.channel === 'private' || this.isPrivateSource(context.source || source)
+      if (!privateCommand && this.taskPool?.workers) {
+        this.handlePublicCraftDebugCommand(username, normalizedCommand)
+      } else if (!this.isDuplicateCommand(username, normalizedCommand, source)) {
+        this.handleCraftDebugCommand(username, normalizedCommand)
+      }
       return
     }
 
@@ -535,18 +546,50 @@ class CloudStoreService {
       .catch(error => this.db.runWithCommandContext(commandLogId, () => this.withBotContext(() => this.handleCommandError(username, error))))
   }
 
-  handleCraftDebugCommand (username, text) {
-    if (!this.isAdmin(username)) return
-
-    const match = String(text || '').trim().match(/^!调试\s+合成日志\s+(开|关)$/)
+  handlePublicCraftDebugCommand (username, text) {
+    if (!this.isAdmin(username) || !this.taskPool.acceptIncoming(username, text, 'craft-debug:public')) return
+    const match = text.match(CRAFT_DEBUG_COMMAND)
     if (!match) {
-      this.msg(username, '格式：!调试 合成日志 开|关')
+      this.handleCraftDebugCommand(username, text)
       return
+    }
+    const workers = [...new Set([this, ...this.taskPool.workers])]
+      .filter(worker => !worker.connectionInvalidated && (worker === this || worker.ready))
+    const completed = []
+    const failed = []
+    // These switches are synchronous local settings: finish every worker before
+    // replying, without waiting for another copy of the same chat packet.
+    for (const worker of workers) {
+      const name = worker.bot.username || worker.botId
+      try {
+        if (!worker.handleCraftDebugCommand(username, text, { reply: false })) throw new Error('未获管理员授权')
+        completed.push(name)
+      } catch (error) {
+        failed.push(`${name}：${error.message || error}`)
+      }
+    }
+    const responder = workers.find(worker => !worker.connectionInvalidated)
+    if (!responder) return
+    const state = match[1] === '开' ? '开启' : '关闭'
+    const summary = completed.length
+      ? `${completed.length} 个机器人（${completed.join('、')}）的合成日志已${state}，重启后自动关闭。`
+      : '合成日志开关未完成。'
+    responder.msg(username, summary + (failed.length ? ` 未完成：${failed.join('；')}。` : ''))
+  }
+
+  handleCraftDebugCommand (username, text, { reply = true } = {}) {
+    if (!this.isAdmin(username)) return false
+
+    const match = String(text || '').trim().match(CRAFT_DEBUG_COMMAND)
+    if (!match) {
+      if (reply) this.msg(username, '格式：!调试 合成日志 开|关')
+      return false
     }
 
     this.craftDebugEnabled = match[1] === '开'
     const state = this.craftDebugEnabled ? '开启' : '关闭'
-    this.msg(username, `机器人 ${this.bot.username || this.botId} 的合成日志已${state}，重启后自动关闭。`)
+    if (reply) this.msg(username, `机器人 ${this.bot.username || this.botId} 的合成日志已${state}，重启后自动关闭。`)
+    return true
   }
 
   debugCraft (event, details = {}) {
