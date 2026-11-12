@@ -105,3 +105,59 @@ test('pinyin quantities are validated and the existing trailing player syntax is
   assert.equal(collision.targetUsername, 'hongshifen')
   assert.equal(collision.requests[0].itemId, 'minecraft:stone')
 })
+
+test('withdraw accepts initials and full/initial mixtures at every syllable boundary', () => {
+  const service = fixture()
+  for (const spelling of ['hsk', 'hskuai', 'hongsk', 'hshikuai', 'hongshik', 'hshik', 'hongskuai', 'hongshikuai', 'HONGSK']) {
+    const [item] = service.parseWithdraw(`${spelling}64`)
+    assert.equal(item.itemId, 'minecraft:redstone_block', spelling)
+    assert.equal(item.amount, 64)
+  }
+  const requests = service.parseWithdraw('zsk16 hsk 8 hongsk', 'player', { uuid: 'owner', scope: 'personal' })
+  assert.deepEqual(requests.map(item => [item.itemId, item.amount]), [
+    ['minecraft:diamond_block', 16], ['minecraft:redstone_block', 8], ['minecraft:redstone_block', 1]
+  ])
+  assert.equal(service.parseWithdraw('zzczylb')[0].itemId, 'minecraft:heavy_weighted_pressure_plate')
+  assert.equal(service.parseWithdraw('zuanshig')[0].itemId, 'minecraft:diamond_pickaxe')
+})
+
+test('ambiguous initials preserve every candidate without inventory-based selection', () => {
+  const service = fixture()
+  assert.throws(() => service.parseWithdraw('hs', 'player', { uuid: 'owner', scope: 'personal' }), error => {
+    assert.equal(error.code, 'WITHDRAW_PINYIN_AMBIGUOUS')
+    for (const id of ['red_sand', 'piston', 'blackstone']) assert.ok(error.message.includes(`minecraft:${id}`))
+    return true
+  })
+  assert.throws(() => service.parseWithdraw('h'), /未知物品/)
+  assert.throws(() => service.parseWithdraw('hongshikuaijunk'), /未知物品/)
+})
+
+test('full spellings win over abbreviation matches and matching aliases deduplicate by item', () => {
+  const service = fixture()
+  service.catalog = new ItemCatalog('1.21.11', { 红: 'redstone', 海欧牛瓜: 'diamond', 红石坎: 'redstone_block' }, { file: 'data/zh_cn.json' })
+  assert.equal(service.parseWithdraw('hong')[0].itemId, 'minecraft:redstone')
+  assert.equal(service.parseWithdraw('hsk')[0].itemId, 'minecraft:redstone_block')
+})
+
+test('initials and mixtures retain legacy alias, short-code and target priority', () => {
+  const custom = { itemId: 'minecraft:diamond', itemKey: 'minecraft:diamond|abcdef', displayName: '自定义钻石' }
+  for (const spelling of ['hsk', 'hongsk']) {
+    for (const method of ['findItemByPlayerAlias', 'findItemByGlobalAlias']) {
+      assert.equal(fixture({ [method]: () => custom }).parseWithdraw(`${spelling}16`)[0].itemKey, custom.itemKey)
+    }
+    assert.throws(() => fixture({ isGlobalItemAliasDisabled: () => true }).parseWithdraw(spelling), /你已禁用全局别名/)
+  }
+  const service = fixture({ findItemByShortCode: () => custom })
+  service.catalog = new ItemCatalog('1.21.11', { hsk: 'stone', 艾波草的饿风: 'stone' }, { file: 'data/zh_cn.json' })
+  assert.equal(service.parseWithdraw('hsk16')[0].itemId, 'minecraft:stone')
+  assert.equal(service.parseWithdraw('abcdef16')[0].itemKey, custom.itemKey)
+  const owner = { uuid: 'owner', username: 'Alice', scope: 'personal' }
+  const parsed = service.parseWithdrawCommand('!取 hongsk16 Bob', owner, 'Alice', 'player')
+  assert.equal(parsed.targetUsername, 'Bob')
+  assert.equal(parsed.requests[0].itemId, 'minecraft:redstone_block')
+  assert.equal(parsed.requests[0].amount, 16)
+  const collision = service.parseWithdrawCommand('!取 石头 hongsk', owner, 'Alice', 'player')
+  assert.equal(collision.targetUsername, 'hongsk')
+  assert.equal(collision.requests[0].itemId, 'minecraft:stone')
+  assert.throws(() => service.resolveStoredItem('hongsk'), /未知物品/)
+})
