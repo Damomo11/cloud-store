@@ -285,6 +285,7 @@ class Warehouse {
       })
       const container = await this.openContainerAt(chest)
       let movedInChest = 0
+      const noSpaceKeys = new Set()
       try {
         const confirmedDeposit = options.requireServerEvidence ? createConfirmedDepositor(this, options.check, container) : null
         let progress = true
@@ -296,7 +297,19 @@ class Warehouse {
           const items = this.currentDepositItemsFromContainer(container)
           if (!items.length) break
           for (const item of items) {
+            if (options.requireServerEvidence) {
+              const key = this.catalog.fromPrismarineItem(item).itemKey
+              if (noSpaceKeys.has(key)) continue
+              if (this.containerFreeSpaceFor(container, key, item) <= 0) {
+                noSpaceKeys.add(key)
+                continue
+              }
+            }
             const moved = confirmedDeposit ? await confirmedDeposit(container, item) : await this.tryDepositInto(container, item)
+            // Reuse a negative capacity result only across synchronous checks.
+            // Any awaited transfer may deliver a new window state, even if it
+            // reports no movement. It must invalidate all skipped identities.
+            noSpaceKeys.clear()
             if (moved > 0) {
               progress = true
               movedInChest += moved
