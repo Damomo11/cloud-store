@@ -11,7 +11,9 @@ function merge (items) {
     if (!item?.itemKey || !Number.isSafeInteger(item.amount) || item.amount < 0) throw new Error('invalid craft inventory snapshot')
     if (!item.amount) continue
     const previous = totals.get(item.itemKey)
-    totals.set(item.itemKey, { ...item, amount: (previous?.amount || 0) + item.amount })
+    const amount = (previous?.amount || 0) + item.amount
+    if (!Number.isSafeInteger(amount)) throw new Error('invalid craft inventory snapshot total')
+    totals.set(item.itemKey, { ...item, amount })
   }
   return [...totals.values()]
 }
@@ -255,9 +257,25 @@ class CraftController {
   }
 
   physicalTotals () {
-    const slots = this.db.listChestSlots().filter(row => Number(row.amount) > 0).map(row => ({
-      ...this.db.getItemByKey(row.itemKey), itemKey: row.itemKey, amount: Number(row.amount)
-    }))
+    // Aggregate registered storage by exact identity before loading metadata.
+    // Read afresh at each checkpoint; recovery must never use cached amounts.
+    const slots = typeof this.db.db?.prepare === 'function'
+      ? this.db.db.prepare(`
+          SELECT totals.itemKey, totals.amount, totals.invalid, i.item_id AS itemId,
+                 i.display_name AS displayName, i.nbt_json AS nbtJson, i.meta_json AS metaJson
+          FROM (
+            SELECT cs.item_key AS itemKey, SUM(cs.amount) AS amount,
+                   MAX(typeof(cs.amount) <> 'integer' OR cs.amount > 9007199254740991) AS invalid
+            FROM chest_slots cs JOIN chests c ON c.chest_id = cs.chest_id
+            WHERE cs.amount > 0 GROUP BY cs.item_key
+          ) totals LEFT JOIN items i ON i.item_key = totals.itemKey
+        `).all().map(({ invalid, ...row }) => {
+          if (invalid) throw new Error('invalid craft inventory snapshot')
+          return row
+        })
+      : this.db.listChestSlots().filter(row => Number(row.amount) > 0).map(row => ({
+          ...this.db.getItemByKey(row.itemKey), itemKey: row.itemKey, amount: Number(row.amount)
+        }))
     return merge([...slots, ...this.inventory()])
   }
 
