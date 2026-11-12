@@ -6,7 +6,7 @@ const { shortKey } = require('../traceLog')
 // input/cursor changes. A mismatched stateId still applies the click, then makes
 // Vanilla/Paper send the complete authoritative menu, including carriedItem.
 // Send no speculative changedSlots (1.21.11 uses hashed slots on this packet).
-function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {}) {
+function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {}, options = {}) {
   if (!bot.supportFeature?.('stateIdUsed') || typeof bot._client?.write !== 'function') return null
   const registry = bot.registry || catalog.mcData
   const Item = require('prismarine-item')(registry)
@@ -34,7 +34,10 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
 
   const click = async function (window, slot, mouseButton, mode, check, accept) {
     check()
-    if (![bot.inventory, bot.currentWindow].includes(window) || !window.type?.match(/^minecraft:(inventory|crafting)$/)) {
+    const allowed = window.type?.match(/^minecraft:(inventory|crafting)$/) ||
+      (options.allowContainer && window.type?.match(/^minecraft:generic_9x[1-6]$/) && mode === 1 &&
+        window.inventoryEnd - window.inventoryStart === 36 && window.slots.length === window.inventoryEnd)
+    if (![bot.inventory, bot.currentWindow].includes(window) || !allowed) {
       throw failure('confirmed craft click lost its inventory window')
     }
     const expected = window.slots.map(value => copy(value))

@@ -6,6 +6,7 @@ const { logLocalError } = require('./localErrorLog')
 const { isFatalProtocolReadError } = require('./botConnection')
 const { traceEvent, shortKey } = require('./traceLog')
 const { openServerContainer, readServerContainer } = require('./craft/server-container-evidence')
+const { createConfirmedDepositor } = require('./craft/confirmed-deposit')
 
 class Warehouse {
   constructor (bot, db, catalog, config, warehouseMutex = null, warehouseState = null) {
@@ -285,6 +286,7 @@ class Warehouse {
       const container = await this.openContainerAt(chest)
       let movedInChest = 0
       try {
+        const confirmedDeposit = options.requireServerEvidence ? createConfirmedDepositor(this, options.check, container) : null
         let progress = true
         while (progress && this.bot.inventory.items().length) {
           progress = false
@@ -294,7 +296,7 @@ class Warehouse {
           const items = this.currentDepositItemsFromContainer(container)
           if (!items.length) break
           for (const item of items) {
-            const moved = await this.tryDepositInto(container, item)
+            const moved = confirmedDeposit ? await confirmedDeposit(container, item) : await this.tryDepositInto(container, item)
             if (moved > 0) {
               progress = true
               movedInChest += moved
@@ -305,7 +307,7 @@ class Warehouse {
                 moved,
                 decision: `存入 ${moved} 个 ${item.name}`
               })
-              await sleep(this.config.timing.containerSettleMs)
+              if (!confirmedDeposit) await sleep(this.config.timing.containerSettleMs)
             }
           }
         }

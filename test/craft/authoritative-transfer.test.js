@@ -39,6 +39,27 @@ function fixture (options = {}) {
       server.player = null
     }
   }
+  if (options.modern) {
+    bot.registry = catalog.mcData
+    bot.supportFeature = name => name === 'stateIdUsed'
+    bot._client.write = (name, packet) => {
+      assert.equal(name, 'window_click')
+      assert.equal(packet.stateId, -1)
+      current.acceptClick({ ...packet, item: current.slots[packet.slot] })
+      server.chest = make(4)
+      server.player = null
+      const response = { windowId: current.id, stateId: 1,
+        items: current.slots.map(item => Item.toNotch(item)), carriedItem: Item.toNotch(null) }
+      if (options.transferMode === 'old') {
+        response.items[0] = Item.toNotch(null)
+        response.items[current.inventoryStart] = Item.toNotch(make(4))
+      }
+      if (options.transferMode === 'cursor') response.carriedItem = Item.toNotch(make(1))
+      if (options.transferMode === 'missing') delete response.carriedItem
+      bot._client.emit('window_items', response)
+    }
+    config.craft = { ...config.craft, confirmTimeoutMs: 30 }
+  }
   const warehouse = new Warehouse(bot, db, catalog, config)
   if (options.withdraw) warehouse.tryWithdrawExactFrom = async container => {
     withdrawals++
@@ -57,7 +78,7 @@ function fixture (options = {}) {
   }
   warehouse.openContainerAt = async () => {
     opens++
-    current = windows.createWindow(7 + opens, 'minecraft:generic_9x3', 'Barrel')
+    current = windows.createWindow(7 + opens, options.containerType || 'minecraft:generic_9x3', 'Barrel')
     current.updateSlot(0, server.chest)
     current.updateSlot(current.inventoryStart, server.player)
     bot.currentWindow = current
@@ -110,6 +131,66 @@ test('strict deposit confirms a fresh server container and player snapshot', asy
     assert.equal(f.opens(), 2)
     assert.deepEqual(f.bot.inventory.items(), [])
     assert.equal(f.db.listChestSlots().find(row => row.slot === 0)?.amount, 4)
+  } finally { f.close() }
+})
+
+test('modern strict deposit confirms its shift without a fixed settle delay and still reopens the barrel', async () => {
+  const f = fixture({ modern: true })
+  const originalClick = f.bot.clickWindow
+  const originalTimer = global.setTimeout
+  let settles = 0
+  f.config.timing.containerSettleMs = 123
+  global.setTimeout = (fn, ms, ...args) => {
+    if (ms === 123) settles++
+    return originalTimer(fn, ms, ...args)
+  }
+  f.bot.clickWindow = () => { throw new Error('must use the confirmed craft deposit') }
+  try {
+    await f.warehouse.depositAllPossible({ requireServerEvidence: true })
+    assert.equal(f.opens(), 2)
+    assert.deepEqual(f.bot.inventory.items(), [])
+    assert.equal(f.db.listChestSlots().find(row => row.slot === 0)?.amount, 4)
+    assert.equal(f.bot._client.listenerCount('window_items'), 0)
+    assert.equal(settles, 0)
+  } finally { global.setTimeout = originalTimer; f.bot.clickWindow = originalClick; f.close() }
+})
+
+test('modern strict deposit still rejects a missing final independent barrel snapshot', async () => {
+  const f = fixture({ modern: true, packetMode: 'missing' })
+  try {
+    await assert.rejects(f.warehouse.depositAllPossible({ requireServerEvidence: true }), error => error.uncertainTransfer === true)
+    assert.equal(f.opens(), 2)
+  } finally { f.close() }
+})
+
+for (const transferMode of ['old', 'cursor', 'missing']) {
+  test(`modern strict deposit cannot advance on ${transferMode} transfer evidence`, async () => {
+    const f = fixture({ modern: true, transferMode })
+    try {
+      await assert.rejects(f.warehouse.depositAllPossible({ requireServerEvidence: true }), error => error.uncertainTransfer === true)
+      assert.equal(f.opens(), 1)
+      assert.equal(f.bot._client.listenerCount('window_items'), 0)
+    } finally { f.close() }
+  })
+}
+
+test('ordinary deposits retain the original click helper on modern protocols', async () => {
+  const f = fixture({ modern: true })
+  f.bot._client.write = () => { throw new Error('ordinary deposits must not request craft confirmation') }
+  try {
+    await f.warehouse.depositAllPossible()
+    assert.equal(f.opens(), 1)
+    assert.deepEqual(f.bot.inventory.items(), [])
+  } finally { f.close() }
+})
+
+test('strict deposits keep the original adapter for other supported container types', async () => {
+  const f = fixture({ modern: true, containerType: 'minecraft:shulker_box' })
+  f.bot._client.write = () => { throw new Error('unsupported confirmation model must use the original deposit helper') }
+  try {
+    await f.warehouse.depositAllPossible({ requireServerEvidence: true })
+    assert.equal(f.opens(), 2)
+    assert.deepEqual(f.bot.inventory.items(), [])
   } finally { f.close() }
 })
 
