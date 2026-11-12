@@ -2,6 +2,7 @@ const { clampInt, sanitizeChatText, sleep, sumBy, notchYawDeg, notchPitchDeg } =
 const { startTrace, traceEvent, traceSummary, traceStandalone, shortKey } = require('./traceLog')
 const { runHotReload } = require('./hotReload')
 const { planShortages, normalizeItemId } = require('./shortagePlanner')
+const { findWithdrawPinyinItems } = require('./withdrawPinyin')
 
 const REPAIR_BOTTLE_ITEM_ID = 'minecraft:experience_bottle'
 const REPAIR_BOTTLE_AMOUNT = 64
@@ -3692,7 +3693,7 @@ class CloudStoreService {
     return { layer: 'none', item: null }
   }
 
-  resolveStoredItem (name, playerUuid = '') {
+  resolveStoredItem (name, playerUuid = '', { allowPinyin = false } = {}) {
     const alias = this.resolveByAliasChain(name, playerUuid)
     if (alias.item) return alias.item
     if (alias.layer === 'disabled') throw new Error(`你已禁用全局别名：${name}`)
@@ -3701,7 +3702,17 @@ class CloudStoreService {
       return this.catalog.resolveName(name)
     } catch (error) {
       const matches = this.db.findItemsByDisplayQuery(name, playerUuid)
-      if (!matches.length) throw error
+      if (!matches.length) {
+        const phonetic = allowPinyin ? findWithdrawPinyinItems(this.catalog, name) : []
+        if (phonetic.length > 1) {
+          const names = phonetic.slice(0, 5).map(item => `${item.displayName}(${item.itemId})`).join('，')
+          const ambiguity = new Error(`物品名不够精确：${name}，匹配到 ${names}`)
+          ambiguity.code = 'WITHDRAW_PINYIN_AMBIGUOUS'
+          throw ambiguity
+        }
+        if (phonetic.length === 1) return phonetic[0]
+        throw error
+      }
       const exact = matches.filter(item => item.displayName.toLowerCase() === String(name).trim().toLowerCase())
       const candidates = exact.length ? exact : matches
       if (candidates.length > 1) {
@@ -3719,8 +3730,9 @@ class CloudStoreService {
 
   resolveStoredItemForWithdraw (name, playerUuid = '', storageOwner = null) {
     try {
-      return this.resolveStoredItem(name, playerUuid)
+      return this.resolveStoredItem(name, playerUuid, { allowPinyin: true })
     } catch (error) {
+      if (error.code === 'WITHDRAW_PINYIN_AMBIGUOUS') throw error
       const enchantedBook = this.resolveHighestStockedEnchantedBook(name, playerUuid, storageOwner)
       if (enchantedBook) return enchantedBook
       throw error
