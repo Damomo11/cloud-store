@@ -5,6 +5,7 @@ const { standardRecipeOutputs, withStandardRecipeOutputs } = require('./recipe-o
 const { readServerContainer } = require('./server-container-evidence')
 const { shortKey } = require('../traceLog')
 const { createConfirmedWindowClicker } = require('./confirmed-window')
+const { planTransfer } = require('./transfer-plan')
 
 // A fragmented source stack can be split with right-clicks, but each click is
 // a separate server window action.  Keep small legacy batches compatible while
@@ -460,29 +461,14 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
   }
 
   function placementClickCount (plan) {
-    const transferCount = (sourceCount, amount) => {
-      let available = sourceCount
-      let remaining = amount
-      let clicks = 0
-      while (remaining > 0) {
-        if (available === remaining) return clicks + 2
-        const picked = Math.ceil(available / 2)
-        clicks++ // split the source stack with a right click
-        if (picked <= remaining) {
-          clicks++ // place the selected half into the grid cell
-          remaining -= picked
-          available -= picked
-        } else {
-          // The target receives one item per right click, then the cursor is
-          // returned to the source slot with a final left click.
-          return clicks + remaining + 1
-        }
+    return plan.reduce((total, placement) => {
+      let targetCount = 0
+      for (const source of placement.sources) {
+        total += planTransfer(source.sourceCount, source.count, targetCount).length
+        targetCount += source.count
       }
-      return clicks
-    }
-    return plan.reduce((total, placement) => total + placement.sources.reduce((count, source) => {
-      return count + transferCount(source.sourceCount, source.count)
-    }, 0), 0)
+      return total
+    }, 0)
   }
 
   function cloneInventoryWindow (window) {
@@ -801,70 +787,16 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
       }
       const placementBaselines = new Map(placementSlots.map(slot => [slot, evidence.current().slotVersion(window.id, slot)]))
       const transferPartial = async (sourceSlot, targetSlot, amount) => {
-        let remaining = amount
-        while (remaining > 0) {
+        const available = Number(window.slots[sourceSlot]?.count || 0)
+        const targetCount = Number(window.slots[targetSlot]?.count || 0)
+        const actions = planTransfer(available, amount, targetCount)
+        for (const action of actions) {
           check()
-          const source = window.slots[sourceSlot]
-          const available = Number(source?.count || 0)
-          if (!available) throw error('craft wave source stack disappeared', true)
-          if (available === remaining) {
-            await bot.clickWindow(sourceSlot, 0, 0)
-            await bot.clickWindow(targetSlot, 0, 0)
-            return
-          }
-          await bot.clickWindow(sourceSlot, 1, 0)
-          const picked = Number(window.selectedItem?.count || 0)
-          if (!picked) throw error('craft wave source split was not confirmed', true)
-          if (picked <= remaining) {
-            await bot.clickWindow(targetSlot, 0, 0)
-            remaining -= picked
-          } else {
-            // An empty target can hold the whole half; return its excess in halves when that saves clicks.
-            if (!window.slots[targetSlot]) {
-              let targetCount = picked
-              let excess = picked - remaining
-              let trimClicks = 0
-              while (excess > 0) {
-                const removed = Math.ceil(targetCount / 2)
-                if (removed <= excess) {
-                  trimClicks += 2
-                  targetCount -= removed
-                  excess -= removed
-                } else {
-                  trimClicks += 2 + removed - excess
-                  break
-                }
-              }
-              if (trimClicks < remaining) {
-                await bot.clickWindow(targetSlot, 0, 0)
-                excess = picked - remaining
-                while (excess > 0) {
-                  check()
-                  await bot.clickWindow(targetSlot, 1, 0)
-                  const removed = Number(window.selectedItem?.count || 0)
-                  if (!removed) throw error('craft wave target trim was not confirmed', true)
-                  if (removed <= excess) {
-                    await bot.clickWindow(sourceSlot, 0, 0)
-                    excess -= removed
-                  } else {
-                    for (let count = excess; count < removed; count++) await bot.clickWindow(targetSlot, 1, 0)
-                    if (Number(window.selectedItem?.count || 0) !== excess) {
-                      throw error('craft wave target trim did not retain the exact excess', true)
-                    }
-                    await bot.clickWindow(sourceSlot, 0, 0)
-                    excess = 0
-                  }
-                }
-                if (Number(window.slots[targetSlot]?.count || 0) !== amount || window.selectedItem) {
-                  throw error('craft wave partial transfer did not confirm the exact target amount', true)
-                }
-                return
-              }
-            }
-            for (let count = 0; count < remaining; count++) await bot.clickWindow(targetSlot, 1, 0)
-            await bot.clickWindow(sourceSlot, 0, 0)
-            return
-          }
+          await bot.clickWindow(action.target ? targetSlot : sourceSlot, action.button, 0)
+        }
+        if (Number(window.slots[targetSlot]?.count || 0) !== targetCount + amount ||
+          Number(window.slots[sourceSlot]?.count || 0) !== available - amount || window.selectedItem) {
+          throw error('craft wave partial transfer did not confirm the exact source and target amounts', true)
         }
       }
       await measurePhase('placement', async () => {
