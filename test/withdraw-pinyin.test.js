@@ -41,6 +41,17 @@ test('pinyin recognition is limited to withdrawal and uses the configured catalo
   assert.throws(() => service.parseWithdraw('hongshifen'), /未知物品/)
 })
 
+test('game-specific polyphonic names accept their correct full pronunciation', () => {
+  const service = fixture()
+  for (const [spelling, id] of [
+    ['fengdan', 'wind_charge'], ['huoyandan', 'fire_charge'],
+    ['zuanshigao', 'diamond_pickaxe'], ['mugao', 'wooden_pickaxe'],
+    ['yunshanmu', 'spruce_wood']
+  ]) {
+    assert.equal(service.parseWithdraw(`${spelling}1`)[0].itemId, `minecraft:${id}`)
+  }
+})
+
 test('full pinyin never selects one of several catalog candidates', () => {
   const service = fixture()
   assert.throws(() => service.parseWithdraw('qizhituan'), /物品名不够精确.*旗帜图案/)
