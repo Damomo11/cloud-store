@@ -625,6 +625,25 @@ test('wave planning minimizes placement clicks plus result shifts across nearby 
   assert.equal(f.clicks.length, 17)
 })
 
+test('wave placement estimates equal actual clicks when an empty target can be trimmed', async () => {
+  const step = { requiresTable: true, result: { name: 'piston', count: 1 }, inputs: [
+    { names: ['oak_planks'], count: 3 }, { names: ['cobblestone'], count: 4 },
+    { names: ['iron_ingot'], count: 1 }, { names: ['redstone'], count: 1 }
+  ] }
+  const waveAfter = (index, waveTriggers, window) => {
+    const state = window.slots.slice(window.inventoryStart, window.inventoryEnd).filter(Boolean).map(copyItem)
+    state.push(item('piston', waveTriggers))
+    return state
+  }
+  const f = proportionalFixture([item('oak_planks', 44), item('oak_planks', 1), item('cobblestone', 60), item('iron_ingot', 15), item('redstone', 15)], [item('piston', 15)], step,
+    { triggers: 15, waveAfter })
+  const result = await f.executor.execute({ step, triggers: 15 })
+  assert.deepEqual(amounts(result.produced), [['minecraft:piston', 15]])
+  const planned = f.debugEvents.find(event => event.event === 'executor.grid_waves_planned').details.waves
+  assert.equal(f.clicks.length, planned.reduce((sum, wave) => sum + wave.clickCount + 1, 0))
+  assert.ok(planned.every(wave => wave.clickCount <= 96))
+})
+
 test('16 hopper minecarts use one crafting window with one wave per unstackable output', async () => {
   const step = {
     requiresTable: false,
@@ -841,11 +860,11 @@ test('proportional batch collects a result that reappears while clearing recipe 
     ]
   }
   const f = proportionalFixture([
-    item('milk_bucket', 6), item('sugar', 4), item('egg', 2), item('wheat', 6)
+    ...Array.from({ length: 6 }, () => item('milk_bucket', 1)), item('sugar', 4), item('egg', 2), item('wheat', 6)
   ], [item('cake', 1), item('bucket', 6)], step, {
     triggers: 2,
     waveAfter: [
-      [item('milk_bucket', 3), item('sugar', 2), item('egg', 1), item('wheat', 3)],
+      [...Array.from({ length: 3 }, () => item('milk_bucket', 1)), item('sugar', 2), item('egg', 1), item('wheat', 3)],
       [item('cake', 2), item('bucket', 3)]
     ],
     residualAfterCleanup: true
@@ -871,11 +890,11 @@ test('proportional batch rejects repeated residual output without matching mater
     ]
   }
   const f = proportionalFixture([
-    item('milk_bucket', 6), item('sugar', 4), item('egg', 2), item('wheat', 6)
+    ...Array.from({ length: 6 }, () => item('milk_bucket', 1)), item('sugar', 4), item('egg', 2), item('wheat', 6)
   ], [item('cake', 2), item('bucket', 6)], step, {
     triggers: 2,
     waveAfter: [
-      [item('milk_bucket', 3), item('sugar', 2), item('egg', 1), item('wheat', 3)],
+      [...Array.from({ length: 3 }, () => item('milk_bucket', 1)), item('sugar', 2), item('egg', 1), item('wheat', 3)],
       [item('cake', 2), item('bucket', 3)]
     ],
     residualAfterCleanup: true,
