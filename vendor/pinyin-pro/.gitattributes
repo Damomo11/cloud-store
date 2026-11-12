@@ -1,0 +1,2 @@
+# Preserve the published bundle's bytes on Windows and Unix checkouts.
+index.js text eol=lf
