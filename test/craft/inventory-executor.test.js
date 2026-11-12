@@ -677,6 +677,40 @@ test('16 hopper minecarts use one crafting window with one wave per unstackable 
     plan.details.waves.reduce((sum, wave) => sum + wave.clickCount, 0))
 })
 
+test('single-trigger wave preflight avoids replaying every prefix while checking the complete batch', async t => {
+  const measure = async triggers => {
+    const step = { requiresTable: false, result: { name: 'hopper_minecart', count: 1 },
+      inputs: [{ names: ['hopper'], count: 1 }, { names: ['minecart'], count: 1 }] }
+    let reads = 0
+    let planningReads
+    let plan
+    const waveAfter = Array.from({ length: triggers }, (_, index) => {
+      const completed = index + 1
+      return [
+        ...(completed < triggers ? [item('hopper', triggers - completed)] : []),
+        ...Array.from({ length: triggers - completed }, () => item('minecart', 1)),
+        ...Array.from({ length: completed }, () => item('hopper_minecart', 1))
+      ]
+    })
+    const f = proportionalFixture([item('hopper', triggers), ...Array.from({ length: triggers }, () => item('minecart', 1))],
+      waveAfter.at(-1), step, { triggers, waveAfter, debugCraft: (event, details) => {
+        if (event === 'executor.grid_waves_planned') { planningReads = reads; plan = details }
+      } })
+    const normalize = f.catalog.fromPrismarineItem.bind(f.catalog)
+    f.catalog.fromPrismarineItem = value => { reads++; return normalize(value) }
+    const result = await f.executor.execute({ step, triggers })
+    assert.deepEqual(amounts(result.produced), [['minecraft:hopper_minecart', triggers]])
+    assert.equal(plan.waves.length, triggers)
+    assert.ok(plan.waves.every(wave => wave.triggers === 1))
+    assert.equal(f.clicks.filter(click => click.slot === 0 && click.mode === 1).length, triggers)
+    return planningReads
+  }
+  const small = await measure(8)
+  const large = await measure(32)
+  t.diagnostic(`planning identity reads for 8/32 triggers: ${small}/${large}`)
+  assert.ok(large <= small * 20, `planning identity reads grew too quickly: ${small} -> ${large}`)
+})
+
 test('repeated wildcard ingredient cells can use different concrete item variants in later waves', async () => {
   const step = { ...stickStep, requiresTable: false }
   const first = item('oak_planks', 15, 'first variant')

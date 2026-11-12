@@ -554,6 +554,10 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
 
     const initial = cloneInventoryWindow(window)
     const baseline = greedyTail(cloneInventoryWindow(initial), 0)
+    // Every wave is forced to one trigger. The complete baseline has already
+    // validated identities, click limits and output capacity; no alternate
+    // trigger count exists, so replaying all its prefixes cannot improve it.
+    if (waveLimit === 1) return baseline
     let best = baseline
     let bestActions = baseline.reduce((sum, wave) => sum + wave.clickCount + 1, 0)
 
