@@ -132,6 +132,16 @@ test('ambiguous initials preserve every candidate without inventory-based select
   assert.throws(() => service.parseWithdraw('hongshikuaijunk'), /未知物品/)
 })
 
+test('Chinese item names containing Latin letters preserve those letters in phonetic matching', () => {
+  const service = fixture()
+  for (const spelling of ['tntkuangche', 'tntkc', 'TNTkuangc']) {
+    const [item] = service.parseWithdraw(`${spelling}16`)
+    assert.equal(item.itemId, 'minecraft:tnt_minecart')
+    assert.equal(item.amount, 16)
+  }
+  assert.equal(service.parseWithdraw('TNT16')[0].itemId, 'minecraft:tnt')
+})
+
 test('full spellings win over abbreviation matches and matching aliases deduplicate by item', () => {
   const service = fixture()
   service.catalog = new ItemCatalog('1.21.11', { 红: 'redstone', 海欧牛瓜: 'diamond', 红石坎: 'redstone_block' }, { file: 'data/zh_cn.json' })

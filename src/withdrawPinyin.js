@@ -10,12 +10,12 @@ function buildIndex (catalog) {
     ...(catalog.aliases || [])
   ]
   for (const [name, itemId] of names) {
-    if (!/^\p{Script=Han}+$/u.test(name)) continue
+    if (!/\p{Script=Han}/u.test(name) || !/^[\p{Script=Han}a-z]+$/iu.test(name)) continue
     const key = `${itemId}:${name}`
     if (seen.has(key)) continue
     seen.add(key)
     // Contextual defaults misread game words such as 风弹、镐 and 云杉.
-    const syllables = polyphonic(name, { toneType: 'none', type: 'array', v: true })
+    const syllables = polyphonic(name.toLowerCase(), { toneType: 'none', type: 'array', v: true })
       .map(readings => [...new Set(readings.filter(reading => /^[a-z]+$/.test(reading)))])
     if (syllables.every(readings => readings.length)) index.push({ itemId, syllables })
   }
