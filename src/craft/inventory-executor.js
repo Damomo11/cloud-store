@@ -669,10 +669,27 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
     }
     const outputItems = standardRecipeOutputs(registry, recipe)
       .map(output => new Item(output.id, output.count, output.metadata))
+    // Start with the standard two-input recipe whose unstackable minecart
+    // limits every result shift to one trigger. Other recipes and identities
+    // continue to stage their complete grid independently for every wave.
+    let retained = null
+    const hopperCell = cells.find(cell => registry.items[cell.ingredient.id]?.name === 'hopper')
+    const minecartCell = cells.find(cell => registry.items[cell.ingredient.id]?.name === 'minecart')
+    if (confirmedClick && triggers > 1 && waveLimit === 1 && !recipe.requiresTable && cells.length === 2 &&
+      hopperCell && minecartCell && registry.items[recipe.result.id]?.name === 'hopper_minecart' &&
+      recipe.result.count === 1 && outputItems.length === 1 && !recipe.outShape?.flat().some(value => value?.id >= 0)) {
+      const plan = proportionalPlacementPlan(window, [hopperCell], triggers)
+      const other = proportionalPlacementPlan(window, [minecartCell], 1)
+      if (plan && other && placementClickCount([...plan, ...other]) <= MAX_SAFE_FRAGMENTED_PLACEMENT_CLICKS) {
+        retained = { cell: hopperCell, plan, item: catalog.fromPrismarineItem(window.slots[plan[0].sources[0].slot]), other }
+      }
+    }
     let preflightWaves
     const planningStartedAt = performance.now()
     try {
       preflightWaves = simulatePlacementWaves(window, cells, triggers, waveLimit, outputItems)
+      if (retained) preflightWaves = preflightWaves.map((wave, index) => ({ ...wave,
+        clickCount: placementClickCount(index === 0 ? [...retained.plan, ...retained.other] : retained.other) }))
     } catch (cause) {
       emitDebug('executor.grid_placement_rejected', {
         reason: cause?.message || 'unsafe proportional placement',
@@ -733,7 +750,8 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
       if (!proportionalOutputsFit(recipe, waveTriggers, window.inventoryEnd - window.inventoryStart)) {
         throw error('craft wave outputs no longer fit in the open inventory', true)
       }
-      const plan = proportionalPlacementPlan(window, cells, waveTriggers)
+      let plan = proportionalPlacementPlan(window, retained ? cells.filter(cell => cell !== retained.cell) : cells, waveTriggers)
+      if (retained && completed === 0 && plan) plan = [...retained.plan, ...plan]
       if (!plan) {
         throw error(`craft wave ${completed}+${waveTriggers} cannot be placed from confirmed inventory stacks`, true)
       }
@@ -747,9 +765,10 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
       const expectedPlacement = new Map(Array.from({ length: gridSize }, (_, index) => [index + 1, null]))
       for (const placement of plan) {
         expectedPlacement.set(placement.slot, {
-          ...catalog.fromPrismarineItem(window.slots[placement.sources[0].slot]), amount: waveTriggers
+          ...catalog.fromPrismarineItem(window.slots[placement.sources[0].slot]), amount: placement.sources.reduce((sum, source) => sum + source.count, 0)
         })
       }
+      if (retained) expectedPlacement.set(retained.cell.slot, { ...retained.item, amount: triggers - completed })
       const expectedWaveWindow = cloneInventoryWindow(window)
       for (const placement of plan) for (const source of placement.sources) {
         const item = expectedWaveWindow.slots[source.slot]
@@ -757,7 +776,9 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
         if (!item.count) expectedWaveWindow.slots[source.slot] = null
       }
       placeVirtualOutputs(expectedWaveWindow, outputItems, waveTriggers)
+      const retainedAmount = retained ? triggers - completed - waveTriggers : 0
       const expectedWaveInventory = inventoryWindowSnapshot(expectedWaveWindow)
+      if (retainedAmount > 0) expectedWaveInventory.push({ ...retained.item, amount: retainedAmount })
       const fragmentedClickCount = placementClickCount(plan)
       active.wave = { waveIndex, waveStart: completed, waveTriggers }
       emitDebug('executor.grid_placement_plan', {
@@ -850,6 +871,7 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
           )))
         }
       }
+      if (retainedAmount > 0) expectedGrid.set(retained.cell.slot, { ...retained.item, amount: retainedAmount })
       const watchedGridSlots = [...new Set([...activeGridSlots, ...expectedGrid.keys()])]
       const watchedSlots = [0, ...watchedGridSlots]
       const updateBaselines = new Map(watchedSlots.map(slot => [slot, evidence.current().slotVersion(window.id, slot)]))
@@ -889,6 +911,18 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
       // Some servers leave the last result in slot 0 when the shift-click stops
       // early. Collect that concrete item before clearing the next wave.
       await measurePhase('cleanup', async () => {
+        if (retainedAmount > 0) {
+          const observed = catalog.aggregatePrismarineItems(window.slots.slice(window.inventoryStart, window.inventoryEnd)
+            .concat(window.slots.slice(1, gridSize + 1)).filter(Boolean))
+          if (window.selectedItem || window.slots[0] || evidence.current().resultPresent ||
+            ![...expectedGrid].every(([slot, expected]) => {
+              const value = window.slots[slot] && catalog.fromPrismarineItem(window.slots[slot])
+              return expected ? value?.itemKey === expected.itemKey && value.amount === expected.amount : !value
+            }) || !sameAmounts(observed, expectedWaveInventory, entry => entry.itemKey)) {
+            throw error('confirmed retained craft grid or wave inventory does not match the planned output', true)
+          }
+          return
+        }
         await collectResultResidual()
         const maxCleanupPasses = gridSize + 2
         let cleanupPass = 0
