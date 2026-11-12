@@ -2,7 +2,7 @@
 const indexes = new WeakMap()
 
 function buildIndex (catalog) {
-  const { polyphonic } = require('pinyin-pro')
+  const { polyphonic } = require('../vendor/pinyin-pro')
   const index = []
   const seen = new Set()
   const names = [

@@ -190,6 +190,8 @@ python data/warehouse_viewer.py
 
 末尾玩家名仍沿用原有解析规则，且优先于物品名；例如 `!取 hongshifen64 Bob` 交付给 Bob。多个拼音物品建议写成 `!取 hongshifen64 huosai 16`，避免末尾连写的字母数字被当作玩家名。
 
+拼音库和字典已随代码内置在 `vendor/pinyin-pro`。已有部署更新这些代码后只需热重载，无需额外执行 `npm install` 或下载拼音数据。
+
 存物品流程：
 
 1. 玩家输入 `!存`
