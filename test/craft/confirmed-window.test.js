@@ -205,6 +205,7 @@ function serverFixture (target, triggers, options = {}) {
     if (packet.slot >= 0) assert.equal(inFlight, 0, 'another material click was sent before the previous server response')
     inFlight++
     if (packet.slot === 0 && packet.mode === 1 && options.replayOldShift) {
+      initialContents ??= content()
       schedule(() => bot._client.emit('window_items', initialContents))
     }
     const apply = () => {
@@ -217,8 +218,12 @@ function serverFixture (target, triggers, options = {}) {
           add(new Item(recipe.result.id, recipe.result.count))
           craftOnce()
         }
+        if (options.wrongRetained && shifts === 1) {
+          const slot = cells.find(cell => registry.items[cell.id].name === 'hopper').slot
+          menu.updateSlot(slot, copy(menu.slots[slot], menu.slots[slot].count + 1))
+        }
         if (options.wrongResidual) menu.updateSlot(0, new Item(registry.itemsByName.crimson_button.id, 1))
-        if (options.missingOutput) {
+        if (options.missingOutput && (!options.missingOutputAt || shifts === options.missingOutputAt)) {
           const slot = menu.slots.findIndex((value, index) => index >= menu.inventoryStart && value?.type === recipe.result.id)
           menu.updateSlot(slot, copy(menu.slots[slot], menu.slots[slot].count - 1))
         }
@@ -270,6 +275,15 @@ function serverFixture (target, triggers, options = {}) {
   const executor = createInventoryExecutor(bot, catalog, config, { gotoNear: async () => {} }, (event, details) => events.push({ event, details }))
   const totals = () => catalog.aggregatePrismarineItems(player.slots.slice(9, 45).filter(Boolean)).map(value => [value.itemId, value.amount]).sort()
   return { bot, player, config, executor, step, clicks, events, totals, closedWindows, get shifts () { return shifts },
+    splitVariantInput () {
+      const a = copy(player.slots[9], Math.floor(triggers / 2))
+      const b = copy(player.slots[9], triggers - a.count)
+      b.components = [{ type: 'custom_name', data: 'different hopper identity' }]
+      for (const window of [player, bot.inventory]) {
+        window.updateSlot(9, copy(a))
+        window.updateSlot(44, copy(b))
+      }
+    },
     splitInput () {
       const value = copy(player.slots[9], 32)
       player.updateSlot(9, copy(value))
@@ -279,6 +293,76 @@ function serverFixture (target, triggers, options = {}) {
     },
     close: () => { for (const timer of timers) clearTimeout(timer) } }
 }
+
+test('confirmed hopper minecarts stage reusable hoppers once and keep every result shift', async t => {
+  const f = serverFixture('hopper_minecart', 24, { components: true, duplicateSnapshots: true, replayOldShift: true })
+  t.after(f.close)
+  const result = await f.executor.execute({ step: f.step, triggers: 24 })
+  assert.deepEqual(result.produced.map(value => [value.itemId, value.amount]), [['minecraft:hopper_minecart', 24]])
+  assert.deepEqual(f.totals(), [['minecraft:hopper_minecart', 24]])
+  const shifts = f.clicks.filter(click => click.slot === 0 && click.mode === 1)
+  assert.equal(shifts.length, 24)
+  assert.deepEqual(shifts.map(click => click.grid.find(value => value?.name === 'hopper')?.count), Array.from({ length: 24 }, (_, i) => 24 - i))
+  assert.equal(f.clicks.filter(click => click.slot >= 0).length, 74)
+  assert.ok(f.bot.inventory.slots.slice(0, 5).every(value => !value))
+  assert.equal(f.bot.inventory.selectedItem, null)
+})
+
+for (const triggers of [20, 34, 32]) {
+  test(`retained hopper batch of ${triggers} needs only ${3 * triggers + 2} material/result clicks`, async t => {
+    const f = serverFixture('hopper_minecart', triggers)
+    t.after(f.close)
+    await f.executor.execute({ step: f.step, triggers })
+    assert.deepEqual(f.totals(), [['minecraft:hopper_minecart', triggers]])
+    assert.equal(f.shifts, triggers)
+    assert.equal(f.clicks.filter(click => click.slot >= 0).length, 3 * triggers + 2)
+  })
+}
+
+for (const failure of ['wrongRetained', 'missingOutput']) {
+  test(`retained hopper wave rejects ${failure} before staging the next minecart`, async t => {
+    const f = serverFixture('hopper_minecart', 24, { [failure]: true })
+    t.after(f.close)
+    await assert.rejects(f.executor.execute({ step: f.step, triggers: 24 }), error => error.recoveryRequired)
+    assert.equal(f.shifts, 1)
+    const firstShift = f.clicks.findIndex(click => click.slot === 0 && click.mode === 1)
+    assert.ok(f.clicks.slice(firstShift + 1).every(click => click.slot < 0))
+  })
+}
+
+test('mixed hopper identities use the original single-trigger staging', async t => {
+  const f = serverFixture('hopper_minecart', 24)
+  t.after(f.close)
+  f.splitVariantInput()
+  const result = await f.executor.execute({ step: f.step, triggers: 24 })
+  assert.deepEqual(result.produced.map(value => [value.itemId, value.amount]), [['minecraft:hopper_minecart', 24]])
+  const shifts = f.clicks.filter(click => click.slot === 0 && click.mode === 1)
+  assert.ok(shifts.every(click => click.grid.find(value => value?.name === 'hopper')?.count === 1))
+})
+
+test('cancelling a retained hopper batch returns all remaining grid materials', async t => {
+  const f = serverFixture('hopper_minecart', 24)
+  t.after(f.close)
+  const abort = new AbortController()
+  f.bot._client.on('window_items', packet => {
+    if (packet.items.slice(9, 45).some(value => Item.fromNotch(value)?.name === 'hopper_minecart')) abort.abort(new Error('cancel retained batch'))
+  })
+  await assert.rejects(f.executor.execute({ step: f.step, triggers: 24, signal: abort.signal }), /cancel retained batch/)
+  assert.equal(f.shifts, 1)
+  assert.deepEqual(f.totals(), [['minecraft:hopper', 23], ['minecraft:hopper_minecart', 1], ['minecraft:minecart', 23]])
+  assert.ok(f.closedWindows.includes(0))
+  assert.ok(f.bot.inventory.slots.slice(0, 5).every(value => !value))
+  assert.equal(f.bot.inventory.selectedItem, null)
+})
+
+test('a later retained wave still needs its own exact output increase', async t => {
+  const f = serverFixture('hopper_minecart', 24, { missingOutput: true, missingOutputAt: 2, replayOldShift: true })
+  t.after(f.close)
+  await assert.rejects(f.executor.execute({ step: f.step, triggers: 24 }), error => error.recoveryRequired)
+  assert.equal(f.shifts, 2)
+  const lastShift = f.clicks.findLastIndex(click => click.slot === 0 && click.mode === 1)
+  assert.ok(f.clicks.slice(lastShift + 1).every(click => click.slot < 0))
+})
 
 for (const [target, triggers, expected, expectedShifts] of [
   ['stick', 100, [['minecraft:stick', 400]], 3],
