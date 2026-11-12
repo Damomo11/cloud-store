@@ -10,19 +10,19 @@ function buildIndex (catalog) {
     ...(catalog.aliases || [])
   ]
   for (const [name, itemId] of names) {
-    if (!/^\p{Script=Han}+$/u.test(name)) continue
+    if (!/\p{Script=Han}/u.test(name) || !/^[\p{Script=Han}a-z]+$/iu.test(name)) continue
     const key = `${itemId}:${name}`
     if (seen.has(key)) continue
     seen.add(key)
     // Contextual defaults misread game words such as 风弹、镐 and 云杉.
-    const syllables = polyphonic(name, { toneType: 'none', type: 'array', v: true })
+    const syllables = polyphonic(name.toLowerCase(), { toneType: 'none', type: 'array', v: true })
       .map(readings => [...new Set(readings.filter(reading => /^[a-z]+$/.test(reading)))])
     if (syllables.every(readings => readings.length)) index.push({ itemId, syllables })
   }
   return index
 }
 
-function matchesSyllables (syllables, query) {
+function matchesSyllables (syllables, query, allowInitials = false) {
   if (query.length < syllables.length) return false
   let offsets = new Set([0])
   for (const readings of syllables) {
@@ -30,6 +30,7 @@ function matchesSyllables (syllables, query) {
     for (const offset of offsets) {
       for (const reading of readings) {
         if (query.startsWith(reading, offset)) next.add(offset + reading.length)
+        if (allowInitials && query.startsWith(reading[0], offset)) next.add(offset + 1)
       }
     }
     if (!next.size) return false
@@ -42,9 +43,11 @@ function findWithdrawPinyinItems (catalog, name) {
   const query = String(name || '').trim().toLowerCase()
   if (!/^[a-z]{2,128}$/.test(query)) return []
   if (!indexes.has(catalog)) indexes.set(catalog, buildIndex(catalog))
-  const itemIds = new Set(indexes.get(catalog)
-    .filter(entry => matchesSyllables(entry.syllables, query))
-    .map(entry => entry.itemId))
+  const index = indexes.get(catalog)
+  const full = index.filter(entry => matchesSyllables(entry.syllables, query))
+  // Full spellings take precedence over initials and mixed spellings.
+  const matches = full.length ? full : index.filter(entry => matchesSyllables(entry.syllables, query, true))
+  const itemIds = new Set(matches.map(entry => entry.itemId))
   return [...itemIds].map(itemId => catalog.resolveName(itemId))
 }
 
