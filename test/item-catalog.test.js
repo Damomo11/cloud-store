@@ -24,6 +24,81 @@ function createCatalog () {
   return new ItemCatalog('1.21.11')
 }
 
+test('legacy malformed durable components retain tolerant contained-item decoding', () => {
+  const catalog = createCatalog()
+  const Item = require('prismarine-item')(catalog.mcData)
+  const itemId = catalog.mcData.itemsByName.diamond_sword.id
+  const expected = catalog.fromPrismarineItem(Item.fromNotch({ itemId, itemCount: 1, components: [], removeComponents: [] }))
+  for (const components of [{}, [null], true, 7, 'legacy', null, undefined]) {
+    const contained = catalog.fromContainerEntry({ itemId, count: 1, components, removeComponents: {} })
+    assert.equal(contained.amount, 1)
+    assert.equal(contained.itemKey, expected.itemKey)
+    assert.equal(contained.metaJson, expected.metaJson)
+    assert.equal(contained.nbtJson, expected.nbtJson)
+  }
+})
+
+test('catalog startup rebuild indexes a persisted shulker with legacy malformed durable components', () => {
+  const fs = require('node:fs')
+  const os = require('node:os')
+  const path = require('node:path')
+  const StoreDb = require('../src/db')
+  const { DEFAULT_CONFIG } = require('../src/config')
+  const catalog = createCatalog()
+  const Item = require('prismarine-item')(catalog.mcData)
+  const itemId = catalog.mcData.itemsByName.diamond_sword.id
+  const expected = catalog.fromPrismarineItem(Item.fromNotch({ itemId, itemCount: 1, components: [], removeComponents: [] }))
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'catalog-durable-rebuild-'))
+  const dbPath = path.join(directory, 'db.sqlite')
+  let db = new StoreDb(dbPath, structuredClone(DEFAULT_CONFIG))
+  try {
+    db.addBalanceItems('legacy-owner', [{ itemKey: 'legacy-sword-box', itemId: 'minecraft:blue_shulker_box',
+      displayName: 'Persisted sword box', nbtJson: 'null', amount: 1,
+      metaJson: JSON.stringify({ metadata: null, components: [{ type: 'container', data: {
+        contents: [{ itemId, count: 1, components: {} }]
+      } }] }) }])
+    db.close()
+    db = new StoreDb(dbPath, structuredClone(DEFAULT_CONFIG))
+    const startup = db.setCatalog(catalog)
+    assert.equal(startup.indexed, 1)
+    assert.equal(db.catalogMigrationDeferred, false)
+    const indexed = db.getOwnerShulkersContainingItemKey('legacy-owner', expected.itemKey)
+    assert.equal(indexed.length, 1)
+    assert.equal(indexed[0].containedAmount, 1)
+    assert.equal(indexed[0].shulkerAmount, 1)
+    assert.equal(indexed[0].containedItemId, 'minecraft:diamond_sword')
+    assert.equal(db.getItemByKey(expected.itemKey).nbtJson, expected.nbtJson)
+    assert.equal(db.rebuildShulkerContentIndex(), 1)
+    assert.equal(db.getOwnerShulkersContainingItemKey('legacy-owner', expected.itemKey).length, 1)
+  } finally {
+    if (db.db.open) db.close()
+    fs.rmSync(directory, { recursive: true, force: true })
+  }
+})
+
+test('modern durable container entries match inventory identities after real packet decoding', () => {
+  const catalog = createCatalog()
+  const Item = require('prismarine-item')(catalog.mcData)
+  const protocol = require('minecraft-protocol')
+  const serializer = protocol.createSerializer({ state: 'play', version: '1.21.11', isServer: true })
+  const deserializer = protocol.createDeserializer({ state: 'play', version: '1.21.11', isServer: false })
+  for (const name of ['diamond_sword', 'bow', 'shield', 'stone', 'ender_pearl', 'beehive']) {
+    for (const components of [[], [{ type: 'damage', data: 12 }, { type: 'custom_name', data: typedString('Owned equipment') }]]) {
+      const entry = { itemId: catalog.mcData.itemsByName[name].id, itemCount: 1,
+        addedComponentCount: components.length, removedComponentCount: 0, components, removeComponents: [] }
+      const buffer = serializer.createPacketBuffer({ name: 'window_items', params: { windowId: 0, stateId: 1, items: [entry], carriedItem: { itemCount: 0 } } })
+      const decoded = deserializer.parsePacketBuffer(buffer).data.params.items[0]
+      const loose = catalog.fromPrismarineItem(Item.fromNotch(decoded))
+      const contained = catalog.fromContainerEntry(decoded)
+      assert.equal(contained.itemKey, loose.itemKey, `${name} must stay withdrawable after packing`)
+      assert.equal(contained.nbtJson, loose.nbtJson)
+      const box = new Item(catalog.mcData.itemsByName.blue_shulker_box.id, 1)
+      box.components = [{ type: 'container', data: { contents: [decoded, { itemCount: 0 }] } }]
+      assert.equal(catalog.extractShulkerContents(catalog.fromPrismarineItem(box))[0].item.itemKey, loose.itemKey)
+    }
+  }
+})
+
 test('shit hat ignores CraftEngine network data without changing stored metadata', () => {
   const catalog = createCatalog()
   const saddle = catalog.mcData.itemsByName.saddle

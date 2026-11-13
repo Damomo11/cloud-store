@@ -1,5 +1,7 @@
 'use strict'
 
+const { isEmptySlot } = require('./protocol')
+
 const MAX_PACKING_BOXES = 256
 const BOX_SLOTS = 27
 
@@ -128,7 +130,7 @@ function validateEmptyBox (box, catalog) {
   for (const component of meta.components || []) {
     if (component.type !== 'container') continue
     if (!isObject(component.data) || !Array.isArray(component.data.contents)) throw new Error('Invalid packing container contents metadata')
-    if (component.data.contents.length) throw new Error('Packing requires empty boxes; box has contents')
+    if (component.data.contents.length > BOX_SLOTS || !component.data.contents.every(isEmptySlot)) throw new Error('Packing requires empty boxes; box has contents')
   }
   if (hasLegacyContents(nbt) || hasLegacyContents(meta)) throw new Error('Packing requires empty boxes; legacy contents are present or invalid')
 }
