@@ -300,6 +300,23 @@ test('strict withdrawal verifies the server chest and player after the local cli
   } finally { f.close() }
 })
 
+test('only strict craft withdrawal opts into fragmented stack packing', async () => {
+  for (const requireServerEvidence of [false, true]) {
+    const f = fixture({ withdraw: true })
+    try {
+      let transferOptions
+      const withdraw = f.warehouse.tryWithdrawExactFrom
+      f.warehouse.tryWithdrawExactFrom = async (...args) => {
+        transferOptions = args[4]
+        return withdraw(...args)
+      }
+      const item = f.catalog.fromPrismarineItem(f.server.chest)
+      await f.warehouse.withdrawAllocationsLocked([{ ...item, amount: 4 }], { requireServerEvidence })
+      assert.equal(transferOptions?.requireServerEvidence, requireServerEvidence)
+    } finally { f.close() }
+  }
+})
+
 test('strict withdrawal rejects a predicted transfer refused by the server', async () => {
   const f = fixture({ withdraw: true, accepted: false })
   try {
