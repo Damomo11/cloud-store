@@ -486,10 +486,12 @@ class StoreDb {
     this.migratePlayerItemNameOverridesToAliases()
     this.migrateExistingPersonalWarehouses()
     const hasCraftOperations = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'craft_operations'").get()
-    const staleReservations = this.db.prepare(hasCraftOperations
-      ? `DELETE FROM inventory_reservations WHERE reservation_id NOT IN (
-          SELECT id FROM craft_operations WHERE state NOT IN ('completed', 'complete', 'failed')
-        )`
+    const hasPackingOperations = this.db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'packing_operations'").get()
+    const durableReservations = []
+    if (hasCraftOperations) durableReservations.push("SELECT id FROM craft_operations WHERE state NOT IN ('completed', 'complete', 'failed')")
+    if (hasPackingOperations) durableReservations.push("SELECT id FROM packing_operations WHERE state NOT IN ('completed', 'failed')")
+    const staleReservations = this.db.prepare(durableReservations.length
+      ? `DELETE FROM inventory_reservations WHERE reservation_id NOT IN (${durableReservations.join(' UNION ')})`
       : 'DELETE FROM inventory_reservations').run().changes
     if (staleReservations) console.log(`Released ${staleReservations} stale inventory reservation(s) from the previous process`)
 
@@ -514,7 +516,7 @@ class StoreDb {
     this.catalog = catalog
     // A durable craft journal refers to exact itemKeys. Do not migrate those
     // identities underneath an interrupted operation during process startup.
-    if (this.hasPendingCraft()) {
+    if (this.hasPendingCraft() || this.hasPendingPacking()) {
       this.catalogMigrationDeferred = true
       return { deferred: true }
     }
@@ -522,6 +524,11 @@ class StoreDb {
   }
 
   applyCatalogMigration () {
+    this.assertNoPendingCraft()
+    if (this.hasPendingPacking()) {
+      this.catalogMigrationDeferred = true
+      return { deferred: true }
+    }
     this.catalogMigrationDeferred = true
     const migrated = this.canonicalizeItemKeys()
     if (migrated.moved > 0) {
@@ -533,7 +540,7 @@ class StoreDb {
   }
 
   runDeferredMigrations () {
-    if (this.hasPendingCraft()) {
+    if (this.hasPendingCraft() || this.hasPendingPacking()) {
       return { deferred: this.catalogMigrationDeferred || this.offlineIdentityMergeDeferred }
     }
     const result = {}
@@ -582,6 +589,10 @@ class StoreDb {
 
   canonicalizeItemKeys () {
     this.assertNoPendingCraft()
+    if (this.hasPendingPacking()) {
+      this.catalogMigrationDeferred = true
+      return { deferred: true, moved: 0, mergedBalances: 0 }
+    }
     if (!this.catalog) return { moved: 0, mergedBalances: 0 }
 
     const rows = this.db.prepare(`
@@ -1629,7 +1640,7 @@ class StoreDb {
   autoMergeOfflineIdentities ({ throwOnError = false } = {}) {
     // A durable craft operation owns exact owner/item-key rows until it
     // finishes. Startup identity migration must wait for that journal too.
-    if (this.hasPendingCraft()) {
+    if (this.hasPendingCraft() || this.hasPendingPacking()) {
       this.offlineIdentityMergeDeferred = true
       return []
     }
@@ -1653,6 +1664,12 @@ class StoreDb {
   // 方向由调用方决定：一般把“库存多/更常用”的号留作 primary。
   mergePlayerIdentities (primaryUuid, secondaryUuid, adminUsername = '') {
     this.assertNoPendingCraft()
+    if (this.hasPendingPacking()) {
+      const owners = this.db.prepare("SELECT owner_json AS ownerJson FROM packing_operations WHERE state NOT IN ('completed','failed')").all()
+      if (owners.some(row => [String(primaryUuid || '').trim(), String(secondaryUuid || '').trim()].includes(JSON.parse(row.ownerJson).uuid))) {
+        throw new Error('Packing operation pins this owner identity until safe completion')
+      }
+    }
     const primary = String(primaryUuid || '').trim()
     const secondary = String(secondaryUuid || '').trim()
     if (!primary || !secondary) throw new Error('缺少要合并的 UUID。')
@@ -2785,6 +2802,13 @@ class StoreDb {
     return Boolean(botId
       ? this.db.prepare("SELECT 1 FROM craft_operations WHERE state NOT IN ('completed','complete','failed') AND bot_id = ? LIMIT 1").get(String(botId))
       : this.db.prepare("SELECT 1 FROM craft_operations WHERE state NOT IN ('completed','complete','failed') LIMIT 1").get())
+  }
+
+  hasPendingPacking (botId = '') {
+    if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='packing_operations'").get()) return false
+    return Boolean(botId
+      ? this.db.prepare("SELECT 1 FROM packing_operations WHERE state NOT IN ('completed','failed') AND bot_id=? LIMIT 1").get(String(botId))
+      : this.db.prepare("SELECT 1 FROM packing_operations WHERE state NOT IN ('completed','failed') LIMIT 1").get())
   }
 
   pendingCraftBotIds () {

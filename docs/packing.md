@@ -58,3 +58,107 @@ const plan = planPacking({
 规划结果是可能过期的库存快照。内部执行层应在现有仓库互斥锁内重新核验 owner 权限、可用库存和精确空盒，并原子预留 `allocations`。单盒作为持久化批次：先记录意图，取回该盒及其 `inputs`，依据服务端确认填入 27 格，核验实际内容和盒子原有元数据，再将成品归还同一仓库。余额转换必须以已确认的实际成品为依据，并保持重试幂等和原 owner 归属。
 
 物理执行必须独立检查真实槽位容量、服务端回包、光标状态和结果内容；规划成功不构成物理操作完成或余额已转换的证据。中断恢复应保留批次证据和预留，仅在实物状态得到证明后结算或释放。执行接口保持内部使用，不注册玩家入口。
+
+## 持久化账务接口
+
+`src/packing/ledger.js` 导出 `PackingLedger` 类，接收真实 `StoreDb`。表在实例化账务类时创建；数据库启动查询 `hasPendingPacking(botId = '')` 不创建表。开始新计划、核验成品以及结算需要已配置的 `db.catalog`；没有目录也能读取、列出和保留待恢复记录。
+
+```js
+const ledger = new PackingLedger(db)
+ledger.begin({ id, botId, owner, actor, plan })
+ledger.get(id)                         // 不存在则 null
+ledger.pending(botId = '')
+ledger.checkpoint(id, phase, data)
+ledger.settleBatch(id, batchIndex, product, packedInputs)
+ledger.finish(id, status, message = '')
+ledger.markRecovery(id, message, data)  // data 可省略，保留原 phase
+```
+
+`id` 以 `packing:` 开头；`owner` 为 `{ uuid, username, scope, vaultName? }`。`begin` 使用规划器的完整结果，重新核对每个精确指纹的目录身份、owner、批次布局和聚合预留。操作记录与 `reserveInventory` 处于同一 SQLite 事务；库存或预留不足时全部回滚。一个 bot 最多有一条非终态装盒记录，不同 bot 和 owner 可以各自预留。重复相同请求返回原记录；重复 ID 携带不同 owner、actor、bot 或计划时拒绝。
+
+`get`、`pending` 和更新操作返回以下独立解析的数据；修改返回对象不会修改持久化记录。
+
+```js
+{
+  id, botId, owner, actor, plan, // plan 不可由 checkpoint 修改
+  state,                      // running / recovery_required / completed / failed
+  phase, message, createdAt, updatedAt,
+  data: { batchIndex: 0, held: [], product: null, packedInputs: [] }
+}
+```
+
+`data` 可附加控制器自己的可序列化证据，例如当前批次空盒和输入、操作前/预期物品总量、源桶快照。`checkpoint` 替换整个 `data`，因此调用方应基于上一条完整数据构造新值；`batchIndex` 只能由结算推进。`held` 和 `packedInputs` 是带精确 `itemKey` 与正安全整数 `amount` 的数组。`product` 是目录格式的成品行，`amount` 必须为 1。检查点允许的 phase 为 `ready`、`withdrawing`、`withdrawn`、`packing`、`returning`、`stored`、`recovery_required`。`ready` 仅表示尚未动本批实物的初态，或上一批已安全结算；其他物理阶段不能通过普通检查点退回 `ready`。原料仍在手中时，普通检查点不能减少或清空其数量。已保存的成品/内容、取货证明和存回收据不能被清空或替换。
+
+`markRecovery` 将 `state` 设为 `recovery_required` 并记录原因，保留原物理 `phase` 供恢复使用；如传入 data，它也必须通过原 phase 的检查点核验。该状态仍保留全部未使用预留。
+
+## 精确木桶证据契约
+
+账务层验证证据的结构、指纹和数量关系；控制器负责从服务端权威快照获得证据。数组中的物品总量是相应木桶或背包的完整快照，不是只过滤目标物品后的列表；每个 `chestId` 必须已登记在 `chests`。各快照可以按指纹聚合。历史全仓总量或重启后空背包本身不构成存回证明。
+
+正常路径在实物存回前，先保存 `returning` 检查点：
+
+```js
+{
+  batchIndex,
+  held, product, packedInputs,
+  returnIntent: {
+    chests: [{ chestId, before: [{ itemKey, amount }] }],
+    returned: [{ itemKey, amount }]
+  }
+}
+```
+
+`product` 的实际 container 组件内容必须完全等于 `packedInputs`；每项是当前计划批次的正数量子集，不能包含潜影盒。色号、名称以及移除 container 后的原空盒元数据必须保留，成品指纹必须符合目录的规范化规则。原始容器条目不能因未知类型、畸形数量或旧式隐藏内容而被忽略。部分装入后核验的盒子可以保存和结算，但整单不能成功完成。
+
+`returned` 必须包含成品一盒和本次取出后所有未装入的散装余料。未使用下面的部分取货证明时，它按完整计划批次取出计算。允许多次 `returning` 检查点追加新目标木桶的 before 基线；已有基线、成品、内容与 returned 不得变化。新增目标木桶也必须先保存基线，再进行存入。
+
+服务端确认返回后保存 `stored` 检查点，保留上述数据并增加：
+
+```js
+{
+  // 保留 batchIndex / product / packedInputs / returnIntent / 取货证据
+  held: [],
+  storedProof: {
+    chests: [{ chestId, after: [{ itemKey, amount }] }],
+    inventoryAfter: [] // 服务端确认完整玩家物品栏为空；光标等仍由控制器核验
+  }
+}
+```
+
+`stored` 中的完整目标木桶集合及其 before 基线必须与此前持久化的 `returning` 意图一致；新增目标必须先单独保存 `returning` 检查点，不能在提交 after 收据时补写基线。每个目标木桶必须有唯一 after 收据；每个指纹在每个木桶的差值不能为负，所有正差合计必须恰好等于 `returned`。任何额外增加、减少、缺失木桶或非空玩家物品栏都会拒绝该检查点。无需所有成品放入同一木桶。`storedProof` 持久化后不可被普通检查点清空或修改。
+
+## 部分取货和未转换原料的回收
+
+取货可能在空盒或原料只取到一部分时失败。此时释放未用预留之前，必须证明哪些物品已离开源桶。在取货动作前保存 `withdrawing` 检查点及：
+
+```js
+withdrawalIntent: {
+  chests: [{ chestId, before: [{ itemKey, amount }] }]
+}
+```
+
+取货前一次保存本批全部已知源桶的基线；保存后整个 withdrawalIntent 不可追加、移除或修改。随后保存权威结果：
+
+```js
+withdrawalProof: {
+  chests: [{ chestId, after: [{ itemKey, amount }] }],
+  withdrawn: [{ itemKey, amount }],
+  inventoryAfter: [{ itemKey, amount }]
+}
+```
+
+证明必须引用先前已持久化的完整源桶基线。每桶每种指纹的变化只能为减少；所有减少的合计必须恰好等于 `withdrawn`，且 `withdrawn` 只能是当前批次空盒加输入的子集。`inventoryAfter` 必须恰好等于 `withdrawn`。证明一旦保存即不可替换。
+
+若没有发生转换，令 `product=null`、`packedInputs=[]`；`returnIntent.returned` 必须恰好等于证明中的 `withdrawn`。完整批次取货也可直接返回原空盒和全部原料，不需要部分取货证明。通过上述 `returning` → `stored` 收据后可 `finish(id, 'failed')`，无需结算转换行；余额保持原样。零取货仍需源桶未变化与空背包证明，此时允许 `returnIntent.chests=[]`、`returned=[]`、`storedProof.chests=[]`。出现已验证的非空成品后，不能改为此原料回收路径。
+
+若只取出部分原料后产生了成品，则 returned 为 proven withdrawn 减去空盒与已装输入、再加成品；源桶内没动过的部分不用假装存回。结算和失败完成仍要求完整的取货与存回证明。
+
+## 原子结算与终态
+
+`settleBatch` 仅接受当前持久化批次和有效 `stored` 证据。单个 SQLite 事务核验本 owner 的精确剩余预留与余额、写入规范成品、扣一只空盒和实际装入输入、加一只成品、逐项减少本操作预留，写入唯一的 `packing_batches` 行和 `packing_batch` 流水，然后将 `batchIndex` 加一并重置 data 为下一批初始结构。零数量预留直接删除，不释放其他操作预留。异常时以上所有动作一起回滚。
+
+结算返回 `{ operationId, batchIndex, product, packedInputs, full }`。完全相同的重复结算返回原结果；改动成品或 packedInputs 的重复提交拒绝，即使操作已终态也一样。完成的转换行将完整 stored 检查点 data 保存为 proof_json，保留源桶基线、取货证明、返回意图和存回收据。
+
+`finish` 只接受 `completed` 或 `failed`。成功要求全部计划盒子已按完整输入结算，不能有 held、待结算成品或未决物理阶段。失败只能在真正未动实物的 `ready` 或有完整原料存回证明的 `stored` 完成；部分成品先结算后再失败。终态在同一事务内释放本操作未用预留并写一条 `packing` 总结流水。同状态重复完成返回原记录；不同状态拒绝。
+
+数据库重启时同时保留非终态 craft 与 packing 的预留，继续清理其他临时预留。装盒待恢复不会进入 `assertNoPendingCraft`，不会增加全局库存锁；普通库存读写保持现有行为，既有合成 guard 也不会被装盒结算绕过。目录指纹迁移与启动离线身份合并在装盒待恢复时延后；显式合并正在被该记录引用的 owner 身份被拒绝，直到安全终态。最后一条待处理记录完成后重试延后迁移。
