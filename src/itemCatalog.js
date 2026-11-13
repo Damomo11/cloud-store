@@ -150,7 +150,8 @@ class ItemCatalog {
     if (item.maxDurability && this.mcData.supportFeature('itemsWithComponents')) {
       this.containerItem ??= require('prismarine-item')(this.mcData)
       nbt = this.sanitizeNbtForStorage(itemId, this.containerItem.fromNotch({
-        ...entry, itemId: entryItemId, itemCount: entry.itemCount ?? entry.count
+        ...entry, itemId: entryItemId, itemCount: entry.itemCount ?? entry.count,
+        components: meta.components, removeComponents: meta.removeComponents || null
       })?.nbt || null)
     }
     const nbtJson = stableStringify(nbt)
