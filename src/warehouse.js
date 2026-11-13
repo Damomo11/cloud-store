@@ -860,7 +860,7 @@ class Warehouse {
             decision: `打开木桶：目标物品实际 ${available} 个（账本 ${group.recordedAmount}），本次计划取 ${toTake}`
           })
           transferAttempted = true
-          const moved = await this.tryWithdrawExactFrom(container, allocation.itemKey, toTake, group.slots.map(row => row.slot))
+          const moved = await this.tryWithdrawExactFrom(container, allocation.itemKey, toTake, group.slots.map(row => row.slot), options)
           if (moved > 0) {
             withdrawn.push({ ...itemInfo, amount: moved })
             remaining -= moved
@@ -2180,7 +2180,7 @@ class Warehouse {
       .sort((a, b) => b.recordedAmount - a.recordedAmount || a.chestId.localeCompare(b.chestId))
   }
 
-  async tryWithdrawExactFrom (container, itemKey, amount, preferredSlots = []) {
+  async tryWithdrawExactFrom (container, itemKey, amount, preferredSlots = [], options = {}) {
     let movedTotal = 0
     let remaining = amount
     let uncertainStreak = 0
@@ -2211,7 +2211,17 @@ class Warehouse {
 
         // mineflayer 会在点击后回写 item.slot（移动到窗口背包区），先快照真实来源槽位供日志使用。
         const sourceSlot = item.slot
-        const take = Math.min(item.count, expectedTake - planned)
+        let take = Math.min(item.count, expectedTake - planned)
+        // Craft batches budget fully packed inputs. Fill existing headroom
+        // before opening another slot, even when the source does not fit whole.
+        if (options.requireServerEvidence) {
+          const mergeSlot = this.windowMergeSlotForItem(container, itemKey, 1)
+          if (mergeSlot !== null) {
+            const target = container.slots[mergeSlot]
+            const stackSize = target.stackSize || this.catalog.getStackSize(`minecraft:${target.name}`)
+            take = Math.min(take, stackSize - target.count)
+          }
+        }
         this.trace('take', 'slot_take_plan', {
           pass: pass + 1,
           slot: sourceSlot,
@@ -2230,7 +2240,7 @@ class Warehouse {
           if (take >= item.count) {
             await this.moveContainerSlotToInventory(container, sourceSlot)
           } else {
-            await this.movePartialContainerSlotToInventory(container, sourceSlot, take)
+            await this.movePartialContainerSlotToInventory(container, sourceSlot, take, options)
           }
           const confirmed = await this.waitForInventoryTransfer(
             container,
@@ -2399,19 +2409,29 @@ class Warehouse {
     await this.bot.clickWindow(destSlot, 0, 0)
   }
 
-  async movePartialContainerSlotToInventory (container, sourceSlot, count) {
+  async movePartialContainerSlotToInventory (container, sourceSlot, count, options = {}) {
     const sourceItem = container.slots[sourceSlot]
     if (!sourceItem) throw new Error(`容器槽位 ${sourceSlot} 上没有物品，无法拆分取物`)
     // 右键逐个放入同类型半堆同样是合并语义：优先并堆，没有能整份收下的半堆再开新格
     const destSlot = this.withdrawDestinationSlot(container, sourceItem, count)
     if (destSlot === null) throw new Error('机器人背包没有空槽，无法拆分取物')
     const intervalMs = Math.max(0, Number(this.config.timing?.containerClickIntervalMs ?? 50))
+    const target = container.slots[destSlot]
+    const fillStack = options.requireServerEvidence && target &&
+      (target.stackSize || this.catalog.getStackSize(`minecraft:${target.name}`)) - target.count === count
 
     await this.bot.clickWindow(sourceSlot, 0, 0)
     await sleep(intervalMs)
-    for (let i = 0; i < count; i++) {
-      await this.bot.clickWindow(destSlot, 1, 0)
-      if (intervalMs > 0) await sleep(intervalMs)
+    if (fillStack) {
+      // A left click fills only the target's free space. Return the rest to
+      // its source below, preserving exact quantities without per-item clicks.
+      await this.bot.clickWindow(destSlot, 0, 0)
+      await sleep(intervalMs)
+    } else {
+      for (let i = 0; i < count; i++) {
+        await this.bot.clickWindow(destSlot, 1, 0)
+        if (intervalMs > 0) await sleep(intervalMs)
+      }
     }
     await this.bot.clickWindow(sourceSlot, 0, 0)
     await sleep(intervalMs)
