@@ -1082,3 +1082,84 @@ test('recovery holds a cancellable lease until an outstanding deposit has draine
     assert.equal(f.getInventory()[0].count, 4)
   } finally { f.db.close() }
 })
+
+for (const resumed of [false, true]) {
+  for (const inventoryFull of [false, true]) {
+    test(`${resumed ? 'resumed' : 'new'} craft distinguishes ${inventoryFull ? 'inventory full' : 'other withdrawal shortage'} and preserves recovery`, async () => {
+      const { CraftController } = require('../../src/craft/controller')
+      const f = fixture()
+      try {
+        const plank = f.seed('alice', 'oak_planks', resumed ? 4 : 2)
+        const controller = new CraftController({ ...f, botId: 'bot-a' })
+        const request = { actor: 'Alice', owner: { uuid: 'alice', username: 'Alice', scope: 'personal' }, item: 'stick', quantity: resumed ? 8 : 4 }
+        let operationId
+        let executions = 0
+        const execute = f.executor.execute
+        f.executor.execute = async args => { executions++; return execute(args) }
+        if (resumed) {
+          controller.maxTriggersPerBatch = () => 1
+          await assert.rejects(controller.run({ ...request, onProgress: () => controller.cancel('death between batches') }), /death between batches/)
+          const recovered = await controller.recover()
+          assert.equal(recovered.status, 'resumable')
+          operationId = recovered.operationId
+        }
+        const withdraw = f.warehouse.withdrawAllocationsLocked
+        f.warehouse.withdrawAllocationsLocked = async allocations => {
+          const result = await withdraw(allocations.map(item => ({ ...item, amount: item.amount - 1 })))
+          return { ...result, missing: allocations.map(item => ({ ...item, amount: 1, inventoryFull })) }
+        }
+        const attemptsBefore = executions
+        const attempt = resumed ? controller.resume(operationId) : controller.run(request)
+        await assert.rejects(attempt, inventoryFull ? /合成取料时机器人背包已满，本批原料未取齐/ : /仓库原料取出失败或不足/)
+        assert.equal(executions, attemptsBefore, 'incomplete inputs must never reach the executor')
+        assert.equal(controller.isBusy(), false)
+        if (resumed) {
+          const pending = controller.ledger.pending('bot-a')
+          assert.equal(pending.length, 1, 'resume retains its durable recovery evidence')
+          assert.equal(pending[0].id, operationId)
+          assert.deepEqual(pending[0].data.progress, { stepIndex: 0, nextTrigger: 1 })
+          const recovered = await controller.recover()
+          assert.equal(recovered.status, 'resumable')
+          assert.equal(recovered.operationId, operationId)
+        } else {
+          assert.equal(controller.ledger.pending('bot-a').length, 0, 'proven unchanged ingredients are returned immediately')
+        }
+        assert.deepEqual(f.getInventory(), [])
+        assert.equal(f.db.getBalance('alice', plank.itemKey), 2)
+        assert.equal(f.stored.get(plank.itemKey).count, 2)
+        f.warehouse.withdrawAllocationsLocked = withdraw
+        const finished = resumed ? await controller.resume(operationId) : await controller.run(request)
+        assert.equal(finished.status, 'complete')
+        assert.equal(f.db.getOwnerItemsByItemId('alice', 'minecraft:stick')[0].amount, request.quantity)
+        assert.equal(controller.ledger.pending('bot-a').length, 0)
+        assert.equal(controller.ledger.listCraftReservations(finished.operationId).length, 0)
+      } finally { f.db.close() }
+    })
+  }
+
+  test(`${resumed ? 'resumed' : 'new'} craft accepts exact live inputs despite stale inventory-full metadata`, async () => {
+    const { CraftController } = require('../../src/craft/controller')
+    const f = fixture()
+    try {
+      f.seed('alice', 'oak_planks', resumed ? 4 : 2)
+      const controller = new CraftController({ ...f, botId: 'bot-a' })
+      const request = { actor: 'Alice', owner: { uuid: 'alice', username: 'Alice', scope: 'personal' }, item: 'stick', quantity: resumed ? 8 : 4 }
+      let operationId
+      if (resumed) {
+        controller.maxTriggersPerBatch = () => 1
+        await assert.rejects(controller.run({ ...request, onProgress: () => controller.cancel('death between batches') }), /death between batches/)
+        operationId = (await controller.recover()).operationId
+      }
+      const withdraw = f.warehouse.withdrawAllocationsLocked
+      f.warehouse.withdrawAllocationsLocked = async allocations => ({
+        ...await withdraw(allocations),
+        missing: allocations.map(item => ({ ...item, amount: 1, inventoryFull: true }))
+      })
+      const result = resumed ? await controller.resume(operationId) : await controller.run(request)
+      assert.equal(result.status, 'complete')
+      assert.equal(f.db.getOwnerItemsByItemId('alice', 'minecraft:stick')[0].amount, request.quantity)
+      assert.deepEqual(f.getInventory(), [])
+      assert.equal(controller.ledger.pending('bot-a').length, 0)
+    } finally { f.db.close() }
+  })
+}

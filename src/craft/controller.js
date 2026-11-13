@@ -24,6 +24,14 @@ function same (left, right) {
   return a.size === b.size && [...a].every(([key, amount]) => b.get(key) === amount)
 }
 
+function assertWithdrawnInputs (actual, expected, withdrawal) {
+  if (same(actual, expected)) return
+  if (withdrawal?.missing?.some(item => item.inventoryFull && item.amount > 0)) {
+    throw new Error('合成取料时机器人背包已满，本批原料未取齐。')
+  }
+  throw new Error('仓库原料取出失败或不足。')
+}
+
 function converted (before, consumed, produced) {
   const result = new Map(merge(before).map(item => [item.itemKey, { ...item }]))
   for (const item of consumed) {
@@ -589,7 +597,7 @@ class CraftController {
                 requested: this.summarizeItems(inputs),
                 withdrawn: this.summarizeItems(withdrawal?.withdrawn || [])
               })
-              if (!same(before, inputs)) throw new Error('仓库原料取出失败或不足。')
+              assertWithdrawnInputs(before, inputs, withdrawal)
               check()
               const intent = this.executor.preview ? this.executor.preview(step, triggers) : {
                 expectedConsumed: before,
@@ -813,10 +821,10 @@ class CraftController {
             const data = { ...operation.data, held: [], pending: null, physicalTotals: this.physicalTotals(), inputs,
               stepIndex: index, trigger, progress: progressBefore }
             operation = this.ledger.checkpoint(id, 'withdrawing', data)
-            await this.measurePhase('withdraw', { operationId: id, stepId, resumed: true },
+            const withdrawal = await this.measurePhase('withdraw', { operationId: id, stepId, resumed: true },
               () => this.warehouse.withdrawAllocationsLocked(inputs, { requireServerEvidence: true }))
             const before = this.inventory()
-            if (!same(before, inputs)) throw new Error('仓库原料取出失败或不足。')
+            assertWithdrawnInputs(before, inputs, withdrawal)
             check()
             const intent = this.executor.preview ? this.executor.preview(step, triggers) : {
               expectedConsumed: before,
