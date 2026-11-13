@@ -145,6 +145,10 @@ class CloudStoreWebServer {
         const body = await this.readBody(req)
         return this.sendJson(res, this.apiWithdraw(session, body))
       }
+      if (req.method === 'POST' && url.pathname === '/api/action/withdraw-deposit') {
+        const body = await this.readBody(req)
+        return this.sendJson(res, this.apiWithdrawDeposit(session, body))
+      }
       if (req.method === 'POST' && url.pathname === '/api/action/withdraw/plan') {
         const body = await this.readBody(req)
         return this.sendJson(res, this.apiWithdrawPlan(session, body))
@@ -689,6 +693,23 @@ class CloudStoreWebServer {
     const message = Array.isArray(body.items)
       ? service.startWebWithdrawMany(user, ownerUuid, body.items, body.targetUsername)
       : service.startWebWithdraw(user, ownerUuid, body.item, body.amount, body.targetUsername)
+    return { ok: true, message, active: this.activeSnapshot() }
+  }
+
+  // 存取组合（对应游戏内 !存取）：取完物品机器人留在玩家身边，接着收存玩家丢的物品。
+  // 与普通取货分开成独立端点；只能本人接收，不支持代收。
+  apiWithdrawDeposit (session, body) {
+    const user = this.requireUser(session)
+    const ownerUuid = String(body.ownerUuid || user.uuid)
+    this.requireOwnerAccess(user, ownerUuid)
+    const service = this.requireService()
+    const targetUsername = String(body.targetUsername || user.username || '').trim()
+    if (!this.isSameUsername(targetUsername, user.username)) {
+      throw new Error('存取组合只能由本人接收物品，不能指定其他目标玩家。')
+    }
+    const message = Array.isArray(body.items)
+      ? service.startWebWithdrawMany(user, ownerUuid, body.items, targetUsername, { continueWithDeposit: true })
+      : service.startWebWithdraw(user, ownerUuid, body.item, body.amount, targetUsername, { continueWithDeposit: true })
     return { ok: true, message, active: this.activeSnapshot() }
   }
 

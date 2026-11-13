@@ -1082,11 +1082,11 @@ class CloudStoreService {
     return `存货任务已提交到${this.ownerScopeName(owner)}，空闲机器人会自动处理。`
   }
 
-  startWebWithdraw (user, ownerUuid, itemText, amount, targetUsername = '') {
-    return this.startWebWithdrawMany(user, ownerUuid, [{ item: itemText, amount }], targetUsername)
+  startWebWithdraw (user, ownerUuid, itemText, amount, targetUsername = '', options = {}) {
+    return this.startWebWithdrawMany(user, ownerUuid, [{ item: itemText, amount }], targetUsername, options)
   }
 
-  startWebWithdrawMany (user, ownerUuid, webRequests, targetUsername = '') {
+  startWebWithdrawMany (user, ownerUuid, webRequests, targetUsername = '', options = {}) {
     const owner = this.resolveWebStorageOwner(user, ownerUuid)
     if (!Array.isArray(webRequests) || !webRequests.length) throw new Error('请先选择要取出的物品。')
     const target = String(targetUsername || user.username || '').trim()
@@ -1109,10 +1109,11 @@ class CloudStoreService {
       })),
       decision: '玩家通过 Web 面板提交取货任务'
     })
-    this.enqueueTask(user.username, 'withdraw', worker => worker.handleWithdraw(user.username, '', owner, requests, target))
+    this.enqueueTask(user.username, 'withdraw', worker => worker.handleWithdraw(user.username, '', owner, requests, target, options))
       .catch(error => this.handleCommandError(user.username, error))
+    const thenDeposit = Boolean(options.continueWithDeposit)
     return target === user.username
-      ? `取货任务已提交，将从${this.ownerScopeName(owner)}取出 ${requests.length} 种物品。`
+      ? `取货任务已提交，将从${this.ownerScopeName(owner)}取出 ${requests.length} 种物品${thenDeposit ? '，交付后机器人会留在原地继续帮你收存' : ''}。`
       : `取货任务已提交，将从${this.ownerScopeName(owner)}取出 ${requests.length} 种物品并交给 ${target}。`
   }
 
@@ -1941,6 +1942,16 @@ class CloudStoreService {
       if (this.isActiveCancelled()) {
         cancelled = true
         break
+      }
+      // !存取专属：tpa 落地后先等 1s 再开始丢物品，给维度切换后的状态留缓冲；
+      // 普通 !取（continueWithDeposit=false）不等待，行为不变。
+      if (continueWithDeposit) {
+        traceEvent(trace, 'delivery', 'withdraw_pause_before_drop', {
+          batchId,
+          ms: 1000,
+          decision: '存取指令：tpa 到玩家身边后等 1s 再开始丢物品'
+        })
+        await sleep(1000)
       }
       const deliveryPhase = deliveryMode === 'repair' ? 'withdraw_repairing' : 'withdraw_dropping'
       this.setWithdrawBatchProgress(index + 1, batches.length, deliveryPhase)
