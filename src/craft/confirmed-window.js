@@ -1,6 +1,7 @@
 'use strict'
 
 const { shortKey } = require('../traceLog')
+const { isEmptySlot } = require('../packing/protocol')
 
 // Scoped to crafting. Modern menu clicks do not acknowledge correctly predicted
 // input/cursor changes. A mismatched stateId still applies the click, then makes
@@ -31,12 +32,27 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
     const value = catalog.fromPrismarineItem(item)
     return { itemId: value.itemId, amount: item.count, fingerprint: shortKey(value.itemKey) }
   }
+  // Packing cannot interpret malformed protocol slots as empty. Keep this
+  // stricter decode opt-in so ordinary crafting callers retain their contract.
+  const decode = raw => {
+    if (options.allowPacking && (!raw || typeof raw !== 'object' ||
+      (registry.supportFeature('itemsWithComponents')
+        ? !Number.isSafeInteger(raw.itemCount) || raw.itemCount < 0 || (raw.itemCount === 0 && !isEmptySlot(raw))
+        : typeof raw.present !== 'boolean'))) throw failure('invalid packing protocol slot')
+    const value = Item.fromNotch(raw)
+    if (options.allowPacking && value && (!registry.items[value.type] || !Number.isSafeInteger(value.count) || value.count <= 0)) {
+      throw failure('invalid packing item')
+    }
+    return value
+  }
 
   const click = async function (window, slot, mouseButton, mode, check, accept) {
     check()
     const allowed = window.type?.match(/^minecraft:(inventory|crafting)$/) ||
       (options.allowContainer && window.type?.match(/^minecraft:generic_9x[1-6]$/) && mode === 1 &&
-        window.inventoryEnd - window.inventoryStart === 36 && window.slots.length === window.inventoryEnd)
+        window.inventoryEnd - window.inventoryStart === 36 && window.slots.length === window.inventoryEnd) ||
+      (options.allowPacking && window.type === 'minecraft:shulker_box' && mode === 1 &&
+        window.inventoryStart === 27 && window.inventoryEnd === 63 && window.slots.length === 63)
     if (![bot.inventory, bot.currentWindow].includes(window) || !allowed) {
       throw failure('confirmed craft click lost its inventory window')
     }
@@ -110,8 +126,8 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
         return
       }
       try {
-        const slots = raw.map(value => Item.fromNotch(value))
-        const carried = Item.fromNotch(packet.carriedItem)
+        const slots = raw.map(decode)
+        const carried = decode(packet.carriedItem)
         const matches = mode === 1
           ? accept(slots, carried)
           : equal(cursor, carried) && expected.every((value, index) => index === 0 || equal(value, slots[index]))
@@ -132,7 +148,9 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
       bot._client.write('window_click', { windowId: window.id, stateId: -1, slot, mouseButton, mode,
         changedSlots: [], cursorItem: emptyClickCursor })
       while (!confirmed) {
-        check()
+        // Packing cancellation stops the next transfer, but first drains this
+        // sent click through its response/timeout before a recovery close.
+        if (!options.allowPacking) check()
         if (decodeError) throw failure(`cannot decode confirmed craft window: ${decodeError.message}`)
         if (Date.now() >= expires) {
           debug('executor.window_confirmation_timeout', diagnostics)
@@ -192,8 +210,8 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
       const slots = packet.items ?? packet.slots
       if (!Array.isArray(slots) || slots.length !== bot.inventory.slots.length || !Object.hasOwn(packet, 'carriedItem')) return
       try {
-        const decoded = slots.map(value => Item.fromNotch(value))
-        const carried = Item.fromNotch(packet.carriedItem)
+        const decoded = slots.map(decode)
+        const carried = decode(packet.carriedItem)
         decoded.forEach((value, slot) => bot.inventory.updateSlot(slot, copy(value)))
         window.selectedItem = copy(carried)
         bot.inventory.selectedItem = copy(carried)

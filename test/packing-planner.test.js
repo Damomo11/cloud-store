@@ -19,6 +19,16 @@ function fixture (stock = [row('stone', 4096)], boxes = [row('shulker_box', 3)])
   return { ownerUuid, catalog, items: [{ itemKey: stock[0].itemKey, amount: 1 }], availableItems: [...stock, ...boxes], emptyBoxes: boxes }
 }
 
+test('empty box planning permits only bounded exact protocol-empty slot padding', () => {
+  const box = row('blue_shulker_box', 1, [{ type: 'container', data: { contents: Array.from({ length: 27 }, () => ({ itemCount: 0 })) } }])
+  assert.equal(planPacking(fixture([row('stone', 1)], [box])).boxCount, 1)
+  for (const contents of [[{ itemCount: 0, itemId: 1 }], [{ itemCount: 0, components: [] }], [{ itemCount: 0, data: {} }],
+    [{ itemCount: '0' }], [{}], [null], Array.from({ length: 28 }, () => ({ itemCount: 0 }))]) {
+    const invalid = row('blue_shulker_box', 1, [{ type: 'container', data: { contents } }])
+    assert.throws(() => planPacking(fixture([row('stone', 1)], [invalid])), /empty|contents|container/i)
+  }
+})
+
 test('plans exact mixed stacks with aggregated owner allocations and one empty box', () => {
   const stone = row('stone', 64)
   const stick = row('stick', 64)

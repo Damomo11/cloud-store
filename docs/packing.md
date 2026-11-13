@@ -49,7 +49,7 @@ const plan = planPacking({
 
 `packingStackSize(item, catalog)` 使用目录的基础堆叠上限，例如石头 64、末影珍珠 16、钻石剑 1。存储的 `metaJson` 必须是合法 JSON 对象；`components` 可缺省、为 `null` 或组件数组。支持组件 `{ type: 'max_stack_size', data: integer }`，其中 `data` 必须为 1 至 99 的整数。当前物理转移使用基础目录容量，因此规划取 `min(基础上限, 组件上限)`，组件只能降低规划容量。所有组件类型必须有效且不能重复；带非空 `removeComponents` 的元数据暂不支持，以免误判协议相关的组件移除结果。
 
-`nbtJson` 必须是合法 JSON 对象或 `null`。空盒的 `container` 组件如存在，必须含有空 `data.contents` 数组；任何内容项均视为非空，不会因为其中物品无法识别而忽略。旧式 NBT 或组件中的 `Items` / `items` 容器列表也必须为空；不明列表结构按非空处理。这种保守校验可能拒绝自定义插件里用途不同的同名字段。
+`nbtJson` 必须是合法 JSON 对象或 `null`。空盒的 `container` 组件如存在，必须含有 `data.contents` 数组，最多 27 项。空数组或仅包含协议空槽 `{ itemCount: 0 }` 的数组视为空盒；空槽不能带有 itemId、components 或其他字段。其余内容项均视为非空，不会因为其中物品无法识别而忽略。旧式 NBT 或组件中的 `Items` / `items` 容器列表也必须为空；不明列表结构按非空处理。这种保守校验可能拒绝自定义插件里用途不同的同名字段。
 
 规划器抛错拒绝无效 owner、未知精确指纹、无效或溢出的数量、非法元数据、空盒伪装、库存不足、空盒不足，以及把任何潜影盒装入潜影盒的请求。所有数量及聚合运算必须保持为安全整数。单次计划最多 `MAX_PACKING_BOXES = 256` 盒，超限在展开槽位前拒绝。
 
@@ -162,3 +162,28 @@ withdrawalProof: {
 `finish` 只接受 `completed` 或 `failed`。成功要求全部计划盒子已按完整输入结算，不能有 held、待结算成品或未决物理阶段。失败只能在真正未动实物的 `ready` 或有完整原料存回证明的 `stored` 完成；部分成品先结算后再失败。终态在同一事务内释放本操作未用预留并写一条 `packing` 总结流水。同状态重复完成返回原记录；不同状态拒绝。
 
 数据库重启时同时保留非终态 craft 与 packing 的预留，继续清理其他临时预留。装盒待恢复不会进入 `assertNoPendingCraft`，不会增加全局库存锁；普通库存读写保持现有行为，既有合成 guard 也不会被装盒结算绕过。目录指纹迁移与启动离线身份合并在装盒待恢复时延后；显式合并正在被该记录引用的 owner 身份被拒绝，直到安全终态。最后一条待处理记录完成后重试延后迁移。
+
+## 权威物理执行接口
+
+`src/packing/executor.js` 导出内部 `PackingExecutor`，不注册任何玩家入口：
+
+```js
+const { PackingExecutor } = require('./src/packing/executor')
+const executor = new PackingExecutor({ bot, catalog, warehouse, config, debug })
+await executor.execute({ box, inputs, signal, check }) // { product, packedInputs }
+await executor.recover({ box, inputs, signal, check }) // { product, packedInputs, remainingInputs }
+executor.cancel(reason)
+executor.isBusy()
+```
+
+`box` 是原始已归属空盒的目录行，amount 必须为 1。`inputs` 是同一规划批次的非空、唯一精确指纹行，包含 itemKey、itemId、metaJson、nbtJson、正安全整数 amount；真实规划器附加的 ownerUuid 会保留在 packedInputs 和 remainingInputs 中。执行器检查单盒容量；归属权限、余额预留和跨操作互斥由调用方负责。不得并行启动同一执行器的 execute/recover。
+
+execute 要求当前没有打开的容器、光标为空、背包仅持有精确空盒和全部输入，装备及副手等额外槽位为空。打开前监听原始 open_window/open_screen 和 window_items/container_set_content，并向 warehouse.openQuickShulkerWindow 传递实际持有盒的精确 key。仅接受本次打开的 minecraft:shulker_box、27 盒内槽加 36 玩家槽，以及带 carriedItem 的完整服务端快照。初始盒内必须为空，服务端玩家物品须与请求完全一致。
+
+每个散装源堆叠使用一次 mode 1 shift；接收完整服务端内容后检查源槽减少量恰好等于目标指纹在盒内增加量，包括第 0 槽。其他输入槽不得变化，盒壳颜色、名称和去除 container 后的规范化元数据不得变化。任何剩余、额外、未知、过量物品或光标持物都会失败。`allowPacking` 是 confirmed-window 适配器的显式内部选项，普通合成或 generic 容器调用方仍不能使用潜影盒窗口。
+
+填充结束后通过 click.close 关闭并请求完整玩家菜单。只有实际服务端盒子元数据与已确认的盒内内容完全一致、无散装剩余、光标为空且盒壳不变，才返回 amount=1 的实际 product 及 packedInputs。缺少关闭快照或盒 NBT 仍未更新都不能产生成功证明。容器内容中只跳过严格协议空槽，其他畸形条目一律拒绝；现代耐久物品的容器索引复用玩家物品解码器的伤害 NBT，以保持装入前后的精确身份和可取出性，盒子自身指纹算法不变。
+
+recover 只核验原批次当前实物，不继续填充。它选择唯一匹配原始盒壳的持有盒，用本次服务端菜单证明盒内内容加散装余料恰好等于原 inputs，再关闭核验实际 product。返回已装入的 packedInputs 和 remainingInputs；完全未改变的空盒返回 packedInputs=[]。缺盒、多个匹配盒、缺料、超量或无关物品均拒绝。盒已归还时应由控制器使用持久化存回证明处理，执行器不会猜测。
+
+可选 signal 或同步 check 在异步动作前后检查取消/外部约束。cancel 只阻止后续动作；已发送的 shift 会先等待服务端确认或超时，再执行关闭核验。isBusy 在打开、点击和关闭的等待完成前始终为 true，避免恢复抢占尚未退出的调用。所有拒绝均保留原始 Error 并设置 recoveryRequired=true；失败时尽力关闭窗口，关闭失败不覆盖原错误。debug 回调异常不影响实物操作。超时使用现有 config.craft.confirmTimeoutMs（缺省 5000ms），不改写配置。

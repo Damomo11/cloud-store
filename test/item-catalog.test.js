@@ -24,6 +24,29 @@ function createCatalog () {
   return new ItemCatalog('1.21.11')
 }
 
+test('modern durable container entries match inventory identities after real packet decoding', () => {
+  const catalog = createCatalog()
+  const Item = require('prismarine-item')(catalog.mcData)
+  const protocol = require('minecraft-protocol')
+  const serializer = protocol.createSerializer({ state: 'play', version: '1.21.11', isServer: true })
+  const deserializer = protocol.createDeserializer({ state: 'play', version: '1.21.11', isServer: false })
+  for (const name of ['diamond_sword', 'bow', 'shield', 'stone', 'ender_pearl', 'beehive']) {
+    for (const components of [[], [{ type: 'damage', data: 12 }, { type: 'custom_name', data: typedString('Owned equipment') }]]) {
+      const entry = { itemId: catalog.mcData.itemsByName[name].id, itemCount: 1,
+        addedComponentCount: components.length, removedComponentCount: 0, components, removeComponents: [] }
+      const buffer = serializer.createPacketBuffer({ name: 'window_items', params: { windowId: 0, stateId: 1, items: [entry], carriedItem: { itemCount: 0 } } })
+      const decoded = deserializer.parsePacketBuffer(buffer).data.params.items[0]
+      const loose = catalog.fromPrismarineItem(Item.fromNotch(decoded))
+      const contained = catalog.fromContainerEntry(decoded)
+      assert.equal(contained.itemKey, loose.itemKey, `${name} must stay withdrawable after packing`)
+      assert.equal(contained.nbtJson, loose.nbtJson)
+      const box = new Item(catalog.mcData.itemsByName.blue_shulker_box.id, 1)
+      box.components = [{ type: 'container', data: { contents: [decoded, { itemCount: 0 }] } }]
+      assert.equal(catalog.extractShulkerContents(catalog.fromPrismarineItem(box))[0].item.itemKey, loose.itemKey)
+    }
+  }
+})
+
 test('shit hat ignores CraftEngine network data without changing stored metadata', () => {
   const catalog = createCatalog()
   const saddle = catalog.mcData.itemsByName.saddle

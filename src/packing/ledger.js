@@ -1,6 +1,7 @@
 'use strict'
 
 const { planPacking, packingStackSize } = require('./planner')
+const { isEmptySlot } = require('./protocol')
 const TERMINAL = new Set(['completed', 'failed'])
 const PHASES = new Set(['ready', 'withdrawing', 'withdrawn', 'packing', 'returning', 'stored', 'recovery_required'])
 const clone = value => JSON.parse(JSON.stringify(value))
@@ -170,7 +171,8 @@ class PackingLedger {
     if (!equal(strip(product), strip(batch.box)) || !equal(catalog.normalizeNbtForFingerprint(product.itemId, nbt), catalog.normalizeNbtForFingerprint(batch.box.itemId, JSON.parse(batch.box.nbtJson)))) throw new Error('Packing product empty-box fingerprint changed')
     const containers = meta.components.filter(component => component.type === 'container')
     if (containers.length !== 1 || !Array.isArray(containers[0].data?.contents) || containers[0].data.contents.length > 27) throw new Error('Invalid packing product container')
-    const contents = containers[0].data.contents.map(entry => {
+    const contents = containers[0].data.contents.filter(entry => !isEmptySlot(entry)).map(entry => {
+      if (!object(entry)) throw new Error('Invalid packing container entry')
       positive(entry.itemCount ?? entry.count, 'container count')
       if ((entry.removeComponents || []).length || (entry.components !== undefined && !Array.isArray(entry.components))) throw new Error('Invalid packing container components')
       const item = catalog.fromContainerEntry(entry)

@@ -54,6 +54,26 @@ function stored (f, result = product(f), inputs = [qty(f.stone, result ? catalog
     storedProof: { chests: [{ chestId: 'return', after: returned }], inventoryAfter: [] } })
 }
 
+test('settlement accepts protocol-empty padding but refuses hidden data in empty slots', () => {
+  const f = fixture()
+  try {
+    f.ledger.begin(f.input())
+    const result = product(f)
+    const withEntries = entries => {
+      const meta = JSON.parse(result.metaJson)
+      meta.components.find(component => component.type === 'container').data.contents.push(...entries)
+      return catalog.canonicalizeStoredItem({ ...result, metaJson: JSON.stringify(meta) })
+    }
+    for (const entry of [{ itemCount: 0, itemId: 1 }, { itemCount: 0, components: [] }, { itemCount: 0, data: {} }, {}, null]) {
+      assert.throws(() => stored(f, withEntries([entry]), [f.stone]), /container|count|entry/i)
+    }
+    const padded = withEntries([{ itemCount: 0 }, { itemCount: 0 }])
+    stored(f, padded, [f.stone])
+    assert.equal(f.ledger.settleBatch('packing:1', 0, padded, [f.stone]).full, true)
+    assert.equal(f.db.getBalance(owner.uuid, padded.itemKey), 1)
+  } finally { f.close() }
+})
+
 test('begin atomically reserves exact owned planner allocations without balances changing', () => {
   const f = fixture()
   try {

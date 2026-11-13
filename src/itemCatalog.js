@@ -143,7 +143,17 @@ class ItemCatalog {
       removeComponents: entry.removeComponents || null
     })
 
-    const nbtJson = stableStringify(null)
+    // Component-era inventory decoding synthesizes legacy damage NBT for
+    // durable items. Use that same decoder for the content index so a sword's
+    // identity stays the same when it is taken out of a shulker box.
+    let nbt = null
+    if (item.maxDurability && this.mcData.supportFeature('itemsWithComponents')) {
+      this.containerItem ??= require('prismarine-item')(this.mcData)
+      nbt = this.sanitizeNbtForStorage(itemId, this.containerItem.fromNotch({
+        ...entry, itemId: entryItemId, itemCount: entry.itemCount ?? entry.count
+      })?.nbt || null)
+    }
+    const nbtJson = stableStringify(nbt)
     const metaJson = stableStringify(meta)
     const fingerprintMeta = this.normalizeMetaForFingerprint(itemId, meta)
     const fingerprint = sha1(stableStringify({ itemId, nbtJson, metaJson: stableStringify(fingerprintMeta) }))
@@ -159,7 +169,7 @@ class ItemCatalog {
       amount,
       type: item.id,
       metadata: null,
-      nbt: null
+      nbt
     }
   }
 
