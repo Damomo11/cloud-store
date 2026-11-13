@@ -214,6 +214,7 @@ class PackingLedger {
     }
     if (!stored) return
     if (!['returning', 'stored', 'recovery_required'].includes(op.phase) || !op.data.returnIntent || !equal(op.data.product, data.product) || !sameItems(op.data.packedInputs, data.packedInputs)) throw new Error('Stored packing proof requires prior durable return intent')
+    if (data.returnIntent.chests.length !== op.data.returnIntent.chests.length) throw new Error('Stored packing destinations require prior durable baselines')
     if (data.held.length || !object(data.storedProof) || !Array.isArray(data.storedProof.inventoryAfter) || data.storedProof.inventoryAfter.length || !Array.isArray(data.storedProof.chests) || data.storedProof.chests.length !== names.size) throw new Error('Stored packing proof requires empty held/inventory and complete chest receipts')
     const deltas = []
     for (const before of data.returnIntent.chests) {

@@ -339,6 +339,30 @@ test('named return intents append registered chest baselines but cannot change p
   } finally { f.close() }
 })
 
+test('stored receipt cannot introduce a destination baseline absent from durable returning intent', () => {
+  const f = fixture()
+  try {
+    f.ledger.begin(f.input())
+    f.db.upsertChest({ chestId: 'late-return', x: 2, y: 64, z: 0, blockName: 'barrel' })
+    const result = product(f)
+    const data = { ...f.ledger.get('packing:1').data, product: result, packedInputs: [f.stone], held: [result],
+      returnIntent: { chests: [{ chestId: 'return', before: [] }], returned: [result] } }
+    f.ledger.checkpoint('packing:1', 'returning', data)
+    const before = f.ledger.get('packing:1')
+    const forged = { ...data, held: [],
+      returnIntent: { ...data.returnIntent, chests: [...data.returnIntent.chests, { chestId: 'late-return', before: [] }] },
+      storedProof: { chests: [{ chestId: 'return', after: [] }, { chestId: 'late-return', after: [result] }], inventoryAfter: [] } }
+    assert.throws(() => f.ledger.checkpoint('packing:1', 'stored', forged), /prior durable|destination|baseline/)
+    assert.deepEqual(f.ledger.get('packing:1'), before)
+    assert.throws(() => f.ledger.settleBatch('packing:1', 0, result, [f.stone]), /stored|proof/)
+    assert.equal(f.db.getBalance(owner.uuid, f.stone.itemKey), 20)
+    assert.equal(f.db.getBalance(owner.uuid, f.box.itemKey), 3)
+    assert.equal(f.db.getItemByKey(result.itemKey), null)
+    assert.equal(f.db.db.prepare('SELECT COUNT(*) AS n FROM packing_batches').get().n, 0)
+    assert.equal(f.db.db.prepare("SELECT COUNT(*) AS n FROM inventory_reservations WHERE reservation_id='packing:1'").get().n, 2)
+  } finally { f.close() }
+})
+
 test('pending craft guard still blocks packing conversion atomically', () => {
   const f = fixture()
   try {
