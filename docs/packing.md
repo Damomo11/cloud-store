@@ -1,6 +1,6 @@
 # 仓库自动装盒
 
-`src/packing/planner.js` 提供独立的纯规划器，将选定 owner 的精确散装物品分配到该 owner 已有的空潜影盒。规划器只计算数据，不读取数据库、不预留或扣除余额，也不操作机器人、背包或容器。当前没有聊天命令、HTTP 路由、按钮或运行时调用入口。
+`src/packing/planner.js` 提供独立的纯规划器，将选定 owner 的精确散装物品分配到该 owner 已有的空潜影盒。规划器只计算数据，不读取数据库、不预留或扣除余额，也不操作机器人、背包或容器。内部控制器、持久化账务、服务端确认执行与生命周期恢复已实现；仅提供内部后端调用，没有聊天命令、HTTP 路由、GUI 按钮或玩家调度入口。
 
 ## 规划接口
 
@@ -53,9 +53,9 @@ const plan = planPacking({
 
 规划器抛错拒绝无效 owner、未知精确指纹、无效或溢出的数量、非法元数据、空盒伪装、库存不足、空盒不足，以及把任何潜影盒装入潜影盒的请求。所有数量及聚合运算必须保持为安全整数。单次计划最多 `MAX_PACKING_BOXES = 256` 盒，超限在展开槽位前拒绝。
 
-## 后续内部执行约定
+## 内部执行约定
 
-规划结果是可能过期的库存快照。内部执行层应在现有仓库互斥锁内重新核验 owner 权限、可用库存和精确空盒，并原子预留 `allocations`。单盒作为持久化批次：先记录意图，取回该盒及其 `inputs`，依据服务端确认填入 27 格，核验实际内容和盒子原有元数据，再将成品归还同一仓库。余额转换必须以已确认的实际成品为依据，并保持重试幂等和原 owner 归属。
+规划结果是可能过期的库存快照。内部执行层在现有仓库互斥锁内重新核验 owner 权限、可用库存和精确空盒，并原子预留 `allocations`。单盒作为持久化批次：先记录意图，取回该盒及其 `inputs`，依据服务端确认填入 27 格，核验实际内容和盒子原有元数据，再将成品归还同一仓库。余额转换必须以已确认的实际成品为依据，并保持重试幂等和原 owner 归属。
 
 物理执行必须独立检查真实槽位容量、服务端回包、光标状态和结果内容；规划成功不构成物理操作完成或余额已转换的证据。中断恢复应保留批次证据和预留，仅在实物状态得到证明后结算或释放。执行接口保持内部使用，不注册玩家入口。
 
@@ -187,3 +187,42 @@ execute 要求当前没有打开的容器、光标为空、背包仅持有精确
 recover 只核验原批次当前实物，不继续填充。它选择唯一匹配原始盒壳的持有盒，用本次服务端菜单证明盒内内容加散装余料恰好等于原 inputs，再关闭核验实际 product。返回已装入的 packedInputs 和 remainingInputs；完全未改变的空盒返回 packedInputs=[]。缺盒、多个匹配盒、缺料、超量或无关物品均拒绝。盒已归还时应由控制器使用持久化存回证明处理，执行器不会猜测。
 
 可选 signal 或同步 check 在异步动作前后检查取消/外部约束。cancel 只阻止后续动作；已发送的 shift 会先等待服务端确认或超时，再执行关闭核验。isBusy 在打开、点击和关闭的等待完成前始终为 true，避免恢复抢占尚未退出的调用。所有拒绝均保留原始 Error 并设置 recoveryRequired=true；失败时尽力关闭窗口，关闭失败不覆盖原错误。debug 回调异常不影响实物操作。超时使用现有 config.craft.confirmTimeoutMs（缺省 5000ms），不改写配置。
+
+## 内部控制器与恢复
+
+```js
+new PackingController({ bot, db, catalog, warehouse, config, botId,
+  ledger, executor, validateOwner })
+controller.run({ owner, actor, items: [{ itemKey, amount }], boxItemKey })
+controller.recover()
+controller.cancel(reason)
+controller.isBusy()
+```
+
+controller、planner、executor 和 PackingLedger 从 src/packing/index.js 导出。ledger、executor 可省略；validateOwner 必须提供并验证新请求的 owner/actor，否则拒绝。恢复使用日志里不可变的原 owner，不依赖原 actor 仍有组织成员资格，也不向 actor 交付物品。服务层的 getPackingController() 惰性创建控制器，enqueuePacking(request) 只排内部 packing 任务，不设置 exclusive。组织授权同时检查精确 vault UUID 与组织成员身份，不能用另一个组织名替代目标 UUID。
+
+正常返回为 { status: 'completed', operationId, batches, boxCount, itemCount }。batches 每项为 { batchIndex, product, packedInputs, full }；product 为真实服务端物品元数据，boxCount 是已结算盒数，itemCount 是已装入物品总数。recover() 在无记录时返回 { status: 'empty' }，有记录时返回相同结果结构，status 为 completed 或 failed。中断取货/装盒/回库恢复成功通常结束为 failed，即使已回库的部分刚好包含完整的一盒，也不会伪报整单成功。只有所有正常完整批次已经保存 storedProof 或已结算时，恢复才能完成订单。
+
+run() 失败保留原 Error；已创建日志时附带 operationId、recoveryRequired，以及立即清理的 recovery 结果或 recoveryError。取消不会抢先释放租约；所有已 await 的网络调用先 drain。日志写入或诊断物品解码失败分别留在 journalError 或 observation.inventoryError，不替换原始失败原因。
+
+控制器在第一次 await 前取得自己的租约，整个订单都保留它；仓库互斥锁按批次持有，只有本批全部归还、storedProof 保存并结算后才让其他机器人的普通仓库任务穿插。每批采用独立 120000ms 检查截止时间，清理/恢复另有 120000ms；不以整单两分钟限制多盒请求。底层确认仍使用现有网络/点击超时，没有释放锁后继续运行的 Promise.race。自然失败在当前锁区间内立即尝试一次有界恢复；取消、死亡和断线保留证据待拥有该背包的机器人恢复。
+
+开始前必须验证本地窗口、光标、制作格、装备和背包清洁，再回仓库并通过确认的玩家菜单快照证明空背包。读取 db.getCraftAvailableItems(owner.uuid) 获取该 owner 扣除预留后的全部库存；有效空盒与精确散装都来自同一 owner。每批沿既有已知分组顺序只选择记录量足够的源桶前缀。完整实际源桶槽位必须与已登记槽位一致，不能先刷新漂移记录再绕过严格取货检查。持久化全部 withdrawalIntent 后，调用 withdrawAllocationsLocked 的 requireServerEvidence=true 与 packingSourceChestIds 白名单；白名单只能包含已登记桶，必须配合严格模式，不能搜索或使用白名单以外的桶。普通调用不带此选项时行为不变。
+
+## 有名桶回库证明
+
+src/packing/storage.js 只操作实物证据，不调整余额。初始桶数据必须对应本次打开事件的窗口 ID，采用完整原始服务端槽位验证；无关窗口包不能替代该快照。最终关闭请求完整玩家菜单，严格拒绝藏有元数据的零数量槽位、非空光标、制作格、装备及未知物品。
+
+回库前先保存 verified product/packedInputs，再为每个目的桶保存完整 before 快照和首次固定的 returned 总集合，之后才允许点击。复用 confirmed depositor 的逐次服务端确认，检查目的桶增加等于玩家减少且其他内容未变。每次验证只重读已命名桶；桶中增量加当前剩余背包必须恰好等于 returned，所有桶差值均非负。可在下一次点击前追加目的桶，但不能替换旧基线或缩小原始 held。每轮最多尝试 11 个本地已登记目的桶，跳过无进展桶；没有发现新桶或全仓扫描。
+
+完整回库并确认玩家清空后，先保存 storedProof，再原子 settleBatch。storedProof 已持久化时不会再二次回库或重读历史目的桶，普通后续仓库变化不影响该收据的结算资格。批次 proof_json 保存 normalBatch 标志；中断恢复将其置 false，防止恢复结算完成后崩溃被误当正常订单成功。
+
+withdrawing 用不可变的源桶 before、当前 named after 和当前玩家快照证明精确已取子集，包含合法的零取货；只有证明子集才回库，未取库存不作转换。packing 调用 executor.recover 只读取实际壳体/内容/余料，不继续填盒；空壳原料原样归还，部分成品和全部余料存回后只结算实际 packedInputs。returning 按原基线恢复已转移和仍持有的部分；stored 仅重试账务；ready 只有确认空背包才能释放未用预留。缺失、死亡丢失、外来物品和无法解释的桶差值会保留具体 observation 与剩余预留，不虚构入库或改归 momo。
+
+## 生命周期与普通业务边界
+
+invalidateConnection/handleDeath 取消装盒；spawn/respawn 在普通残余清理之前检查本机器人日志。任务池的 hasInFlightPacking/waitForPackingDrain 与 withPackingRecoveryLease 跟踪真实尚未结束的 Promise，包括生命周期直接恢复及失败后的空背包证据读取。同 botId 替换实例必须等待旧网络调用结束；其他 botId 仍可调度。这是活跃调用租约，不是全仓或持久日志锁。
+
+自己的恢复不能证明清理时，有实物残留则阻止该机器人把它当作普通存取/momo 残余处理；若额外服务端快照证实当前背包空，普通任务仍能开始，日志和预留继续保留。当前普通任务保留这个空背包起点证明，后续取得的普通库存不会在同任务 flushResidual/死亡处理中被重新归类成装盒残留。该证明仅限当前任务；重连后无法确认的新旧残余混合继续保守保留，不能擅自转账。无装盒日志时不创建控制器或日志表，也不改变普通合成恢复保护。
+
+仅管理动作中的 owner 身份迁移受新增保护：有未完装盒的精确 owner 不能被改 UUID 的组织更名或仓库删除转入 momo；大小写/显示名称等同 key 更名及其他 owner 的管理操作仍可进行。普通余额查询、存取、预留与其他机器人操作没有新增全局 packing guard。

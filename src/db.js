@@ -2417,6 +2417,7 @@ class StoreDb {
 
   deleteOwnerWarehouseToMomo (ownerUuid, ownerUsername, warehouseType, adminUsername, deleteWarehouse) {
     this.assertNoPendingCraft()
+    this.assertPackingOwnerMutable(ownerUuid)
     if (!ownerUuid || ownerUuid === this.momoOwner) throw new Error('不能删除该仓库。')
     const items = this.getOwnerBalances(ownerUuid)
     const totalAmount = items.reduce((sum, item) => sum + Number(item.amount || 0), 0)
@@ -2441,6 +2442,14 @@ class StoreDb {
     return { ownerUuid, ownerUsername, itemTypes: items.length, totalAmount, items }
   }
 
+  assertPackingOwnerMutable (ownerUuid) {
+    if (!this.hasPendingPacking()) return
+    const owners = this.db.prepare("SELECT owner_json AS ownerJson FROM packing_operations WHERE state NOT IN ('completed','failed')").all()
+    if (owners.some(row => JSON.parse(row.ownerJson).uuid === ownerUuid)) {
+      throw new Error('Packing operation pins this owner identity until safe completion')
+    }
+  }
+
   renameCustomWarehouse (name, newName) {
     this.assertNoPendingCraft()
     const warehouse = this.getCustomWarehouse(name)
@@ -2462,6 +2471,8 @@ class StoreDb {
     if (this.getCustomWarehouse(nextName)) throw new Error(`仓库名已存在：${nextName}`)
     const oldOwner = `vault:${warehouse.nameLower}`
     const newOwner = `vault:${nextLower}`
+    this.assertPackingOwnerMutable(oldOwner)
+    this.assertPackingOwnerMutable(newOwner)
     this.transaction(() => {
       this.db.prepare(`
         INSERT INTO custom_warehouses (name_lower, name, creator_uuid, creator_username, created_at)
