@@ -637,6 +637,16 @@ class Warehouse {
   }
 
   async withdrawAllocationsLocked (allocations, options = {}) {
+    let packingSources = null
+    if (Object.hasOwn(options, 'packingSourceChestIds')) {
+      const ids = options.packingSourceChestIds
+      const registered = new Set(this.db.listChests().map(chest => chest.chestId))
+      if (!options.requireServerEvidence || !Array.isArray(ids) || !ids.length ||
+        new Set(ids).size !== ids.length || ids.some(id => typeof id !== 'string' || !registered.has(id))) {
+        throw new Error('Invalid packing source whitelist; registered IDs and strict server evidence required')
+      }
+      packingSources = new Set(ids)
+    }
     const withdrawn = []
     const missing = []
     const unlocated = []
@@ -670,6 +680,7 @@ class Warehouse {
 
       const slots = this.db.listSlotsForItemKey(allocation.itemKey)
       let chestGroups = this.groupSlotsForWithdrawal(slots)
+      if (packingSources) chestGroups = chestGroups.filter(group => packingSources.has(group.chestId))
       this.debug(`withdraw plan ${itemInfo.displayName || allocation.itemKey} need=${allocation.amount} chests=${chestGroups.map(group => `${group.chestId}:${group.recordedAmount}`).join(' | ') || 'none'}`)
 
       // 账本有量但一个槽位记录都没有（物品被人工移动/记录漂移）：登记库存异常，

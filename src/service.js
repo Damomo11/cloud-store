@@ -78,6 +78,7 @@ class CloudStoreService {
     this.ready = false
     this.active && (this.active.cancelled = true)
     this.craftController?.cancel(reason)
+    this.packingController?.cancel(reason)
     this.warehouse.invalidateConnection(reason)
   }
 
@@ -158,6 +159,7 @@ class CloudStoreService {
     }
     this.bot.pathfinder?.stop()
     this.craftController?.cancel('机器人死亡，合成已停止并保留恢复记录。')
+    this.packingController?.cancel('机器人死亡，装盒已停止并保留恢复记录。')
     this.bot.clearControlStates()
   }
 
@@ -166,6 +168,14 @@ class CloudStoreService {
     this.recoveringFromDeath = true
     const context = this.deathContext
     this.deathContext = null
+
+    if (context.type === 'packing' || context.type === 'packing_recovery' || (!context.packingInventoryClean && this.db.hasPendingPacking?.(this.botId))) {
+      try { await this.recoverOwnPacking() } finally {
+        this.recoveringFromDeath = false
+        this.taskPool?.dispatch()
+      }
+      return
+    }
 
     // The craft controller keeps its lease until every outstanding craft call
     // drains. Do not run generic death cleanup or erase its durable journal.
@@ -329,6 +339,10 @@ class CloudStoreService {
   }
 
   async recoverPersistedTaskOnSpawn () {
+    if (this.db.hasPendingPacking?.(this.botId) || this.taskPool?.hasInFlightPacking?.(this.botId)) {
+      await this.recoverOwnPacking()
+      return
+    }
     if (this.db.hasPendingCraft?.(this.botId)) {
       if (this.connectionInvalidated) throw new Error('连接已失效，合成恢复留待新连接。')
       // An old disconnected instance may still be draining a network Promise.
@@ -1061,6 +1075,9 @@ class CloudStoreService {
   }
 
   async runExclusive (username, type, fn, extra = {}) {
+    const packingRecovery = type !== 'packing' && type !== 'packing_recovery' &&
+      (this.db.hasPendingPacking?.(this.botId) || this.taskPool?.hasInFlightPacking?.(this.botId))
+      ? await this.recoverOwnPacking() : null
     // The task pool already owns this craft's exclusive lease. Recover directly
     // before setting active; enqueueing another exclusive task here would wait
     // on this very task. Other bots' journals retain the upstream global guard.
@@ -1073,7 +1090,8 @@ class CloudStoreService {
     if (migration?.catalogError || migration?.offlineIdentityError) {
       throw new Error('恢复后的库存身份迁移尚未完成，请检查日志并重试。')
     }
-    const active = { type, username, cancelled: false, dead: false, phase: 'start', player: null, ...extra }
+    const active = { type, username, cancelled: false, dead: false, phase: 'start', player: null, ...extra,
+      ...(packingRecovery?.inventoryClean ? { packingInventoryClean: true } : {}) }
     this.active = active
     try {
       return await this.db.runWithCommandContext(active.commandLogId, () => this.withBotContext(fn))
@@ -2222,6 +2240,60 @@ class CloudStoreService {
         throw new Error('组织仓库已不存在或你不是该仓库成员，无法使用合成。')
       }
     } else if (owner.uuid !== player.uuid) throw new Error('合成仓库归属与请求玩家不一致。')
+  }
+
+  // Internal backend only. No dispatcher, command, HTTP or UI registration.
+  getPackingController () {
+    if (!this.packingController) {
+      const { PackingController } = require('./packing')
+      this.packingController = new PackingController({ bot: this.bot, db: this.db, catalog: this.catalog,
+        warehouse: this.warehouse, config: this.config, botId: this.botId,
+        validateOwner: (owner, actor) => this.validatePackingOwner(owner, actor) })
+    }
+    return this.packingController
+  }
+
+  enqueuePacking (request) {
+    if (!this.taskPool) return this.runExclusive(request.actor, 'packing', () => this.getPackingController().run(request))
+    return this.taskPool.enqueue({ username: request.actor, type: 'packing',
+      run: worker => worker.getPackingController().run(request) })
+  }
+
+  validatePackingOwner (owner, actor) {
+    const player = this.getPlayer(actor)
+    if (!owner || typeof owner.uuid !== 'string' || !player?.uuid) throw new Error('Invalid packing owner or actor')
+    if (owner.scope === 'custom' || owner.uuid.startsWith('vault:')) {
+      const name = owner.vaultName || owner.uuid.slice(6)
+      const warehouse = this.db.getCustomWarehouse(name)
+      if (!warehouse || owner.uuid !== `vault:${warehouse.nameLower}` || !this.db.isCustomWarehouseMember(name, player.uuid)) {
+        throw new Error('Packing owner identity or warehouse membership is invalid')
+      }
+    } else if (owner.scope !== 'personal' || owner.uuid !== player.uuid) throw new Error('Packing owner does not belong to actor')
+  }
+
+  async recoverOwnPacking () {
+    if (this.taskPool?.hasInFlightPacking?.(this.botId)) await this.taskPool.waitForPackingDrain(this.botId)
+    if (!this.db.hasPendingPacking?.(this.botId)) return null
+    if (this.connectionInvalidated) throw new Error('连接已失效，装盒恢复留待原机器人重连。')
+    const controller = this.getPackingController()
+    const recover = async () => {
+      try { return await controller.recover() } catch (error) {
+        // An unresolved journal with proven empty inventory is not a global or
+        // per-bot quarantine. Physical residue, however, cannot enter momo or a
+        // subsequent player's ordinary task.
+        if (this.connectionInvalidated || controller.isBusy()) throw error
+        const clean = await this.warehouse.withWarehouseLock(async () => {
+          const check = () => {
+            if (this.connectionInvalidated) throw error
+            this.warehouse.assertConnectionHealthy?.()
+          }
+          return !(await controller.storage.player(check)).length
+        })
+        if (!clean) throw error
+        return { status: 'recovery_required', operationId: error.operationId, inventoryClean: true }
+      }
+    }
+    return this.taskPool?.withPackingRecoveryLease ? this.taskPool.withPackingRecoveryLease(this, recover) : recover()
   }
 
   async handleCraft (username, text, storageOwner = null) {
@@ -4091,6 +4163,7 @@ class CloudStoreService {
   }
 
   async flushResidual () {
+    if (!this.active?.packingInventoryClean && (this.db.hasPendingPacking?.(this.botId) || this.taskPool?.hasInFlightPacking?.(this.botId))) await this.recoverOwnPacking()
     if (this.db.hasPendingCraft?.(this.botId)) throw new Error('存在合成恢复记录，禁止将其残留物记入 momo；请执行 !合成恢复。')
     const held = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
     const task = this.db.getRecoveryTask(this.botId)

@@ -27,6 +27,8 @@ class BotTaskPool {
     // or unregisters a disconnected worker. Its network calls may still drain.
     this.inFlight = new Map()
     this.drainWaiters = new Set()
+    this.packingDrainWaiters = new Set()
+    this.packingRecoveryLeases = new Set()
     this.warehouseMutex = new AsyncMutex()
     this.warehouseState = { revision: 0, chestRevisions: new Map() }
   }
@@ -97,21 +99,51 @@ class BotTaskPool {
   eligibleWorkerForTask (task) {
     // Craft recovery is bound to the bot that owns its physical inventory and
     // durable journal. Unlike ordinary private tasks, it must never fall back.
-    if (task.type === 'craft_recovery') {
+    if (task.type === 'craft_recovery' || task.type === 'packing_recovery') {
       const original = task.stickyWorker
       const sticky = this.workers.has(original) ? original : original?.botId
         ? [...this.workers].find(worker => worker.botId === original.botId)
         : null
       if (!sticky) return null
       return sticky.ready && !sticky.connectionInvalidated && !sticky.active && !this.inFlight.has(sticky) &&
+        !(sticky.botId && this.hasInFlightPacking(sticky.botId)) &&
         !(sticky.botId && this.hasInFlightCraft(sticky.botId)) && !sticky.recoveringFromDeath && !sticky.emergencyRescueActive ? sticky : null
     }
     // 私聊进来的业务任务绑定接收私信的机器人；该机器人掉线后退回任意空闲机器人，避免任务卡死。
     if (task.stickyWorker && this.workers.has(task.stickyWorker)) {
       const sticky = task.stickyWorker
-      return sticky.ready && !sticky.active && !this.inFlight.has(sticky) && !sticky.recoveringFromDeath && !sticky.emergencyRescueActive ? sticky : null
+      return sticky.ready && !sticky.active && !this.inFlight.has(sticky) && !(sticky.botId && this.hasInFlightPacking(sticky.botId)) && !sticky.recoveringFromDeath && !sticky.emergencyRescueActive ? sticky : null
     }
-    return [...this.workers].find(candidate => candidate.ready && !candidate.active && !this.inFlight.has(candidate) && !candidate.recoveringFromDeath && !candidate.emergencyRescueActive) || null
+    return [...this.workers].find(candidate => candidate.ready && !candidate.active && !this.inFlight.has(candidate) && !(candidate.botId && this.hasInFlightPacking(candidate.botId)) && !candidate.recoveringFromDeath && !candidate.emergencyRescueActive) || null
+  }
+
+  hasInFlightPacking (botId = '') {
+    return [...this.packingRecoveryLeases].some(worker => !botId || worker.botId === botId) || [...this.inFlight].some(([worker, task]) =>
+      (task.type === 'packing' || task.type === 'packing_recovery') && (!botId || worker.botId === botId))
+  }
+
+  async withPackingRecoveryLease (worker, fn) {
+    if (this.hasInFlightPacking(worker.botId)) throw new Error('Previous packing calls must drain before lifecycle recovery')
+    this.packingRecoveryLeases.add(worker)
+    try { return await fn() } finally {
+      this.packingRecoveryLeases.delete(worker)
+      this.resolvePackingDrainWaiters()
+      this.dispatch()
+    }
+  }
+
+  waitForPackingDrain (botId = '') {
+    if (!this.hasInFlightPacking(botId)) return Promise.resolve()
+    return new Promise(resolve => this.packingDrainWaiters.add({ botId, resolve }))
+  }
+
+  resolvePackingDrainWaiters () {
+    for (const waiter of this.packingDrainWaiters) {
+      if (!this.hasInFlightPacking(waiter.botId)) {
+        this.packingDrainWaiters.delete(waiter)
+        waiter.resolve()
+      }
+    }
   }
 
   hasInFlightCraft (botId = '') {
@@ -186,6 +218,7 @@ class BotTaskPool {
     } finally {
       this.inFlight.delete(worker)
       this.resolveCraftDrainWaiters()
+      this.resolvePackingDrainWaiters()
       this.dispatch()
     }
   }
