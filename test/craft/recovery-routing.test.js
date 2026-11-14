@@ -82,7 +82,11 @@ test('a new craft first recovers its own pending journal before the upstream glo
       assertNoPendingCraft: () => { if (pending) throw new Error('pending craft recovery owner') },
       runWithCommandContext: (_id, fn) => fn(), runWithBotContext: (_context, fn) => fn()
     },
-    getCraftController: () => ({ recover: async () => { assert.equal(service.active, undefined); recovered++; pending = false } })
+    getCraftController: () => ({ recover: async () => {
+      assert.equal(service.active?.type, 'craft')
+      assert.equal(service.active?.cancelled, false)
+      recovered++; pending = false
+    } })
   })
   await service.runExclusive('Alice', 'craft', () => { ran = true }, { exclusive: true })
   assert.equal(recovered, 1)

@@ -206,3 +206,88 @@ test('service replacement waits for disconnected direct recovery network calls b
   assert.equal((await recovery).status, 'failed')
   assert.equal(pool.hasInFlightPacking('bot-a'), false)
 })
+
+test('reconnect does not let packing recovery claim an ordinary owner handoff', async t => {
+  const f = fixture(); t.after(() => f.close())
+  const controller = f.controller()
+  const withdraw = f.warehouse.withdrawAllocationsLocked.bind(f.warehouse)
+  f.warehouse.withdrawAllocationsLocked = async (...args) => {
+    const result = await withdraw(...args)
+    controller.cancel('packing disconnected after physical withdrawal')
+    return result
+  }
+  await assert.rejects(controller.run(f.request), /packing disconnected/)
+  const operation = controller.ledger.pending('bot-a')[0]
+  assert.equal(operation.phase, 'withdrawing')
+  const originalHeld = f.player.slots.map(require('./helpers/packing-server').copy)
+  f.player.slots.fill(null); f.sync()
+
+  const ordinary = new Service(f.bot, f.db, f.catalog, f.warehouse, f.config)
+  ordinary.botId = 'bot-a'; ordinary.getPackingController = () => controller
+  await assert.rejects(ordinary.runExclusive('Bob', 'deposit', async () => {
+    originalHeld.forEach((value, slot) => f.player.updateSlot(slot, require('./helpers/packing-server').copy(value)))
+    f.sync()
+    ordinary.saveRecoveryTask('deposit', 'Bob', { uuid: 'bob', username: 'Bob', scope: 'personal' }, 'Bob')
+    throw new Error('ordinary connection interrupted')
+  }), /ordinary connection interrupted/)
+
+  const replacement = new Service(f.bot, f.db, f.catalog, f.warehouse, f.config)
+  replacement.botId = 'bot-a'; replacement.getPackingController = () => f.controller()
+  f.bot.chat = () => {}
+  f.warehouse.goHome = async () => {}
+  f.warehouse.depositInventoryForOwner = async () => {
+    const deposited = f.catalog.aggregatePrismarineItems(f.bot.inventory.items())
+    f.player.slots.fill(null); f.sync()
+    return { deposited, leftover: [] }
+  }
+  await replacement.recoverPersistedTaskOnSpawn()
+  assert.equal(f.db.getRecoveryTask('bot-a'), null)
+  assert.equal(f.db.getOwnerBalances('bob').length, 0)
+  assert.equal(f.player.items().length, 0)
+  assert.equal(controller.ledger.pending('bot-a')[0].id, operation.id)
+  assert.equal(f.db.db.prepare('SELECT count(*) AS n FROM inventory_reservations WHERE reservation_id=?').get(operation.id).n > 0, true)
+})
+
+test('death during packing preflight cancels the ordinary task before it starts', async t => {
+  const f = fixture({ refuseReturn: true }); t.after(() => f.close())
+  const controller = f.controller()
+  await assert.rejects(controller.run(f.request))
+  f.player.slots.fill(null); f.sync()
+  const service = new Service(f.bot, f.db, f.catalog, f.warehouse, f.config)
+  service.botId = 'bot-a'; service.getPackingController = () => controller
+  f.bot.clearControlStates = () => {}
+  let enteredResolve
+  const entered = new Promise(resolve => { enteredResolve = resolve })
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  const originalPlayer = controller.storage.player.bind(controller.storage)
+  controller.storage.player = async check => {
+    enteredResolve()
+    await gate
+    return originalPlayer(check)
+  }
+  let ran = false
+  const task = service.runExclusive('Bob', 'withdraw', async () => { ran = true })
+  await entered
+  service.handleDeath()
+  release()
+  await assert.rejects(task)
+  assert.equal(ran, false)
+})
+
+test('terminal packing recovery clears an obsolete inventory handoff marker', async () => {
+  let pending = true
+  let cleared = 0
+  const service = Object.assign(Object.create(Service.prototype), {
+    botId: 'bot-a', connectionInvalidated: false, taskPool: null,
+    bot: { inventory: { items: () => [] } },
+    catalog: { aggregatePrismarineItems: () => [] },
+    db: {
+      hasPendingPacking: () => pending,
+      clearPackingInventoryHandoff: () => { cleared++ }
+    },
+    getPackingController: () => ({ recover: async () => { pending = false; return { status: 'failed' } } })
+  })
+  assert.deepEqual(await service.recoverOwnPacking(), { status: 'failed' })
+  assert.equal(cleared, 1)
+})
