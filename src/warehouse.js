@@ -5,7 +5,7 @@ const { sleep, sumBy, notchYawDeg, notchPitchDeg } = require('./utils')
 const { logLocalError } = require('./localErrorLog')
 const { isFatalProtocolReadError } = require('./botConnection')
 const { traceEvent, shortKey } = require('./traceLog')
-const { openServerContainer, readServerContainer } = require('./craft/server-container-evidence')
+const { openServerContainer, readServerContainer, snapshotCraftWindow } = require('./craft/server-container-evidence')
 const { createConfirmedDepositor } = require('./craft/confirmed-deposit')
 const { planCraftChestRoute } = require('./craft/withdraw-route')
 
@@ -373,6 +373,38 @@ class Warehouse {
       error.uncertainTransfer = true
       throw error
     }
+  }
+
+  // Reuse the already confirmed craft barrel window when every piece of
+  // evidence still lines up. If anything changed, close it and take one fresh
+  // authoritative snapshot before continuing; an uncertain transfer never
+  // proceeds on a stale client window.
+  async reuseOrReopenCraftContainer (chest, container, evidence) {
+    if (evidence?.isReusable?.()) return { container, evidence }
+
+    const local = snapshotCraftWindow(container, this.catalog, this.bot)
+    evidence?.dispose?.()
+    this.closeContainerQuietly(container)
+
+    let reopened
+    try {
+      reopened = await openServerContainer(this, chest, this.catalog, this.bot, { keepEvidence: true })
+    } catch (error) {
+      error.uncertainTransfer = true
+      throw error
+    }
+    const botMatches = local?.botPlayerItems == null || this.sameCraftItems(reopened.playerItems, local.botPlayerItems)
+    const matches = local && this.sameCraftChestSlots(reopened.chestSlots, local.chestSlots) &&
+      this.sameCraftItems(reopened.playerItems, local.playerItems) && botMatches &&
+      !reopened.container.selectedItem && !this.bot.inventory.selectedItem
+    if (!matches) {
+      this.closeContainerQuietly(reopened.container)
+      reopened.evidence?.dispose?.()
+      const error = new Error('合成取料窗口失去服务端证据，重开后的木桶或背包快照仍不一致。')
+      error.uncertainTransfer = true
+      throw error
+    }
+    return reopened
   }
 
   sameCraftChestSlots (left, right) {
@@ -792,6 +824,7 @@ class Warehouse {
           decision: `定位到木桶 ${this.describeChest(chest)}（账本 ${group.recordedAmount} 个），走去打开`
         })
         let container
+        let evidence
         if (options.requireServerEvidence) {
           let snapshot
           try { snapshot = await openServerContainer(this, chest, this.catalog, this.bot) } catch (error) {
@@ -799,6 +832,7 @@ class Warehouse {
             throw error
           }
           container = snapshot.container
+          evidence = snapshot.evidence
           const recorded = this.db.listChestSlots().filter(row => row.chestId === chest.chestId && Number.isInteger(row.slot))
             .map(row => ({ slot: row.slot, itemKey: row.itemKey, amount: Number(row.amount) }))
           const localChest = this.containerContentItems(container).map(item => ({
@@ -957,6 +991,7 @@ class Warehouse {
           })
           throw error
         } finally {
+          evidence?.dispose?.()
           this.closeContainerQuietly(container)
         }
         if (options.requireServerEvidence && transferAttempted) await this.verifyCraftContainer(chest)
@@ -1036,14 +1071,16 @@ class Warehouse {
         decision: '合成批次按当前位置路线合并同一木桶访问'
       })
       let container
+      let evidence
       let transferAttempted = false
       try {
         let snapshot
-        try { snapshot = await openServerContainer(this, chest, this.catalog, this.bot) } catch (error) {
+        try { snapshot = await openServerContainer(this, chest, this.catalog, this.bot, { keepEvidence: true }) } catch (error) {
           error.uncertainTransfer = true
           throw error
         }
         container = snapshot.container
+        evidence = snapshot.evidence
         const recorded = this.db.listChestSlots().filter(row => row.chestId === chest.chestId && Number.isInteger(row.slot))
           .map(row => ({ slot: row.slot, itemKey: row.itemKey, amount: Number(row.amount) }))
         const localChest = this.containerContentItems(container).map(item => ({
@@ -1062,6 +1099,9 @@ class Warehouse {
 
         for (const entry of routeGroup.entries) {
           if (entry.remaining <= 0) continue
+          const ready = await this.reuseOrReopenCraftContainer(chest, container, evidence)
+          container = ready.container
+          evidence = ready.evidence
           const itemKey = entry.allocation.itemKey
           const available = this.countContainerItem(container, itemKey)
           if (available !== entry.group.recordedAmount) {
@@ -1078,14 +1118,19 @@ class Warehouse {
             withdrawn.push({ ...entry.itemInfo, amount: moved })
           }
         }
-        if (transferAttempted) this.refreshChestSnapshot(chest, container)
+        if (transferAttempted) {
+          const ready = await this.reuseOrReopenCraftContainer(chest, container, evidence)
+          container = ready.container
+          evidence = ready.evidence
+          this.refreshChestSnapshot(chest, container)
+        }
       } catch (error) {
         if (transferAttempted) error.uncertainTransfer = true
         throw error
       } finally {
+        evidence?.dispose?.()
         this.closeContainerQuietly(container)
       }
-      if (transferAttempted) await this.verifyCraftContainer(chest)
     }
 
     for (const entry of entries) {
