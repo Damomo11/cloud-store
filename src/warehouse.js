@@ -258,11 +258,20 @@ class Warehouse {
     let emptyAttempts = 0
     let fullAttempts = 0
     let stopReason = ''
+    const craftVisited = options.craftBatch ? new Set() : null
+    let craftRoutePosition = options.craftBatch
+      ? (this.bot.entity?.position || this.homePosition || null)
+      : null
 
     while (this.bot.inventory.items().length) {
-      const chest = this.nextDepositChest(skippedNoProgress, {
+      const skipped = craftVisited
+        ? new Set([...skippedNoProgress, ...craftVisited])
+        : skippedNoProgress
+      const chest = this.nextDepositChest(skipped, {
         allowEmpty: emptyAttempts < maxEmptyAttempts,
-        allowFull: fullAttempts < maxFullAttempts
+        allowFull: fullAttempts < maxFullAttempts,
+        craftBatch: Boolean(options.craftBatch),
+        routePosition: craftRoutePosition
       })
       if (!chest) {
         stopReason = `没有本地记录可用的入库木桶；已尝试空槽木桶 ${emptyAttempts} 个、满记录木桶 ${fullAttempts} 个。请管理员执行 !同步 后再试。`
@@ -328,6 +337,11 @@ class Warehouse {
         this.refreshChestSnapshot(chest, container)
       } finally {
         this.closeContainerQuietly(container)
+      }
+
+      if (craftVisited) {
+        craftVisited.add(chest.chestId)
+        craftRoutePosition = { x: chest.x, y: chest.y, z: chest.z }
       }
 
       if (options.requireServerEvidence) await this.verifyCraftContainer(chest)
@@ -440,8 +454,26 @@ class Warehouse {
           ? candidates.filter(chest => chest.emptySlots > 0)
           : (options.allowFull ? fullRecordCandidates : []))
 
+    const origin = options.routePosition || this.bot.entity?.position || this.homePosition
+    const distanceSquared = chest => {
+      if (!origin || !Number.isFinite(Number(origin.x)) || !Number.isFinite(Number(origin.y)) || !Number.isFinite(Number(origin.z))) {
+        return Number.POSITIVE_INFINITY
+      }
+      const dx = Number(chest.x) - Number(origin.x)
+      const dy = Number(chest.y) - Number(origin.y)
+      const dz = Number(chest.z) - Number(origin.z)
+      return (dx * dx) + (dy * dy) + (dz * dz)
+    }
     const best = candidatePool
-      .sort((a, b) => b.score - a.score || b.sameItemFree - a.sameItemFree || b.emptySlots - a.emptySlots || a.chestId.localeCompare(b.chestId))[0] || null
+      .sort((a, b) => {
+        if (options.craftBatch) {
+          const sameCapacity = b.sameItemFree - a.sameItemFree
+          if (sameCapacity) return sameCapacity
+          const distance = distanceSquared(a) - distanceSquared(b)
+          if (distance) return distance
+        }
+        return b.score - a.score || b.sameItemFree - a.sameItemFree || b.emptySlots - a.emptySlots || a.chestId.localeCompare(b.chestId)
+      })[0] || null
     if (best) {
       this.debug(`deposit candidate ${this.describeChest(best)} sameFree=${best.sameItemFree} emptySlots=${best.emptySlots}`)
     }

@@ -939,7 +939,7 @@ class CraftController {
       })
       const baseline = this.physicalTotals()
       operation = this.ledger.checkpoint(operation.id, 'storing', { ...operation.data, held: before, physicalTotals: baseline })
-      const deposited = await this.warehouse.depositAllPossible({ requireServerEvidence: true, check })
+      const deposited = await this.warehouse.depositAllPossible({ requireServerEvidence: true, check, craftBatch: true })
       check()
       if (!same(this.physicalTotals(), baseline)) throw new Error('合成回库实物总量校验失败。')
       const held = this.inventory()
@@ -1075,7 +1075,7 @@ class CraftController {
       recoveryBaseline: baseline
     })
     this.debug('controller.recovery_return_start', { operationId: operation.id, items: this.summarizeItems(this.inventory()) })
-    const deposited = await this.warehouse.depositAllPossible({ requireServerEvidence: true })
+    const deposited = await this.warehouse.depositAllPossible({ requireServerEvidence: true, craftBatch: true })
     check()
     if (this.inventory().length) throw new Error('仓库空间不足，恢复的物品保留在机器人背包并等待恢复。')
     this.assertCleanInventory()
