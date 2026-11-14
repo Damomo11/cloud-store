@@ -2365,7 +2365,11 @@ class CloudStoreService {
       available: this.availableCraftStock(owner.uuid), config: this.config, forceCraft: true
     })
     if (!planned.ok) {
-      this.debugCraft('service.plan_rejected', { target: { name: resolved.name, quantity: parsed.quantity }, reason: planned.reason || 'unknown' })
+      this.debugCraft('service.plan_rejected', {
+        target: { name: resolved.name, quantity: parsed.quantity },
+        reason: planned.reason || 'unknown',
+        ...this.summarizeCraftPlanRejection(planned.plan)
+      })
       this.msg(username, this.describeCraftRejection(planned, parsed))
       return
     }
@@ -2427,9 +2431,43 @@ class CloudStoreService {
   }
 
   describeCraftRejection (planned, parsed) {
-    if (planned.reason === 'needs_collection') return '仓库内原料不足，无法合成 ' + parsed.itemName + '（只使用散装库存，不采集）。'
+    const details = this.formatCraftPlanRejection(planned.plan)
+    if (planned.reason === 'needs_collection') {
+      return '仓库内原料不足，无法合成 ' + parsed.itemName + details + '（只使用已登记散装库存，不会自动采集）。'
+    }
     if (planned.reason === 'already_in_warehouse') return '仓库里已有足够 ' + parsed.itemName + '，无需合成。'
-    return '无法合成 ' + parsed.itemName + '：配方不可达、原料不足或合成配置无效。'
+    return '无法合成 ' + parsed.itemName + '：配方不可达、原料不足或合成配置无效' + details + '（只使用已登记散装库存，不会自动采集）。'
+  }
+
+  summarizeCraftPlanRejection (plan) {
+    const unreachable = Array.isArray(plan?.unreachable)
+      ? plan.unreachable.slice(0, 20).map(row => ({
+        name: row.name,
+        quantity: Number(row.quantity) || 0,
+        category: row.category || null,
+        reason: row.reason || null
+      }))
+      : []
+    const collectGaps = Array.isArray(plan?.collectGaps)
+      ? plan.collectGaps.slice(0, 20).map(row => ({
+        name: row.name,
+        quantity: Number(row.qty) || 0,
+        method: row.method || null
+      }))
+      : []
+    return { unreachable, collectGaps }
+  }
+
+  formatCraftPlanRejection (plan) {
+    const { unreachable, collectGaps } = this.summarizeCraftPlanRejection(plan)
+    const parts = []
+    if (unreachable.length) {
+      parts.push('；云仓不可达材料：' + unreachable.map(row => `${row.name}×${row.quantity}`).join('、'))
+    }
+    if (collectGaps.length) {
+      parts.push('；云仓缺少：' + collectGaps.map(row => `${row.name}×${row.quantity}`).join('、'))
+    }
+    return parts.join('')
   }
 
   async runCraftCommand (command) {

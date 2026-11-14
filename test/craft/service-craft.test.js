@@ -126,6 +126,27 @@ test('handleCraft explains a collection gap instead of starting a task', async (
   }
 })
 
+test('craft rejection explains the exact stock-only gaps', () => {
+  const fixture = createFixture()
+  try {
+    const message = fixture.service.describeCraftRejection({
+      reason: 'plan_unreachable',
+      plan: {
+        unreachable: [{
+          name: 'slime_ball', quantity: 1,
+          reason: '硬排除：怪物掉落/水生生物产物（slime_ball）一期不获取'
+        }],
+        collectGaps: []
+      }
+    }, { itemName: '粘性活塞' })
+    assert.match(message, /slime_ball/)
+    assert.match(message, /云仓/)
+    assert.match(message, /不会自动采集/)
+  } finally {
+    fixture.close()
+  }
+})
+
 test('handleCraft enqueues 3x3 recipes even without a configured table (autodiscovery)', async () => {
   const fixture = createFixture()
   try {

@@ -32,6 +32,25 @@ function assertWithdrawnInputs (actual, expected, withdrawal) {
   throw new Error('仓库原料取出失败或不足。')
 }
 
+function summarizePlanRejection (plan) {
+  const unreachable = Array.isArray(plan?.unreachable)
+    ? plan.unreachable.slice(0, 20).map(row => ({
+      name: row.name,
+      quantity: Number(row.quantity) || 0,
+      category: row.category || null,
+      reason: row.reason || null
+    }))
+    : []
+  const collectGaps = Array.isArray(plan?.collectGaps)
+    ? plan.collectGaps.slice(0, 20).map(row => ({
+      name: row.name,
+      quantity: Number(row.qty) || 0,
+      method: row.method || null
+    }))
+    : []
+  return { unreachable, collectGaps }
+}
+
 function converted (before, consumed, produced) {
   const result = new Map(merge(before).map(item => [item.itemKey, { ...item }]))
   for (const item of consumed) {
@@ -507,7 +526,11 @@ class CraftController {
         const planned = planToCraftCommand({ item: request.item, quantity: request.quantity, available: this.availableStock(request.owner.uuid), config: this.config, forceCraft: true })
         this.debug('controller.planning_complete', { elapsedMs: performance.now() - planningStartedAt, ok: planned.ok })
         if (!planned.ok) {
-          this.debug('controller.plan_rejected', { target: { name: request.item, quantity: request.quantity }, reason: planned.reason || 'unknown' })
+          this.debug('controller.plan_rejected', {
+            target: { name: request.item, quantity: request.quantity },
+            reason: planned.reason || 'unknown',
+            ...summarizePlanRejection(planned.plan)
+          })
           // A stocked target is not a failure: the planner already reported
           // already_in_warehouse for zero-craft-step plans, but any other
           // rejection (missing inputs, unreachable recipe) stops the order.
