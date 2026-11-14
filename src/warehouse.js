@@ -7,6 +7,7 @@ const { isFatalProtocolReadError } = require('./botConnection')
 const { traceEvent, shortKey } = require('./traceLog')
 const { openServerContainer, readServerContainer } = require('./craft/server-container-evidence')
 const { createConfirmedDepositor } = require('./craft/confirmed-deposit')
+const { planCraftChestRoute } = require('./craft/withdraw-route')
 
 class Warehouse {
   constructor (bot, db, catalog, config, warehouseMutex = null, warehouseState = null) {
@@ -637,6 +638,7 @@ class Warehouse {
   }
 
   async withdrawAllocationsLocked (allocations, options = {}) {
+    if (options.craftBatch) return this.withdrawCraftBatchAllocationsLocked(allocations, options)
     let packingSources = null
     if (Object.hasOwn(options, 'packingSourceChestIds')) {
       const ids = options.packingSourceChestIds
@@ -992,6 +994,108 @@ class Warehouse {
       missing: this.mergeItems(missing),
       unlocated: this.mergeItems(unlocated),
       searchedUnlocatedBarrels
+    }
+  }
+
+  async withdrawCraftBatchAllocationsLocked (allocations, options = {}) {
+    if (!options.requireServerEvidence) throw new Error('合成批次取料必须使用服务端实物证据。')
+
+    const entries = []
+    const missing = []
+    for (const allocation of allocations || []) {
+      if (allocation.withdrawMode === 'shulker_extract') throw new Error('合成取料只支持已登记的散装库存。')
+      const amount = Number(allocation.amount || 0)
+      if (amount <= 0) continue
+      const itemInfo = this.db.getItemByKey(allocation.itemKey)
+      if (!itemInfo) {
+        missing.push({ ...allocation })
+        continue
+      }
+      const groups = this.groupSlotsForWithdrawal(this.db.listSlotsForItemKey(allocation.itemKey))
+      if (!groups.length) throw new Error('合成取料缺少已登记的箱子槽位，等待人工核对。')
+      let remaining = amount
+      for (const group of groups) {
+        if (remaining <= 0) break
+        const planned = Math.min(remaining, group.recordedAmount)
+        if (planned <= 0) continue
+        entries.push({ allocation: { ...allocation }, itemInfo, group, remaining: planned })
+        remaining -= planned
+      }
+      if (remaining > 0) missing.push({ ...itemInfo, amount: remaining })
+    }
+
+    const route = planCraftChestRoute(entries, this.bot.entity?.position || this.homePosition)
+    const withdrawn = []
+    for (const routeGroup of route) {
+      const slot = routeGroup.slots[0]
+      const chest = { chestId: routeGroup.chestId, x: slot.x, y: slot.y, z: slot.z, blockName: slot.blockName }
+      this.trace('locate', 'craft_route_chest', {
+        chest: this.describeChest(chest),
+        itemCount: routeGroup.entries.length,
+        items: routeGroup.entries.map(entry => ({ item: entry.allocation.itemKey, amount: entry.remaining })),
+        decision: '合成批次按当前位置路线合并同一木桶访问'
+      })
+      let container
+      let transferAttempted = false
+      try {
+        let snapshot
+        try { snapshot = await openServerContainer(this, chest, this.catalog, this.bot) } catch (error) {
+          error.uncertainTransfer = true
+          throw error
+        }
+        container = snapshot.container
+        const recorded = this.db.listChestSlots().filter(row => row.chestId === chest.chestId && Number.isInteger(row.slot))
+          .map(row => ({ slot: row.slot, itemKey: row.itemKey, amount: Number(row.amount) }))
+        const localChest = this.containerContentItems(container).map(item => ({
+          ...this.catalog.fromPrismarineItem(item), slot: item.slot, amount: item.count
+        }))
+        const windowPlayer = this.catalog.aggregatePrismarineItems(container.items())
+        if (!this.sameCraftChestSlots(snapshot.chestSlots, recorded) || !this.sameCraftChestSlots(snapshot.chestSlots, localChest) ||
+          !this.sameCraftItems(snapshot.playerItems, windowPlayer) ||
+          !this.sameCraftItems(snapshot.playerItems, this.catalog.aggregatePrismarineItems(this.bot.inventory.items())) ||
+          container.selectedItem || this.bot.currentWindow !== container) {
+          this.closeContainerQuietly(container)
+          const error = new Error('合成取料开箱时服务端实物与背包记录不一致，等待人工核对。')
+          error.uncertainTransfer = true
+          throw error
+        }
+
+        for (const entry of routeGroup.entries) {
+          if (entry.remaining <= 0) continue
+          const itemKey = entry.allocation.itemKey
+          const available = this.countContainerItem(container, itemKey)
+          if (available !== entry.group.recordedAmount) {
+            const error = new Error('合成取料时箱子实物与记录不一致，等待人工核对。')
+            error.uncertainTransfer = true
+            throw error
+          }
+          const toTake = Math.min(entry.remaining, available)
+          if (toTake <= 0) continue
+          transferAttempted = true
+          const moved = await this.tryWithdrawExactFrom(container, itemKey, toTake, entry.group.slots.map(row => row.slot), options)
+          if (moved > 0) {
+            entry.remaining -= moved
+            withdrawn.push({ ...entry.itemInfo, amount: moved })
+          }
+        }
+        if (transferAttempted) this.refreshChestSnapshot(chest, container)
+      } catch (error) {
+        if (transferAttempted) error.uncertainTransfer = true
+        throw error
+      } finally {
+        this.closeContainerQuietly(container)
+      }
+      if (transferAttempted) await this.verifyCraftContainer(chest)
+    }
+
+    for (const entry of entries) {
+      if (entry.remaining > 0) missing.push({ ...entry.itemInfo, amount: entry.remaining })
+    }
+    return {
+      withdrawn: this.mergeItems(withdrawn),
+      missing: this.mergeItems(missing),
+      unlocated: [],
+      searchedUnlocatedBarrels: 0
     }
   }
 

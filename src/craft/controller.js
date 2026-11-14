@@ -611,7 +611,7 @@ class CraftController {
               operation = this.ledger.checkpoint(id, 'withdrawing', data)
               this.debug('controller.withdraw_start', { operationId: id, stepId, items: this.summarizeItems(inputs) })
               const withdrawal = await this.measurePhase('withdraw', { operationId: id, stepId },
-                () => this.warehouse.withdrawAllocationsLocked(inputs, { requireServerEvidence: true }))
+                () => this.warehouse.withdrawAllocationsLocked(inputs, { requireServerEvidence: true, craftBatch: true }))
               const before = this.inventory()
               this.debug('controller.withdraw_confirmed', {
                 operationId: id,
@@ -845,7 +845,7 @@ class CraftController {
               stepIndex: index, trigger, progress: progressBefore }
             operation = this.ledger.checkpoint(id, 'withdrawing', data)
             const withdrawal = await this.measurePhase('withdraw', { operationId: id, stepId, resumed: true },
-              () => this.warehouse.withdrawAllocationsLocked(inputs, { requireServerEvidence: true }))
+              () => this.warehouse.withdrawAllocationsLocked(inputs, { requireServerEvidence: true, craftBatch: true }))
             const before = this.inventory()
             assertWithdrawnInputs(before, inputs, withdrawal)
             check()
