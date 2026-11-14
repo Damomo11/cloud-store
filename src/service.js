@@ -339,7 +339,17 @@ class CloudStoreService {
   }
 
   async recoverPersistedTaskOnSpawn () {
-    if (this.db.hasPendingPacking?.(this.botId) || this.taskPool?.hasInFlightPacking?.(this.botId)) {
+    const pendingPacking = this.db.hasPendingPacking?.(this.botId) || this.taskPool?.hasInFlightPacking?.(this.botId)
+    const handoff = this.db.getPackingInventoryHandoff?.(this.botId)
+    let task = this.db.getRecoveryTask?.(this.botId) || null
+    if (pendingPacking && !handoff) {
+      await this.recoverOwnPacking()
+      return
+    }
+    if (pendingPacking && handoff && !task) {
+      const held = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
+      if (held.length) throw new Error('普通任务交接后的背包归属无法确认，保留实物等待人工处理。')
+      this.db.clearPackingInventoryHandoff?.(this.botId)
       await this.recoverOwnPacking()
       return
     }
@@ -353,7 +363,6 @@ class CloudStoreService {
       await recoverAndResumeCraft(this, this.getCraftController())
       return
     }
-    const task = this.db.getRecoveryTask(this.botId)
     const held = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
     const pendingRecord = this.db.getShulkerRepackRecovery?.(this.botId) || null
     const pendingRepack = this.resolvePreparedShulkerRepackRecovery()
@@ -383,6 +392,10 @@ class CloudStoreService {
     if (!held.length && !pendingRepack && !(task.type === 'withdraw' && this.isWithdrawDeliveryPhase(task.phase) && task.items?.length)) {
       console.warn(`[disconnect-recovery] clearing stale recovery task without held items: ${task.type}:${task.actorUsername}:${task.phase}`)
       this.db.clearRecoveryTask(this.botId)
+      if (handoff) {
+        this.db.clearPackingInventoryHandoff?.(this.botId)
+        if (pendingPacking) await this.recoverOwnPacking()
+      }
       return
     }
 
@@ -436,6 +449,16 @@ class CloudStoreService {
       }
 
       this.db.clearRecoveryTask(this.botId)
+      if (handoff) {
+        const remaining = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
+        if (remaining.length) {
+          console.warn(`[disconnect-recovery] keeping packing handoff while ordinary recovery still holds inventory: ${this.formatItemList(remaining)}`)
+          traceSummary(trace, { status: 'done', reason: 'disconnect', packingHandoff: 'held_inventory' })
+          return
+        }
+        this.db.clearPackingInventoryHandoff?.(this.botId)
+        if (pendingPacking) await this.recoverOwnPacking()
+      }
       traceSummary(trace, { status: 'done', reason: 'disconnect' })
     } catch (error) {
       traceEvent(trace, 'error', 'recovery_error', { message: error?.message || String(error) })
@@ -1075,25 +1098,32 @@ class CloudStoreService {
   }
 
   async runExclusive (username, type, fn, extra = {}) {
-    const packingRecovery = type !== 'packing' && type !== 'packing_recovery' &&
-      (this.db.hasPendingPacking?.(this.botId) || this.taskPool?.hasInFlightPacking?.(this.botId))
-      ? await this.recoverOwnPacking() : null
-    // The task pool already owns this craft's exclusive lease. Recover directly
-    // before setting active; enqueueing another exclusive task here would wait
-    // on this very task. Other bots' journals retain the upstream global guard.
-    if (type === 'craft' && this.db.hasPendingCraft?.(this.botId)) {
-      if (this.connectionInvalidated) throw new Error('连接已失效，合成恢复留待原机器人重连。')
-      await this.withBotContext(() => recoverAndResumeCraft(this, this.getCraftController()))
-    }
-    if (type !== 'craft_recovery') this.db.assertNoPendingCraft?.()
-    const migration = this.db.runDeferredMigrations?.()
-    if (migration?.catalogError || migration?.offlineIdentityError) {
-      throw new Error('恢复后的库存身份迁移尚未完成，请检查日志并重试。')
-    }
     const active = { type, username, cancelled: false, dead: false, phase: 'start', player: null, ...extra,
-      ...(packingRecovery?.inventoryClean ? { packingInventoryClean: true } : {}) }
+      packingInventoryClean: false }
     this.active = active
     try {
+      const handoff = this.db.getPackingInventoryHandoff?.(this.botId)
+      const pendingPacking = this.db.hasPendingPacking?.(this.botId) || this.taskPool?.hasInFlightPacking?.(this.botId)
+      if (type !== 'packing' && type !== 'packing_recovery' && pendingPacking && handoff && this.db.getRecoveryTask?.(this.botId)) {
+        throw new Error('机器人存在待恢复的普通库存交接，暂不接收新任务。')
+      }
+      const packingRecovery = type !== 'packing' && type !== 'packing_recovery' && pendingPacking
+        ? await this.recoverOwnPacking() : null
+      if (active.cancelled || active.dead || this.connectionInvalidated) throw new Error('机器人生命周期已变化，任务已取消。')
+      // The task pool already owns this craft's exclusive lease. Recover directly
+      // before invoking the task; the preflight active context keeps death and
+      // disconnect cancellation visible while that recovery is awaiting I/O.
+      if (type === 'craft' && this.db.hasPendingCraft?.(this.botId)) {
+        if (this.connectionInvalidated) throw new Error('连接已失效，合成恢复留待原机器人重连。')
+        await this.withBotContext(() => recoverAndResumeCraft(this, this.getCraftController()))
+      }
+      if (active.cancelled || active.dead || this.connectionInvalidated) throw new Error('机器人生命周期已变化，任务已取消。')
+      if (type !== 'craft_recovery') this.db.assertNoPendingCraft?.()
+      const migration = this.db.runDeferredMigrations?.()
+      if (migration?.catalogError || migration?.offlineIdentityError) {
+        throw new Error('恢复后的库存身份迁移尚未完成，请检查日志并重试。')
+      }
+      Object.assign(active, packingRecovery?.inventoryClean ? { packingInventoryClean: true } : {})
       return await this.db.runWithCommandContext(active.commandLogId, () => this.withBotContext(fn))
     } catch (error) {
       if (error && typeof error === 'object' && !error.commandContext) {
@@ -1102,6 +1132,11 @@ class CloudStoreService {
       throw error
     } finally {
       if (active.reservationId) this.db.releaseInventoryReservation(active.reservationId)
+      if (active.packingInventoryClean && !this.db.getRecoveryTask?.(this.botId)) {
+        try {
+          if (!this.catalog.aggregatePrismarineItems(this.bot.inventory.items()).length) this.db.clearPackingInventoryHandoff?.(this.botId)
+        } catch {}
+      }
       if (this.active === active) this.active = null
     }
   }
@@ -2290,10 +2325,20 @@ class CloudStoreService {
           return !(await controller.storage.player(check)).length
         })
         if (!clean) throw error
+        const operationId = error.operationId || controller.ledger.pending(this.botId)[0]?.id
+        if (operationId) this.db.beginPackingInventoryHandoff?.(this.botId, operationId)
         return { status: 'recovery_required', operationId: error.operationId, inventoryClean: true }
       }
     }
-    return this.taskPool?.withPackingRecoveryLease ? this.taskPool.withPackingRecoveryLease(this, recover) : recover()
+    const result = await (this.taskPool?.withPackingRecoveryLease
+      ? this.taskPool.withPackingRecoveryLease(this, recover)
+      : recover())
+    if (!this.db.hasPendingPacking?.(this.botId) && !this.taskPool?.hasInFlightPacking?.(this.botId)) {
+      try {
+        if (!this.catalog.aggregatePrismarineItems(this.bot.inventory.items()).length) this.db.clearPackingInventoryHandoff?.(this.botId)
+      } catch {}
+    }
+    return result
   }
 
   async handleCraft (username, text, storageOwner = null) {

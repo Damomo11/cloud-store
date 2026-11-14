@@ -267,6 +267,13 @@ class StoreDb {
         updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
 
+      CREATE TABLE IF NOT EXISTS packing_inventory_handoffs (
+        bot_id TEXT PRIMARY KEY,
+        operation_id TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+
       CREATE TABLE IF NOT EXISTS shulker_repack_recovery (
         bot_id TEXT PRIMARY KEY,
         state TEXT NOT NULL DEFAULT 'prepared',
@@ -763,6 +770,28 @@ class StoreDb {
 
   clearRecoveryTask (botId = 'legacy') {
     this.db.prepare('DELETE FROM bot_recovery_tasks WHERE bot_id = ?').run(String(botId || 'legacy'))
+  }
+
+  beginPackingInventoryHandoff (botId, operationId) {
+    const id = String(botId || 'legacy')
+    const operation = String(operationId || '')
+    if (!operation) throw new Error('Packing inventory handoff requires an operation')
+    this.db.prepare(`
+      INSERT INTO packing_inventory_handoffs (bot_id, operation_id, updated_at)
+      VALUES (?, ?, CURRENT_TIMESTAMP)
+      ON CONFLICT(bot_id) DO UPDATE SET operation_id=excluded.operation_id, updated_at=CURRENT_TIMESTAMP
+    `).run(id, operation)
+  }
+
+  getPackingInventoryHandoff (botId = 'legacy') {
+    return this.db.prepare(`
+      SELECT bot_id AS botId, operation_id AS operationId, created_at AS createdAt, updated_at AS updatedAt
+      FROM packing_inventory_handoffs WHERE bot_id=?
+    `).get(String(botId || 'legacy')) || null
+  }
+
+  clearPackingInventoryHandoff (botId = 'legacy') {
+    this.db.prepare('DELETE FROM packing_inventory_handoffs WHERE bot_id=?').run(String(botId || 'legacy'))
   }
 
   beginShulkerRepackRecovery (botId, details) {
