@@ -101,7 +101,7 @@ test('recovery parks the backpack first, then confirms the interrupted conversio
     const result = await f.controller.recover()
     assert.equal(result.status, 'recovered')
     assert.equal(f.deposits(), 1)
-    assert.deepEqual(f.depositOptions(), { requireServerEvidence: true })
+    assert.deepEqual(f.depositOptions(), { requireServerEvidence: true, craftBatch: true })
     assert.equal(f.openAttempts(), 0, 'recovery relies on server evidence collected while depositing')
     assert.equal(f.confirmed(), 1)
     assert.equal(f.db.getBalance('alice', f.before[0].itemKey), 0)
