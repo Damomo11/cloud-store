@@ -205,6 +205,14 @@ class ServuxClient {
       timer.unref?.()
       this.handshakeWaiter = finish
       try {
+        // 1.21.6+ 的 payload 协商：客户端需先通过 minecraft:register 声明支持的
+        // 通道（\0 分隔），否则协议转换/注册表环节会静默丢弃该通道双向的包。
+        // bot（mineflayer）不会替 mod 声明，这里自己发；老版本服务器会忽略它。
+        this.client.write('custom_payload', {
+          channel: 'minecraft:register',
+          data: Buffer.from(`${SERVUX_CHANNEL}\0`, 'utf8')
+        })
+        // 2. 再发 servux 握手请求
         writePayload(this.client, buildRegisterPacket())
       } catch {
         finish(false)
