@@ -40,12 +40,14 @@ function encodeBlockPos (x, y, z) {
   return Buffer.from(bytes)
 }
 
-// 注册包：varint(2) + named NBT compound { version: Int(2) }，手写字节避免依赖解析器版本。
+// 注册包：varint(2) + unnamed NBT compound { version: Int(2) }。
+// 1.20.5+ 的网络 NBT 是「无名根」（anonymousNbt）：compound 后直接跟条目，
+// 不带根名字段；服务器（26.3）按新 API 读取，发老式 named 根会解析不出内容。
 function buildRegisterPacket () {
   return Buffer.concat([
     writeVarInt(C2S_METADATA_REQUEST),
     Buffer.from([
-      0x0A, 0x00, 0x00, // TAG_Compound，根名 ""
+      0x0A, // TAG_Compound（无名根，直接条目）
       0x03, 0x00, 0x07, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6F, 0x6E, 0x00, 0x00, 0x00, 0x02, // TAG_Int "version" = 2
       0x00 // TAG_End
     ])
@@ -100,13 +102,30 @@ function readBlockPosFrom (buffer, offset) {
   }
 }
 
+// 发包：nmp 没有 writeChannel API，用原生 custom_payload 包写。
+function writePayload (client, data) {
+  client.write('custom_payload', { channel: SERVUX_CHANNEL, data })
+}
+
 // 回包负载：先试 GZIP 解压，失败回退裸 NBT（对齐 Servux 的 DataByteBufUtils.fromByteBuf）。
+// 1.20.5+ 网络回包是「无名根」NBT，而 prismarine-nbt.parse 只认 named 根。
+// 用字节特征确定性区分两种根（不猜）：
+//   unnamed 非空：0A + 条目tagId(≠00)…；unnamed 空：0A 00（仅 2 字节）
+//   named：0A + 根名长度（高位恒 00，标准实现根名极短）
+// unnamed 就在 0A 后补空根名（00 00）转 named 再解析。
 async function decodeBlockNbt (payload) {
   let buffer = payload
   try {
     buffer = zlib.gunzipSync(payload)
   } catch {
     // 非压缩数据，直接当裸 NBT 用
+  }
+  if (buffer.length < 2 || buffer[0] !== 0x0A) {
+    throw new Error(`非 compound 根 NBT（首字节 0x${(buffer[0] ?? -1).toString(16)}，长度 ${buffer.length}）`)
+  }
+  const isUnnamed = buffer.length === 2 || buffer[1] !== 0x00
+  if (isUnnamed) {
+    buffer = Buffer.concat([buffer.subarray(0, 1), Buffer.from([0x00, 0x00]), buffer.subarray(1)])
   }
   // 显式 big endian（Java 版网络 NBT）；不传格式时空 compound（0A 00 00 00）
   // 会被 prismarine-nbt 误判成基岩版 level.dat 头，空箱子必踩。
@@ -184,7 +203,7 @@ class ServuxClient {
       timer.unref?.()
       this.handshakeWaiter = finish
       try {
-        this.client.writeChannel(SERVUX_CHANNEL, buildRegisterPacket())
+        writePayload(this.client, buildRegisterPacket())
       } catch {
         finish(false)
       }
@@ -295,7 +314,7 @@ class ServuxClient {
       jobs.push(entry)
       this.inFlight++
       try {
-        this.client.writeChannel(SERVUX_CHANNEL, buildBlockEntityRequest(job.x, job.y, job.z))
+        writePayload(this.client, buildBlockEntityRequest(job.x, job.y, job.z))
       } catch (error) {
         const at = jobs.indexOf(entry)
         if (at >= 0) jobs.splice(at, 1)
