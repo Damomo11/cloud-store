@@ -8,6 +8,7 @@ const { traceEvent, shortKey } = require('./traceLog')
 const { openServerContainer, readServerContainer, snapshotCraftWindow } = require('./craft/server-container-evidence')
 const { createConfirmedDepositor } = require('./craft/confirmed-deposit')
 const { planCraftChestRoute } = require('./craft/withdraw-route')
+const { ServuxClient } = require('./servux')
 
 class Warehouse {
   constructor (bot, db, catalog, config, warehouseMutex = null, warehouseState = null) {
@@ -2703,11 +2704,22 @@ class Warehouse {
     const actualItems = []
     const snapshots = []
     const failures = []
-    for (let index = 0; index < blocks.length; index++) {
+    // 优先走 Servux 快路径（servux:litematics 隔空查方块实体 NBT）：不用跑路开箱。
+    // 通道不可用、单桶超时或解析失败的桶，回落到下面逐桶开箱的老路。
+    let openBlocks = blocks
+    if (blocks.length && this.config.timing?.servux?.enabled !== false) {
+      const servuxScan = await this.tryServuxScan(blocks)
+      if (servuxScan) {
+        snapshots.push(...servuxScan.snapshots)
+        for (const snapshot of servuxScan.snapshots) actualItems.push(...snapshot.slots)
+        openBlocks = servuxScan.fallbackBlocks
+      }
+    }
+    for (let index = 0; index < openBlocks.length; index++) {
       this.assertConnectionHealthy()
-      const block = blocks[index]
+      const block = openBlocks[index]
       const chest = this.blockToChest(block)
-      this.debug(`sync open ${index + 1}/${blocks.length} ${this.describeChest(chest)}`)
+      this.debug(`sync open ${index + 1}/${openBlocks.length} ${this.describeChest(chest)}`)
       const preReadSeq = this.warehouseState.revision
       let container
       try {
@@ -2751,6 +2763,93 @@ class Warehouse {
     }
 
     return { radius, blocks, snapshots, actualItems }
+  }
+
+  // Servux 快路径扫描：握手成功则批量隔空查每个木桶的方块实体 NBT（含 Items），
+  // 不跑路不开箱。返回 null 表示通道不可用（调用方整体回退开箱）；否则
+  // fallbackBlocks 里是查询失败/解析失败、需要逐桶开箱兜底的木桶。
+  async tryServuxScan (blocks) {
+    const settings = this.config.timing?.servux || {}
+    const client = new ServuxClient(this.bot._client, {
+      handshakeTimeoutMs: Number(settings.handshakeTimeoutMs ?? 5000),
+      perTick: Number(settings.perTickPackets ?? 4),
+      maxInFlight: Number(settings.maxInFlight ?? 100),
+      requestTimeoutMs: Number(settings.requestTimeoutMs ?? 5000)
+    })
+    let usable = false
+    try {
+      usable = await client.handshake()
+    } catch (error) {
+      this.debug(`servux handshake error: ${error.message}`)
+    }
+    if (!usable) {
+      this.trace('sync', 'sync_servux_unavailable', {
+        decision: '服务器未响应 servux:litematics 握手，本次同步回退逐桶开箱'
+      })
+      client.destroy()
+      return null
+    }
+
+    const snapshots = []
+    const fallbackBlocks = []
+    const { map: results } = await client.queryBlocks(blocks.map(block => block.position))
+    for (const block of blocks) {
+      const { x, y, z } = block.position
+      const outcome = results.get(`${x},${y},${z}`)
+      const chest = this.blockToChest(block)
+      if (!outcome?.ok) {
+        fallbackBlocks.push(block)
+        this.trace('sync', 'sync_servux_miss', {
+          chest: this.describeChest(chest),
+          reason: outcome?.reason || 'no_response',
+          decision: 'Servux 查询无响应/失败，该桶回退逐桶开箱读取'
+        })
+        continue
+      }
+      try {
+        const slots = this.servuxItemsToSlots(outcome.compound)
+        const preReadSeq = this.warehouseState.revision
+        snapshots.push({ chest, slots, preReadSeq })
+        this.debug(`servux read ${this.describeChest(chest)} slots=${slots.length} items=${slots.reduce((sum, item) => sum + item.amount, 0)}`)
+        this.trace('sync', 'sync_servux_barrel', {
+          chest: this.describeChest(chest),
+          slots: slots.length,
+          items: slots.reduce((sum, item) => sum + item.amount, 0)
+        })
+      } catch (error) {
+        fallbackBlocks.push(block)
+        this.trace('error', 'sync_servux_parse_failed', {
+          chest: this.describeChest(chest),
+          message: error.message,
+          decision: 'Servux 返回的 NBT 解析失败，该桶回退逐桶开箱读取'
+        })
+      }
+    }
+    client.destroy()
+    this.trace('sync', 'sync_servux_summary', {
+      total: blocks.length,
+      viaServux: snapshots.length,
+      fallback: fallbackBlocks.length,
+      decision: `Servux 快路径：${snapshots.length}/${blocks.length} 个木桶隔空读取，${fallbackBlocks.length} 个回退开箱`
+    })
+    return { snapshots, fallbackBlocks }
+  }
+
+  // Servux 方块实体 NBT 的 Items → 与开箱路径同形状的槽位列表。
+  servuxItemsToSlots (compound) {
+    const entries = Array.isArray(compound?.Items) ? compound.Items : []
+    const maxSlot = this.expectedContainerSlots()
+    const slots = []
+    for (const entry of entries) {
+      const slot = Number(entry?.Slot)
+      if (!Number.isInteger(slot) || slot < 0 || slot >= maxSlot) continue
+      slots.push({
+        ...this.catalog.fromServuxItem(entry),
+        slot,
+        amount: Number(entry.count ?? 1)
+      })
+    }
+    return slots
   }
 
   // 并行参与者：回仓就位后扫描分配到的分区。与协调 bot 共用同一份
