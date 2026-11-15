@@ -199,6 +199,10 @@ class PackingStorage {
       } catch (error) {
         if (this.bot.currentWindow) await this.clicker().close(snapshot.container)
         throw error
+      } finally {
+        // A sync may have read this barrel during an awaited transfer. Mark
+        // even uncertain returns before releasing the warehouse lock.
+        this.warehouse.noteChestMutation(chestId)
       }
       observed = await this.observeReturn(operation, check)
     }

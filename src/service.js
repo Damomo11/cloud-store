@@ -1023,6 +1023,11 @@ class CloudStoreService {
         this.msg(username, '合成仍在结束或等待恢复，已请求停止；请在操作结束后执行 !合成恢复，核对物品归属。')
         return false
       }
+      if (this.packingController?.isBusy() || this.db.hasPendingPacking?.(this.botId) || this.taskPool?.hasInFlightPacking?.(this.botId)) {
+        this.packingController?.cancel('管理员急救请求：装盒停止，物品保留原归属等待恢复。')
+        this.msg(username, '装盒仍在结束或等待恢复，已请求停止；物品保留原归属，不执行传送丢物。')
+        return false
+      }
       const cancelledQueued = this.taskPool?.cancelQueuedForWorker(this, 'emergency rescue') || 0
       if (cancelledQueued && this.config.debug) {
         console.log(`[emergency-rescue:${this.botId}] cancelled queued tasks=${cancelledQueued}`)
@@ -3213,7 +3218,8 @@ class CloudStoreService {
         const unresolvedAmount = this.totalAmount(result.unresolved)
         const failureText = result.failures.length ? `，失败${result.failures.length}` : ''
         const parallelText = result.botCount > 1 ? `，${result.botCount}台并行` : ''
-        this.msg(username, `同步完成：木桶${result.chestCount}，打开${result.openedChestCount}，重读${result.rescanCount || 0}${failureText}${parallelText}，多余${addedAmount}/${this.itemTypeCount(result.addedToMomo)}种，缺失${unresolvedAmount}/${this.itemTypeCount(result.unresolved)}种。详情见Web管理页。`)
+        const packingText = result.deferredForPacking?.length ? `，${result.deferredForPacking.length}种物品待装盒恢复结算后再对账` : ''
+        this.msg(username, `同步完成：木桶${result.chestCount}，打开${result.openedChestCount}，重读${result.rescanCount || 0}${failureText}${parallelText}，多余${addedAmount}/${this.itemTypeCount(result.addedToMomo)}种，缺失${unresolvedAmount}/${this.itemTypeCount(result.unresolved)}种${packingText}。详情见Web管理页。`)
         traceSummary(trace, {
           status: 'ok',
           chests: result.chestCount,
