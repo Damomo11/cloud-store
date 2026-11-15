@@ -2851,6 +2851,22 @@ class StoreDb {
       : this.db.prepare("SELECT 1 FROM packing_operations WHERE state NOT IN ('completed','failed') LIMIT 1").get())
   }
 
+  pendingPackingReconciliationKeys () {
+    const keys = new Set()
+    if (!this.hasPendingPacking()) return keys
+    const rows = this.db.prepare(`SELECT plan_json AS planJson, data_json AS dataJson FROM packing_operations
+      WHERE state NOT IN ('completed','failed') AND phase <> 'ready'`).all()
+    for (const row of rows) {
+      const plan = JSON.parse(row.planJson)
+      const data = JSON.parse(row.dataJson)
+      const batch = plan.boxes[data.batchIndex]
+      // These physical inputs may be outside barrels, or already converted to
+      // an uncommitted box. Only their exact keys await the packing receipt.
+      for (const item of [...batch.inputs, batch.box, ...(data.product ? [data.product] : [])]) keys.add(item.itemKey)
+    }
+    return keys
+  }
+
   pendingCraftBotIds () {
     if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='craft_operations'").get()) return []
     return this.db.prepare("SELECT DISTINCT bot_id AS botId FROM craft_operations WHERE state NOT IN ('completed','complete','failed') ORDER BY bot_id")
@@ -3682,7 +3698,7 @@ class StoreDb {
     return pairs
   }
 
-  resolveOpenInventoryMismatches (note = '') {
+  resolveOpenInventoryMismatches (note = '', excludedKeys = []) {
     return this.db.prepare(`
       UPDATE inventory_mismatches
       SET status = 'resolved',
@@ -3692,8 +3708,8 @@ class StoreDb {
             WHEN note = '' THEN ?
             ELSE note || '；' || ?
           END
-      WHERE status = 'open'
-    `).run(note, note, note).changes
+      WHERE status = 'open' ${excludedKeys.length ? `AND item_key NOT IN (${excludedKeys.map(() => '?').join(',')})` : ''}
+    `).run(note, note, note, ...excludedKeys).changes
   }
 
   reconcileTotalsToMomo (actualTotals, allowedOperationId = '') {
@@ -3716,10 +3732,11 @@ class StoreDb {
 
   reconcileTotalsToMomoAllowed (actualTotals, baselineTotals = null) {
     this.assertNoPendingCraft(this.transactionContext.getStore()?.craftOperationId || '')
-    const ledgerRows = this.getLedgerTotals()
+    const deferredKeys = this.pendingPackingReconciliationKeys()
+    const ledgerRows = this.getLedgerTotals().filter(row => !deferredKeys.has(row.itemKey))
     const ledger = new Map(ledgerRows.map(row => [row.itemKey, row]))
-    const actual = new Map(actualTotals.map(row => [row.itemKey, row]))
-    const baseline = baselineTotals ? new Map(baselineTotals.map(row => [row.itemKey, row])) : null
+    const actual = new Map(actualTotals.filter(row => !deferredKeys.has(row.itemKey)).map(row => [row.itemKey, row]))
+    const baseline = baselineTotals ? new Map(baselineTotals.filter(row => !deferredKeys.has(row.itemKey)).map(row => [row.itemKey, row])) : null
     const reference = baseline || ledger
     const keys = new Set([...reference.keys(), ...actual.keys()])
     const addedToMomo = []
@@ -3727,7 +3744,7 @@ class StoreDb {
     const unresolved = []
 
     this.transaction(() => {
-      if (!baseline) this.resolveOpenInventoryMismatches('新的同步已刷新库存异常状态。')
+      if (!baseline) this.resolveOpenInventoryMismatches('新的同步已刷新库存异常状态。', [...deferredKeys])
 
       // 指纹漂移配对：同内容的 missing/extra 潜影盒判定为同一只盒子的新旧两代
       // 指纹（拆盒重打包），把新指纹的账记回原主并留转移流水；两侧 Map 已在
@@ -3847,7 +3864,7 @@ class StoreDb {
       }
     })
 
-    return { addedToMomo, removedFromMomo, unresolved }
+    return { addedToMomo, removedFromMomo, unresolved, ...(deferredKeys.size ? { deferredForPacking: [...deferredKeys] } : {}) }
   }
 
   rowToItem (row) {
