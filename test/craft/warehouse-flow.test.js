@@ -139,6 +139,31 @@ function fixture () {
     counts: () => ({ withdrawCalls, depositCalls }) }
 }
 
+test('forced template duplication reuses reserved seeds across real controller batches and credits only net growth', async t => {
+  const { CraftController } = require('../../src/craft/controller')
+  const f = fixture(); t.after(() => f.db.close())
+  const name = 'netherite_upgrade_smithing_template'
+  const template = f.seed('alice', name, 12)
+  const diamond = f.seed('alice', 'diamond', 21)
+  const material = f.seed('alice', 'netherrack', 3)
+  const batches = []
+  const execute = f.executor.execute
+  f.executor.execute = async args => {
+    batches.push(args.triggers)
+    return execute(args)
+  }
+  const controller = new CraftController({ ...f, botId: 'bot-a' })
+  const result = await controller.run({ actor: 'Alice', owner: { uuid: 'alice', username: 'Alice', scope: 'personal' }, item: name, quantity: 3 })
+  assert.equal(result.status, 'complete')
+  assert.deepEqual(batches, [1, 2])
+  assert.equal(f.db.getBalance('alice', template.itemKey), 15)
+  assert.equal(f.stored.get(template.itemKey).count, 15)
+  assert.equal(f.db.getBalance('alice', diamond.itemKey), 0)
+  assert.equal(f.db.getBalance('alice', material.itemKey), 0)
+  assert.equal(controller.ledger.pending().length, 0)
+  assert.deepEqual(f.getInventory(), [])
+})
+
 test('batch budget fits ten pistons in one crafting transaction', async () => {
   const { CraftController } = require('../../src/craft/controller')
   const f = fixture()

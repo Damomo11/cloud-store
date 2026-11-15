@@ -43,3 +43,39 @@ test('initial storage read correlates the current barrel packet despite unrelate
   }
   assert.equal((await f.controller().run(f.request)).status, 'completed')
 })
+
+for (const delayed of [false, true]) test(`packing read cannot persist a full snapshot superseded by a chest-only slot update${delayed ? ' after the opening helper returns' : ''}`, async t => {
+  const f = fixture(); t.after(() => f.close())
+  const open = f.warehouse.openContainerAt
+  f.warehouse.openContainerAt = async chest => {
+    const window = await open(chest)
+    const update = () => {
+      window.updateSlot(0, null)
+      f.bot._client.emit('set_slot', { windowId: window.id, slot: 0, item: { itemCount: 0 } })
+    }
+    if (delayed) queueMicrotask(() => queueMicrotask(update))
+    else update()
+    return window
+  }
+  const before = f.db.listChestSlots()
+  await assert.rejects(f.controller().storage.read('source', () => {}))
+  assert.deepEqual(f.db.listChestSlots(), before)
+})
+
+test('packing read derives records from the latest full packet across the opening helper handoff', async t => {
+  const f = fixture(); t.after(() => f.close())
+  const Item = require('prismarine-item')(f.bot.registry)
+  const open = f.warehouse.openContainerAt
+  f.warehouse.openContainerAt = async chest => {
+    const window = await open(chest)
+    queueMicrotask(() => queueMicrotask(() => {
+      window.updateSlot(0, item('dirt', 3))
+      f.bot._client.emit('window_items', { windowId: window.id, stateId: 3,
+        items: window.slots.map(value => value ? Item.toNotch(value) : { itemCount: 0 }), carriedItem: { itemCount: 0 } })
+    }))
+    return window
+  }
+  const result = await f.controller().storage.read('source', () => {})
+  assert.equal(result.slots.find(value => value.slot === 0).itemId, 'minecraft:dirt')
+  assert.equal(result.slots.find(value => value.slot === 0).amount, 3)
+})

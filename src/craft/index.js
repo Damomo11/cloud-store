@@ -25,14 +25,26 @@ function planToCraftCommand ({ item, quantity, available, config, forceCraft = f
   const cleanName = String(item).replace(/^minecraft:/, '')
   // forceCraft keeps planning when the target is already stocked: the planner
   // would otherwise satisfy the request from available stock and return zero
-  // craft steps. Hiding the target's own stock makes it plan the full request;
-  // other items stay withdrawable as chain inputs.
+  // craft steps. Hide finished stock except the minimum reusable seed of a
+  // productive self-input recipe, such as template duplication. Request that
+  // seed in addition to the full new quantity so stock cannot offset the order.
   let planAvailable = available || {}
+  let planQuantity = quantity
   if (forceCraft && graph.getRecipesFor(cleanName).length) {
     planAvailable = { ...planAvailable }
+    const seeds = graph.getRecipesFor(cleanName).map(recipe => {
+      const seed = recipe.inputs.filter(input => input.names.length === 1 && input.names[0] === cleanName)
+        .reduce((count, input) => count + input.count, 0)
+      return seed > 0 && recipe.result.count > seed && planAvailable[cleanName] >= seed ? seed : 0
+    }).filter(Boolean)
     delete planAvailable[cleanName]
+    if (seeds.length) {
+      const seed = Math.min(...seeds)
+      planAvailable[cleanName] = seed
+      planQuantity += seed
+    }
   }
-  const plan = new CraftPlanner(graph).plan(cleanName, quantity, { available: planAvailable })
+  const plan = new CraftPlanner(graph).plan(cleanName, planQuantity, { available: planAvailable })
   if (!plan.ok) return { ok: false, reason: 'plan_unreachable', plan }
   if (plan.collectGaps?.length) return { ok: false, reason: 'needs_collection', plan }
   if (!plan.craftSteps?.length) return { ok: false, reason: 'already_in_warehouse', plan }
