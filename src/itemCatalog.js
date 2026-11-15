@@ -93,6 +93,30 @@ class ItemCatalog {
     }
   }
 
+  // Servux 方块实体 NBT 的 Items 条目 → 物品记录。components（map 形状）转成
+  // [{ type, data }] 数组以对齐开箱路径里 node-minecraft-protocol 的解析形状，
+  // 再复用 fromPrismarineItem，保证同一件物品两条路径算出同一个指纹。
+  fromServuxItem (entry) {
+    const name = String(entry?.id || '').replace(/^minecraft:/, '')
+    const data = this.mcData.itemsByName[name]
+    if (!data) throw new Error(`未知物品：${entry?.id}`)
+    const rawComponents = entry?.components && typeof entry.components === 'object' && !Array.isArray(entry.components)
+      ? entry.components
+      : null
+    const components = rawComponents
+      ? Object.entries(rawComponents).map(([key, value]) => ({ type: key.replace(/^minecraft:/, ''), data: value }))
+      : null
+    return this.fromPrismarineItem({
+      name,
+      count: Number(entry.count ?? 1),
+      type: data.id,
+      components,
+      removedComponents: null,
+      metadata: null,
+      nbt: null
+    })
+  }
+
   fromItemIdAmount (itemId, amount) {
     const normalized = this.normalizeItemId(itemId)
     const nbtJson = stableStringify(null)

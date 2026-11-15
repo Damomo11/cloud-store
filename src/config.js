@@ -76,6 +76,17 @@ const DEFAULT_CONFIG = {
     teleportRequestTimeoutMs: 15000,
     teleportDetectRadius: 8,
     reconnectDelayMs: 10000,
+    // Servux litematics 通道（服务器装了 Servux 才可用）：同步仓库时隔空查木桶
+    // 方块实体 NBT，替代逐桶跑路开箱。不可用/超时的桶自动回退开箱老路。
+    // perTickPackets：每游戏刻（50ms）最多发几个查询包；maxInFlight：在途（已发
+    // 未回）请求上限，达到就暂停发包等回包；requestTimeoutMs：单包等待上限。
+    servux: {
+      enabled: true,
+      handshakeTimeoutMs: 5000,
+      perTickPackets: 4,
+      maxInFlight: 100,
+      requestTimeoutMs: 5000
+    },
     // !热重载 等待所有机器人空闲的最长时间；超时后直接重启，进行中的任务会在重启后自动恢复。
     hotReloadIdleTimeoutMs: 600000,
     // !热重载 退出前是否由本进程自己拉起新代码进程。默认 false：推荐在 screen 循环/

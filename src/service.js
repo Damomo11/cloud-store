@@ -3,6 +3,7 @@ const { startTrace, traceEvent, traceSummary, traceStandalone, shortKey } = requ
 const { runHotReload } = require('./hotReload')
 const { planShortages, normalizeItemId } = require('./shortagePlanner')
 const { findWithdrawPinyinItems } = require('./withdrawPinyin')
+const { ServuxClient } = require('./servux')
 
 const REPAIR_BOTTLE_ITEM_ID = 'minecraft:experience_bottle'
 const REPAIR_BOTTLE_AMOUNT = 64
@@ -961,6 +962,11 @@ class CloudStoreService {
 
     if (text.startsWith('!同步仓库') || text.startsWith('!同步')) {
       await this.handleSync(username, text)
+      return
+    }
+
+    if (text.startsWith('!servux测速')) {
+      await this.handleServuxBenchmark(username, text)
       return
     }
 
@@ -3188,6 +3194,83 @@ class CloudStoreService {
       for (const service of borrowed) {
         if (service.active?.borrowedBySync === coordinator.botId) service.active = null
       }
+    }
+  }
+
+  // !servux测速 [数量]：管理员诊断用。对已登记木桶的坐标全速批量发 servux:litematics
+  // 查询（解除生产限速：每刻4个/在途100），实测通道每秒最多能收多少个回包，
+  // 顺带报往返延迟，方便对比生产配置（每刻 N 个 = N×20/秒）是否还有余量。
+  async handleServuxBenchmark (username, text) {
+    if (!this.isAdmin(username)) {
+      this.msg(username, '你没有权限使用测速命令。')
+      return
+    }
+    if (this.servuxBenchmarkRunning) {
+      this.msg(username, '测速还在跑，等这轮出结果再来喵。')
+      return
+    }
+    const chests = this.db.listChests()
+    if (!chests.length) {
+      this.msg(username, '还没有已登记的木桶，先执行 !同步仓库 登记之后才能测速。')
+      return
+    }
+    const parts = text.split(/\s+/).filter(Boolean)
+    const samples = clampInt(Number(parts[1]), 200, 50, 2000)
+    this.servuxBenchmarkRunning = true
+    this.msg(username, `开始 servux 测速：一口气发 ${samples} 个查询包，全在途、不等回包…`)
+    const client = new ServuxClient(this.bot._client, {
+      perTick: samples,
+      maxInFlight: samples,
+      requestTimeoutMs: 5000,
+      handshakeTimeoutMs: 5000
+    })
+    try {
+      const usable = await client.handshake()
+      if (!usable) {
+        this.msg(username, '测速失败：服务器没有响应 servux:litematics 通道（未装 Servux 或未启用）。')
+        return
+      }
+      const positions = []
+      for (let index = 0; index < samples; index++) {
+        const chest = chests[index % chests.length]
+        positions.push({ x: chest.x, y: chest.y, z: chest.z })
+      }
+      const startAt = Date.now()
+      const { list: outcomes } = await client.queryBlocks(positions)
+      const elapsedMs = Math.max(1, Date.now() - startAt)
+      let ok = 0
+      let timeouts = 0
+      let otherFails = 0
+      let rttMin = Infinity
+      let rttMax = 0
+      let rttSum = 0
+      let rttCount = 0
+      for (const outcome of outcomes) {
+        if (outcome?.ok) {
+          ok++
+          if (Number.isFinite(outcome.rttMs)) {
+            rttMin = Math.min(rttMin, outcome.rttMs)
+            rttMax = Math.max(rttMax, outcome.rttMs)
+            rttSum += outcome.rttMs
+            rttCount++
+          }
+        } else if (outcome?.reason === 'timeout') timeouts++
+        else otherFails++
+      }
+      const throughput = Math.round(ok / (elapsedMs / 1000))
+      const avgRtt = rttCount ? Math.round(rttSum / rttCount) : 0
+      const perTick = Number(this.config.timing?.servux?.perTickPackets ?? 4)
+      const configLimit = perTick * 20
+      console.log(`[servux] benchmark by ${username}: ${ok}/${samples} ok in ${elapsedMs}ms, ~${throughput}/s, rtt ${rttCount ? `${rttMin}~${rttMax}ms avg ${avgRtt}ms` : 'n/a'}`)
+      this.msg(username, [
+        `测速完成：${ok}/${samples} 成功${timeouts ? `，超时 ${timeouts}` : ''}${otherFails ? `，其他失败 ${otherFails}` : ''}；`,
+        `总耗时 ${(elapsedMs / 1000).toFixed(1)} 秒，最高吞吐约 ${throughput} 个/秒；`,
+        `往返 ${rttCount ? `${rttMin}~${rttMax}ms（平均 ${avgRtt}ms）` : '无数据'}。`,
+        `生产配置（每刻 ${perTick} 个）上限 ${configLimit} 个/秒：${throughput >= configLimit ? '通道余量充足，瓶颈在自身限速' : '通道更紧，别再调高每刻发包数'}。`
+      ].join(''))
+    } finally {
+      client.destroy()
+      this.servuxBenchmarkRunning = false
     }
   }
 
