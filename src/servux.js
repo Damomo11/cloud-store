@@ -40,17 +40,19 @@ function encodeBlockPos (x, y, z) {
   return Buffer.from(bytes)
 }
 
-// 注册包：varint(2) + unnamed NBT compound { version: Int(2) }。
-// 1.20.5+ 的网络 NBT 是「无名根」（anonymousNbt）：compound 后直接跟条目，
-// 不带根名字段；服务器（26.3）按新 API 读取，发老式 named 根会解析不出内容。
+// 注册包：varint(2) + FriendlyByteBuf.writeNbt 格式（1.21.5+）的 NBT。
+// writeNbt = varint(NBT字节数) + unnamed 根 compound；26.3 服务器 readNbt
+// 先读 varint 长度再读 NBT——缺长度头时会把 NBT 首字节 0x0A 当长度，静默丢弃。
 function buildRegisterPacket () {
+  const nbtBytes = Buffer.from([
+    0x0A, // TAG_Compound（无名根，直接条目）
+    0x03, 0x00, 0x07, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6F, 0x6E, 0x00, 0x00, 0x00, 0x02, // TAG_Int "version" = 2
+    0x00 // TAG_End
+  ])
   return Buffer.concat([
     writeVarInt(C2S_METADATA_REQUEST),
-    Buffer.from([
-      0x0A, // TAG_Compound（无名根，直接条目）
-      0x03, 0x00, 0x07, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6F, 0x6E, 0x00, 0x00, 0x00, 0x02, // TAG_Int "version" = 2
-      0x00 // TAG_End
-    ])
+    writeVarInt(nbtBytes.length),
+    nbtBytes
   ])
 }
 
