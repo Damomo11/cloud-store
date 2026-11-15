@@ -970,6 +970,11 @@ class CloudStoreService {
       return
     }
 
+    if (text.startsWith('!servux探测')) {
+      await this.handleServuxProbe(username)
+      return
+    }
+
     if (text === '!热重载') {
       // handleIncoming 已在更早处拦下 !热重载 并做了权限校验；
       // 这里只是兜底（如测试直接调 handleChat），不再重复校验权限。
@@ -3195,6 +3200,68 @@ class CloudStoreService {
         if (service.active?.borrowedBySync === coordinator.botId) service.active = null
       }
     }
+  }
+
+  // !servux探测：管理员诊断用。发 register + 握手，然后监听 6 秒内所有到达的
+  // custom_payload，报告：服务器下发的通道注册表（minecraft:register 回执）、
+  // servux:litematics 有无回包。用于劈开「包没到服务器」vs「回了没收着」。
+  async handleServuxProbe (username) {
+    if (!this.isAdmin(username)) {
+      this.msg(username, '你没有权限使用探测命令。')
+      return
+    }
+    const client = this.bot._client
+    const seen = new Map() // channel -> { count, bytes }
+    const registers = [] // 服务器下发的 S2C register 通道列表
+    const servuxPackets = []
+    const onPayload = packet => {
+      const channel = packet?.channel || '?'
+      const size = Buffer.isBuffer(packet.data) ? packet.data.length : -1
+      const entry = seen.get(channel) || { count: 0, bytes: 0 }
+      entry.count++
+      entry.bytes += Math.max(0, size)
+      seen.set(channel, entry)
+      if (channel === 'minecraft:register' && Buffer.isBuffer(packet.data)) {
+        registers.push(packet.data.toString('utf8').split('\0').filter(Boolean))
+      }
+      if (channel === 'servux:litematics' && Buffer.isBuffer(packet.data)) {
+        servuxPackets.push(packet.data.subarray(0, 16).toString('hex'))
+      }
+    }
+    client.on('custom_payload', onPayload)
+    this.msg(username, '探测开始：发 minecraft:register + servux 握手，监听 6 秒内所有插件通道包…')
+    try {
+      client.write('custom_payload', {
+        channel: 'minecraft:register',
+        data: Buffer.from('servux:litematics\0', 'utf8')
+      })
+      client.write('custom_payload', {
+        channel: 'servux:litematics',
+        data: Buffer.from([0x02, 0x10, 0x0A, 0x03, 0x00, 0x07, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6F, 0x6E, 0x00, 0x00, 0x00, 0x02, 0x00])
+      })
+    } catch (error) {
+      this.msg(username, `发包失败：${error.message}`)
+    }
+    await sleep(6000)
+    client.removeListener('custom_payload', onPayload)
+    const lines = []
+    lines.push(`6 秒内收到 ${[...seen.values()].reduce((sum, e) => sum + e.count, 0)} 个插件通道包，涉及 ${seen.size} 个通道：`)
+    for (const [channel, entry] of [...seen.entries()].sort((a, b) => b[1].count - a[1].count).slice(0, 12)) {
+      lines.push(`- ${channel}：${entry.count} 个 / ${entry.bytes} 字节`)
+    }
+    if (!seen.size) lines.push('（一个都没收到）')
+    if (registers.length) {
+      lines.push(`服务器注册表回执：${JSON.stringify([...new Set(registers.flat())])}`)
+    } else {
+      lines.push('没有收到服务器的 minecraft:register 回执。')
+    }
+    if (servuxPackets.length) {
+      lines.push(`servux:litematics 回包 ${servuxPackets.length} 个，首个前 16 字节：${servuxPackets[0]}`)
+    } else {
+      lines.push('servux:litematics 没有任何回包。')
+    }
+    console.log(`[servux] probe by ${username}: channels=${JSON.stringify([...seen.entries()])} registers=${JSON.stringify(registers)}`)
+    this.msg(username, lines.join('\n'))
   }
 
   // !servux测速 [数量]：管理员诊断用。对已登记木桶的坐标全速批量发 servux:litematics
