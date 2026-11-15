@@ -3215,7 +3215,7 @@ class CloudStoreService {
       return
     }
     const parts = text.split(/\s+/).filter(Boolean)
-    const samples = clampInt(Number(parts[1]), 200, 50, 2000)
+    const samples = clampInt(Number(parts[1]), 200, 10, 2000)
     this.servuxBenchmarkRunning = true
     this.msg(username, `开始 servux 测速：一口气发 ${samples} 个查询包，全在途、不等回包…`)
     const client = new ServuxClient(this.bot._client, {
