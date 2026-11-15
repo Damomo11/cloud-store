@@ -45,6 +45,17 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
     }
     return value
   }
+  const windowId = packet => packet.windowId ?? packet.containerId
+  const incrementalListeners = (id, invalidate) => {
+    const onSlot = packet => {
+      if ([id, 0, -1, 255, -2, 254].includes(windowId(packet))) invalidate()
+    }
+    return [
+      ['set_slot', onSlot], ['container_set_slot', onSlot],
+      ['set_cursor_item', invalidate], ['container_set_cursor_item', invalidate],
+      ['set_player_inventory', invalidate]
+    ]
+  }
 
   const click = async function (window, slot, mouseButton, mode, check, accept) {
     check()
@@ -116,8 +127,16 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
       wakeConfirmation = null
       resolve()
     }
+    const invalidate = () => { confirmed = null }
     const onContent = packet => {
-      if ((packet.windowId ?? packet.containerId) !== window.id) return
+      if (windowId(packet) !== window.id) {
+        if (windowId(packet) === 0) invalidate()
+        return
+      }
+      // Only the latest relevant response may authorize mirroring state. A
+      // later rejected/incomplete response must not leave an old acceptance.
+      invalidate()
+      decodeError = null
       responseCount++
       firstResponseMs ??= performance.now() - startedAt
       const raw = packet.items ?? packet.slots
@@ -141,8 +160,11 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
       } catch (cause) { decodeError = cause }
       if (confirmed || decodeError) wake()
     }
-    const listeners = ['window_items', 'container_set_content']
-    for (const name of listeners) bot._client.on(name, onContent)
+    const listeners = [
+      ['window_items', onContent], ['container_set_content', onContent],
+      ...incrementalListeners(window.id, invalidate)
+    ]
+    for (const [name, listener] of listeners) bot._client.on(name, listener)
     const expires = Date.now() + timeoutMs
     try {
       bot._client.write('window_click', { windowId: window.id, stateId: -1, slot, mouseButton, mode,
@@ -183,7 +205,7 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
       debug('executor.window_confirmation_failure', () => ({ ...diagnostics(), message: cause?.message || String(cause) }))
       throw cause
     } finally {
-      for (const name of listeners) bot._client.removeListener(name, onContent)
+      for (const [name, listener] of listeners) bot._client.removeListener(name, listener)
     }
   }
 
@@ -194,18 +216,20 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
     const startedAt = performance.now()
     let responseCount = 0
     let finished = false
+    let confirmed = false
     let timer
-    const listeners = ['window_items', 'container_set_content']
-    const finish = confirmed => {
+    const invalidate = () => { confirmed = false }
+    const finish = accepted => {
       if (finished) return
       finished = true
       clearTimeout(timer)
-      for (const name of listeners) bot._client.removeListener(name, content)
-      debug('executor.window_close_confirmed', { windowId: window.id, confirmed, elapsedMs: performance.now() - startedAt, responseCount })
-      resolve(confirmed)
+      for (const [name, listener] of listeners) bot._client.removeListener(name, listener)
+      debug('executor.window_close_confirmed', { windowId: window.id, confirmed: accepted, elapsedMs: performance.now() - startedAt, responseCount })
+      resolve(accepted)
     }
     const content = packet => {
-      if ((packet.windowId ?? packet.containerId) !== 0) return
+      if (windowId(packet) !== 0) return
+      invalidate()
       responseCount++
       const slots = packet.items ?? packet.slots
       if (!Array.isArray(slots) || slots.length !== bot.inventory.slots.length || !Object.hasOwn(packet, 'carriedItem')) return
@@ -215,10 +239,16 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
         decoded.forEach((value, slot) => bot.inventory.updateSlot(slot, copy(value)))
         window.selectedItem = copy(carried)
         bot.inventory.selectedItem = copy(carried)
-        if (!carried && !decoded.slice(0, 5).some(Boolean)) finish(true)
+        confirmed = !carried && !decoded.slice(0, 5).some(Boolean)
+        // Keep observing the rest of this response burst before resolving.
+        if (confirmed) queueMicrotask(() => { if (confirmed) finish(true) })
       } catch { /* Recovery must reread an undecodable window. */ }
     }
-    for (const name of listeners) bot._client.on(name, content)
+    const listeners = [
+      ['window_items', content], ['container_set_content', content],
+      ...incrementalListeners(0, invalidate)
+    ]
+    for (const [name, listener] of listeners) bot._client.on(name, listener)
     timer = setTimeout(() => finish(false), Math.max(1, Number(config?.craft?.confirmTimeoutMs) || 5000))
     try {
       bot.closeWindow(window)

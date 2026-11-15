@@ -105,6 +105,46 @@ test('production recipes and planned steps retain returned containers', () => {
   }
 })
 
+test('forced template duplication preserves one seed and crafts the full additional quantity', () => {
+  const { planToCraftCommand } = require('../../src/craft')
+  for (const version of ['1.21.4', '1.21.11']) {
+    for (const [name, material] of [
+      ['netherite_upgrade_smithing_template', 'netherrack'],
+      ['sentry_armor_trim_smithing_template', 'cobblestone']
+    ]) {
+      for (const quantity of [1, 2, 3]) {
+        for (const stocked of [1, 12]) {
+          const available = { [name]: stocked, diamond: 7 * quantity, [material]: quantity }
+          const result = planToCraftCommand({ item: name, quantity, available,
+            config: { server: { version } }, forceCraft: true })
+          assert.equal(result.ok, true, `${version} ${name} additional ${quantity}, stocked ${stocked}: ${result.reason}`)
+          assert.deepEqual(result.plan.collectGaps, [])
+          assert.equal(result.command.target.quantity, quantity)
+          assert.equal(result.command.craftSteps.length, 1)
+          assert.equal(result.command.craftSteps[0].times, quantity)
+          assert.equal(result.command.inventoryUses.find(input => input.name === name).quantity, 1)
+          const physical = { ...available }
+          for (const step of result.command.craftSteps) for (let trigger = 0; trigger < step.times; trigger++) {
+            for (const input of step.inputs) {
+              assert.ok(physical[input.names[0]] >= input.count)
+              physical[input.names[0]] -= input.count
+            }
+            for (const output of step.outputs) physical[output.name] = (physical[output.name] || 0) + output.count
+          }
+          assert.equal(physical[name], stocked + quantity)
+          assert.equal(physical.diamond, 0)
+          assert.equal(physical[material], 0)
+          assert.deepEqual(available, { [name]: stocked, diamond: 7 * quantity, [material]: quantity })
+        }
+      }
+      for (const available of [{ diamond: 7, [material]: 1 }, { [name]: 12, diamond: 6, [material]: 1 }]) {
+        assert.equal(planToCraftCommand({ item: name, quantity: 1, available,
+          config: { server: { version } }, forceCraft: true }).ok, false)
+      }
+    }
+  }
+})
+
 test('executable recipes retain their own ingredient choices and crafting-grid size', () => {
   const graph = new RecipeGraph({ version: '1.21.11' })
   const chest = graph.getRecipesFor('chest')

@@ -70,10 +70,19 @@ class PackingStorage {
     const observe = packet => {
       if (openedId !== null && (packet.windowId ?? packet.containerId) === openedId) raw = structuredClone(packet)
     }
+    const invalidate = () => { raw = null }
+    const observeSlot = packet => {
+      if ([openedId, 0, -1, 255, -2, 254].includes(packet.windowId ?? packet.containerId)) invalidate()
+    }
     const events = ['window_items', 'container_set_content']
     const opens = ['open_window', 'open_screen']
+    const deltas = [
+      ['set_slot', observeSlot], ['container_set_slot', observeSlot],
+      ['set_cursor_item', invalidate], ['container_set_cursor_item', invalidate], ['set_player_inventory', invalidate]
+    ]
     for (const event of opens) this.bot._client.on(event, observeOpen)
     for (const event of events) this.bot._client.on(event, observe)
+    for (const [event, listener] of deltas) this.bot._client.on(event, listener)
     let snapshot
     try {
       snapshot = await openServerContainer(this.warehouse, chest, this.catalog, this.bot)
@@ -90,15 +99,21 @@ class PackingStorage {
       }
       const slots = raw.items ?? raw.slots
       if (!Array.isArray(slots) || slots.length !== window.inventoryEnd || !Object.hasOwn(raw, 'carriedItem') || decode(raw.carriedItem)) throw new Error('Invalid packing server cursor or slots')
-      slots.map(decode).forEach((value, slot) => window.updateSlot(slot, value))
+      const decoded = slots.map(decode)
+      decoded.forEach((value, slot) => window.updateSlot(slot, value))
       window.selectedItem = null
-      return { container: window, chestSlots: snapshot.chestSlots, playerItems: totals(snapshot.playerItems) }
+      // The helper's await handoff can receive another full packet. Derive both
+      // records and local slots from the same latest, strictly decoded packet.
+      const chestSlots = decoded.slice(0, window.inventoryStart).flatMap((value, slot) => value ? [{ ...this.decoder.normalized(value), slot }] : [])
+      const playerItems = totals(decoded.slice(window.inventoryStart).filter(Boolean).map(value => this.decoder.normalized(value)))
+      return { container: window, chestSlots, playerItems }
     } catch (error) {
       if (snapshot) await this.clicker().close(snapshot.container)
       throw error
     } finally {
       for (const event of events) this.bot._client.removeListener(event, observe)
       for (const event of opens) this.bot._client.removeListener(event, observeOpen)
+      for (const [event, listener] of deltas) this.bot._client.removeListener(event, listener)
     }
   }
 

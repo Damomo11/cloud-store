@@ -99,12 +99,13 @@ async function openServerContainer (warehouse, chest, catalog, bot, options = {}
   }
   const invalidate = () => {
     latest = null
+    decodeError = null
     packets.length = 0
   }
   const onItems = packet => {
     if (keepEvidence && windowId(packet) === 0) invalidate()
     if (!opened.has(windowId(packet))) return
-    if (keepEvidence) invalidate()
+    invalidate()
     const items = packet?.items ?? packet?.slots
     if (Array.isArray(items)) {
       const copy = deserialize(serialize({ ...packet, windowId: windowId(packet), items }))
@@ -123,13 +124,11 @@ async function openServerContainer (warehouse, chest, catalog, bot, options = {}
   }
   const listeners = [
     ['open_window', onOpen], ['open_screen', onOpen],
-    ['window_items', onItems], ['container_set_content', onItems]
-  ]
-  if (keepEvidence) listeners.push(
+    ['window_items', onItems], ['container_set_content', onItems],
     ['set_slot', onSlot], ['container_set_slot', onSlot],
     ['set_cursor_item', invalidate], ['container_set_cursor_item', invalidate],
     ['set_player_inventory', invalidate]
-  )
+  ]
   for (const [event, listener] of listeners) client.on(event, listener)
   let container
   let handedOff = false
@@ -139,8 +138,8 @@ async function openServerContainer (warehouse, chest, catalog, bot, options = {}
     const end = container?.inventoryEnd
     inventoryStart = start
     inventoryEnd = end
-    const packet = packets.findLast(value => value.windowId === container?.id && value.items.length === end)
-    if (!Number.isInteger(start) || !Number.isInteger(end) || end - start !== 36 || !packet || bot.currentWindow !== container) {
+    const packet = packets.findLast(value => value.windowId === container?.id)
+    if (!Number.isInteger(start) || !Number.isInteger(end) || end - start !== 36 || !packet || packet.items.length !== end || bot.currentWindow !== container) {
       throw new Error('没有收到当前容器完整的服务端快照。')
     }
     if (!Object.hasOwn(packet, 'carriedItem')) throw new Error('服务端容器快照缺少光标状态。')

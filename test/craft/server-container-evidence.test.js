@@ -52,7 +52,7 @@ test('craft window evidence can be reused only while revision, owner, cursor and
   }
 })
 
-async function retainedFixture (afterContent) {
+async function retainedFixture (afterContent, options = { keepEvidence: true }) {
   const catalog = new ItemCatalog('1.21.11')
   const Item = require('prismarine-item')(catalog.mcData)
   const container = windows.createWindow(5, 'minecraft:generic_9x3', 'Barrel')
@@ -72,9 +72,27 @@ async function retainedFixture (afterContent) {
     },
     closeContainerQuietly: () => {}
   }
-  const { evidence } = await openServerContainer(warehouse, { chestId: 'source' }, catalog, bot, { keepEvidence: true })
+  const { evidence } = await openServerContainer(warehouse, { chestId: 'source' }, catalog, bot, options)
   return { bot, evidence, content, held: Item.toNotch(new Item(catalog.mcData.itemsByName.stone.id, 1)) }
 }
+
+for (const [label, name, packet] of [
+  ['current slot update', 'set_slot', () => ({ windowId: 5, slot: 0, item: { itemCount: 0 } })],
+  ['slot update alias', 'container_set_slot', () => ({ containerId: 5, slot: 0, item: { itemCount: 0 } })],
+  ['cursor update', 'set_cursor_item', () => ({})],
+  ['incomplete full content', 'window_items', () => ({ windowId: 5, items: [] })],
+  ['missing cursor', 'window_items', content => ({ windowId: 5, items: content.items })]
+]) {
+  test(`default opening evidence rejects a snapshot superseded by ${label}`, async () => {
+    await assert.rejects(retainedFixture((client, content) => client.emit(name, packet(content)), {}))
+  })
+}
+
+test('default opening ignores unrelated player-menu full content', async () => {
+  const f = await retainedFixture((client, content) => client.emit('window_items', { ...content, windowId: 0 }), {})
+  assert.equal(f.evidence, null)
+  assert.equal(f.bot._client.eventNames().length, 0)
+})
 
 for (const [label, name, packet] of [
   ['legacy cursor update', 'set_slot', f => ({ windowId: -1, slot: -1, item: f.held })],
