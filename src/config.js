@@ -83,8 +83,10 @@ const DEFAULT_CONFIG = {
     servux: {
       enabled: true,
       handshakeTimeoutMs: 5000,
-      perTickPackets: 4,
-      maxInFlight: 100,
+      // 实测通道吞吐 ~600 个/秒、基线往返 52ms（2026-11 线上测速 2000/2000 零失败），
+      // 每刻 20 个（400/秒）仍有充足余量
+      perTickPackets: 20,
+      maxInFlight: 1000,
       requestTimeoutMs: 5000
     },
     // !热重载 等待所有机器人空闲的最长时间；超时后直接重启，进行中的任务会在重启后自动恢复。
