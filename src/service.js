@@ -3,7 +3,7 @@ const { startTrace, traceEvent, traceSummary, traceStandalone, shortKey } = requ
 const { runHotReload } = require('./hotReload')
 const { planShortages, normalizeItemId } = require('./shortagePlanner')
 const { findWithdrawPinyinItems } = require('./withdrawPinyin')
-const { ServuxClient, getEarlyPayloadLog } = require('./servux')
+const { ServuxClient, getEarlyPayloadLog, buildRegisterPacket } = require('./servux')
 
 const REPAIR_BOTTLE_ITEM_ID = 'minecraft:experience_bottle'
 const REPAIR_BOTTLE_AMOUNT = 64
@@ -3237,7 +3237,7 @@ class CloudStoreService {
       })
       client.write('custom_payload', {
         channel: 'servux:litematics',
-        data: Buffer.from([0x02, 0x10, 0x0A, 0x03, 0x00, 0x07, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6F, 0x6E, 0x00, 0x00, 0x00, 0x02, 0x00])
+        data: buildRegisterPacket()
       })
     } catch (error) {
       this.msg(username, `发包失败：${error.message}`)
