@@ -2670,18 +2670,18 @@ class Warehouse {
   async syncWarehouse (radius, options = {}) {
     // 阶段一：不持仓库锁扫描，业务存取照常进行；
     // 阶段二：短暂持锁，重读扫描期间被业务改动过的木桶后换入新库存并对账。
-    const scan = await this.scanWarehouseContainers(radius)
+    const scan = await this.scanWarehouseContainers(radius, options)
     return this.withWarehouseLock(() => this.applyWarehouseScan(scan, radius, options))
   }
 
-  async scanWarehouseContainers (radius) {
-    const blocks = await this.prepareSyncBlocks(radius)
-    return this.scanBarrelBlocks(blocks, radius)
+  async scanWarehouseContainers (radius, options = {}) {
+    const blocks = await this.prepareSyncBlocks(radius, options)
+    return this.scanBarrelBlocks(blocks, radius, options)
   }
 
   // 全仓同步准备阶段：回仓并枚举半径内全部容器。并行同步时只由协调 bot
   // 执行一次，参与并行的各 bot 共用同一份木桶清单做分区，保证并集=全集。
-  async prepareSyncBlocks (radius) {
+  async prepareSyncBlocks (radius, options = {}) {
     this.debug(`sync start radius=${radius}`)
     this.trace('sync', 'sync_start', {
       radius,
@@ -2690,9 +2690,12 @@ class Warehouse {
     await this.goHome({ requireWarehouse: this.db.listChests().length > 0 })
     // Servux 隔空模式：有登记记录时先回 home，再从 home 广度优先搜索落脚点，
     // 用落脚点扫描球的并集枚举全仓容器——不受 bot 单个球形搜索半径限制，
-    // 圆柱仓库两头的桶也能发现。没有登记（首次扫描）或并集体积超限时回退老路。
+    // 圆柱仓库两头的桶也能发现。没有登记（首次扫描）、并集体积超限、或
+    // !同步-n（options.servuxDisabled）明确要老路时，回退球形搜索。
     let blocks = null
-    if (this.config.timing?.servux?.enabled !== false && this.db.listChests().length > 0) {
+    if (options?.servuxDisabled !== true &&
+        this.config.timing?.servux?.enabled !== false &&
+        this.db.listChests().length > 0) {
       blocks = this.findContainerBlocksByUnion(radius)
     }
     if (!blocks) blocks = this.findContainerBlocks(radius)
@@ -2708,17 +2711,18 @@ class Warehouse {
 
   // 逐桶打开读取给定清单（单 bot 同步时是全部，并行时是其中一个分区）。
   // 任一木桶读取失败都抛错：此时还没写入任何记录，旧库存原样保留。
-  async scanBarrelBlocks (blocks, radius) {
+  async scanBarrelBlocks (blocks, radius, options = {}) {
     const actualItems = []
     const snapshots = []
     const failures = []
     // 优先走 Servux 快路径（servux:litematics 隔空查方块实体 NBT）：不用跑路开箱。
-    // 通道不可用、单桶超时或解析失败的桶，回落到下面逐桶开箱的老路。
+    // !同步-n（options.servuxDisabled）强制走老路；通道不可用、单桶超时或解析
+    // 失败的桶，回落到下面逐桶开箱的老路。
     let openBlocks = blocks
     // servuxScan 需提升到 if 外：函数末尾的 return 用它统计 servuxRead，
     // 块内 const 会在 servux 未启用/空列表时于 return 行抛 ReferenceError
     let servuxScan = null
-    if (blocks.length && this.config.timing?.servux?.enabled !== false) {
+    if (options?.servuxDisabled !== true && blocks.length && this.config.timing?.servux?.enabled !== false) {
       servuxScan = await this.tryServuxScan(blocks)
       if (servuxScan) {
         snapshots.push(...servuxScan.snapshots)
@@ -2923,8 +2927,8 @@ class Warehouse {
   // warehouseState（revision / chestRevisions），快照语义不变。
   // Servux 可用时参与 bot 原地隔空发查询，无需回仓；通道不可用时
   // scanBarrelBlocks 内部会先回仓再逐桶开箱。
-  async scanSyncPartition (radius, blocks) {
-    return this.scanBarrelBlocks(blocks, radius)
+  async scanSyncPartition (radius, blocks, options = {}) {
+    return this.scanBarrelBlocks(blocks, radius, options)
   }
 
   async applyWarehouseScan (scan, radius, options = {}) {

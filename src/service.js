@@ -3156,17 +3156,19 @@ class CloudStoreService {
   }
 
   async syncWarehouseWithTeam (coordinator, radius, trace, options = {}) {
-    const blocks = await coordinator.warehouse.prepareSyncBlocks(radius)
+    const blocks = await coordinator.warehouse.prepareSyncBlocks(radius, options)
     // Servux 隔空模式只派一只 bot：扫描不跑路不开箱，借别的 bot 并行没有意义，
-    // 反而让它们各自回 home 空跑一趟。
-    const servuxOnly = coordinator.config.timing?.servux?.enabled !== false && coordinator.db.listChests().length > 0
+    // 反而让它们各自回 home 空跑一趟。!同步-n（servuxDisabled）走老路，允许并行。
+    const servuxOnly = options.servuxDisabled !== true &&
+      coordinator.config.timing?.servux?.enabled !== false &&
+      coordinator.db.listChests().length > 0
     const participants = servuxOnly ? [coordinator] : this.collectSyncParticipants(coordinator)
     // 桶数不足就不分区（<=1 个桶并行没有意义）。
     const workerCount = blocks.length > 1 ? Math.min(participants.length, blocks.length) : 1
     const team = participants.slice(0, workerCount)
 
     if (workerCount === 1) {
-      const scan = await coordinator.warehouse.scanBarrelBlocks(blocks, radius)
+      const scan = await coordinator.warehouse.scanBarrelBlocks(blocks, radius, options)
       const result = await coordinator.warehouse.withWarehouseLock(() => coordinator.warehouse.applyWarehouseScan(scan, radius, options))
       return { ...result, botCount: 1, servuxRead: scan.servuxRead || 0 }
     }
@@ -3186,7 +3188,7 @@ class CloudStoreService {
 
     try {
       // 等所有分区全部落地再合并：任一分区失败整体中止，旧记录原样保留。
-      const settled = await Promise.allSettled(strips.map((strip, index) => team[index].warehouse.scanSyncPartition(radius, strip)))
+      const settled = await Promise.allSettled(strips.map((strip, index) => team[index].warehouse.scanSyncPartition(radius, strip, options)))
       const failure = settled.find(outcome => outcome.status === 'rejected')
       if (failure) throw failure.reason
       const scans = settled.map(outcome => outcome.value)
@@ -3376,6 +3378,9 @@ class CloudStoreService {
       // "强制" 用于确属拆除木桶后的缩量重扫，跳过缩量守卫（守卫默认开启，
       // 防止小半径同步误删半径外的桶记录并对账抽干 momo）。
       const force = parts.slice(1).some(part => part === '强制' || part.toLowerCase() === 'force')
+      // "!同步-n" / "!同步仓库-n"：强制走非 Servux 老路（bot 跑路逐桶开箱），
+      // 用于 Servux 通道异常时的人工兜底；枚举也回到 bot 球形搜索。
+      const legacy = /^!同步(仓库)?-n\b/.test(parts[0] || '')
       const numericArg = parts.slice(1).find(part => /^-?\d+$/.test(part))
       const radius = clampInt(
         numericArg,
@@ -3385,9 +3390,9 @@ class CloudStoreService {
       )
       const trace = startTrace({ bot: this.botId, kind: 'sync', actor: username, radius })
       this.attachWarehouseTrace(trace)
-      this.msg(username, `开始同步仓库，半径 ${radius}${force ? '（强制，跳过缩量守卫）' : ''}。`)
+      this.msg(username, `开始同步仓库，半径 ${radius}${force ? '（强制，跳过缩量守卫）' : ''}${legacy ? '（非Servux老路：跑路开箱）' : ''}。`)
       try {
-        const result = await this.syncWarehouseWithTeam(worker, radius, trace, { allowShrink: force })
+        const result = await this.syncWarehouseWithTeam(worker, radius, trace, { allowShrink: force, servuxDisabled: legacy })
         const addedAmount = this.totalAmount(result.addedToMomo)
         const unresolvedAmount = this.totalAmount(result.unresolved)
         const failureText = result.failures.length ? `，失败${result.failures.length}` : ''
