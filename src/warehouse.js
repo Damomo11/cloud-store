@@ -2817,6 +2817,7 @@ class Warehouse {
 
     const snapshots = []
     const missedBlocks = []
+    this.servuxShulkerSampleSeen = false // 每次同步抓一条潜影盒样本
     const { map: results } = await client.queryBlocks(blocks.map(block => block.position))
     // 首轮失败的桶原地重试一次（间隔 600ms），偶发丢包/区块未就绪大多能补回来
     const firstMissed = new Map() // key -> { block, reason }（首轮漏读）
@@ -2901,8 +2902,16 @@ class Warehouse {
     for (const entry of entries) {
       const slot = Number(entry?.Slot)
       if (!Number.isInteger(slot) || slot < 0 || slot >= maxSlot) continue
+      const normalized = this.catalog.fromServuxItem(entry)
+      // 每次同步抓第一条潜影盒做样本：原始 NBT + 解析结果 + 盒内索引数，
+      // 排查「盒内物品没统计到」时不用猜，直接看真实形状。
+      if (/shulker/i.test(String(entry?.id || '')) && !this.servuxShulkerSampleSeen) {
+        this.servuxShulkerSampleSeen = true
+        const extracted = this.catalog.extractShulkerContents(normalized)
+        console.log(`[warehouse] servux 潜影盒样本（盒内索引 ${extracted.length} 种）: raw=${JSON.stringify(entry).slice(0, 1500)}`)
+      }
       slots.push({
-        ...this.catalog.fromServuxItem(entry),
+        ...normalized,
         slot,
         amount: Number(entry.count ?? 1)
       })
