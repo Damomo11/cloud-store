@@ -2688,7 +2688,14 @@ class Warehouse {
       decision: `开始全仓同步：扫描半径 ${radius} 内的全部木桶`
     })
     await this.goHome({ requireWarehouse: this.db.listChests().length > 0 })
-    const blocks = this.findContainerBlocks(radius)
+    // Servux 隔空模式：有登记记录时先回 home，再从 home 广度优先搜索落脚点，
+    // 用落脚点扫描球的并集枚举全仓容器——不受 bot 单个球形搜索半径限制，
+    // 圆柱仓库两头的桶也能发现。没有登记（首次扫描）或并集体积超限时回退老路。
+    let blocks = null
+    if (this.config.timing?.servux?.enabled !== false && this.db.listChests().length > 0) {
+      blocks = this.findContainerBlocksByUnion(radius)
+    }
+    if (!blocks) blocks = this.findContainerBlocks(radius)
     this.debug(`found ${blocks.length} openable container blocks: ${blocks.map(block => this.describeBlock(block)).join(' | ')}`)
     this.trace('sync', 'sync_blocks_found', {
       radius,
@@ -3089,6 +3096,118 @@ class Warehouse {
       .filter(Boolean)
       .filter(block => this.shouldScanContainerBlock(block))
       .sort((a, b) => this.compareContainerScanOrder(a, b))
+  }
+
+  // Servux 隔空模式的全仓枚举：不再受“以 bot 为圆心的单个球形搜索”半径限制
+  // （圆柱仓库两头够不着的老毛病），改成两步：
+  // 1) 从 home 出发广度优先搜索——只搜平面四个方向、步长 1 格——把 bot 能直接
+  //    走到的每个落脚点记成集合（原地不走也算一个位置）；
+  // 2) 以每个落脚点为球心、同步半径为半径放一个“扫描球”，所有球拼起来的范围
+  //    就是扫描范围：逐格检查并集，是木桶就收集。
+  // 找不到落脚点或并集体积超保护上限时返回 null，由调用方回退球形搜索。
+  findContainerBlocksByUnion (radius) {
+    const centers = this.collectWalkablePositions(radius)
+    if (!centers.length) {
+      this.debug('union scan: no walkable positions around home, fallback to sphere search')
+      return null
+    }
+    const radiusSq = radius * radius
+    const planeY = centers[0].y
+    let minX = Infinity
+    let maxX = -Infinity
+    let minZ = Infinity
+    let maxZ = -Infinity
+    for (const center of centers) {
+      minX = Math.min(minX, center.x)
+      maxX = Math.max(maxX, center.x)
+      minZ = Math.min(minZ, center.z)
+      maxZ = Math.max(maxZ, center.z)
+    }
+    // 先逐列算“离最近球心的水平距离”，距离内的列记下半径内的竖直范围。
+    // 顺带把并集要扫的格数估出来，超过保护上限视为异常布局，回退老路。
+    const columns = new Map()
+    let estimate = 0
+    for (let x = minX - radius; x <= maxX + radius; x++) {
+      for (let z = minZ - radius; z <= maxZ + radius; z++) {
+        const distSq = this.minHorizontalDistSq(centers, x, z)
+        if (distSq > radiusSq) continue
+        const half = Math.floor(Math.sqrt(radiusSq - distSq))
+        columns.set(`${x},${z}`, half)
+        estimate += 2 * half + 1
+      }
+    }
+    if (estimate > 150000) {
+      console.warn(`[warehouse] union scan too large (${estimate} cells, ${centers.length} spots), fallback to sphere search`)
+      return null
+    }
+    const found = new Map()
+    for (const [columnKey, half] of columns) {
+      const [x, z] = columnKey.split(',').map(Number)
+      for (let y = planeY - half; y <= planeY + half; y++) {
+        const block = this.bot.blockAt(new Vec3(x, y, z))
+        if (!block || !this.chestNames.has(block.name) || !this.shouldScanContainerBlock(block)) continue
+        found.set(`${x},${y},${z}`, block)
+      }
+    }
+    const blocks = [...found.values()]
+    this.debug(`union scan: ${centers.length} walkable spots, ${columns.size} columns, ~${estimate} cells, found ${blocks.length} containers`)
+    return blocks.sort((a, b) => this.compareContainerScanOrder(a, b))
+  }
+
+  minHorizontalDistSq (centers, x, z) {
+    let best = Infinity
+    for (const center of centers) {
+      const dx = center.x - x
+      const dz = center.z - z
+      const distSq = dx * dx + dz * dz
+      if (distSq < best) best = distSq
+    }
+    return best
+  }
+
+  // 广度优先搜索：从 home 脚下出发，平面四个方向、步长 1 格。
+  // 落脚点判定：脚下和头顶不是实心方块、地面上是实心方块。
+  collectWalkablePositions (radius) {
+    const pos = this.bot.entity?.position
+    if (!pos) return []
+    const startX = Math.floor(pos.x)
+    const y = Math.floor(pos.y)
+    const startZ = Math.floor(pos.z)
+    const radiusSq = radius * radius
+    const maxSpots = 20000
+    const seen = new Set([`${startX},${startZ}`])
+    const spots = []
+    if (this.canStandAt(startX, y, startZ)) spots.push({ x: startX, y, z: startZ })
+    const queue = [[startX, startZ]]
+    while (queue.length) {
+      const [x, z] = queue.shift()
+      for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const nx = x + dx
+        const nz = z + dz
+        const key = `${nx},${nz}`
+        if (seen.has(key)) continue
+        seen.add(key)
+        const dxs = nx - startX
+        const dzs = nz - startZ
+        if (dxs * dxs + dzs * dzs > radiusSq) continue
+        if (spots.length >= maxSpots) {
+          console.warn(`[warehouse] union scan: walkable spots capped at ${maxSpots}`)
+          return spots
+        }
+        if (!this.canStandAt(nx, y, nz)) continue
+        spots.push({ x: nx, y, z: nz })
+        queue.push([nx, nz])
+      }
+    }
+    return spots
+  }
+
+  canStandAt (x, y, z) {
+    const feet = this.bot.blockAt(new Vec3(x, y, z))
+    const head = this.bot.blockAt(new Vec3(x, y + 1, z))
+    const ground = this.bot.blockAt(new Vec3(x, y - 1, z))
+    if (!feet || !head || !ground) return false
+    return feet.boundingBox !== 'block' && head.boundingBox !== 'block' && ground.boundingBox === 'block'
   }
 
   compareContainerScanOrder (a, b) {
