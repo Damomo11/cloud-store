@@ -13,6 +13,7 @@ const CloudStoreWebServer = require('./webServer')
 const SubscriptionManager = require('./subscriptions')
 const { BotTaskPool } = require('./taskPool')
 const { deliverHotReloadNotify } = require('./hotReload')
+const { hookEarlyChannelRegister } = require('./servux')
 const {
   invalidateMinecraftAccessTokenCache,
   isMinecraftProfileAuthError,
@@ -44,6 +45,9 @@ function createBot (config, onMsaCode) {
   }
 
   const bot = mineflayer.createBot(options)
+
+  // 1.21.6+ 需在 configuration 阶段声明 servux 通道（详见 servux.js 注释）
+  hookEarlyChannelRegister(bot)
 
   bot.loadPlugin(pathfinder)
   return bot

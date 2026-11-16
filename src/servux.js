@@ -340,9 +340,39 @@ class ServuxClient {
   }
 }
 
+// 1.21.6+ 的 payload 注册表机制：插件通道需在 configuration 阶段通过
+// minecraft:register 声明（fabric 客户端由 loader 自动完成），否则 play 阶段
+// 该通道的包会被服务器/协议转换层静默丢弃——与线上「探测 6 秒 0 个包」吻合。
+// 实战参照：1.21.11 fabric + servux bridge 经 Via 连 26.3 服务器可用。
+// 必须在 createBot 之后立即调用（configuration 在 login 后转瞬即逝）。
+function hookEarlyChannelRegister (bot) {
+  const client = bot?._client
+  if (!client || typeof client.write !== 'function') return
+  let sent = false
+  const sendRegister = () => {
+    if (sent || client.state !== 'configuration') return
+    sent = true
+    try {
+      client.write('custom_payload', {
+        channel: 'minecraft:register',
+        data: Buffer.from(`${SERVUX_CHANNEL}\0`, 'utf8')
+      })
+      console.log('[servux] configuration 阶段已声明通道（minecraft:register）')
+    } catch (error) {
+      console.log(`[servux] configuration 阶段声明通道失败: ${error.message}`)
+    }
+  }
+  // nmp 内部的 login handler 先把 state 切到 configuration，监听器按注册顺序
+  // 依次执行，所以我们的 login 回调里 state 已就绪
+  client.once('login', sendRegister)
+  // 兜底挂点：configuration 的必经包（服务器下发 select_known_packs）
+  client.once('select_known_packs', sendRegister)
+}
+
 module.exports = {
   SERVUX_CHANNEL,
   ServuxClient,
+  hookEarlyChannelRegister,
   // 以下导出仅供建议单元测试 / 协议对照使用
   buildRegisterPacket,
   buildBlockEntityRequest,
