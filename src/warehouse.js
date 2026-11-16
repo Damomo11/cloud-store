@@ -2978,9 +2978,14 @@ class Warehouse {
         .map(chest => chest.chestId)
         .filter(chestId => !scannedIds.has(chestId))
       this.db.removeChests(removedIds)
+      let applied = 0
       for (const snapshot of snapshots) {
         this.db.upsertChest(snapshot.chest)
         this.db.replaceChestSlots(snapshot.chest.chestId, snapshot.slots)
+        // 落库是同步 CPU 活（几千桶 × 槽位建档 + 指纹），连着跑会把事件循环
+        // 卡死几十秒，keepalive 得不到处理、同进程 bot 全体超时掉线——
+        // 每 50 个桶让出一次主线给 I/O 喘气。
+        if (++applied % 50 === 0) await new Promise(resolve => setImmediate(resolve))
       }
       // 未读桶沿用旧槽位记录计入对账：账面把它们的库存视作「未变化」。
       // 行必须带完整物品档案（对账内部会按行 upsertItem）。
@@ -3014,9 +3019,12 @@ class Warehouse {
     }
 
     this.db.clearChests()
+    let applied = 0
     for (const snapshot of snapshots) {
       this.db.upsertChest(snapshot.chest)
       this.db.replaceChestSlots(snapshot.chest.chestId, snapshot.slots)
+      // 同 Servux 分支：每 50 个桶让出一次主线，防止同步落库卡死事件循环
+      if (++applied % 50 === 0) await new Promise(resolve => setImmediate(resolve))
     }
 
     const totals = this.mergeItems(actualItems)
