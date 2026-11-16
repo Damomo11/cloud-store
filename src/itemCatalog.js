@@ -101,21 +101,47 @@ class ItemCatalog {
     // 服务器自定义物品（数据包注册的 minecraft: 命名空间物品）不在本地 mcData 词典里，
     // 以前直接抛“未知物品”导致整个桶漏读；现在对齐开箱路径（fromPrismarineItem 不查词典），
     // 用原始物品 id 建档案，这些桶照常入账。
-    const rawComponents = entry?.components && typeof entry.components === 'object' && !Array.isArray(entry.components)
-      ? entry.components
-      : null
-    const components = rawComponents
-      ? Object.entries(rawComponents).map(([key, value]) => ({ type: key.replace(/^minecraft:/, ''), data: value }))
-      : null
     return this.fromPrismarineItem({
       name,
       count: Number(entry.count ?? 1),
       type: this.mcData.itemsByName[name]?.id ?? null,
-      components,
+      components: this.componentsMapToArray(entry.components),
       removedComponents: null,
       metadata: null,
       nbt: null
     })
+  }
+
+  // NBT 复合组件（Servux 回包的 map 形状）→ 协议组件数组 [{ type, data }]，
+  // 与开箱路径里 node-minecraft-protocol 的解析形状对齐。
+  componentsMapToArray (rawComponents) {
+    if (!rawComponents || typeof rawComponents !== 'object' || Array.isArray(rawComponents)) return null
+    return Object.entries(rawComponents).map(([key, value]) => {
+      const type = key.replace(/^minecraft:/, '')
+      // 容器组件（潜影盒内容）转成协议形状，保证盒内物品索引两条路径一个指纹
+      if (type === 'container') return { type, data: this.nbtContainerDataToProtocol(value) }
+      return { type, data: value }
+    })
+  }
+
+  // 容器组件数据 → 协议形状 { contents: [{ itemId, itemCount, components }] }。
+  // Servux NBT 里可能是直接的列表，也可能已带 contents 包一层；条目是
+  // { id: 'minecraft:x', count } 的 NBT 形状，逐条转成 fromContainerEntry 认的形状。
+  nbtContainerDataToProtocol (value) {
+    const list = Array.isArray(value) ? value : (Array.isArray(value?.contents) ? value.contents : null)
+    if (!list) return value
+    return {
+      contents: list.map(entry => {
+        const name = String(entry?.id || '').replace(/^minecraft:/, '')
+        const data = name ? this.mcData.itemsByName[name] : null
+        return {
+          itemId: data ? data.id : null,
+          itemCount: Number(entry?.count ?? 1),
+          components: this.componentsMapToArray(entry?.components),
+          removeComponents: null
+        }
+      })
+    }
   }
 
   fromItemIdAmount (itemId, amount) {
