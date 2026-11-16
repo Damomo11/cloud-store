@@ -125,19 +125,20 @@ class ItemCatalog {
   }
 
   // 容器组件数据 → 协议形状 { contents: [{ itemId, itemCount, components }] }。
-  // Servux NBT 里可能是直接的列表，也可能已带 contents 包一层；条目是
-  // { id: 'minecraft:x', count } 的 NBT 形状，逐条转成 fromContainerEntry 认的形状。
+  // Servux 实测（1.21.11，AxShulkers 插件）条目是 { slot, item: { id, count } }——
+  // 物品包在 item 字段里；也兼容直接的 { id, count } 列表形状。
   nbtContainerDataToProtocol (value) {
     const list = Array.isArray(value) ? value : (Array.isArray(value?.contents) ? value.contents : null)
     if (!list) return value
     return {
       contents: list.map(entry => {
-        const name = String(entry?.id || '').replace(/^minecraft:/, '')
+        const item = (entry && typeof entry.item === 'object' && entry.item) ? entry.item : entry
+        const name = String(item?.id || '').replace(/^minecraft:/, '')
         const data = name ? this.mcData.itemsByName[name] : null
         return {
           itemId: data ? data.id : null,
-          itemCount: Number(entry?.count ?? 1),
-          components: this.componentsMapToArray(entry?.components),
+          itemCount: Number(item?.count ?? 1),
+          components: this.componentsMapToArray(item?.components),
           removeComponents: null
         }
       })
