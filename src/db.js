@@ -3493,6 +3493,19 @@ class StoreDb {
     })
   }
 
+  // 批量移除指定登记（拆除清理）。chest_slots 由外键级联或显式删除。
+  removeChests (chestIds) {
+    if (!chestIds?.length) return
+    this.transaction(() => {
+      const deleteSlots = this.db.prepare('DELETE FROM chest_slots WHERE chest_id = ?')
+      const deleteChest = this.db.prepare('DELETE FROM chests WHERE chest_id = ?')
+      for (const chestId of chestIds) {
+        deleteSlots.run(chestId)
+        deleteChest.run(chestId)
+      }
+    })
+  }
+
   clearInventoryData () {
     this.assertNoPendingCraft()
     const counts = {

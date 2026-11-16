@@ -2688,7 +2688,14 @@ class Warehouse {
       decision: `开始全仓同步：扫描半径 ${radius} 内的全部木桶`
     })
     await this.goHome({ requireWarehouse: this.db.listChests().length > 0 })
-    const blocks = this.findContainerBlocks(radius)
+    // Servux 隔空模式：有登记记录时先回 home，再从 home 广度优先搜索落脚点，
+    // 用落脚点扫描球的并集枚举全仓容器——不受 bot 单个球形搜索半径限制，
+    // 圆柱仓库两头的桶也能发现。没有登记（首次扫描）或并集体积超限时回退老路。
+    let blocks = null
+    if (this.config.timing?.servux?.enabled !== false && this.db.listChests().length > 0) {
+      blocks = this.findContainerBlocksByUnion(radius)
+    }
+    if (!blocks) blocks = this.findContainerBlocks(radius)
     this.debug(`found ${blocks.length} openable container blocks: ${blocks.map(block => this.describeBlock(block)).join(' | ')}`)
     this.trace('sync', 'sync_blocks_found', {
       radius,
@@ -2717,6 +2724,11 @@ class Warehouse {
         for (const snapshot of servuxScan.snapshots) actualItems.push(...snapshot.slots)
         openBlocks = servuxScan.fallbackBlocks
       }
+    }
+    if (!servuxScan && blocks.length) {
+      // 整体回退开箱老路：并行参与者可能还没回仓，先回仓再跑路；
+      // 协调 bot 已在 home（枚举清单时回过），此处 goHome 是 no-op。
+      await this.goHome({ requireWarehouse: this.db.listChests().length > 0 })
     }
     for (let index = 0; index < openBlocks.length; index++) {
       this.assertConnectionHealthy()
@@ -2765,12 +2777,21 @@ class Warehouse {
       throw new Error(`同步失败：${blocks.length} 个容器中有 ${failures.length} 个读取失败；已保留全部旧记录，不会生成库存异常。${examples ? `失败示例：${examples}` : ''}`)
     }
 
-    return { radius, blocks, snapshots, actualItems, servuxRead: servuxScan?.viaServux || 0 }
+    return {
+      radius,
+      blocks,
+      snapshots,
+      actualItems,
+      servuxRead: servuxScan?.viaServux || 0,
+      servuxMissed: servuxScan?.missed || 0,
+      servuxMode: Boolean(servuxScan)
+    }
   }
 
   // Servux 快路径扫描：握手成功则批量隔空查每个木桶的方块实体 NBT（含 Items），
-  // 不跑路不开箱。返回 null 表示通道不可用（调用方整体回退开箱）；否则
-  // fallbackBlocks 里是查询失败/解析失败、需要逐桶开箱兜底的木桶。
+  // 不跑路不开箱；失败桶原地重试一次，仍失败记入 missedBlocks（保留旧记录参与
+  // 对账，applyWarehouseScan 的 servux 分支处理）。返回 null 表示通道不可用
+  // （调用方整体回退逐桶开箱老路）。
   async tryServuxScan (blocks) {
     const settings = this.config.timing?.servux || {}
     const client = new ServuxClient(this.bot._client, {
@@ -2794,19 +2815,16 @@ class Warehouse {
     }
 
     const snapshots = []
-    const fallbackBlocks = []
+    const missedBlocks = []
     const { map: results } = await client.queryBlocks(blocks.map(block => block.position))
+    // 首轮失败的桶原地重试一次（间隔 600ms），偶发丢包/区块未就绪大多能补回来
+    const firstMissed = []
     for (const block of blocks) {
       const { x, y, z } = block.position
       const outcome = results.get(`${x},${y},${z}`)
       const chest = this.blockToChest(block)
       if (!outcome?.ok) {
-        fallbackBlocks.push(block)
-        this.trace('sync', 'sync_servux_miss', {
-          chest: this.describeChest(chest),
-          reason: outcome?.reason || 'no_response',
-          decision: 'Servux 查询无响应/失败，该桶回退逐桶开箱读取'
-        })
+        firstMissed.push(block)
         continue
       }
       try {
@@ -2814,28 +2832,49 @@ class Warehouse {
         const preReadSeq = this.warehouseState.revision
         snapshots.push({ chest, slots, preReadSeq })
         this.debug(`servux read ${this.describeChest(chest)} slots=${slots.length} items=${slots.reduce((sum, item) => sum + item.amount, 0)}`)
-        this.trace('sync', 'sync_servux_barrel', {
-          chest: this.describeChest(chest),
-          slots: slots.length,
-          items: slots.reduce((sum, item) => sum + item.amount, 0)
-        })
       } catch (error) {
-        fallbackBlocks.push(block)
-        this.trace('error', 'sync_servux_parse_failed', {
-          chest: this.describeChest(chest),
-          message: error.message,
-          decision: 'Servux 返回的 NBT 解析失败，该桶回退逐桶开箱读取'
+        firstMissed.push(block)
+      }
+    }
+    if (firstMissed.length) {
+      await sleep(600)
+      const { map: retryResults } = await client.queryBlocks(firstMissed.map(block => block.position))
+      for (const block of firstMissed) {
+        const { x, y, z } = block.position
+        const outcome = retryResults.get(`${x},${y},${z}`)
+        if (outcome?.ok) {
+          try {
+            const slots = this.servuxItemsToSlots(outcome.compound)
+            const preReadSeq = this.warehouseState.revision
+            snapshots.push({ chest: this.blockToChest(block), slots, preReadSeq })
+            continue
+          } catch (error) {
+            // 解析失败按漏读处理
+          }
+        }
+        missedBlocks.push(block)
+        this.trace('sync', 'sync_servux_miss', {
+          chest: `${x},${y},${z}`,
+          reason: outcome?.reason || 'no_response',
+          decision: 'Servux 查询重试后仍无响应，该桶保留旧记录参与对账，不跑路开箱'
         })
       }
+    }
+    for (const snapshot of snapshots) {
+      this.trace('sync', 'sync_servux_barrel', {
+        chest: this.describeChest(snapshot.chest),
+        slots: snapshot.slots.length,
+        items: snapshot.slots.reduce((sum, item) => sum + item.amount, 0)
+      })
     }
     client.destroy()
     this.trace('sync', 'sync_servux_summary', {
       total: blocks.length,
       viaServux: snapshots.length,
-      fallback: fallbackBlocks.length,
-      decision: `Servux 快路径：${snapshots.length}/${blocks.length} 个木桶隔空读取，${fallbackBlocks.length} 个回退开箱`
+      missed: missedBlocks.length,
+      decision: `Servux 快路径：${snapshots.length}/${blocks.length} 个木桶隔空读取，${missedBlocks.length} 个漏读（保留旧记录，不跑路）`
     })
-    return { snapshots, fallbackBlocks, viaServux: snapshots.length }
+    return { snapshots, fallbackBlocks: [], missedBlocks, viaServux: snapshots.length, missed: missedBlocks.length }
   }
 
   // Servux 方块实体 NBT 的 Items → 与开箱路径同形状的槽位列表。
@@ -2855,10 +2894,11 @@ class Warehouse {
     return slots
   }
 
-  // 并行参与者：回仓就位后扫描分配到的分区。与协调 bot 共用同一份
+  // 并行参与者：扫描分配到的分区。与协调 bot 共用同一份
   // warehouseState（revision / chestRevisions），快照语义不变。
+  // Servux 可用时参与 bot 原地隔空发查询，无需回仓；通道不可用时
+  // scanBarrelBlocks 内部会先回仓再逐桶开箱。
   async scanSyncPartition (radius, blocks) {
-    await this.goHome({ requireWarehouse: this.db.listChests().length > 0 })
     return this.scanBarrelBlocks(blocks, radius)
   }
 
@@ -2903,6 +2943,51 @@ class Warehouse {
     this.assertConnectionHealthy()
     const actualItems = snapshots.flatMap(snapshot => snapshot.slots)
     this.assertConnectionHealthy()
+
+    // Servux 部分更新模式：漏读的桶保留旧记录（不 clearChests 全量重写），
+    // 只移除「登记中不在本次枚举」的桶（已拆除），对账时把未读桶的旧库存计入。
+    if (scan.servuxMode) {
+      const readIds = new Set(snapshots.map(snapshot => snapshot.chest.chestId))
+      const scannedIds = new Set(blocks.map(block => `${block.position.x},${block.position.y},${block.position.z}`))
+      const removedIds = this.db.listChests()
+        .map(chest => chest.chestId)
+        .filter(chestId => !scannedIds.has(chestId))
+      this.db.removeChests(removedIds)
+      for (const snapshot of snapshots) {
+        this.db.upsertChest(snapshot.chest)
+        this.db.replaceChestSlots(snapshot.chest.chestId, snapshot.slots)
+      }
+      // 未读桶沿用旧槽位记录计入对账：账面把它们的库存视作「未变化」。
+      // 行必须带完整物品档案（对账内部会按行 upsertItem）。
+      const unreadItems = this.db.listChestSlots()
+        .filter(row => !readIds.has(row.chestId) && row.itemKey && row.amount > 0)
+        .map(row => {
+          const item = this.db.getItemByKey(row.itemKey)
+          return item
+            ? { ...item, amount: row.amount }
+            : { itemKey: row.itemKey, itemId: row.itemKey, displayName: row.itemKey, nbtJson: '', metaJson: '', amount: row.amount }
+        })
+      const totals = this.mergeItems([...actualItems, ...unreadItems])
+      const reconcile = this.db.reconcileTotalsToMomo(totals)
+      this.db.addTransaction('sync', 'ok', this.config.momoOwner, 'momo', totals, `radius=${radius}, chests=${blocks.length}, servux=${scan.servuxRead}, missed=${scan.servuxMissed}, removed=${removedIds.length}`)
+      this.trace('sync', 'sync_servux_partial_apply', {
+        applied: snapshots.length,
+        missedKept: readIds.size ? this.db.listChests().length - snapshots.length : 0,
+        removed: removedIds.length,
+        decision: `Servux 模式落库：更新 ${snapshots.length} 桶，漏读 ${scan.servuxMissed} 桶保留旧记录，移除已拆除 ${removedIds.length} 桶`
+      })
+      return {
+        chestCount: blocks.length,
+        openedChestCount: snapshots.length,
+        rescanCount,
+        failures: [],
+        servuxRead: scan.servuxRead,
+        servuxMissed: scan.servuxMissed,
+        totals,
+        ...reconcile
+      }
+    }
+
     this.db.clearChests()
     for (const snapshot of snapshots) {
       this.db.upsertChest(snapshot.chest)
@@ -2918,6 +3003,8 @@ class Warehouse {
       openedChestCount: snapshots.length,
       rescanCount,
       failures: [],
+      servuxRead: scan.servuxRead || 0,
+      servuxMissed: scan.servuxMissed || 0,
       totals,
       ...reconcile
     }
@@ -3009,6 +3096,118 @@ class Warehouse {
       .filter(Boolean)
       .filter(block => this.shouldScanContainerBlock(block))
       .sort((a, b) => this.compareContainerScanOrder(a, b))
+  }
+
+  // Servux 隔空模式的全仓枚举：不再受“以 bot 为圆心的单个球形搜索”半径限制
+  // （圆柱仓库两头够不着的老毛病），改成两步：
+  // 1) 从 home 出发广度优先搜索——只搜平面四个方向、步长 1 格——把 bot 能直接
+  //    走到的每个落脚点记成集合（原地不走也算一个位置）；
+  // 2) 以每个落脚点为球心、同步半径为半径放一个“扫描球”，所有球拼起来的范围
+  //    就是扫描范围：逐格检查并集，是木桶就收集。
+  // 找不到落脚点或并集体积超保护上限时返回 null，由调用方回退球形搜索。
+  findContainerBlocksByUnion (radius) {
+    const centers = this.collectWalkablePositions(radius)
+    if (!centers.length) {
+      this.debug('union scan: no walkable positions around home, fallback to sphere search')
+      return null
+    }
+    const radiusSq = radius * radius
+    const planeY = centers[0].y
+    let minX = Infinity
+    let maxX = -Infinity
+    let minZ = Infinity
+    let maxZ = -Infinity
+    for (const center of centers) {
+      minX = Math.min(minX, center.x)
+      maxX = Math.max(maxX, center.x)
+      minZ = Math.min(minZ, center.z)
+      maxZ = Math.max(maxZ, center.z)
+    }
+    // 先逐列算“离最近球心的水平距离”，距离内的列记下半径内的竖直范围。
+    // 顺带把并集要扫的格数估出来，超过保护上限视为异常布局，回退老路。
+    const columns = new Map()
+    let estimate = 0
+    for (let x = minX - radius; x <= maxX + radius; x++) {
+      for (let z = minZ - radius; z <= maxZ + radius; z++) {
+        const distSq = this.minHorizontalDistSq(centers, x, z)
+        if (distSq > radiusSq) continue
+        const half = Math.floor(Math.sqrt(radiusSq - distSq))
+        columns.set(`${x},${z}`, half)
+        estimate += 2 * half + 1
+      }
+    }
+    if (estimate > 150000) {
+      console.warn(`[warehouse] union scan too large (${estimate} cells, ${centers.length} spots), fallback to sphere search`)
+      return null
+    }
+    const found = new Map()
+    for (const [columnKey, half] of columns) {
+      const [x, z] = columnKey.split(',').map(Number)
+      for (let y = planeY - half; y <= planeY + half; y++) {
+        const block = this.bot.blockAt(new Vec3(x, y, z))
+        if (!block || !this.chestNames.has(block.name) || !this.shouldScanContainerBlock(block)) continue
+        found.set(`${x},${y},${z}`, block)
+      }
+    }
+    const blocks = [...found.values()]
+    this.debug(`union scan: ${centers.length} walkable spots, ${columns.size} columns, ~${estimate} cells, found ${blocks.length} containers`)
+    return blocks.sort((a, b) => this.compareContainerScanOrder(a, b))
+  }
+
+  minHorizontalDistSq (centers, x, z) {
+    let best = Infinity
+    for (const center of centers) {
+      const dx = center.x - x
+      const dz = center.z - z
+      const distSq = dx * dx + dz * dz
+      if (distSq < best) best = distSq
+    }
+    return best
+  }
+
+  // 广度优先搜索：从 home 脚下出发，平面四个方向、步长 1 格。
+  // 落脚点判定：脚下和头顶不是实心方块、地面上是实心方块。
+  collectWalkablePositions (radius) {
+    const pos = this.bot.entity?.position
+    if (!pos) return []
+    const startX = Math.floor(pos.x)
+    const y = Math.floor(pos.y)
+    const startZ = Math.floor(pos.z)
+    const radiusSq = radius * radius
+    const maxSpots = 20000
+    const seen = new Set([`${startX},${startZ}`])
+    const spots = []
+    if (this.canStandAt(startX, y, startZ)) spots.push({ x: startX, y, z: startZ })
+    const queue = [[startX, startZ]]
+    while (queue.length) {
+      const [x, z] = queue.shift()
+      for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const nx = x + dx
+        const nz = z + dz
+        const key = `${nx},${nz}`
+        if (seen.has(key)) continue
+        seen.add(key)
+        const dxs = nx - startX
+        const dzs = nz - startZ
+        if (dxs * dxs + dzs * dzs > radiusSq) continue
+        if (spots.length >= maxSpots) {
+          console.warn(`[warehouse] union scan: walkable spots capped at ${maxSpots}`)
+          return spots
+        }
+        if (!this.canStandAt(nx, y, nz)) continue
+        spots.push({ x: nx, y, z: nz })
+        queue.push([nx, nz])
+      }
+    }
+    return spots
+  }
+
+  canStandAt (x, y, z) {
+    const feet = this.bot.blockAt(new Vec3(x, y, z))
+    const head = this.bot.blockAt(new Vec3(x, y + 1, z))
+    const ground = this.bot.blockAt(new Vec3(x, y - 1, z))
+    if (!feet || !head || !ground) return false
+    return feet.boundingBox !== 'block' && head.boundingBox !== 'block' && ground.boundingBox === 'block'
   }
 
   compareContainerScanOrder (a, b) {
