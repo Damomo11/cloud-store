@@ -2,7 +2,8 @@
 // 协议（通道 servux:litematics，PROTOCOL_VERSION=2，参考 sakura-ryoko/servux 的
 // LitematicsDataProvider / ServuxLitematicaPacket）：
 //   C2S type=2 注册（named NBT {version:2}）      → S2C type=1 metadata（握手完成）
-//   C2S type=3 + BlockPos（varlong 打包）          → S2C type=5 + BlockPos + int32长度 + [GZIP]named NBT
+//   C2S type=3 + BlockPos（8字节大端 long，FriendlyByteBuf.writeBlockPos/asLong 位布局）
+//                                                → S2C type=5 + BlockPos + int32长度 + [GZIP]named NBT
 // 服务端对查不到的方块（区块未加载/权限不足）不回包，靠单包超时兜底。
 const zlib = require('node:zlib')
 const nbt = require('prismarine-nbt')
@@ -26,18 +27,15 @@ function writeVarInt (value) {
   return Buffer.from(bytes)
 }
 
-// BlockPos 走 varlong：val = (x & 0x3FFFFFF) << 38 | (z & 0x3FFFFFF) << 12 | (y & 0xFFF)
+// BlockPos 线上格式 = FriendlyByteBuf.writeBlockPos：固定 8 字节大端 long，
+// 位布局与 vanilla asLong 一致：val = (x & 0x3FFFFFF) << 38 | (z & 0x3FFFFFF) << 12 | (y & 0xFFF)
+// 注意不是 varlong——sakura 26.3 参考实现两侧都走 FriendlyByteBuf 的定长 long，
+// varlong 编码会被服务器解出垃圾坐标（区块未加载 → 不回包 → 全部超时）。
 function encodeBlockPos (x, y, z) {
   const val = (BigInt(x & 0x3FFFFFF) << 38n) | (BigInt(z & 0x3FFFFFF) << 12n) | BigInt(y & 0xFFF)
-  const bytes = []
-  let rest = val
-  while (true) {
-    const byte = Number(rest & 0x7Fn)
-    rest >>= 7n
-    if (rest === 0n) { bytes.push(byte); break }
-    bytes.push(byte | 0x80)
-  }
-  return Buffer.from(bytes)
+  const buf = Buffer.alloc(8)
+  buf.writeBigUInt64BE(val)
+  return buf
 }
 
 // 注册包：varint(2) + FriendlyByteBuf.writeNbt 格式的 NBT。
@@ -73,19 +71,6 @@ function readVarIntFrom (buffer, offset) {
   return { value, offset }
 }
 
-function readVarLongFrom (buffer, offset) {
-  let value = 0n
-  let shift = 0n
-  while (offset < buffer.length) {
-    const byte = buffer[offset++]
-    value |= BigInt(byte & 0x7F) << shift
-    if ((byte & 0x80) === 0) return { value, offset }
-    shift += 7n
-    if (shift > 63n) return { value, offset }
-  }
-  return { value, offset }
-}
-
 function signExtend (value, bits) {
   const half = 1 << (bits - 1)
   const full = 1 << bits
@@ -95,12 +80,12 @@ function signExtend (value, bits) {
 }
 
 function readBlockPosFrom (buffer, offset) {
-  const { value, offset: next } = readVarLongFrom(buffer, offset)
+  const raw = buffer.readBigUInt64BE(offset)
   return {
-    x: signExtend((value >> 38n) & 0x3FFFFFFn, 26),
-    y: signExtend(value & 0xFFFn, 12),
-    z: signExtend((value >> 12n) & 0x3FFFFFFn, 26),
-    offset: next
+    x: signExtend((raw >> 38n) & 0x3FFFFFFn, 26),
+    y: signExtend(raw & 0xFFFn, 12),
+    z: signExtend((raw >> 12n) & 0x3FFFFFFn, 26),
+    offset: offset + 8
   }
 }
 
