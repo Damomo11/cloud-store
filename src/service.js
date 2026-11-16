@@ -3165,7 +3165,7 @@ class CloudStoreService {
     if (workerCount === 1) {
       const scan = await coordinator.warehouse.scanBarrelBlocks(blocks, radius)
       const result = await coordinator.warehouse.withWarehouseLock(() => coordinator.warehouse.applyWarehouseScan(scan, radius, options))
-      return { ...result, botCount: 1 }
+      return { ...result, botCount: 1, servuxRead: scan.servuxRead || 0 }
     }
 
     const strips = this.splitBlocksForParallelSync(workerCount, blocks)
@@ -3194,7 +3194,7 @@ class CloudStoreService {
         actualItems: scans.flatMap(scan => scan.actualItems)
       }
       const result = await coordinator.warehouse.withWarehouseLock(() => coordinator.warehouse.applyWarehouseScan(merged, radius, options))
-      return { ...result, botCount: workerCount }
+      return { ...result, botCount: workerCount, servuxRead: scans.reduce((sum, scan) => sum + (scan.servuxRead || 0), 0) }
     } finally {
       for (const service of borrowed) {
         if (service.active?.borrowedBySync === coordinator.botId) service.active = null
@@ -3389,8 +3389,9 @@ class CloudStoreService {
         const unresolvedAmount = this.totalAmount(result.unresolved)
         const failureText = result.failures.length ? `，失败${result.failures.length}` : ''
         const parallelText = result.botCount > 1 ? `，${result.botCount}台并行` : ''
+        const servuxText = result.servuxRead > 0 ? `，Servux隔空读${result.servuxRead}个桶` : ''
         const packingText = result.deferredForPacking?.length ? `，${result.deferredForPacking.length}种物品待装盒恢复结算后再对账` : ''
-        this.msg(username, `同步完成：木桶${result.chestCount}，打开${result.openedChestCount}，重读${result.rescanCount || 0}${failureText}${parallelText}，多余${addedAmount}/${this.itemTypeCount(result.addedToMomo)}种，缺失${unresolvedAmount}/${this.itemTypeCount(result.unresolved)}种${packingText}。详情见Web管理页。`)
+        this.msg(username, `同步完成：木桶${result.chestCount}，打开${result.openedChestCount}，重读${result.rescanCount || 0}${failureText}${parallelText}${servuxText}，多余${addedAmount}/${this.itemTypeCount(result.addedToMomo)}种，缺失${unresolvedAmount}/${this.itemTypeCount(result.unresolved)}种${packingText}。详情见Web管理页。`)
         traceSummary(trace, {
           status: 'ok',
           chests: result.chestCount,

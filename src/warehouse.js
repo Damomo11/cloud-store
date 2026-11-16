@@ -2762,7 +2762,7 @@ class Warehouse {
       throw new Error(`同步失败：${blocks.length} 个容器中有 ${failures.length} 个读取失败；已保留全部旧记录，不会生成库存异常。${examples ? `失败示例：${examples}` : ''}`)
     }
 
-    return { radius, blocks, snapshots, actualItems }
+    return { radius, blocks, snapshots, actualItems, servuxRead: servuxScan?.viaServux || 0 }
   }
 
   // Servux 快路径扫描：握手成功则批量隔空查每个木桶的方块实体 NBT（含 Items），
@@ -2832,7 +2832,7 @@ class Warehouse {
       fallback: fallbackBlocks.length,
       decision: `Servux 快路径：${snapshots.length}/${blocks.length} 个木桶隔空读取，${fallbackBlocks.length} 个回退开箱`
     })
-    return { snapshots, fallbackBlocks }
+    return { snapshots, fallbackBlocks, viaServux: snapshots.length }
   }
 
   // Servux 方块实体 NBT 的 Items → 与开箱路径同形状的槽位列表。
