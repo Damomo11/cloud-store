@@ -340,7 +340,11 @@ class ServuxClient {
   }
 }
 
-// 1.21.6+ 的 payload 注册表机制：插件通道需在 configuration 阶段通过
+// 早期取证记录：configuration/play 阶段收到的全部 custom_payload（ring buffer），
+// 供 !servux探测 打印——判断服务器/Via 有没有把 S2C 的 register 等通道包转回来。
+const earlyPayloadLog = []
+const EARLY_LOG_LIMIT = 120
+
 // minecraft:register 声明（fabric 客户端由 loader 自动完成），否则 play 阶段
 // 该通道的包会被服务器/协议转换层静默丢弃——与线上「探测 6 秒 0 个包」吻合。
 // 实战参照：1.21.11 fabric + servux bridge 经 Via 连 26.3 服务器可用。
@@ -348,6 +352,17 @@ class ServuxClient {
 function hookEarlyChannelRegister (bot) {
   const client = bot?._client
   if (!client || typeof client.write !== 'function') return
+  // 取证监听：尽早挂上，configuration 期的 S2C custom_payload 也逃不掉
+  client.on('custom_payload', packet => {
+    if (earlyPayloadLog.length >= EARLY_LOG_LIMIT) earlyPayloadLog.shift()
+    earlyPayloadLog.push({
+      at: new Date().toISOString().slice(11, 19),
+      state: client.state,
+      channel: packet?.channel || '?',
+      bytes: Buffer.isBuffer(packet.data) ? packet.data.length : -1,
+      head: Buffer.isBuffer(packet.data) ? packet.data.subarray(0, 24).toString('hex') : ''
+    })
+  })
   let sent = false
   const sendRegister = () => {
     if (sent || client.state !== 'configuration') return
@@ -369,8 +384,13 @@ function hookEarlyChannelRegister (bot) {
   client.once('select_known_packs', sendRegister)
 }
 
+function getEarlyPayloadLog () {
+  return earlyPayloadLog.slice()
+}
+
 module.exports = {
   SERVUX_CHANNEL,
+  getEarlyPayloadLog,
   ServuxClient,
   hookEarlyChannelRegister,
   // 以下导出仅供建议单元测试 / 协议对照使用
