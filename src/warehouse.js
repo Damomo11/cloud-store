@@ -2707,8 +2707,11 @@ class Warehouse {
     // 优先走 Servux 快路径（servux:litematics 隔空查方块实体 NBT）：不用跑路开箱。
     // 通道不可用、单桶超时或解析失败的桶，回落到下面逐桶开箱的老路。
     let openBlocks = blocks
+    // servuxScan 需提升到 if 外：函数末尾的 return 用它统计 servuxRead，
+    // 块内 const 会在 servux 未启用/空列表时于 return 行抛 ReferenceError
+    let servuxScan = null
     if (blocks.length && this.config.timing?.servux?.enabled !== false) {
-      const servuxScan = await this.tryServuxScan(blocks)
+      servuxScan = await this.tryServuxScan(blocks)
       if (servuxScan) {
         snapshots.push(...servuxScan.snapshots)
         for (const snapshot of servuxScan.snapshots) actualItems.push(...snapshot.slots)
