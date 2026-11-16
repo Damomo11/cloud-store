@@ -2819,13 +2819,13 @@ class Warehouse {
     const missedBlocks = []
     const { map: results } = await client.queryBlocks(blocks.map(block => block.position))
     // 首轮失败的桶原地重试一次（间隔 600ms），偶发丢包/区块未就绪大多能补回来
-    const firstMissed = []
+    const firstMissed = new Map() // key -> 漏读原因（首轮）
     for (const block of blocks) {
       const { x, y, z } = block.position
       const outcome = results.get(`${x},${y},${z}`)
       const chest = this.blockToChest(block)
       if (!outcome?.ok) {
-        firstMissed.push(block)
+        firstMissed.set(`${x},${y},${z}`, outcome ? String(outcome.reason || 'no_response') : 'no_response')
         continue
       }
       try {
@@ -2833,30 +2833,43 @@ class Warehouse {
         const preReadSeq = this.warehouseState.revision
         snapshots.push({ chest, slots, preReadSeq })
       } catch (error) {
-        firstMissed.push(block)
+        firstMissed.set(`${x},${y},${z}`, `解析失败: ${error.message}`)
       }
     }
-    if (firstMissed.length) {
+    if (firstMissed.size) {
       await sleep(600)
-      const { map: retryResults } = await client.queryBlocks(firstMissed.map(block => block.position))
-      for (const block of firstMissed) {
-        const { x, y, z } = block.position
-        const outcome = retryResults.get(`${x},${y},${z}`)
+      const { map: retryResults } = await client.queryBlocks([...firstMissed.keys()].map(key => {
+        const [x, y, z] = key.split(',').map(Number)
+        return new Vec3(x, y, z)
+      }))
+      for (const [key, firstReason] of firstMissed) {
+        const [x, y, z] = key.split(',').map(Number)
+        const outcome = retryResults.get(key)
         if (outcome?.ok) {
           try {
             const slots = this.servuxItemsToSlots(outcome.compound)
             const preReadSeq = this.warehouseState.revision
-            snapshots.push({ chest: this.blockToChest(block), slots, preReadSeq })
+            snapshots.push({ chest: this.blockToChest({ position: { x, y, z } }), slots, preReadSeq })
             continue
           } catch (error) {
             // 解析失败按漏读处理
+            missedBlocks.push({ block: { position: { x, y, z } }, reason: `解析失败: ${error.message}` })
+            this.trace('sync', 'sync_servux_miss', {
+              chest: key,
+              reason: `解析失败: ${error.message}`,
+              firstReason,
+              decision: 'Servux 回包解析失败，该桶保留旧记录参与对账，不跑路开箱'
+            })
+            continue
           }
         }
-        missedBlocks.push(block)
+        const reason = outcome ? String(outcome.reason || 'no_response') : 'no_response'
+        missedBlocks.push({ block: { position: { x, y, z } }, reason })
         this.trace('sync', 'sync_servux_miss', {
-          chest: `${x},${y},${z}`,
-          reason: outcome?.reason || 'no_response',
-          decision: 'Servux 查询重试后仍无响应，该桶保留旧记录参与对账，不跑路开箱'
+          chest: key,
+          reason,
+          firstReason,
+          decision: `Servux 查询重试后仍失败（首轮: ${firstReason}），该桶保留旧记录参与对账，不跑路开箱`
         })
       }
     }
@@ -2869,8 +2882,8 @@ class Warehouse {
     }
     client.destroy()
     if (missedBlocks.length) {
-      // 漏读桶坐标直接打到控制台，排查服务器侧区块/布局问题不用再翻链路日志
-      console.error(`[warehouse] servux 漏读 ${missedBlocks.length} 个桶（已保留旧记录）: ${missedBlocks.map(block => this.describeChest(this.blockToChest(block))).join(' | ')}`)
+      // 漏读桶坐标+原因直接打到控制台，排查服务器侧区块/布局问题不用再翻链路日志
+      console.error(`[warehouse] servux 漏读 ${missedBlocks.length} 个桶（已保留旧记录）: ${missedBlocks.map(entry => `${this.describeChest(this.blockToChest(entry.block))}[${entry.reason}]`).join(' | ')}`)
     }
     this.trace('sync', 'sync_servux_summary', {
       total: blocks.length,
