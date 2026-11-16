@@ -3389,7 +3389,9 @@ class CloudStoreService {
         const unresolvedAmount = this.totalAmount(result.unresolved)
         const failureText = result.failures.length ? `，失败${result.failures.length}` : ''
         const parallelText = result.botCount > 1 ? `，${result.botCount}台并行` : ''
-        const servuxText = result.servuxRead > 0 ? `，Servux隔空读${result.servuxRead}个桶` : ''
+        const servuxText = result.servuxRead > 0
+          ? `，Servux隔空读${result.servuxRead}个桶${result.servuxMissed > 0 ? `（漏读${result.servuxMissed}个已保留旧记录）` : ''}`
+          : ''
         const packingText = result.deferredForPacking?.length ? `，${result.deferredForPacking.length}种物品待装盒恢复结算后再对账` : ''
         this.msg(username, `同步完成：木桶${result.chestCount}，打开${result.openedChestCount}，重读${result.rescanCount || 0}${failureText}${parallelText}${servuxText}，多余${addedAmount}/${this.itemTypeCount(result.addedToMomo)}种，缺失${unresolvedAmount}/${this.itemTypeCount(result.unresolved)}种${packingText}。详情见Web管理页。`)
         traceSummary(trace, {

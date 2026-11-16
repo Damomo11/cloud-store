@@ -2718,6 +2718,11 @@ class Warehouse {
         openBlocks = servuxScan.fallbackBlocks
       }
     }
+    if (!servuxScan && blocks.length) {
+      // 整体回退开箱老路：并行参与者可能还没回仓，先回仓再跑路；
+      // 协调 bot 已在 home（枚举清单时回过），此处 goHome 是 no-op。
+      await this.goHome({ requireWarehouse: this.db.listChests().length > 0 })
+    }
     for (let index = 0; index < openBlocks.length; index++) {
       this.assertConnectionHealthy()
       const block = openBlocks[index]
@@ -2765,12 +2770,21 @@ class Warehouse {
       throw new Error(`同步失败：${blocks.length} 个容器中有 ${failures.length} 个读取失败；已保留全部旧记录，不会生成库存异常。${examples ? `失败示例：${examples}` : ''}`)
     }
 
-    return { radius, blocks, snapshots, actualItems, servuxRead: servuxScan?.viaServux || 0 }
+    return {
+      radius,
+      blocks,
+      snapshots,
+      actualItems,
+      servuxRead: servuxScan?.viaServux || 0,
+      servuxMissed: servuxScan?.missed || 0,
+      servuxMode: Boolean(servuxScan)
+    }
   }
 
   // Servux 快路径扫描：握手成功则批量隔空查每个木桶的方块实体 NBT（含 Items），
-  // 不跑路不开箱。返回 null 表示通道不可用（调用方整体回退开箱）；否则
-  // fallbackBlocks 里是查询失败/解析失败、需要逐桶开箱兜底的木桶。
+  // 不跑路不开箱；失败桶原地重试一次，仍失败记入 missedBlocks（保留旧记录参与
+  // 对账，applyWarehouseScan 的 servux 分支处理）。返回 null 表示通道不可用
+  // （调用方整体回退逐桶开箱老路）。
   async tryServuxScan (blocks) {
     const settings = this.config.timing?.servux || {}
     const client = new ServuxClient(this.bot._client, {
@@ -2794,19 +2808,16 @@ class Warehouse {
     }
 
     const snapshots = []
-    const fallbackBlocks = []
+    const missedBlocks = []
     const { map: results } = await client.queryBlocks(blocks.map(block => block.position))
+    // 首轮失败的桶原地重试一次（间隔 600ms），偶发丢包/区块未就绪大多能补回来
+    const firstMissed = []
     for (const block of blocks) {
       const { x, y, z } = block.position
       const outcome = results.get(`${x},${y},${z}`)
       const chest = this.blockToChest(block)
       if (!outcome?.ok) {
-        fallbackBlocks.push(block)
-        this.trace('sync', 'sync_servux_miss', {
-          chest: this.describeChest(chest),
-          reason: outcome?.reason || 'no_response',
-          decision: 'Servux 查询无响应/失败，该桶回退逐桶开箱读取'
-        })
+        firstMissed.push(block)
         continue
       }
       try {
@@ -2814,28 +2825,49 @@ class Warehouse {
         const preReadSeq = this.warehouseState.revision
         snapshots.push({ chest, slots, preReadSeq })
         this.debug(`servux read ${this.describeChest(chest)} slots=${slots.length} items=${slots.reduce((sum, item) => sum + item.amount, 0)}`)
-        this.trace('sync', 'sync_servux_barrel', {
-          chest: this.describeChest(chest),
-          slots: slots.length,
-          items: slots.reduce((sum, item) => sum + item.amount, 0)
-        })
       } catch (error) {
-        fallbackBlocks.push(block)
-        this.trace('error', 'sync_servux_parse_failed', {
-          chest: this.describeChest(chest),
-          message: error.message,
-          decision: 'Servux 返回的 NBT 解析失败，该桶回退逐桶开箱读取'
+        firstMissed.push(block)
+      }
+    }
+    if (firstMissed.length) {
+      await sleep(600)
+      const { map: retryResults } = await client.queryBlocks(firstMissed.map(block => block.position))
+      for (const block of firstMissed) {
+        const { x, y, z } = block.position
+        const outcome = retryResults.get(`${x},${y},${z}`)
+        if (outcome?.ok) {
+          try {
+            const slots = this.servuxItemsToSlots(outcome.compound)
+            const preReadSeq = this.warehouseState.revision
+            snapshots.push({ chest: this.blockToChest(block), slots, preReadSeq })
+            continue
+          } catch (error) {
+            // 解析失败按漏读处理
+          }
+        }
+        missedBlocks.push(block)
+        this.trace('sync', 'sync_servux_miss', {
+          chest: `${x},${y},${z}`,
+          reason: outcome?.reason || 'no_response',
+          decision: 'Servux 查询重试后仍无响应，该桶保留旧记录参与对账，不跑路开箱'
         })
       }
+    }
+    for (const snapshot of snapshots) {
+      this.trace('sync', 'sync_servux_barrel', {
+        chest: this.describeChest(snapshot.chest),
+        slots: snapshot.slots.length,
+        items: snapshot.slots.reduce((sum, item) => sum + item.amount, 0)
+      })
     }
     client.destroy()
     this.trace('sync', 'sync_servux_summary', {
       total: blocks.length,
       viaServux: snapshots.length,
-      fallback: fallbackBlocks.length,
-      decision: `Servux 快路径：${snapshots.length}/${blocks.length} 个木桶隔空读取，${fallbackBlocks.length} 个回退开箱`
+      missed: missedBlocks.length,
+      decision: `Servux 快路径：${snapshots.length}/${blocks.length} 个木桶隔空读取，${missedBlocks.length} 个漏读（保留旧记录，不跑路）`
     })
-    return { snapshots, fallbackBlocks, viaServux: snapshots.length }
+    return { snapshots, fallbackBlocks: [], missedBlocks, viaServux: snapshots.length, missed: missedBlocks.length }
   }
 
   // Servux 方块实体 NBT 的 Items → 与开箱路径同形状的槽位列表。
@@ -2855,10 +2887,11 @@ class Warehouse {
     return slots
   }
 
-  // 并行参与者：回仓就位后扫描分配到的分区。与协调 bot 共用同一份
+  // 并行参与者：扫描分配到的分区。与协调 bot 共用同一份
   // warehouseState（revision / chestRevisions），快照语义不变。
+  // Servux 可用时参与 bot 原地隔空发查询，无需回仓；通道不可用时
+  // scanBarrelBlocks 内部会先回仓再逐桶开箱。
   async scanSyncPartition (radius, blocks) {
-    await this.goHome({ requireWarehouse: this.db.listChests().length > 0 })
     return this.scanBarrelBlocks(blocks, radius)
   }
 
@@ -2903,6 +2936,51 @@ class Warehouse {
     this.assertConnectionHealthy()
     const actualItems = snapshots.flatMap(snapshot => snapshot.slots)
     this.assertConnectionHealthy()
+
+    // Servux 部分更新模式：漏读的桶保留旧记录（不 clearChests 全量重写），
+    // 只移除「登记中不在本次枚举」的桶（已拆除），对账时把未读桶的旧库存计入。
+    if (scan.servuxMode) {
+      const readIds = new Set(snapshots.map(snapshot => snapshot.chest.chestId))
+      const scannedIds = new Set(blocks.map(block => `${block.position.x},${block.position.y},${block.position.z}`))
+      const removedIds = this.db.listChests()
+        .map(chest => chest.chestId)
+        .filter(chestId => !scannedIds.has(chestId))
+      this.db.removeChests(removedIds)
+      for (const snapshot of snapshots) {
+        this.db.upsertChest(snapshot.chest)
+        this.db.replaceChestSlots(snapshot.chest.chestId, snapshot.slots)
+      }
+      // 未读桶沿用旧槽位记录计入对账：账面把它们的库存视作「未变化」。
+      // 行必须带完整物品档案（对账内部会按行 upsertItem）。
+      const unreadItems = this.db.listChestSlots()
+        .filter(row => !readIds.has(row.chestId) && row.itemKey && row.amount > 0)
+        .map(row => {
+          const item = this.db.getItemByKey(row.itemKey)
+          return item
+            ? { ...item, amount: row.amount }
+            : { itemKey: row.itemKey, itemId: row.itemKey, displayName: row.itemKey, nbtJson: '', metaJson: '', amount: row.amount }
+        })
+      const totals = this.mergeItems([...actualItems, ...unreadItems])
+      const reconcile = this.db.reconcileTotalsToMomo(totals)
+      this.db.addTransaction('sync', 'ok', this.config.momoOwner, 'momo', totals, `radius=${radius}, chests=${blocks.length}, servux=${scan.servuxRead}, missed=${scan.servuxMissed}, removed=${removedIds.length}`)
+      this.trace('sync', 'sync_servux_partial_apply', {
+        applied: snapshots.length,
+        missedKept: readIds.size ? this.db.listChests().length - snapshots.length : 0,
+        removed: removedIds.length,
+        decision: `Servux 模式落库：更新 ${snapshots.length} 桶，漏读 ${scan.servuxMissed} 桶保留旧记录，移除已拆除 ${removedIds.length} 桶`
+      })
+      return {
+        chestCount: blocks.length,
+        openedChestCount: snapshots.length,
+        rescanCount,
+        failures: [],
+        servuxRead: scan.servuxRead,
+        servuxMissed: scan.servuxMissed,
+        totals,
+        ...reconcile
+      }
+    }
+
     this.db.clearChests()
     for (const snapshot of snapshots) {
       this.db.upsertChest(snapshot.chest)
@@ -2918,6 +2996,8 @@ class Warehouse {
       openedChestCount: snapshots.length,
       rescanCount,
       failures: [],
+      servuxRead: scan.servuxRead || 0,
+      servuxMissed: scan.servuxMissed || 0,
       totals,
       ...reconcile
     }
