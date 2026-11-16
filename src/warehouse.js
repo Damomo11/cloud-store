@@ -2831,7 +2831,6 @@ class Warehouse {
         const slots = this.servuxItemsToSlots(outcome.compound)
         const preReadSeq = this.warehouseState.revision
         snapshots.push({ chest, slots, preReadSeq })
-        this.debug(`servux read ${this.describeChest(chest)} slots=${slots.length} items=${slots.reduce((sum, item) => sum + item.amount, 0)}`)
       } catch (error) {
         firstMissed.push(block)
       }
@@ -2868,6 +2867,10 @@ class Warehouse {
       })
     }
     client.destroy()
+    if (missedBlocks.length) {
+      // 漏读桶坐标直接打到控制台，排查服务器侧区块/布局问题不用再翻链路日志
+      console.error(`[warehouse] servux 漏读 ${missedBlocks.length} 个桶（已保留旧记录）: ${missedBlocks.map(block => this.describeChest(this.blockToChest(block))).join(' | ')}`)
+    }
     this.trace('sync', 'sync_servux_summary', {
       total: blocks.length,
       viaServux: snapshots.length,
