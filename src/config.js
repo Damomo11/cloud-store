@@ -207,6 +207,26 @@ function stripJsonComments (text) {
   return result
 }
 
+// servux 参数曾以旧默认值自动补写进线上 config.json；新默认值上线后自动升级，
+// 只迁移「恰好等于旧默认值」的字段，用户手动改成其他值的保留不动。
+const STALE_SERVUX_DEFAULTS = [
+  ['perTickPackets', 4, 20],
+  ['maxInFlight', 100, 1000]
+]
+
+function upgradeStaleServuxDefaults (config) {
+  const upgrades = []
+  const servux = config?.timing?.servux
+  if (!servux || typeof servux !== 'object') return upgrades
+  for (const [key, oldValue, newValue] of STALE_SERVUX_DEFAULTS) {
+    if (servux[key] === oldValue) {
+      servux[key] = newValue
+      upgrades.push(`timing.servux.${key}: ${oldValue} → ${newValue}`)
+    }
+  }
+  return upgrades
+}
+
 function normalizeConfig (config) {
   if (config?.server && config.server.auth !== 'microsoft') {
     console.warn('[config] only Microsoft OAuth2 is supported; auth has been set to microsoft in memory')
@@ -215,6 +235,7 @@ function normalizeConfig (config) {
   if (config?.web && typeof config.web.dashboardUrl === 'string' && !config.web.dashboardUrl.trim()) {
     delete config.web.dashboardUrl
   }
+  upgradeStaleServuxDefaults(config)
   return config
 }
 
@@ -264,13 +285,29 @@ function formatConfigFile (config) {
   ].join('\n')
 }
 
+// 检测文件文本里是否还留着旧默认值（normalizeConfig 已在内存中升级，此处只为
+// 触发文件写回持久化）。key 名全配置唯一，宽松匹配安全。
+function detectStaleServuxInText (text) {
+  const upgrades = []
+  for (const [key, oldValue, newValue] of STALE_SERVUX_DEFAULTS) {
+    if (new RegExp(`"${key}"\\s*:\\s*${oldValue}\\b`).test(text)) {
+      upgrades.push(`timing.servux.${key}: ${oldValue} → ${newValue}`)
+    }
+  }
+  return upgrades
+}
+
 function autoUpdateConfigFile (configPath, config, originalText) {
+  const staleUpgrades = detectStaleServuxInText(originalText)
   const added = applyMissingDefaults(config, DEFAULT_CONFIG)
-  if (!added.length) return { changed: false, added }
+  if (!added.length && !staleUpgrades.length) return { changed: false, added }
 
   const backupPath = backupPathForConfig(configPath)
   fs.writeFileSync(backupPath, originalText, 'utf8')
   fs.writeFileSync(configPath, formatConfigFile(config), 'utf8')
+  if (staleUpgrades.length) {
+    console.log(`[config] upgraded stale servux defaults: ${staleUpgrades.join(', ')}`)
+  }
   console.log(`[config] added missing config fields: ${added.join(', ')}`)
   console.log(`[config] backup written to ${backupPath}`)
   return { changed: true, added, backupPath }
