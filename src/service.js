@@ -3,7 +3,7 @@ const { startTrace, traceEvent, traceSummary, traceStandalone, shortKey } = requ
 const { runHotReload } = require('./hotReload')
 const { planShortages, normalizeItemId } = require('./shortagePlanner')
 const { findWithdrawPinyinItems } = require('./withdrawPinyin')
-const { ServuxClient } = require('./servux')
+const { ServuxClient, getEarlyPayloadLog } = require('./servux')
 
 const REPAIR_BOTTLE_ITEM_ID = 'minecraft:experience_bottle'
 const REPAIR_BOTTLE_AMOUNT = 64
@@ -3261,7 +3261,28 @@ class CloudStoreService {
       lines.push('servux:litematics 没有任何回包。')
     }
     console.log(`[servux] probe by ${username}: channels=${JSON.stringify([...seen.entries()])} registers=${JSON.stringify(registers)}`)
-    this.msg(username, lines.join('\n'))
+    // 早期取证：从程序启动（configuration）至今收到的全部 custom_payload 摘要
+    const early = getEarlyPayloadLog()
+    const earlyLines = [`\n[早期取证] 自启动以来共录到 ${early.length} 个 custom_payload：`]
+    const byState = new Map()
+    for (const item of early) {
+      const key = `${item.state}|${item.channel}`
+      const entry = byState.get(key) || { count: 0, bytes: 0 }
+      entry.count++
+      entry.bytes += Math.max(0, item.bytes)
+      byState.set(key, entry)
+    }
+    for (const [key, entry] of [...byState.entries()].slice(0, 15)) {
+      earlyLines.push(`- [${key}] ${entry.count} 个 / ${entry.bytes} 字节`)
+    }
+    if (!byState.size) earlyLines.push('（一个都没录到——configuration 期服务器/Via 也没下发过任何通道包）')
+    const earlyRegisters = early.filter(i => i.channel === 'minecraft:register' && i.state === 'configuration')
+    if (earlyRegisters.length) {
+      earlyLines.push(`configuration 期收到过服务器 register ${earlyRegisters.length} 次，首 24 字节：${earlyRegisters[0].head}`)
+    } else {
+      earlyLines.push('configuration 期没收到过服务器的 register——S2C 通道声明没被转回来。')
+    }
+    this.msg(username, lines.join('\n') + earlyLines.join('\n'))
   }
 
   // !servux测速 [数量]：管理员诊断用。对已登记木桶的坐标全速批量发 servux:litematics
