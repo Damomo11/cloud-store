@@ -40,9 +40,10 @@ function encodeBlockPos (x, y, z) {
   return Buffer.from(bytes)
 }
 
-// 注册包：varint(2) + FriendlyByteBuf.writeNbt 格式（1.21.5+）的 NBT。
-// writeNbt = varint(NBT字节数) + unnamed 根 compound；26.3 服务器 readNbt
-// 先读 varint 长度再读 NBT——缺长度头时会把 NBT 首字节 0x0A 当长度，静默丢弃。
+// 注册包：varint(2) + FriendlyByteBuf.writeNbt 格式的 NBT。
+// 1.21.11 与 26.3 官方字节码一致：readNbt 直接以首字节为 tag 类型（无长度前缀），
+// 即 [0x0A][条目...][0x00]。此前多塞的 varint 长度头（0x10）被服务器当成非法
+// tag 类型，Servux 的 try/catch 吞掉后静默——这就是线上全超时的根因。
 function buildRegisterPacket () {
   const nbtBytes = Buffer.from([
     0x0A, // TAG_Compound（无名根，直接条目）
@@ -51,7 +52,6 @@ function buildRegisterPacket () {
   ])
   return Buffer.concat([
     writeVarInt(C2S_METADATA_REQUEST),
-    writeVarInt(nbtBytes.length),
     nbtBytes
   ])
 }
