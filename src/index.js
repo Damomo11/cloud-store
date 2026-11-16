@@ -497,7 +497,6 @@ function setupRegistryExport (bot, catalog, db) {
     fs.mkdirSync(path.dirname(filePath), { recursive: true })
     fs.writeFileSync(filePath, JSON.stringify(exported, null, 2), 'utf8')
     console.log(`[registry] exported ${exported.count} server enchantments to ${filePath}`)
-    logEnchantmentRegistry(exported.enchantments)
 
     const loaded = catalog.reloadServerEnchantments(filePath)
     console.log(`[registry] reloaded ${loaded} server enchantment mappings`)
@@ -506,17 +505,6 @@ function setupRegistryExport (bot, catalog, db) {
       console.log(`[registry] refreshed ${refreshed} stored item display names`)
     }
   })
-}
-
-function logEnchantmentRegistry (enchantments, batchSize = 12) {
-  const entries = Array.isArray(enchantments) ? enchantments : []
-  for (let offset = 0; offset < entries.length; offset += batchSize) {
-    const batch = entries.slice(offset, offset + batchSize)
-    const details = batch
-      .map(entry => `${entry.id}:${entry.key}=${String(entry.displayName || '').replace(/\s+/g, ' ').trim()}`)
-      .join(' | ')
-    console.log(`[registry] enchantments ${offset + 1}-${offset + batch.length}/${entries.length}: ${details}`)
-  }
 }
 
 function exportEnchantmentRegistry (packet, catalog) {
