@@ -140,6 +140,8 @@ class ServuxClient {
     this.inFlight = 0
     this.queue = [] // { posKey, x, y, z, resolve }
     this.pumpTimer = null
+    this.decodeQueue = [] // 待解包回包队列（防事件循环饿死，见 drainDecodeQueue）
+    this.decodeDraining = false
     this.payloadHandler = null
     this.handshakeWaiter = null
     this.destroyed = false
@@ -168,6 +170,8 @@ class ServuxClient {
     this.inFlight = 0
     for (const job of this.queue) job.resolve({ ok: false, reason: 'destroyed' })
     this.queue = []
+    for (const job of this.decodeQueue) job.reject(new Error('servux client destroyed'))
+    this.decodeQueue = []
   }
 
   // 注册握手：服务器没有 Servux（或该功能没启用）时超时返回 false，调用方回退开箱同步。
@@ -232,10 +236,35 @@ class ServuxClient {
     this.inFlight--
     clearTimeout(job.timer)
     const rttMs = job.sentAt ? Date.now() - job.sentAt : null
-    decodeBlockNbt(payload)
+    this.enqueueDecode(payload)
       .then(compound => job.resolve({ ok: true, compound, rttMs }))
       .catch(error => job.resolve({ ok: false, reason: `nbt_decode:${error.message}`, rttMs }))
     this.maybeStopPump()
+  }
+
+  // 解包排队：全仓同步一次来几千个回包，gunzip+NBT 解析是同步 CPU 活。
+  // 连着解会把事件循环饿死，keepalive 得不到处理，同进程的所有 bot 一起
+  // 30 秒超时掉线。改成每解一个包就 setImmediate 让出主线，I/O 照常呼吸。
+  enqueueDecode (payload) {
+    return new Promise((resolve, reject) => {
+      this.decodeQueue.push({ payload, resolve, reject })
+      this.drainDecodeQueue().catch(() => {})
+    })
+  }
+
+  async drainDecodeQueue () {
+    if (this.decodeDraining || this.destroyed) return
+    this.decodeDraining = true
+    while (this.decodeQueue.length && !this.destroyed) {
+      const job = this.decodeQueue.shift()
+      try {
+        job.resolve(await decodeBlockNbt(job.payload))
+      } catch (error) {
+        job.reject(error)
+      }
+      if (this.decodeQueue.length) await new Promise(resolve => setImmediate(resolve))
+    }
+    this.decodeDraining = false
   }
 
   // 批量查询：返回 { map, list }。map 按坐标索引（同坐标重复查询时保留最后结果），
