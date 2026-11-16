@@ -2696,11 +2696,12 @@ class Warehouse {
       blocks = this.findContainerBlocksByUnion(radius)
     }
     if (!blocks) blocks = this.findContainerBlocks(radius)
-    this.debug(`found ${blocks.length} openable container blocks: ${blocks.map(block => this.describeBlock(block)).join(' | ')}`)
+    // 只报数量和前几个例子：全仓几千个桶逐个列出来是一行巨长的刷屏日志
+    this.debug(`found ${blocks.length} openable container blocks: ${blocks.slice(0, 3).map(block => this.describeBlock(block)).join(' | ')}${blocks.length > 3 ? ` …等共 ${blocks.length} 个` : ''}`)
     this.trace('sync', 'sync_blocks_found', {
       radius,
       count: blocks.length,
-      blocks: blocks.map(block => this.describeBlock(block))
+      blocks: blocks.slice(0, 10).map(block => this.describeBlock(block))
     })
     return blocks
   }
