@@ -3157,7 +3157,10 @@ class CloudStoreService {
 
   async syncWarehouseWithTeam (coordinator, radius, trace, options = {}) {
     const blocks = await coordinator.warehouse.prepareSyncBlocks(radius)
-    const participants = this.collectSyncParticipants(coordinator)
+    // Servux 隔空模式只派一只 bot：扫描不跑路不开箱，借别的 bot 并行没有意义，
+    // 反而让它们各自回 home 空跑一趟。
+    const servuxOnly = coordinator.config.timing?.servux?.enabled !== false && coordinator.db.listChests().length > 0
+    const participants = servuxOnly ? [coordinator] : this.collectSyncParticipants(coordinator)
     // 桶数不足就不分区（<=1 个桶并行没有意义）。
     const workerCount = blocks.length > 1 ? Math.min(participants.length, blocks.length) : 1
     const team = participants.slice(0, workerCount)
