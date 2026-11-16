@@ -98,8 +98,9 @@ class ItemCatalog {
   // 再复用 fromPrismarineItem，保证同一件物品两条路径算出同一个指纹。
   fromServuxItem (entry) {
     const name = String(entry?.id || '').replace(/^minecraft:/, '')
-    const data = this.mcData.itemsByName[name]
-    if (!data) throw new Error(`未知物品：${entry?.id}`)
+    // 服务器自定义物品（数据包注册的 minecraft: 命名空间物品）不在本地 mcData 词典里，
+    // 以前直接抛“未知物品”导致整个桶漏读；现在对齐开箱路径（fromPrismarineItem 不查词典），
+    // 用原始物品 id 建档案，这些桶照常入账。
     const rawComponents = entry?.components && typeof entry.components === 'object' && !Array.isArray(entry.components)
       ? entry.components
       : null
@@ -109,7 +110,7 @@ class ItemCatalog {
     return this.fromPrismarineItem({
       name,
       count: Number(entry.count ?? 1),
-      type: data.id,
+      type: this.mcData.itemsByName[name]?.id ?? null,
       components,
       removedComponents: null,
       metadata: null,

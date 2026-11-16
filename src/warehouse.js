@@ -2819,13 +2819,13 @@ class Warehouse {
     const missedBlocks = []
     const { map: results } = await client.queryBlocks(blocks.map(block => block.position))
     // 首轮失败的桶原地重试一次（间隔 600ms），偶发丢包/区块未就绪大多能补回来
-    const firstMissed = new Map() // key -> 漏读原因（首轮）
+    const firstMissed = new Map() // key -> { block, reason }（首轮漏读）
     for (const block of blocks) {
       const { x, y, z } = block.position
       const outcome = results.get(`${x},${y},${z}`)
       const chest = this.blockToChest(block)
       if (!outcome?.ok) {
-        firstMissed.set(`${x},${y},${z}`, outcome ? String(outcome.reason || 'no_response') : 'no_response')
+        firstMissed.set(`${x},${y},${z}`, { block, reason: outcome ? String(outcome.reason || 'no_response') : 'no_response' })
         continue
       }
       try {
@@ -2833,7 +2833,7 @@ class Warehouse {
         const preReadSeq = this.warehouseState.revision
         snapshots.push({ chest, slots, preReadSeq })
       } catch (error) {
-        firstMissed.set(`${x},${y},${z}`, `解析失败: ${error.message}`)
+        firstMissed.set(`${x},${y},${z}`, { block, reason: `解析失败: ${error.message}` })
       }
     }
     if (firstMissed.size) {
@@ -2842,34 +2842,33 @@ class Warehouse {
         const [x, y, z] = key.split(',').map(Number)
         return new Vec3(x, y, z)
       }))
-      for (const [key, firstReason] of firstMissed) {
-        const [x, y, z] = key.split(',').map(Number)
+      for (const [key, first] of firstMissed) {
         const outcome = retryResults.get(key)
         if (outcome?.ok) {
           try {
             const slots = this.servuxItemsToSlots(outcome.compound)
             const preReadSeq = this.warehouseState.revision
-            snapshots.push({ chest: this.blockToChest({ position: { x, y, z } }), slots, preReadSeq })
+            snapshots.push({ chest: this.blockToChest(first.block), slots, preReadSeq })
             continue
           } catch (error) {
             // 解析失败按漏读处理
-            missedBlocks.push({ block: { position: { x, y, z } }, reason: `解析失败: ${error.message}` })
+            missedBlocks.push({ block: first.block, reason: `解析失败: ${error.message}` })
             this.trace('sync', 'sync_servux_miss', {
               chest: key,
               reason: `解析失败: ${error.message}`,
-              firstReason,
+              firstReason: first.reason,
               decision: 'Servux 回包解析失败，该桶保留旧记录参与对账，不跑路开箱'
             })
             continue
           }
         }
         const reason = outcome ? String(outcome.reason || 'no_response') : 'no_response'
-        missedBlocks.push({ block: { position: { x, y, z } }, reason })
+        missedBlocks.push({ block: first.block, reason })
         this.trace('sync', 'sync_servux_miss', {
           chest: key,
           reason,
-          firstReason,
-          decision: `Servux 查询重试后仍失败（首轮: ${firstReason}），该桶保留旧记录参与对账，不跑路开箱`
+          firstReason: first.reason,
+          decision: `Servux 查询重试后仍失败（首轮: ${first.reason}），该桶保留旧记录参与对账，不跑路开箱`
         })
       }
     }
