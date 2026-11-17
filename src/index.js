@@ -70,6 +70,17 @@ function createBot (config, onMsaCode) {
     attachCatalog(createCatalogForVersion(negotiated))
   })
 
+  // 26.x（1.21.2+）机制：客户端要发 player_loaded 告诉服务器"加载完成"，
+  // 服务器收到后才开始推区块/坐标/keepalive。以前 1.21.11 直连靠服务器端
+  // Via 代发，现在直连 26.3 必须自己发，不然 30 秒 keepalive 超时被踢。
+  bot.once('login', () => {
+    try {
+      bot._client.write('player_loaded', {})
+    } catch {
+      // 版本没有这个包（< 1.21.2）就跳过
+    }
+  })
+
   bot.loadPlugin(pathfinder)
   return bot
 }

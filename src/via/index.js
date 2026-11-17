@@ -39,6 +39,9 @@ function activate () {
   // prismarine-physics 特性表补 26.x（不然 Physics() 抛 No liquid gravity settings）
   require('./physics-features').installPhysics26()
 
+  // mineflayer time 插件兼容 26.x 单字段 update_time（不然 longToBigInt(undefined) 炸）
+  require('./time-compat').installTimeCompat()
+
   // mineflayer 的版本边界检查（lib/version.js → lib/loader.js 解构）放行 26.3
   try {
     const mfPkgDir = path.dirname(require.resolve('mineflayer/package.json'))
