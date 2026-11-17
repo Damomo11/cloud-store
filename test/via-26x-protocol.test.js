@@ -230,3 +230,43 @@ test('sync_entity_position 修复不再覆盖 mineflayer 已转好的弧度朝�
   assert.ok(Math.abs(entity.yaw - Math.PI / 2) < 1e-9, 'yaw 应保持 mineflayer 的弧度值不被度数覆盖')
   assert.ok(entity.pitch < 0, 'pitch 应保持弧度符号')
 })
+
+test('26.3 粒子 id 表重排：entity_effect@28 带颜色 / sonic_boom@35 / geyser 系数据结构', () => {
+  require('../src/via').activate()
+  const names263 = require('../data/via/26.3/particles.json').names263
+  const md = require('minecraft-data')
+  const T = md('26.3').protocol.types.Particle
+  const mappings = T[1][0].type[1].mappings
+  assert.strictEqual(mappings[28], 'entity_effect', '26.3 id28 应为 entity_effect（26.1 表是 sonic_boom）')
+  assert.strictEqual(mappings[35], 'sonic_boom')
+  assert.strictEqual(Object.keys(mappings).length, names263.length, 'mapper 应覆盖全部 128 个 26.3 粒子')
+  const fields = T[1][1].type[1].fields
+  // Via fill26_2 真值：geyser_base/geyser_poof = i32+f32，geyser/geyser_plume = i32
+  assert.strictEqual(fields.entity_effect, 'i32')
+  assert.deepStrictEqual(fields.geyser, ['container', [{ name: 'value', type: 'i32' }]])
+  assert.deepStrictEqual(fields.geyser_base, ['container', [{ name: 'value', type: 'i32' }, { name: 'scale', type: 'f32' }]])
+  assert.strictEqual(fields.sulfur_bubbles, 'void', '无数据新粒子显式 void（protodef 对缺失字段宽松，显式声明更稳）')
+  // 带数据的粒子必须有字段；无数据粒子 protodef 宽松处理（26.1 的 cloud/crit 等同样无字段）
+})
+
+test('entity_metadata 药水粒子真包字节（21B）全量消费不再剩 4 字节', () => {
+  const pair = makePair('play', 'toClient')
+  // 2026-11-18 部署实测样本：血量 16.0 + entity_effect 颜色 0xFF33EBFF 的实体 metadata
+  const hex = '65e1f5a5bf050903418000000a11011cff33ebffff'
+  const buf = Buffer.from(hex, 'hex')
+  const { data } = pair.des.parsePacketBuffer(buf)
+  assert.strictEqual(data.name, 'entity_metadata')
+  assert.strictEqual(data.params.entityId, 1474919137)
+  assert.strictEqual(data.params.metadata[1].value[0].type, 'entity_effect')
+  assert.strictEqual(data.params.metadata[1].value[0].data, -13374465, '颜色应为 0xFF33EBFF')
+  // 不抛 "Chunk size is 21 but only 17 was read" 即为全量消费（parsePacketBuffer 异常即测试失败）
+  // 粒子 id 28 → entity_effect 的位移同时覆盖 world_particles（同一 Particle 类型）
+  const wp = roundTrip(pair, 'world_particles', {
+    particle: { type: 'sulfur_bubbles' },
+    overrideLimiter: false, alwaysShow: true,
+    x: 1.5, y: 2.5, z: 3.5,
+    velocityOffset: { x: 0, y: 0, z: 0 },
+    amount: 1, maxSpeed: 0.1, longDistance: false
+  })
+  assert.strictEqual(wp.params.particle.type, 'sulfur_bubbles')
+})
