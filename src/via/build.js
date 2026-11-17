@@ -16,7 +16,8 @@ function loadData () {
     entities: read('entities.json'),
     components: read('data_component_type.json'),
     chain: read('id-chain-26.1-to-26.3.json').registries,
-    newBlockStates: read('new-block-states.json')
+    newBlockStates: read('new-block-states.json'),
+    blockProps: read('new-block-props.json').blocks
   }
 }
 
@@ -27,18 +28,35 @@ function indexByName (list) {
   return map
 }
 
+// 新物品的真实 stackSize（2026-11 从 26.3 客户端 Items.java 反编译核对；
+// 旧逻辑全按 64，会导致仓库/背包把 16 叠的 cushion、1 叠的船当 64 叠处理）
+const NEW_ITEM_STACK_SIZES = {
+  poplar_boat: 1,
+  poplar_chest_boat: 1,
+  poplar_sign: 16,
+  poplar_hanging_sign: 16,
+  sulfur_cube_bucket: 1,
+  music_disc_bounce: 1,
+  sulfur_cube_spawn_egg: 64
+}
+function newItemStackSize (name) {
+  if (/_cushion$/.test(name)) return 16 // ColorCollection.registerItems 统一 stacksTo(16)（white_cushion 等）
+  return NEW_ITEM_STACK_SIZES[name] ?? 64
+}
+
 // items：26.3 全表按 id 重排；旧物品沿用 26.1 条目字段，新物品造最小条目
 function rebuildItems (data, base) {
   const byName = indexByName(base.items)
   const out = data.items.names263.map((name, id) => {
     const old = byName.get(name)
     if (old) return { ...old, id }
+    const stack = newItemStackSize(name)
     return {
       id,
       name,
       displayName: name,
-      stackSize: 64,
-      maxStackSize: 64,
+      stackSize: stack,
+      maxStackSize: stack,
       hideInCommands: false,
       isBrandingItem: false
     }
@@ -66,19 +84,24 @@ function rebuildBlocks (data, base) {
       }
       return entry
     }
-    // 新方块：状态段来自空闲 id 分配
-    const seg = newStates[name]
+    // 新方块：状态段来自空闲 id 分配；hardness/boundingBox/transparent 用 26.3 真实属性
+    // （旧逻辑全填 hardness:0 + diggable:false + boundingBox:'empty'，bot 会拒绝挖白杨木、
+    //  把树当空气穿过。2026-11 审计修正）
+    // 注意 gen 数据的键带 minecraft: 前缀而 names263 无前缀——旧代码直接 newStates[name]
+    // 永远 undefined，状态段/属性从未生效过（minStateId 一直 -1）
+    const seg = newStates[name] ?? newStates['minecraft:' + name]
     const minStateId = seg && seg.firstStateId >= 0 ? seg.firstStateId : -1
+    const p = data.blockProps[name] ?? data.blockProps['minecraft:' + name]
     return {
       id,
       name,
       displayName: name,
-      hardness: 0,
+      hardness: p ? p.hardness : 0,
       stackSize: 64,
-      diggable: false,
-      boundingBox: 'empty',
+      diggable: p ? p.hardness >= 0 : false,
+      boundingBox: p && p.noCollision ? 'empty' : 'block',
       drops: [],
-      transparent: true,
+      transparent: p ? !!(p.noOcclusion || p.noCollision) : true,
       emitLight: 0,
       filterLight: 0,
       shapes: [], // prismarine-block/movements 直接读 shapes.length，缺了就炸
@@ -91,12 +114,22 @@ function rebuildBlocks (data, base) {
 }
 
 // entities：26.3 全表重排
+// 新实体的真实碰撞箱（26.3 客户端 EntityTypes / VFP Mortis ContentRegistry 反编译核对；
+// 旧逻辑全填 0.5×0.5 type:mob，cushion 的垫子碰撞和船的尺寸都会失真）
+const NEW_ENTITY_SIZES = {
+  sulfur_cube: { type: 'mob', height: 0.49, width: 0.49 },
+  cushion: { type: 'object', height: 0.25, width: 1.0 },
+  poplar_boat: { type: 'object', height: 0.5625, width: 1.375 },
+  poplar_chest_boat: { type: 'object', height: 0.5625, width: 1.375 }
+}
+
 function rebuildEntities (data, base) {
   const byName = indexByName(base.entities)
   return data.entities.names263.map((name, id) => {
     const old = byName.get(name)
     if (old) return { ...old, id }
-    return { id, name, displayName: name, type: 'mob', height: 0.5, width: 0.5, newVia26x: true }
+    const known = NEW_ENTITY_SIZES[name] ?? { type: 'mob', height: 0.5, width: 0.5 }
+    return { id, name, displayName: name, ...known, newVia26x: true }
   })
 }
 
