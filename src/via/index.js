@@ -36,6 +36,9 @@ function activate () {
   // prismarine-chunk 注册 26.x 区块实现（26.1 起 section 多一个 fluidCount SHORT）
   require('./chunk-26').installChunk26()
 
+  // prismarine-physics 特性表补 26.x（不然 Physics() 抛 No liquid gravity settings）
+  require('./physics-features').installPhysics26()
+
   // mineflayer 的版本边界检查（lib/version.js → lib/loader.js 解构）放行 26.3
   try {
     const mfPkgDir = path.dirname(require.resolve('mineflayer/package.json'))
