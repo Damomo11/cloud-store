@@ -109,3 +109,26 @@ test('post_effects：varint 数量 + N 个 identifier', () => {
   const { params } = roundTrip(pair, 'post_effects', ['minecraft:test_effect'])
   assert.deepStrictEqual(params, ['minecraft:test_effect'])
 })
+
+test('serverbound 兼容层：teleport_confirm 补坐标 / block_dig status 移位 / arm_animation→punch', () => {
+  const EventEmitter = require('node:events')
+  const { installRepairSync } = require('../src/via/sync-compat.js')
+  const client = new EventEmitter()
+  const writes = []
+  client.write = (name, params) => { writes.push([name, params]) }
+  const fakeBot = { _client: client, entities: {} }
+  installRepairSync(fakeBot)
+  // nmp 先发 'packet' 再发 'position'（physics.js 在 'position' 里写 confirm）
+  client.emit('packet', { teleportId: 7, x: 10.5, y: -3.25, z: 200.75, dx: 0, dy: 0, dz: 0, yaw: 45, pitch: -10 }, { name: 'position' })
+  client.emit('position', { teleportId: 7, x: 10.5, y: -3.25, z: 200.75, yaw: 45, pitch: -10 })
+  client.write('teleport_confirm', { teleportId: 7 })
+  assert.deepStrictEqual(writes[0][1], { teleportId: 7, x: 10.5, y: -3.25, z: 200.75, yRot: 45, xRot: -10 })
+  client.write('block_dig', { status: 0, location: {}, face: 0, sequence: 1 })
+  client.write('block_dig', { status: 1, location: {}, face: 0, sequence: 2 })
+  client.write('block_dig', { status: 2, location: {}, face: 0, sequence: 3 })
+  client.write('block_dig', { status: 5, location: {}, face: 0, sequence: 4 })
+  assert.deepStrictEqual(writes.slice(1).map(w => w[1].status), [0, 2, 3, 6],
+    '26.3 在 action 1 插入 CHANGE_DESTROY_DIRECTION，≥1 的 status 整体 +1')
+  client.write('arm_animation', { hand: 0 })
+  assert.deepStrictEqual(writes[5], ['punch', {}])
+})
