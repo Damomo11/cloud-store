@@ -33,24 +33,44 @@ test('补丁后的 26.3 协议可被 nmp 编译器编译', () => {
   }
 })
 
-test('rel_entity_move：properties 在 delta 之前，0/1 步两种形态', () => {
+test('rel_entity_move：properties 是打包位段（onGround|stepCount<<1），0/1/2 步三种形态', () => {
   const pair = makePair('play', 'toClient')
-  // 线格式：varint id(54) + varint properties + delta；properties=1 → dX/dY/dZ i16
-  const { buf, params } = roundTrip(pair, 'rel_entity_move', { entityId: 5, properties: 1, delta: { dX: 32, dY: 0, dZ: -16 } })
+  // 线格式：varint id(54) + varint properties + delta；properties=1（onGround|stepCount=0）→ dX/dY/dZ i16
+  // 写侧经 mapper：properties 传分支名，线上还原为位段值
+  const { buf, params } = roundTrip(pair, 'rel_entity_move', { properties: 'steps0g', delta: { dX: 32, dY: 0, dZ: -16 }, entityId: 5 })
   assert.strictEqual(buf.length, 9, '典型包应恰好 9 字节 (1+1+6)')
   assert.strictEqual(params.delta.dX, 32)
-  // 单步路径（properties=2 → 1×{tickOffset,dX,dY,dZ}）
-  const r2 = roundTrip(pair, 'rel_entity_move', { entityId: 5, properties: 2, delta: { tickOffset: 3, dX: 10, dY: 0, dZ: 0 } })
-  assert.strictEqual(r2.params.delta.tickOffset, 3)
-  assert.strictEqual(r2.params.delta.dX, 10)
+  assert.strictEqual(params.properties, 'steps0g')
+  // 单步路径（properties 线上值 2 → onGround=0|stepCount=1）
+  const r2 = roundTrip(pair, 'rel_entity_move', { entityId: 5, properties: 'steps1', delta: { steps: [{ tickOffset: 3, dX: 10, dY: 0, dZ: 0 }] } })
+  assert.strictEqual(r2.params.properties, 'steps1')
+  assert.strictEqual(r2.params.delta.steps[0].tickOffset, 3)
+  assert.strictEqual(r2.params.delta.steps[0].dX, 10)
+  // 多步路径（properties 线上值 4 → onGround=0|stepCount=2；2026-11-18 tsl 服实测真包）
+  const r3 = roundTrip(pair, 'rel_entity_move', { entityId: 5, properties: 'steps2', delta: { steps: [{ tickOffset: 2, dX: -447, dY: -307, dZ: -410 }, { tickOffset: 1, dX: -382, dY: 124, dZ: -366 }] } })
+  assert.strictEqual(r3.params.properties, 'steps2')
+  assert.strictEqual(r3.params.delta.steps.length, 2)
+  assert.strictEqual(r3.params.delta.steps[1].dY, 124)
 })
 
-test('entity_move_look：delta 后跟 yaw/pitch i8', () => {
+test('entity_move_look：delta 后跟 yaw/pitch i8（含 properties=4 双步真包字节）', () => {
   const pair = makePair('play', 'toClient')
-  const { buf, params } = roundTrip(pair, 'entity_move_look', { entityId: 5, properties: 1, delta: { dX: 0, dY: 0, dZ: 0 }, yaw: 100, pitch: -40 })
+  const { buf, params } = roundTrip(pair, 'entity_move_look', { entityId: 5, properties: 'steps0g', delta: { dX: 0, dY: 0, dZ: 0 }, yaw: 100, pitch: -40 })
   assert.strictEqual(buf.length, 11)
   assert.strictEqual(params.yaw, 100)
   assert.strictEqual(params.pitch, -40)
+  // 生产真包字节（properties=4 双步 + yaw/pitch），必须全量消费不再剩 7 字节
+  const des = makePair('play', 'toClient').des
+  const raw = Buffer.from('37c9ac9ad5050402fe38fd31fe7e01fe7d0133fe9e5f00', 'hex')
+  const parsed = des.parsePacketBuffer(raw)
+  assert.strictEqual(parsed.data.name, 'entity_move_look')
+  assert.strictEqual(parsed.buffer.length, 23, '应整包消费（旧解析只读 16 字节报 partial packet）')
+  assert.strictEqual(parsed.data.params.properties, 'steps2')
+  assert.strictEqual(parsed.data.params.delta.steps.length, 2)
+  assert.strictEqual(parsed.data.params.delta.steps[0].dX, -456)
+  assert.strictEqual(parsed.data.params.delta.steps[1].dZ, -354)
+  assert.strictEqual(parsed.data.params.yaw, 95)
+  assert.strictEqual(parsed.data.params.pitch, 0)
 })
 
 test('sync_entity_position：LINEAR 直连坐标 + onGround', () => {
@@ -198,13 +218,20 @@ test('rel_entity_move / entity_move_look：delta 扁平化先于 mineflayer 执�
   // 老版本包（顶层 dX 已存在）原样放行
   client.emit('rel_entity_move', { entityId: 9, dX: 1, dY: 2, dZ: 3 })
   assert.deepStrictEqual(translated, { x: 1 / 4096, y: 2 / 4096, z: 3 / 4096 })
-  // entity_move_look 同样扁平化（properties=2 stepped 分支带 tickOffset）
+  // entity_move_look 同样扁平化（properties=2 stepped 分支：delta={steps:[…]}）
   let movedLook = null
   client.on('entity_move_look', (packet) => { movedLook = packet })
-  client.emit('entity_move_look', { entityId: 9, properties: 2, delta: { tickOffset: 3, dX: 10, dY: 0, dZ: -10 }, yaw: 70, pitch: -20 })
+  client.emit('entity_move_look', { entityId: 9, properties: 'steps1', delta: { steps: [{ tickOffset: 3, dX: 10, dY: 0, dZ: -10 }] }, yaw: 70, pitch: -20 })
   assert.strictEqual(movedLook.dX, 10)
   assert.strictEqual(movedLook.dY, 0)
   assert.strictEqual(movedLook.dZ, -10)
+  assert.strictEqual(movedLook.onGround, false)
+  // 多步路径（properties=4 → steps2）：mineflayer 每包应用一次，取各步之和
+  client.emit('rel_entity_move', { entityId: 9, properties: 'steps2', delta: { steps: [{ tickOffset: 2, dX: -456, dY: -719, dZ: -386 }, { tickOffset: 1, dX: -387, dY: 307, dZ: -354 }] } })
+  assert.deepStrictEqual(translated, { x: (-456 - 387) / 4096, y: (-719 + 307) / 4096, z: (-386 - 354) / 4096 })
+  // onGround 位段恢复（properties 奇数 → bit0=1）
+  client.emit('rel_entity_move', { entityId: 9, properties: 'steps0g', delta: { dX: 0, dY: 0, dZ: 0 } })
+  assert.strictEqual(translated.x, 0)
 })
 
 test('sync_entity_position 修复不再覆盖 mineflayer 已转好的弧度朝向', () => {

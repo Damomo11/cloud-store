@@ -231,12 +231,16 @@ function patchFieldTypes (protocol) {
   }
 
   // 26.3：rel_entity_move / entity_move_look 全量重写。真值 ClientboundMoveEntityPacket$Pos/$PosRot + VecDelta：
-  //   entityId varint, properties varint = onGround(bit0) | stepCount<<1,
-  //   stepCount=0 → dX/dY/dZ i16；>0 → stepCount×{tickOffset varint, dX/dY/dZ i16}（PosRot 再 + yaw/pitch i8）
+  //   entityId varint, properties varint = onGround(bit0) | stepCount<<1（packProperties，见反编译），
+  //   VecDelta.read(buf, stepCount)：stepCount=0 → Linear（dX/dY/dZ i16×3）；
+  //   stepCount>0 → N×{tickOffset varint, dX/dY/dZ i16}，每步 7 字节（PosRot 再 + yaw/pitch i8）。
   // Via 写侧（EntityPacketRewriter26_3）同样把 properties 放在 delta 之前（写 [flags,3,xa,ya,za]）。
   // 旧补丁把 flags/interpolationTicks 留在 delta 之后——典型包总长恰好都是 9 字节，
   // 所以不炸但 dX/dY/dZ 全读成乱值，实体坐标静默损坏。
-  // 原版服只发 stepCount=0（properties=0/1）；2/3 是 Via 风格的 1 步路径；>3 按 1 步读（余字节放弃，极罕见）。
+  // properties 不是 0-3 的模式枚举而是打包位段：>3 的多步路径真实存在（2026-11-18 实测
+  // tsl 服发 properties=4 的双步包，按"1 步读"余 7 字节报 partial packet、整包丢弃）。
+  // 用 mapper 把每个 properties 值映到 steps<N>[g] 分支名（N=stepCount，g=onGround），
+  // 分支里用数字字面量 count 精确读 N 步，覆盖 0..15 步。
   const moveStep = ['container', [
     { name: 'tickOffset', type: 'varint' },
     { name: 'dX', type: 'i16' },
@@ -248,19 +252,31 @@ function patchFieldTypes (protocol) {
     { name: 'dY', type: 'i16' },
     { name: 'dZ', type: 'i16' }
   ]]
+  const MOVE_MAX_STEPS = 15
+  const movePropertiesMappings = {}
+  const moveDeltaFields = {}
+  for (let n = 0; n <= MOVE_MAX_STEPS; n++) {
+    const body = n === 0
+      ? moveLinear
+      : ['container', [{ name: 'steps', type: ['array', { count: n, type: moveStep }]}]]
+    moveDeltaFields[`steps${n}`] = body
+    moveDeltaFields[`steps${n}g`] = body
+    movePropertiesMappings[n * 2] = `steps${n}`
+    movePropertiesMappings[n * 2 + 1] = `steps${n}g`
+  }
+  const movePropertiesType = ['mapper', { type: 'varint', mappings: movePropertiesMappings }]
   const moveDelta = ['switch', {
     compareTo: 'properties',
-    fields: { 0: moveLinear, 1: moveLinear, 2: moveStep, 3: moveStep },
-    default: moveStep
+    fields: moveDeltaFields
   }]
   play.packet_rel_entity_move = ['container', [
     { name: 'entityId', type: 'varint' },
-    { name: 'properties', type: 'varint' },
+    { name: 'properties', type: movePropertiesType },
     { name: 'delta', type: moveDelta }
   ]]
   play.packet_entity_move_look = ['container', [
     { name: 'entityId', type: 'varint' },
-    { name: 'properties', type: 'varint' },
+    { name: 'properties', type: movePropertiesType },
     { name: 'delta', type: moveDelta },
     { name: 'yaw', type: 'i8' },
     { name: 'pitch', type: 'i8' }
