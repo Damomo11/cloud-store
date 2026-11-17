@@ -3732,14 +3732,20 @@ class StoreDb {
       .join('|')
     const pairs = []
     for (const [missingKey, missingRow] of missingBoxes) {
-      const holders = this.db.prepare('SELECT owner_uuid AS ownerUuid FROM balances WHERE item_key = ? AND amount > 0').all(missingKey)
+      const holders = this.db.prepare('SELECT owner_uuid AS ownerUuid, amount AS balance FROM balances WHERE item_key = ? AND amount > 0').all(missingKey)
         .filter(row => row.ownerUuid && row.ownerUuid !== this.momoOwner)
       if (holders.length !== 1) continue
       const missingSign = signature(missingKey)
       for (let index = 0; index < extraBoxes.length; index++) {
         const [extraKey, extraRow] = extraBoxes[index]
         if (signature(extraKey) !== missingSign) continue
-        const pairAmount = Math.min(Number(missingRow.amount), Number(extraRow.amount))
+        // missingRow.amount 是按 key 汇总的全账量（含 momo 兜底持有的部分），
+        // 配对转移只能从唯一人类持有者自己的余额里扣：按持有者余额钳制。
+        // 不钳制时 adjustBalance 直接抛负余额（2026-11-18 椰汁橙 shulker_box|69569d49
+        // -1 案例），整个对账事务回滚、同步被这类漂移盒子永久卡死。
+        // 超出持有者余额的残量留在 missing/extra 里，走主循环的标准钳制路径
+        // （momo 扣/划），净转移量不变。
+        const pairAmount = Math.min(Number(missingRow.amount), Number(extraRow.amount), Number(holders[0].balance ?? 0))
         if (pairAmount <= 0) continue
         pairs.push({ missingKey, missingRow, extraKey, extraRow, ownerUuid: holders[0].ownerUuid, pairAmount })
         extraBoxes.splice(index, 1)
