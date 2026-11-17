@@ -74,6 +74,12 @@ class CloudStoreService {
     this.hotReloadStubs = null
   }
 
+  // 26.x 会话按协商版本切换物品字典时同步替换实例（index.js attachCatalog 调用），
+  // 与 warehouse.setCatalog 配对；否则物品聚合/指纹仍按启动时的目录计算。
+  setCatalog (nextCatalog) {
+    this.catalog = nextCatalog
+  }
+
   invalidateConnection (reason = 'connection invalidated') {
     this.connectionInvalidated = true
     this.ready = false

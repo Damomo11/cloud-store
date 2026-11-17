@@ -29,6 +29,13 @@ class Warehouse {
     this.activeTrace = null
   }
 
+  // 26.x 会话按协商版本切换物品字典时同步替换实例（index.js attachCatalog 调用）。
+  // 不替换的话 servux 的数字 id 转换仍按启动时的目录计算（2026-11 部署实测：
+  // 26.3 会话里 hay_block 被转成 1.21.11 的 504 → 指纹漂移 → 幽灵条目/取出失败）。
+  setCatalog (nextCatalog) {
+    this.catalog = nextCatalog
+  }
+
   withWarehouseLock (fn) {
     return this.warehouseMutex ? this.warehouseMutex.run(fn) : fn()
   }
