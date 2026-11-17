@@ -52,7 +52,20 @@ test('recovery delta sync does not deduct unrelated stock omitted by a stale che
   f.db.addInventoryMismatch('missing', 'alice', 'Alice', diamond, 1, 'pre-existing shortage')
   const staleCache = [qty(diamond, 8)]
   const result = f.db.reconcileRecoveryDeltaToMomo(staleCache, staleCache, 'craft:a')
-  assert.deepEqual(result, { addedToMomo: [], removedFromMomo: [], unresolved: [], driftRepair: { repaired: 0, movedAmount: 0 } })
+  assert.deepEqual(result, {
+    addedToMomo: [],
+    removedFromMomo: [],
+    unresolved: [],
+    driftRepair: { repaired: 0, movedAmount: 0 },
+    diffSummary: {
+      missingBoxKinds: 0,
+      missingPlainKinds: 0,
+      extraBoxKinds: 0,
+      extraPlainKinds: 0,
+      missingTop: [],
+      extraTop: []
+    }
+  })
   assert.equal(f.db.getBalance('alice', diamond.itemKey), 10)
   assert.equal(f.db.db.prepare("SELECT status FROM inventory_mismatches WHERE note = 'pre-existing shortage'").get().status, 'open')
 })

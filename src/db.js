@@ -3912,6 +3912,10 @@ class StoreDb {
     const removedFromMomo = []
     const unresolved = []
     let driftRepair = { repaired: 0, movedAmount: 0 }
+    let diffSummary = {
+      missingBoxKinds: 0, missingPlainKinds: 0, extraBoxKinds: 0, extraPlainKinds: 0,
+      missingTop: [], extraTop: []
+    }
 
     this.transaction(() => {
       if (!baseline) {
@@ -3954,6 +3958,21 @@ class StoreDb {
         )
       }
 
+      // 对账分歧明细（诊断用）：每次同步把"账面≠实物"的 key 逐个记下来（截断 top N），
+      // 否则多余/缺失只会是一个总数，无法判断漂移的是盒子还是散货、账面挂在谁头上。
+      const missingDetails = []
+      const extraDetails = []
+      const diffDetail = (key, ledgerAmount, actualAmount, row) => ({
+        keyTail: String(key || '').slice(-6),
+        itemId: String(row?.itemId || ''),
+        isBox: /shulker/.test(String(row?.itemId || '')),
+        ledger: Number(ledgerAmount || 0),
+        actual: Number(actualAmount || 0),
+        holders: String(key || '').length
+          ? this.db.prepare('SELECT COUNT(*) AS n FROM balances WHERE item_key = ? AND amount > 0').get(key).n
+          : 0
+      })
+
       for (const key of keys) {
         const actualRow = actual.get(key)
         const referenceRow = reference.get(key)
@@ -3965,9 +3984,11 @@ class StoreDb {
         if (item) this.upsertItem(this.rowToItem(item))
 
         if (diff > 0) {
+          if (extraDetails.length < 200) extraDetails.push(diffDetail(key, ledgerAmount, actualAmount, item))
           this.adjustBalance(this.momoOwner, key, diff)
           addedToMomo.push({ ...this.rowToItem(item), amount: diff })
         } else if (diff < 0) {
+          if (missingDetails.length < 200) missingDetails.push(diffDetail(key, ledgerAmount, actualAmount, item))
           const missing = Math.abs(diff)
           const momoBalance = this.getBalance(this.momoOwner, key)
           const covered = Math.min(missing, momoBalance)
@@ -4038,9 +4059,19 @@ class StoreDb {
               : '同步发现仓库实物多于账本，已自动划入 momo，可在查看器转移给正确归属。'
         )
       }
+
+      const byMagnitude = (a, b) => (Math.abs(b.ledger - b.actual)) - (Math.abs(a.ledger - a.actual))
+      diffSummary = {
+        missingBoxKinds: missingDetails.filter(d => d.isBox).length,
+        missingPlainKinds: missingDetails.filter(d => !d.isBox).length,
+        extraBoxKinds: extraDetails.filter(d => d.isBox).length,
+        extraPlainKinds: extraDetails.filter(d => !d.isBox).length,
+        missingTop: [...missingDetails].sort(byMagnitude).slice(0, 30),
+        extraTop: [...extraDetails].sort(byMagnitude).slice(0, 30)
+      }
     })
 
-    return { addedToMomo, removedFromMomo, unresolved, driftRepair, ...(deferredKeys.size ? { deferredForPacking: [...deferredKeys] } : {}) }
+    return { addedToMomo, removedFromMomo, unresolved, driftRepair, diffSummary, ...(deferredKeys.size ? { deferredForPacking: [...deferredKeys] } : {}) }
   }
 
   rowToItem (row) {
