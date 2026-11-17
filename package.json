@@ -17,7 +17,7 @@
   },
   "dependencies": {
     "better-sqlite3": "^12.10.0",
-    "minecraft-data": "^3.112.0",
+    "minecraft-data": "3.119.0",
     "mineflayer": "^4.37.1",
     "mineflayer-pathfinder": "file:vendor/mineflayer-pathfinder",
     "prismarine-item": "^1.18.0",
