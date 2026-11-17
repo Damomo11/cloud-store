@@ -207,20 +207,39 @@ function patchFieldTypes (protocol) {
     }
   }
 
-  // 26.3：declare_recipes 尾部追加 brewing_input / brewing_reagent 两条目
-  // （Via Protocol26_2To26_3:181-189：size+2，每条 = string + varint[]，位置在整个包尾、
-  //  stoneCutterRecipes 之后 —— 与 26.1 recipes 条目同构，不带 array count 前缀）
-  const recipes = play.packet_declare_recipes[1]
-  if (!recipes.some(f => f.name === 'brewingInput')) {
-    const brewingEntry = () => ['container', [
-      { name: 'name', type: 'string' },
-      { name: 'items', type: ['array', { countType: 'varint', type: 'varint' }] }
-    ]]
-    recipes.push(
-      { name: 'brewingInput', type: brewingEntry() },
-      { name: 'brewingReagent', type: brewingEntry() }
-    )
+  // 26.2：teams 字段重排（Via Protocol26_1To26_2:65-81 铁证）。
+  // 26.1: name, flags, nameTagVisibility, collisionRule, formatting, prefix, suffix
+  // 26.2+: name, prefix, suffix, nameTagVisibility, collisionRule, color(OPTIONAL_VAR_INT), flags
+  // Via rewrite 的 passthrough 先写出 prefix/suffix、暂存的四件组最后 write，
+  // 实测字节流（16 个 ce_* 队，color=chat 色号 0-15）逐位验证通过。
+  const teamsSwitch = play.packet_teams[1].find(f => f.anon === true)?.type?.[1]
+  for (const modeName of ['add', 'change']) {
+    const branch = teamsSwitch?.fields?.[modeName]?.[1]
+    if (!Array.isArray(branch)) continue
+    const byName = name => branch.find(f => f.name === name)
+    const nameF = byName('name')
+    const flags = byName('flags')
+    const ntv = byName('nameTagVisibility')
+    const cr = byName('collisionRule')
+    const formatting = byName('formatting')
+    const prefix = byName('prefix')
+    const suffix = byName('suffix')
+    if (!nameF || !flags || !ntv || !cr || !formatting || !prefix || !suffix) continue
+    if (branch[1].name === 'prefix') continue // 已是 26.2 布局
+    // 原地重排：name, prefix, suffix, ntv, cr, color, flags（players 若有则留在最后）
+    formatting.name = 'color'
+    formatting.type = ['option', 'varint']
+    const players = byName('players')
+    branch.length = 0
+    branch.push(nameF, prefix, suffix, ntv, cr, formatting, flags)
+    if (players) branch.push(players)
   }
+
+  // 26.3：declare_recipes 结构与 26.1 完全一致（无尾部独立字段）。
+  // 之前误读了 Via Protocol26_2To26_3:181-189 的 appendClientbound：wrapper.write 写进
+  // 新 output 头部、原条目透传在后 → brewing_input/brewing_reagent 只是 recipes 数组的
+  // 头两个普通元素（string + varint[]），26.1 的数组结构原样可用，不需要额外字段。
+  // 服务器实测：按尾部独立字段解析会在读 brewing 条目的 string 长度时 buffer 尽炸。
 
   // 26.3：SlotDisplay 的 tag 分支 STRING → HolderSet
   // （Via RecipeDisplayRewriter26_3.handleTag → handleIngredient，即 Types.HOLDER_SET；
@@ -255,6 +274,14 @@ function patchFieldTypes (protocol) {
 
 // ---------- 主入口 ----------
 
+// 新包名 → packet_<name> 类型：写进 packet 容器的 params switch fields。
+// 只改 name mapper 不够 —— protodef 的 packet = [name mapper, params switch]，
+// fields 缺条目时 params 类型为 undefined → 编译后静默不读 payload（实测 post_effects 只吞 id）。
+function addPacketFields (types, names) {
+  const fields = types.packet[1][1].type[1].fields
+  for (const name of names) fields[name] = 'packet_' + name
+}
+
 function patchProtocol (protocol, components263) {
   // 1) 包 id 表移位（锚点已核对 mc-data 26.1 实际包表）
   const pc = protocol.play.toClient.types
@@ -272,10 +299,15 @@ function patchProtocol (protocol, components263) {
   rewritePacketMapper(cc, [
     { after: 'add_resource_pack', add: ['post_effects'] }
   ])
+  // 新包名补进 params switch fields（缺了会静默丢 payload）
+  addPacketFields(pc, ['add_transient_block', 'post_effects', 'swing_animation'])
+  addPacketFields(ps, ['punch', 'spectator_action'])
+  addPacketFields(cc, ['post_effects'])
   // 未知结构的新包 → 空读跳过（Via 同样直接丢弃）
   pc.packet_add_transient_block = 'ViaSkip'
-  pc.packet_post_effects = 'ViaSkip'
-  cc.packet_post_effects = 'ViaSkip'
+  // post_effects 实测 1 字节 payload（00），按 varint flags 读掉，避免 partial 警告刷屏
+  pc.packet_post_effects = ['container', [{ name: 'flags', type: 'varint' }]]
+  cc.packet_post_effects = ['container', [{ name: 'flags', type: 'varint' }]]
   // spectate_entity 改名（26.3 SPECTATOR_ACTION，结构见 patchFieldTypes）
   ps.packet_spectator_action = ps.packet_spectate_entity
   delete ps.packet_spectate_entity
@@ -283,6 +315,12 @@ function patchProtocol (protocol, components263) {
   const psMapper = ps.packet[1][0].type[1].mappings
   for (const [id, name] of Object.entries(psMapper)) {
     if (name === 'spectate_entity') psMapper[id] = 'spectator_action'
+  }
+  // spectate_entity 改名后的 fields 引用也同步（否则 spectate 包解析为空）
+  const psFields = ps.packet[1][1].type[1].fields
+  if (psFields.spectate_entity) {
+    delete psFields.spectate_entity
+    psFields.spectator_action = 'packet_spectator_action'
   }
 
   // 2) 字段手术 + 新包类型
