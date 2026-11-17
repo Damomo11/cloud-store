@@ -178,3 +178,55 @@ test('spawn_entity 玩家包：26.3 线上 id(159) 解析后命中玩家实体�
   assert.ok(entityData, `spawn_entity type=${params.type} 在 internalId 表查不到（玩家实体不会挂链）`)
   assert.strictEqual(entityData.type, 'player', 'spawn_entity 玩家包应走 addNewPlayer 分支')
 })
+
+test('rel_entity_move / entity_move_look：delta 扁平化先于 mineflayer 执行（实体坐标 NaN 根）', () => {
+  const EventEmitter = require('node:events')
+  const { installRepairSync } = require('../src/via/sync-compat.js')
+  const client = new EventEmitter()
+  client.write = () => {}
+  const fakeBot = { _client: client, entities: {} }
+  // 模拟 mineflayer entities.js：处理器读顶层 packet.dX/dY/dZ（26.1 形状）
+  let translated = null
+  client.on('rel_entity_move', (packet) => {
+    translated = { x: (packet.dX ?? NaN) / 4096, y: (packet.dY ?? NaN) / 4096, z: (packet.dZ ?? NaN) / 4096 }
+  })
+  installRepairSync(fakeBot) // installRepairSync 的 prependListener 必须排在 mineflayer 处理器之前
+  // 26.3 线格式解析结果：delta 嵌套（properties=1 线性分支）
+  client.emit('rel_entity_move', { entityId: 9, properties: 1, delta: { dX: 4096, dY: -128, dZ: 2048 } })
+  assert.deepStrictEqual(translated, { x: 1, y: -1 / 32, z: 0.5 },
+    'flatten 未生效 → mineflayer translate(undefined/4096) = NaN，实体坐标被污染')
+  // 老版本包（顶层 dX 已存在）原样放行
+  client.emit('rel_entity_move', { entityId: 9, dX: 1, dY: 2, dZ: 3 })
+  assert.deepStrictEqual(translated, { x: 1 / 4096, y: 2 / 4096, z: 3 / 4096 })
+  // entity_move_look 同样扁平化（properties=2 stepped 分支带 tickOffset）
+  let movedLook = null
+  client.on('entity_move_look', (packet) => { movedLook = packet })
+  client.emit('entity_move_look', { entityId: 9, properties: 2, delta: { tickOffset: 3, dX: 10, dY: 0, dZ: -10 }, yaw: 70, pitch: -20 })
+  assert.strictEqual(movedLook.dX, 10)
+  assert.strictEqual(movedLook.dY, 0)
+  assert.strictEqual(movedLook.dZ, -10)
+})
+
+test('sync_entity_position 修复不再覆盖 mineflayer 已转好的弧度朝向', () => {
+  const EventEmitter = require('node:events')
+  const { installRepairSync } = require('../src/via/sync-compat.js')
+  const client = new EventEmitter()
+  client.write = () => {}
+  const pos = { x: NaN, y: NaN, z: NaN, set (x, y, z) { this.x = x; this.y = y; this.z = z } }
+  const vel = { x: NaN, y: NaN, z: NaN, set (x, y, z) { this.x = x; this.y = y; this.z = z } }
+  const entity = { position: pos, velocity: vel, yaw: 1.23, pitch: -0.5 }
+  const fakeBot = { _client: client, entities: { 42: entity } }
+  // mineflayer 处理器先跑（弧度转换成功，position/velocity 被 26.3 缺字段污染成 NaN）
+  client.on('sync_entity_position', (packet) => {
+    entity.position.set(packet.x, packet.y, packet.z)
+    entity.velocity.set(packet.dx, packet.dy, packet.dz)
+    entity.yaw = packet.yaw / 180 * Math.PI
+    entity.pitch = packet.pitch / 180 * Math.PI
+  })
+  installRepairSync(fakeBot)
+  client.emit('sync_entity_position', { entityId: 42, pathType: 0, path: { x: 1.5, y: 64, z: -2.5 }, yaw: 90, pitch: -10, onGround: true })
+  assert.strictEqual(entity.position.x, 1.5)
+  assert.strictEqual(entity.velocity.x, 0)
+  assert.ok(Math.abs(entity.yaw - Math.PI / 2) < 1e-9, 'yaw 应保持 mineflayer 的弧度值不被度数覆盖')
+  assert.ok(entity.pitch < 0, 'pitch 应保持弧度符号')
+})
