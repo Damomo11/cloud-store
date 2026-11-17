@@ -163,6 +163,9 @@ class ItemCatalog {
   canonicalizeStoredItem (row) {
     if (!row?.itemId) return row
     const meta = this.sanitizeMetaForStorage(row.itemId, this.parseStoredJson(row.metaJson, {}))
+    // 1.21.11 时代入账的行（容器内容是旧目录的数字 id）无法可靠迁移：跳过迁移保留
+    // 旧 key，交给下一次 !同步 的实物重录 + 库存异常对账修正，绝不错误合并余额。
+    if (this.metaHasVersionAmbiguousContainerEntries(row.itemId, meta)) return null
     const nbt = this.sanitizeNbtForStorage(row.itemId, this.parseStoredJson(row.nbtJson, null))
     const canonicalMeta = this.normalizeMetaForFingerprint(row.itemId, meta)
     const canonicalNbt = this.normalizeNbtForFingerprint(row.itemId, nbt)
@@ -473,8 +476,68 @@ class ItemCatalog {
     return Object.keys(value).length === 0 || Object.values(value).every(child => this.isEmptyValue(child))
   }
 
+  // 容器内容里的数字 itemId → 稳定的 minecraft: 全名（指纹用）。
+  // 数字 id 随目录版本变（1.21.11 → 26.3 全表移位 +152）——数字原样进指纹会让
+  // 同一件实物在目录切换后算出不同 key（幽灵条目/取出失败，2026-11 部署实测）。
+  itemNameByNumericId (catalog, numericId) {
+    if (!catalog || !Number.isInteger(numericId)) return null
+    if (!this._numericIdNameCache) this._numericIdNameCache = new WeakMap()
+    let map = this._numericIdNameCache.get(catalog)
+    if (!map) {
+      map = new Map()
+      for (const item of (catalog.itemsArray ?? [])) {
+        if (Number.isInteger(item.id)) map.set(item.id, item.name)
+      }
+      this._numericIdNameCache.set(catalog, map)
+    }
+    return map.get(numericId) ?? null
+  }
+
+  // 1.21.11 目录（bot 切到 26.3 之前的解析基线），用于存量记录的指纹迁移
+  legacy12111Catalog () {
+    if (this._legacy12111Catalog === undefined) {
+      try {
+        this._legacy12111Catalog = require('minecraft-data')('1.21.11')
+      } catch {
+        this._legacy12111Catalog = null
+      }
+    }
+    return this._legacy12111Catalog
+  }
+
+  // 存量记录的容器内容里，是否存在“两个目录解析出不同物品名”的数字 id——
+  // 这类行无法可靠判断它是 1.21.11 时代还是 26.3 时代入的账，迁移会算错名字。
+  // 返回 true 时 canonicalizeStoredItem 会跳过该行（保留旧 key，交给下一次
+  // !同步 的实物重录 + 库存异常对账修正，绝不错误合并余额）。
+  metaHasVersionAmbiguousContainerEntries (itemId, meta) {
+    if (!this.isShulkerBox(itemId)) return false
+    const legacy = this.legacy12111Catalog()
+    if (!legacy) return false
+    const components = Array.isArray(meta?.components) ? meta.components : []
+    const container = components.find(component => component?.type === 'container')
+    const contents = Array.isArray(container?.data?.contents) ? container.data.contents : []
+    for (const entry of contents) {
+      if (!Number.isInteger(entry?.itemId)) continue
+      const currentName = this.itemNameByNumericId(this.mcData, entry.itemId)
+      const legacyName = this.itemNameByNumericId(legacy, entry.itemId)
+      if (currentName && legacyName && currentName !== legacyName) return true
+    }
+    return false
+  }
+
   normalizeContainerEntryForFingerprint (entry) {
-    if (!entry || !Number.isInteger(entry.itemId)) return null
+    if (!entry) return null
+    // 数字 id（协议解析/servux 转换）→ 稳定全名；字符串 id（修复后入账的记录）原样保留
+    let fingerprintItemId
+    if (typeof entry.itemId === 'string' && entry.itemId) {
+      fingerprintItemId = entry.itemId.startsWith('minecraft:') ? entry.itemId : `minecraft:${entry.itemId}`
+    } else if (Number.isInteger(entry.itemId)) {
+      const name = this.itemNameByNumericId(this.mcData, entry.itemId)
+      if (!name) return null
+      fingerprintItemId = `minecraft:${name}`
+    } else {
+      return null
+    }
     const count = Number.parseInt(entry.itemCount ?? entry.count ?? 0, 10)
     if (!Number.isFinite(count) || count <= 0) return null
 
@@ -491,7 +554,7 @@ class ItemCatalog {
       : []
 
     return {
-      itemId: fixedBeeContainer ? this.canonicalBeeContainerItemId(entry) : entry.itemId,
+      itemId: fixedBeeContainer ? this.canonicalBeeContainerItemId(entry) : fingerprintItemId,
       itemCount: count,
       components,
       removeComponents

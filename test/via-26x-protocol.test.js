@@ -132,3 +132,28 @@ test('serverbound 兼容层：teleport_confirm 补坐标 / block_dig status 移�
   client.write('arm_animation', { hand: 0 })
   assert.deepStrictEqual(writes[5], ['punch', {}])
 })
+
+test('指纹稳定：容器内容的数字 itemId 归一到稳定全名（跨目录版本不变）', () => {
+  const ItemCatalog = require('../src/itemCatalog.js')
+  const catalog = new ItemCatalog('26.3')
+  // 26.3 数字 id（协议解析/servux 转换）与字符串 id（修复后入账）→ 同一全名
+  const numeric = catalog.normalizeContainerEntryForFingerprint({ itemId: 579, itemCount: 64 })
+  const string = catalog.normalizeContainerEntryForFingerprint({ itemId: 'minecraft:hay_block', itemCount: 64 })
+  assert.strictEqual(numeric.itemId, 'minecraft:hay_block')
+  assert.strictEqual(string.itemId, 'minecraft:hay_block')
+  // 两条读路径（数字/字符串）对同一只盒子算出同一个指纹输入
+  const metaNumeric = { metadata: null, components: [{ type: 'container', data: { contents: [{ itemId: 579, itemCount: 64 }] } }] }
+  const metaString = { metadata: null, components: [{ type: 'container', data: { contents: [{ itemId: 'minecraft:hay_block', itemCount: 64 }] } }] }
+  assert.strictEqual(
+    JSON.stringify(catalog.normalizeMetaForFingerprint('minecraft:shulker_box', metaNumeric)),
+    JSON.stringify(catalog.normalizeMetaForFingerprint('minecraft:shulker_box', metaString)),
+    '开箱路径与 Servux 路径的指纹输入必须一致'
+  )
+  // 版本歧义检测：504 在 1.21.11 是 hay_block、在 26.3 是 sculk_vein → 判定为歧义行
+  assert.strictEqual(
+    catalog.metaHasVersionAmbiguousContainerEntries('minecraft:shulker_box',
+      { components: [{ type: 'container', data: { contents: [{ itemId: 504, itemCount: 1 }] } }] }),
+    true,
+    '旧目录数字 id 与新目录名字冲突的行应跳过迁移'
+  )
+})

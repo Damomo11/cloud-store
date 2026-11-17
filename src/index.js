@@ -333,6 +333,21 @@ function launchBot (state) {
 
   const warehouse = new Warehouse(bot, db, catalog, launchConfig, taskPool.warehouseMutex, taskPool.warehouseState)
   const service = new CloudStoreService(bot, db, catalog, warehouse, launchConfig, taskPool, subscriptions)
+  // 26.x 会话按协商版本切换物品字典时，同步替换 warehouse/service 的 catalog 实例。
+  // createBot 内的 login 处理器只更新 db——不替换的话 servux 的数字 id 转换、指纹
+  // 归一化仍按启动时的 1.21.11 目录计算（2026-11 部署实测：26.3 会话里 hay_block
+  // 被转成 1.21.11 的 504 → 同一只潜影盒两条路径指纹不同 → 幽灵条目/取出失败）。
+  let warehouseCatalogVersion = config.server.version
+  bot.once('login', () => {
+    const negotiated = bot.registry?.version?.minecraftVersion
+    if (!negotiated || negotiated === warehouseCatalogVersion) return
+    if (!db.catalog) return
+    warehouse.setCatalog(db.catalog)
+    service.setCatalog(db.catalog)
+    warehouseCatalogVersion = negotiated
+    console.log(`[via] warehouse/service 物品字典已切换到 ${negotiated}`)
+  })
+
   // Synthesis (ported from olela bot): attach the crafting executor to this bot.
   // It registers itself as bot._craftingExecutor; the service enqueues craft tasks.
   if (launchConfig.craft?.enabled !== false) {
