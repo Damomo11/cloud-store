@@ -1,11 +1,13 @@
 // 26.3 服务器进出的运行时兼容层（协议结构见 protocol-patch.js 注释）。
 //
-// 1. sync_entity_position 读侧修复：
+// 1. sync_entity_position 读侧扁平化（prependListener，先于 mineflayer 执行）：
 //    26.3 线格式 = entityId + PositionPath(type dispatch) + yRot/xRot/onGround，没有 26.1 的
 //    速度字段（dx/dy/dz），STEPPED 路径也没有前导 x/y/z。mineflayer entities.js 无条件读
-//    packet.dx/dy/dz 和 packet.x/y/z → 实体坐标/速度被污染成 NaN。本模块在 mineflayer 的
-//    处理器之后注册（createBot 返回后挂载，监听顺序靠后），用 LINEAR 坐标或 STEPPED 最后一步
-//    修复 position，velocity 清零。老版本包（无 path 字段）直接跳过。
+//    packet.dx/dy/dz 和 packet.x/y/z → 实体坐标/速度被污染成 NaN。
+//    必须"改包"而不是"修账"：mineflayer 的插件注入是延迟的（等 'inject_allowed'），
+//    installRepairSync 在 createBot 之后立刻挂载反而先于 mineflayer 的处理器执行，
+//    修账型修复随后就会被 mineflayer 的 position.set(packet.x=undefined) 覆盖回 NaN
+//    （2026-11-18 部署实测：9112b09 带 move 扁平化但玩家实体坐标仍 NaN）。改包型与顺序无关。
 //
 // 1b. rel_entity_move / entity_move_look 读侧扁平化（prependListener，先于 mineflayer 执行）：
 //    26.3 把 delta 收进 properties 之后的 VecDelta（解析成嵌套 packet.delta.{tickOffset?,dX,dY,dZ}），
@@ -29,28 +31,47 @@
 function installRepairSync (bot) {
   if (!bot || !bot._client) return
 
-  // ---- 读侧：sync_entity_position 实体修复 ----
-  bot._client.on('sync_entity_position', (packet) => {
+  // ---- 读侧：sync_entity_position 扁平化（prependListener，先于 mineflayer 执行）----
+  // 关键：mineflayer 的插件注入是延迟的（plugin_loader.js 等 'inject_allowed' 才 injectPlugins），
+  // createBot() 返回时插件还没装——installRepairSync 紧跟 createBot 调用，我们的监听器反而排在
+  // mineflayer 前面。旧修复是"修账型"（挂在后面把 entity.position 修回来），实际却先跑，
+  // 随后被 mineflayer 的处理器 position.set(packet.x=undefined) 重新污染成 NaN（2026-11-18 实锤：
+  // 9112b09 已带 move 扁平化但 tpa 后玩家实体坐标仍 NaN）。
+  // 现改成与 move 相同的"改包型"：把 26.3 的 PositionPath 坐标拷回 26.1 顶层 x/y/z、速度清零，
+  // 让 mineflayer 自己的处理器算出正确值——注册顺序无关。
+  const flattenSyncPath = (packet) => {
     if (!packet || !packet.path) return // 非 26.3 格式（回退 1.21.11 等）
-    const entity = bot.entities && bot.entities[packet.entityId]
-    if (!entity) return
     let x = packet.path.x
     let y = packet.path.y
     let z = packet.path.z
     if (x === undefined) {
       const steps = packet.path.steps
-      if (!steps || !steps.length) return
+      if (!steps || !steps.length) {
+        // 病理形态（空步列表）：保持实体当前位置，防止 mineflayer 写 NaN
+        const entity = bot.entities && bot.entities[packet.entityId]
+        if (entity?.position) {
+          packet.x = entity.position.x
+          packet.y = entity.position.y
+          packet.z = entity.position.z
+        }
+        packet.dx = 0; packet.dy = 0; packet.dz = 0
+        return
+      }
       const last = steps[steps.length - 1]
       x = last.x
       y = last.y
       z = last.z
     }
     if ([x, y, z].some(v => v === undefined || Number.isNaN(v))) return
-    entity.position.set(x, y, z)
-    entity.velocity.set(0, 0, 0)
-    // yaw/pitch 不动：26.3 解析结果里 yaw/pitch 是 f32 且 mineflayer 的处理器已先跑过
-    // （fromNotchianYaw 转弧度），这里再覆盖会把弧度错写成原始度数。
-  })
+    packet.x = x
+    packet.y = y
+    packet.z = z
+    packet.dx = 0
+    packet.dy = 0
+    packet.dz = 0
+    // yaw/pitch 保持解析原值（f32 度数）：mineflayer 的处理器自己 fromNotchianYaw 转弧度
+  }
+  bot._client.prependListener('sync_entity_position', flattenSyncPath)
 
   // ---- 读侧：rel_entity_move / entity_move_look delta 扁平化（先于 mineflayer 执行）----
   const flattenMoveDelta = (packet) => {

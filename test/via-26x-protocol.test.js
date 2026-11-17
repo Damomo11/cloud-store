@@ -270,3 +270,34 @@ test('entity_metadata 药水粒子真包字节（21B）全量消费不再剩 4 �
   })
   assert.strictEqual(wp.params.particle.type, 'sulfur_bubbles')
 })
+
+test('sync_entity_position 扁平化与注册顺序无关（生产：repair 先于 mineflayer 插件注入）', () => {
+  const EventEmitter = require('node:events')
+  const { installRepairSync } = require('../src/via/sync-compat.js')
+  const client = new EventEmitter()
+  client.write = () => {}
+  const pos = { x: NaN, y: NaN, z: NaN, set (x, y, z) { this.x = x; this.y = y; this.z = z } }
+  const vel = { x: NaN, y: NaN, z: NaN, set (x, y, z) { this.x = x; this.y = y; this.z = z } }
+  const entity = { position: pos, velocity: vel, yaw: 0, pitch: 0 }
+  const fakeBot = { _client: client, entities: { 42: entity } }
+  // 生产顺序：installRepairSync 先挂载（createBot 后立刻调用），
+  // mineflayer 的处理器因 'inject_allowed' 延迟注入而靠后
+  installRepairSync(fakeBot)
+  client.on('sync_entity_position', (packet) => {
+    entity.position.set(packet.x, packet.y, packet.z)
+    entity.velocity.set(packet.dx, packet.dy, packet.dz)
+    entity.yaw = packet.yaw / 180 * Math.PI
+    entity.pitch = packet.pitch / 180 * Math.PI
+  })
+  client.emit('sync_entity_position', { entityId: 42, pathType: 0, path: { x: 1.5, y: 64, z: -2.5 }, yaw: 90, pitch: -10, onGround: true })
+  assert.strictEqual(entity.position.x, 1.5, 'LINEAR：扁平化后的坐标必须生效（旧修账型此时已被覆盖成 NaN）')
+  assert.strictEqual(entity.velocity.x, 0, '速度字段必须被清零（26.3 无速度字段）')
+  assert.ok(Math.abs(entity.yaw - Math.PI / 2) < 1e-9, 'yaw 由 mineflayer 自己转弧度')
+  // STEPPED：最后一步坐标
+  client.emit('sync_entity_position', { entityId: 42, pathType: 1, path: { steps: [{ x: 9.5, y: 65, z: -9.5, tickOffset: 0 }] }, yaw: 0, pitch: 0, onGround: true })
+  assert.strictEqual(entity.position.x, 9.5)
+  // 病理形态：空步列表 → 保持当前位置，不产生 NaN
+  client.emit('sync_entity_position', { entityId: 42, pathType: 1, path: { steps: [] }, yaw: 0, pitch: 0, onGround: true })
+  assert.strictEqual(entity.position.x, 9.5, '空步列表必须保持当前位置而不是写 NaN')
+  assert.strictEqual(entity.velocity.x, 0)
+})
