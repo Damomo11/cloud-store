@@ -3333,7 +3333,15 @@ class CloudStoreService {
         if (s.note) { log(`--- 木桶 ${s.chest}：${s.note}`); continue }
         log(`--- 木桶 ${s.chest}（${s.blockName}）条目总数=${s.rawCount}`)
         for (const raw of s.rawEntries) log(`  raw:    ${JSON.stringify(raw).slice(0, 600)}`)
-        for (const parsed of s.parsed) log(`  parsed: ${JSON.stringify({ itemId: parsed.itemId, displayName: parsed.displayName, amount: parsed.amount })}`)
+        for (const parsed of s.parsed) {
+          // 潜影盒样本额外输出完整指纹输入（itemKey + metaJson），与账本里同一
+          // AxShulkers-UUID 的旧 key 做 diff 即可定位两条读路径的分岔点
+          const uuid = parsed.metaJson?.components?.find?.(c => c.type === 'custom_data')?.data?.['AxShulkers-UUID']
+          log(`  parsed: ${JSON.stringify({ itemId: parsed.itemId, displayName: parsed.displayName, amount: parsed.amount })}`)
+          log(`          key=${parsed.itemKey}`)
+          log(`          metaJson=${(parsed.metaJson && JSON.stringify(parsed.metaJson)).slice(0, 800)}`)
+          if (uuid) log(`          AxShulkers-UUID=${uuid}`)
+        }
       }
       log('=== 物品诊断结束 ===')
     } catch (error) {
