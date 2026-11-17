@@ -43,9 +43,9 @@ function createBot (config, onMsaCode) {
     port: config.server.port,
     username: config.server.username,
     auth: 'microsoft',
-    // 版本自动协商（mod 式）：ping 服务器 → 协议号 777 自动选 26.3（via 注入的字典）、
-    // 1.21.x 服自动选 1.21.11。config.server.version 仅作 catalog 初始字典，不再锁定连接版本。
-    version: false,
+    // 强制声明 26.3：via 注入字典后直接以 26.3（协议号 777）握手，不走 ping 协商。
+    // config.server.version 仅作 catalog 初始字典，不再锁定连接版本。
+    version: '26.3',
     locale: config.server.locale || 'zh_CN',
     disableChatSigning: true,
     logErrors: false,
