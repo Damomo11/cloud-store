@@ -3481,6 +3481,18 @@ class CloudStoreService {
           addedTotal: addedAmount,
           unresolvedTotal: unresolvedAmount
         })
+        // 对账分歧明细（诊断）：把"账面≠实物"的 key 分类统计 + top 明细写进 trace 和控制台，
+        // 用于定位"哪些 key 在漂移、是盒子还是散货、账面挂谁头上"。
+        const diff = result.diffSummary
+        if (diff && (diff.missingTop.length || diff.extraTop.length)) {
+          traceEvent(trace, 'result', 'sync_diff_details', diff)
+          console.warn(`[sync-diff] 盒子缺失 ${diff.missingBoxKinds} 种 / 散货缺失 ${diff.missingPlainKinds} 种；盒子多余 ${diff.extraBoxKinds} 种 / 散货多余 ${diff.extraPlainKinds} 种`)
+          for (const [label, list] of [['缺失', diff.missingTop], ['多余', diff.extraTop]]) {
+            for (const row of list) {
+              console.warn(`[sync-diff] ${label} ${row.isBox ? '盒子' : '散货'} ${row.itemId} key=…${row.keyTail} 账面=${row.ledger} 实物=${row.actual} 持有者=${row.holders}`)
+            }
+          }
+        }
       } catch (error) {
         traceEvent(trace, 'error', 'sync_error', { message: error?.message || String(error) })
         traceSummary(trace, { status: 'failed', message: error?.message || String(error) })
