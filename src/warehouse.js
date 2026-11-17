@@ -2898,6 +2898,45 @@ class Warehouse {
     return { snapshots, fallbackBlocks: [], missedBlocks, viaServux: snapshots.length, missed: missedBlocks.length }
   }
 
+  // 临时诊断（!物品诊断，2026-11 物品解析排查；排查完随命令一起移除）：
+  // 对前 limit 个登记木桶做 Servux 隔空读取，返回“服务器原始 NBT 条目 vs 解析结果”对照。
+  async debugServuxBarrelSample (limit = 2) {
+    const chests = this.db.listChests().slice(0, limit)
+    if (!chests.length) return { samples: [], note: '还没有已登记的木桶' }
+    const settings = this.config.timing?.servux || {}
+    const client = new ServuxClient(this.bot._client, {
+      handshakeTimeoutMs: Number(settings.handshakeTimeoutMs ?? 5000),
+      perTick: Number(settings.perTickPackets ?? 4),
+      maxInFlight: Number(settings.maxInFlight ?? 100),
+      requestTimeoutMs: Number(settings.requestTimeoutMs ?? 5000)
+    })
+    try {
+      const usable = await client.handshake()
+      if (!usable) return { samples: [], note: 'servux 握手不可用（bot 断线或服务器未响应 servux:litematics）' }
+      const blocks = chests.map(c => ({ position: new Vec3(c.x, c.y, c.z), name: c.blockName }))
+      const { map: results } = await client.queryBlocks(blocks.map(block => block.position))
+      const samples = []
+      for (const chest of chests) {
+        const outcome = results.get(`${chest.x},${chest.y},${chest.z}`)
+        if (!outcome?.ok) {
+          samples.push({ chest: `${chest.x},${chest.y},${chest.z}`, note: String(outcome?.reason || 'no_response') })
+          continue
+        }
+        const entries = Array.isArray(outcome.compound?.Items) ? outcome.compound.Items : []
+        samples.push({
+          chest: `${chest.x},${chest.y},${chest.z}`,
+          blockName: chest.blockName,
+          rawCount: entries.length,
+          rawEntries: entries.slice(0, 5),
+          parsed: this.servuxItemsToSlots(outcome.compound).slice(0, 5)
+        })
+      }
+      return { samples }
+    } finally {
+      client.destroy()
+    }
+  }
+
   // Servux 方块实体 NBT 的 Items → 与开箱路径同形状的槽位列表。
   servuxItemsToSlots (compound) {
     const entries = Array.isArray(compound?.Items) ? compound.Items : []

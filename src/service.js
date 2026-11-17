@@ -986,6 +986,16 @@ class CloudStoreService {
       return
     }
 
+    // 临时诊断命令（2026-11 物品解析排查；结果只进终端实时日志。排查完移除）
+    if (text === '!物品诊断') {
+      if (!this.isAdmin(username)) {
+        this.msg(username, '你没有权限使用诊断命令。')
+        return
+      }
+      await this.handleItemDiagnostics(username)
+      return
+    }
+
     if (/^!修装备(?:\s|$)?/.test(text)) {
       await this.handleRepairCommand(username, text, taskOptions)
       return
@@ -3288,6 +3298,48 @@ class CloudStoreService {
       earlyLines.push('configuration 期没收到过服务器的 register——S2C 通道声明没被转回来。')
     }
     this.msg(username, lines.join('\n') + earlyLines.join('\n'))
+  }
+
+  // !物品诊断：临时诊断命令（2026-11 物品解析排查，排查完连同本方法一起移除）。
+  // 结果只进终端实时日志（web 面板可见），不刷游戏聊天：
+  //   1) 账本最近 25 条物品档案           —— 看“奇奇怪怪”条目的真实 item_id/指纹/入库时间
+  //   2) 同一 item_id 的多个指纹          —— 组件解析漂移的直接证据（修复前后指纹不同）
+  //   3) 木桶槽位聚合 top 20              —— 当前账本实物分布
+  //   4) Servux 实读样本（前 2 个登记桶） —— 服务器原始 NBT 条目 vs 解析结果逐条对照
+  async handleItemDiagnostics (username) {
+    this.msg(username, '物品诊断开始，结果输出到终端实时日志。')
+    const log = line => console.log(`[物品诊断] ${line}`)
+    try {
+      log(`bot=${this.botId} 版本=${this.bot?.registry?.version?.minecraftVersion ?? this.bot?.version ?? '未知'}`)
+      log('=== 1) 账本最近 25 条物品档案 ===')
+      for (const row of this.db.debugRecentItems(25)) {
+        log(`${row.created_at} | ${row.item_id} | ${row.display_name} | key=${String(row.item_key).slice(0, 44)}`)
+      }
+      log('=== 2) 同一 item_id 出现多个指纹（组件解析漂移证据）===')
+      const dups = this.db.debugDuplicateItemKeys()
+      if (!dups.length) log('（无重复指纹）')
+      for (const row of dups) {
+        log(`${row.item_id} × ${row.keyCount} 个指纹：`)
+        for (const v of row.variants) log(`    ${String(v.item_key).slice(0, 52)} | ${v.display_name} | ${v.created_at}`)
+      }
+      log('=== 3) 木桶槽位聚合 top 20（item_key 粒度）===')
+      for (const row of this.db.debugChestSlotTotals(20)) {
+        log(`${row.total} 个 | ${row.item_id} | ${row.display_name}`)
+      }
+      log('=== 4) Servux 实读样本（前 2 个登记桶：原始 NBT vs 解析结果）===')
+      const sample = await this.warehouse.debugServuxBarrelSample(2)
+      if (sample.note) log(`servux 样本不可用：${sample.note}`)
+      for (const s of sample.samples) {
+        if (s.note) { log(`--- 木桶 ${s.chest}：${s.note}`); continue }
+        log(`--- 木桶 ${s.chest}（${s.blockName}）条目总数=${s.rawCount}`)
+        for (const raw of s.rawEntries) log(`  raw:    ${JSON.stringify(raw).slice(0, 600)}`)
+        for (const parsed of s.parsed) log(`  parsed: ${JSON.stringify({ itemId: parsed.itemId, displayName: parsed.displayName, amount: parsed.amount })}`)
+      }
+      log('=== 物品诊断结束 ===')
+    } catch (error) {
+      log(`诊断失败：${error.message}`)
+      console.error(error)
+    }
   }
 
   // !servux测速 [数量]：管理员诊断用。对已登记木桶的坐标全速批量发 servux:litematics

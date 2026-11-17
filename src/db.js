@@ -3476,6 +3476,46 @@ class StoreDb {
     `).all()
   }
 
+  // ---- 临时诊断查询（!物品诊断，2026-11 物品解析排查；排查完随命令一起移除）----
+  debugRecentItems (limit = 25) {
+    return this.db.prepare(`
+      SELECT item_id, display_name, item_key, created_at
+      FROM items
+      ORDER BY created_at DESC, rowid DESC
+      LIMIT ?
+    `).all(limit)
+  }
+
+  debugDuplicateItemKeys () {
+    const dup = this.db.prepare(`
+      SELECT item_id, COUNT(*) AS keyCount
+      FROM items
+      GROUP BY item_id
+      HAVING keyCount > 1
+      ORDER BY keyCount DESC
+      LIMIT 30
+    `).all()
+    const detail = this.db.prepare(`
+      SELECT item_key, display_name, created_at
+      FROM items
+      WHERE item_id = ?
+      ORDER BY created_at DESC
+      LIMIT 6
+    `)
+    return dup.map(row => ({ ...row, variants: detail.all(row.item_id) }))
+  }
+
+  debugChestSlotTotals (limit = 20) {
+    return this.db.prepare(`
+      SELECT i.item_id, i.display_name, SUM(s.amount) AS total
+      FROM chest_slots s
+      JOIN items i ON i.item_key = s.item_key
+      GROUP BY s.item_key
+      ORDER BY total DESC
+      LIMIT ?
+    `).all(limit)
+  }
+
   listChestSlots () {
     return this.db.prepare(`
       SELECT c.chest_id AS chestId, c.x, c.y, c.z, c.block_name AS blockName,
