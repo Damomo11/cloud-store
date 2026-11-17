@@ -3725,20 +3725,36 @@ class StoreDb {
       if (!reference.has(key) && isShulker(row) && Number(row.amount) > 0) extraBoxes.push([key, row])
     }
     if (!missingBoxes.length || !extraBoxes.length) return []
-    const contents = this.getShulkerContentsByBox([...missingBoxes.map(box => box[0]), ...extraBoxes.map(box => box[0])])
-    const signature = key => (contents.get(key) || [])
-      .map(item => `${item.itemKey}:${item.amount}`)
-      .sort()
-      .join('|')
+    // 内容签名改为跨目录双解释（2026-11-18 椰汁橙案例）：shulker_contents 表在目录迁移
+    // 重建时会把旧数字 id 按 26.3 目录错解（1.21.11 的 1353=堆肥桶 → vex_spawn_egg），
+    // 旧指纹的签名全成垃圾，与新指纹永远配不上——迁移前入账的盒子全部漏配，
+    // 拆成大量 missing/extra。改用档案 metaJson 直接解析 + 双目录候选签名，
+    // 任意组合相等即同内容（旧行×旧目录、新行×新目录时两侧都是真名）。
+    // 同时把盒子类型（itemId）纳入签名：蓝盒和同内容的白盒是不同物品，不能互配。
+    const sigCache = new Map()
+    const signaturesOf = row => {
+      if (!sigCache.has(row)) {
+        sigCache.set(row, this.catalog
+          ? this.catalog.shulkerLooseSignatures(row)
+          : { current: '', legacy: '' })
+      }
+      return sigCache.get(row)
+    }
+    const sameContent = (a, b) => {
+      if (String(a?.itemId || '') !== String(b?.itemId || '')) return false
+      const sa = signaturesOf(a)
+      const sb = signaturesOf(b)
+      return sa.current === sb.current || sa.current === sb.legacy ||
+        sa.legacy === sb.current || sa.legacy === sb.legacy
+    }
     const pairs = []
     for (const [missingKey, missingRow] of missingBoxes) {
       const holders = this.db.prepare('SELECT owner_uuid AS ownerUuid, amount AS balance FROM balances WHERE item_key = ? AND amount > 0').all(missingKey)
         .filter(row => row.ownerUuid && row.ownerUuid !== this.momoOwner)
       if (holders.length !== 1) continue
-      const missingSign = signature(missingKey)
       for (let index = 0; index < extraBoxes.length; index++) {
         const [extraKey, extraRow] = extraBoxes[index]
-        if (signature(extraKey) !== missingSign) continue
+        if (!sameContent(missingRow, extraRow)) continue
         // missingRow.amount 是按 key 汇总的全账量（含 momo 兜底持有的部分），
         // 配对转移只能从唯一人类持有者自己的余额里扣：按持有者余额钳制。
         // 不钳制时 adjustBalance 直接抛负余额（2026-11-18 椰汁橙 shulker_box|69569d49
@@ -3771,6 +3787,100 @@ class StoreDb {
     `).run(note, note, note, ...excludedKeys).changes
   }
 
+  // 兜底回填（2026-11-18 椰汁橙 15329 缺失案例的修复通道）：上一次同步对"指纹漂移
+  // 且配对失败"的盒子做了兜底——账面旧指纹按归属扣减（missing 异常留痕 + sync_deduct，
+  // 实扣量记在 balance_adjusted），实物多出的新指纹划入 momo（extra 异常留痕）。
+  // 两侧本是一致的内容（跨目录数字 id 无法直接比对导致漏配）。这里用异常记录里保留的
+  // 双方档案做跨目录签名回配：momo 多持的新指纹 xN 划回 missing 记录的归属者，两侧
+  // 异常按回填量闭环；回填上限为该记录当时实扣的账面量（balance_adjusted），不凭空造账。
+  repairMomoExtrasViaMismatches (excludedKeys = []) {
+    if (!this.catalog) return { repaired: 0, movedAmount: 0 }
+    const excluded = new Set(excludedKeys || [])
+    const extras = this.db.prepare(`
+      SELECT id, item_key AS itemKey, item_id AS itemId, display_name AS displayName,
+             nbt_json AS nbtJson, meta_json AS metaJson, amount
+      FROM inventory_mismatches
+      WHERE status = 'open' AND kind = 'extra' AND owner_uuid = ? AND amount > 0
+      ORDER BY id
+    `).all(this.momoOwner).filter(row => !excluded.has(row.itemKey))
+    if (!extras.length) return { repaired: 0, movedAmount: 0 }
+    const missings = this.db.prepare(`
+      SELECT id, owner_uuid AS ownerUuid, item_key AS itemKey, item_id AS itemId, display_name AS displayName,
+             nbt_json AS nbtJson, meta_json AS metaJson, amount, balance_adjusted AS balanceAdjusted
+      FROM inventory_mismatches
+      WHERE status = 'open' AND kind = 'missing' AND owner_uuid <> '' AND owner_uuid <> ? AND amount > 0
+      ORDER BY id
+    `).all(this.momoOwner).filter(row => !excluded.has(row.itemKey))
+    if (!missings.length) return { repaired: 0, movedAmount: 0 }
+
+    const sigs = row => this.catalog.shulkerLooseSignatures(row)
+    const matchesContent = (a, b) => {
+      if (String(a.itemId || '') !== String(b.itemId || '')) return false
+      const sa = sigs(a)
+      const sb = sigs(b)
+      return sa.current === sb.current || sa.current === sb.legacy ||
+        sa.legacy === sb.current || sa.legacy === sb.legacy
+    }
+
+    const extraLeft = new Map(extras.map(row => [row.id, Number(row.amount)]))
+    const missingLeft = new Map(missings.map(row => [row.id, Math.min(Number(row.amount), Number(row.balanceAdjusted || 0))]))
+    const note = this.db.prepare('UPDATE inventory_mismatches SET note = ?, amount = ?, status = ?, resolved_at = ? WHERE id = ?')
+    let repaired = 0
+    let movedAmount = 0
+
+    for (const extra of extras) {
+      let need = extraLeft.get(extra.id) ?? 0
+      if (need <= 0) continue
+      for (const missing of missings) {
+        if (need <= 0) break
+        const left = missingLeft.get(missing.id) ?? 0
+        if (left <= 0) continue
+        if (!matchesContent(extra, missing)) continue
+        // 钳制到 momo 当前实际持有量：余额可能已被查看器转移/后续同步消耗
+        const move = Math.min(need, left, this.getBalance(this.momoOwner, extra.itemKey))
+        if (move <= 0) continue
+        this.adjustBalance(this.momoOwner, extra.itemKey, -move)
+        this.adjustBalance(missing.ownerUuid, extra.itemKey, move)
+        const username = this.getOwnerLabelForMismatch(missing.ownerUuid)
+        this.addTransaction(
+          'sync_drift_repair',
+          'ok',
+          missing.ownerUuid,
+          username,
+          [{ itemKey: extra.itemKey, itemId: extra.itemId, displayName: extra.displayName, nbtJson: extra.nbtJson, metaJson: extra.metaJson, amount: move }],
+          `漂移兜底回填：上次同步漏配的盒子（旧指纹 ${missing.itemKey.slice(-16)} 已扣账、新指纹 ${extra.itemKey.slice(-16)} 划入了 momo），按跨目录内容签名回配同一只盒子，划回原主 x${move}。`
+        )
+        need -= move
+        movedAmount += move
+        repaired++
+        extraLeft.set(extra.id, need)
+        missingLeft.set(missing.id, left - move)
+      }
+    }
+
+    for (const row of extras) {
+      const left = extraLeft.get(row.id)
+      if (left === undefined || left === Number(row.amount)) continue
+      const suffix = left <= 0
+        ? '；已按跨目录内容签名回配给对应 missing 记录的归属者，本条闭环'
+        : `；已回配 ${Number(row.amount) - left}，剩余留待人工复核`
+      note.run(`${row.note || ''}${suffix}`, left, left <= 0 ? 'resolved' : 'open', left <= 0 ? new Date().toISOString() : null, row.id)
+    }
+    for (const row of missings) {
+      const left = missingLeft.get(row.id)
+      if (left === undefined || left === Math.min(Number(row.amount), Number(row.balanceAdjusted || 0))) continue
+      const used = Math.min(Number(row.amount), Number(row.balanceAdjusted || 0)) - left
+      const fullyCompensated = left <= 0
+      // missing 记录的 amount 保留原始缺失量（扣减流水是历史事实），
+      // 回填情况写进 note；全额补回才闭环。
+      const suffix = fullyCompensated
+        ? `；momo 兜底盒子已按跨目录内容签名划回新指纹 x${used}，本条闭环`
+        : `；momo 兜底盒子已划回新指纹 x${used}，剩余留待人工复核`
+      note.run(`${row.note || ''}${suffix}`, Number(row.amount), fullyCompensated ? 'resolved' : 'open', fullyCompensated ? new Date().toISOString() : null, row.id)
+    }
+    return { repaired, movedAmount }
+  }
+
   reconcileTotalsToMomo (actualTotals, allowedOperationId = '') {
     // Recovery uses the same global reconciliation policy as normal sync. Its
     // own durable journal is exempt only inside this synchronous transaction.
@@ -3801,9 +3911,16 @@ class StoreDb {
     const addedToMomo = []
     const removedFromMomo = []
     const unresolved = []
+    let driftRepair = { repaired: 0, movedAmount: 0 }
 
     this.transaction(() => {
-      if (!baseline) this.resolveOpenInventoryMismatches('新的同步已刷新库存异常状态。', [...deferredKeys])
+      if (!baseline) {
+        // 兜底回填：上一次同步对"漂移但配对失败"的盒子扣了原主、把新指纹划入了 momo
+        //（extra/missing 异常留痕）。这里按异常记录里保留的双方档案做跨目录签名回配，
+        // 把 momo 多持的盒子划回原主，然后再统一刷新剩余异常状态。
+        driftRepair = this.repairMomoExtrasViaMismatches([...deferredKeys])
+        this.resolveOpenInventoryMismatches('新的同步已刷新库存异常状态。', [...deferredKeys])
+      }
 
       // 指纹漂移配对：同内容的 missing/extra 潜影盒判定为同一只盒子的新旧两代
       // 指纹（拆盒重打包），把新指纹的账记回原主并留转移流水；两侧 Map 已在
@@ -3923,7 +4040,7 @@ class StoreDb {
       }
     })
 
-    return { addedToMomo, removedFromMomo, unresolved, ...(deferredKeys.size ? { deferredForPacking: [...deferredKeys] } : {}) }
+    return { addedToMomo, removedFromMomo, unresolved, driftRepair, ...(deferredKeys.size ? { deferredForPacking: [...deferredKeys] } : {}) }
   }
 
   rowToItem (row) {

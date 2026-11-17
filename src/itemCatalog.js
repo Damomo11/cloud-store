@@ -229,6 +229,56 @@ class ItemCatalog {
     }
   }
 
+  // 目录版本无关的物品 id → 全名映射（带缓存），供跨目录签名解析用。
+  itemsByIdMap (reg) {
+    if (!reg) return null
+    if (!reg.__itemsByIdMap) {
+      const map = new Map()
+      for (const entry of reg.itemsArray) map.set(entry.id, `minecraft:${entry.name}`)
+      try {
+        Object.defineProperty(reg, '__itemsByIdMap', { value: map })
+      } catch {
+        return map
+      }
+    }
+    return reg.__itemsByIdMap
+  }
+
+  // 迁移期跨目录内容签名（2026-11-18 椰汁橙 16417 多余/15329 缺失案例）：
+  // 存量 metaJson 的容器内容数字 itemId 是"入账当时目录"的编码——迁移前入账的行
+  // 用 1.21.11 编码、26.3 扫描行用 26.3 编码，任何单一目录解析都必然错一边
+  // （1.21.11 的 1353=堆肥桶在 26.3 目录下解成 vex_spawn_egg），导致配对器
+  // "同内容漂移盒子"判不出来。这里对同一份档案按两个目录各解出一个候选签名，
+  // 配对时任意组合相等即判定同内容（旧行用旧目录、新行用新目录时两侧都是真名）。
+  shulkerLooseSignatures (item) {
+    const meta = this.parseStoredJson(item?.metaJson ?? item?.meta_json ?? null, {})
+    const components = Array.isArray(meta?.components) ? meta.components : []
+    const container = components.find(component => component?.type === 'container')
+    const entries = Array.isArray(container?.data?.contents) ? container.data.contents : []
+    const build = reg => {
+      const byId = this.itemsByIdMap(reg)
+      const tokens = []
+      for (const entry of entries) {
+        const count = Number.parseInt(entry?.itemCount ?? entry?.count ?? 0, 10)
+        if (!Number.isFinite(count) || count <= 0) continue
+        let name = null
+        if (typeof entry?.itemId === 'string' && entry.itemId) {
+          name = entry.itemId.startsWith('minecraft:') ? entry.itemId : `minecraft:${entry.itemId}`
+        } else if (Number.isInteger(entry?.itemId)) {
+          name = byId.get(entry.itemId) ?? null
+        }
+        if (!name) continue
+        tokens.push(`${name}x${count}`)
+      }
+      return tokens.sort().join('|')
+    }
+    const legacyCatalog = this.legacy12111Catalog()
+    return {
+      current: build(this.mcData),
+      legacy: legacyCatalog ? build(legacyCatalog) : ''
+    }
+  }
+
   extractShulkerContents (item) {
     if (!this.isShulkerBox(item?.itemId)) return []
 
@@ -237,7 +287,6 @@ class ItemCatalog {
     const container = this.extractContainerComponent(meta.components)
     const entries = Array.isArray(container?.contents) ? container.contents : []
     const byKey = new Map()
-
     for (const entry of entries) {
       const contained = this.fromContainerEntry(entry)
       if (!contained) continue
