@@ -190,6 +190,27 @@ async function main () {
   }))
   report['新方块状态段'] = `空闲 ${freeIds.length} 个，分配 ${cursor} 个${cursor === freeIds.length ? '（吻合）' : '（!不吻合，需人工核对）'}`
 
+  // ===== 26.3 新物品/新方块中文翻译：从 Mortis 语言文件合并进 bot 的 data/zh_cn.json =====
+  const vfpLangDir = path.join(VFP_ROOT, 'src', 'main', 'resources', 'assets', 'viafabricplus', 'lang')
+  const mortisZh = JSON.parse(fs.readFileSync(path.join(vfpLangDir, 'zh_cn.json'), 'utf8'))
+  const zhCnPath = path.join(__dirname, '..', 'data', 'zh_cn.json')
+  const botZh = JSON.parse(fs.readFileSync(zhCnPath, 'utf8'))
+  let addedZh = 0
+  const itemNames263 = decodeRegistry(v263, global, 'items')
+  const blockNames263 = decodeRegistry(v263, global, 'blocks')
+  const wanted = new Set()
+  for (const name of itemNames263) wanted.add(`item.minecraft.${name}`)
+  for (const name of blockNames263) wanted.add(`block.minecraft.${name}`)
+  for (const key of wanted) {
+    if (botZh[key] !== undefined) continue
+    const localized = mortisZh[key]
+    if (localized === undefined) continue
+    botZh[key] = localized
+    addedZh++
+  }
+  fs.writeFileSync(zhCnPath, JSON.stringify(botZh, null, 2))
+  report['中文翻译合并'] = `Mortis zh_cn 494 条中为 26.3 新内容新增 ${addedZh} 条进 data/zh_cn.json`
+
   // 与 minecraft-data 26.1 的 items 对齐校验：名字→id 应一致
   const mcData261 = require('minecraft-data')('26.1')
   const item263 = JSON.parse(fs.readFileSync(path.join(OUT_DIR, 'items.json'), 'utf8'))
