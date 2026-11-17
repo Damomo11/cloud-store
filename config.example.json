@@ -236,7 +236,7 @@
     "layoutMode": "normal",
 
     // Default scan radius for !同步仓库.
-    "defaultSyncRadius": 16,
+    "defaultSyncRadius": 30,
 
     // Item pickup radius when collecting player drops.
     "pickupRadius": 2,

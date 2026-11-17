@@ -114,7 +114,9 @@ const DEFAULT_CONFIG = {
     // Individual warehouses can override this setting in the admin panel.
     quickShulkerExtractionEnabled: true,
     layoutMode: 'normal',
-    defaultSyncRadius: 16,
+    // 默认同步距离 16→30（2026-11-17 所有者拍板）：扩大默认盘点覆盖半径，
+    // 给箱子视图不稳时的边缘覆盖留冗余；上限 maxSyncRadius=64 内。
+    defaultSyncRadius: 30,
     pickupRadius: 2,
     homeSkipRadius: 8,
     maxSyncRadius: 64,
