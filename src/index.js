@@ -1,12 +1,16 @@
 const fs = require('node:fs')
 const path = require('node:path')
 const crypto = require('node:crypto')
-// via 模块：26.3 伪版本注入。必须先于 mineflayer 的 require——
-// mineflayer/lib/loader.js 加载时解构版本表，晚了放行不进去。
+// via 模块：26.3 伪版本注入（mod 式自动生效，不需要 config 开关）。
+// 必须先于 mineflayer 的 require——mineflayer/lib/loader.js 加载时解构版本表，晚了放行不进去。
+// 注入后 minecraft-protocol 的 autoVersion ping 到 777 会自动选 26.3；连 1.21.x 服时
+// 协商结果不变，注入的字典闲置无害。data/via/26.3 缺失时降级走 1.21.11 老路。
 try {
-  const rawViaConfig = JSON.parse(fs.readFileSync(path.resolve(process.cwd(), 'config.json'), 'utf8'))
-  if (rawViaConfig.server?.version === '26.3') require('./via').activate()
-} catch { /* config 缺失/未启用 via：走原 1.21.11 路径 */ }
+  require('./via').activate()
+  console.log('[via] 26.3 伪版本已注入，连接版本将自动协商')
+} catch (error) {
+  console.log('[via] 注入失败，回退 1.21.11 直连：', error.message)
+}
 const mineflayer = require('mineflayer')
 const nbt = require('prismarine-nbt')
 const { pathfinder } = require('mineflayer-pathfinder')
@@ -39,7 +43,9 @@ function createBot (config, onMsaCode) {
     port: config.server.port,
     username: config.server.username,
     auth: 'microsoft',
-    version: config.server.version,
+    // 版本自动协商（mod 式）：ping 服务器 → 协议号 777 自动选 26.3（via 注入的字典）、
+    // 1.21.x 服自动选 1.21.11。config.server.version 仅作 catalog 初始字典，不再锁定连接版本。
+    version: false,
     locale: config.server.locale || 'zh_CN',
     disableChatSigning: true,
     logErrors: false,
@@ -54,6 +60,15 @@ function createBot (config, onMsaCode) {
 
   // 1.21.6+ 需在 configuration 阶段声明 servux 通道（详见 servux.js 注释）
   hookEarlyChannelRegister(bot)
+
+  // 登录后按协商出的真实版本切换 catalog（26.3 字典含 26.2/26.3 新物品）
+  bot.once('login', () => {
+    const negotiated = bot.registry?.version?.minecraftVersion
+    if (!negotiated || negotiated === currentCatalogVersion) return
+    console.log(`[via] 服务器实际版本 ${negotiated}，切换物品字典（原 ${currentCatalogVersion}）`)
+    currentCatalogVersion = negotiated
+    attachCatalog(createCatalogForVersion(negotiated))
+  })
 
   bot.loadPlugin(pathfinder)
   return bot
@@ -104,6 +119,8 @@ const db = new StoreDb(path.resolve(process.cwd(), 'data', 'cloud-store.sqlite')
 const subscriptions = new SubscriptionManager(db, config)
 const catalog = createCatalogForVersion(config.server.version)
 attachCatalog(catalog)
+// 当前生效的物品字典版本；bot 登录按协商版本自适应（见 createBot 里的 login 钩子）
+let currentCatalogVersion = config.server.version
 
 const configuredAccounts = (Array.isArray(config.bots) && config.bots.length ? config.bots : [config.server])
   .map((account, index) => ({
