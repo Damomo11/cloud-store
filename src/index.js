@@ -1,6 +1,12 @@
 const fs = require('node:fs')
 const path = require('node:path')
 const crypto = require('node:crypto')
+// via 模块：26.3 伪版本注入。必须先于 mineflayer 的 require——
+// mineflayer/lib/loader.js 加载时解构版本表，晚了放行不进去。
+try {
+  const rawViaConfig = JSON.parse(fs.readFileSync(path.resolve(process.cwd(), 'config.json'), 'utf8'))
+  if (rawViaConfig.server?.version === '26.3') require('./via').activate()
+} catch { /* config 缺失/未启用 via：走原 1.21.11 路径 */ }
 const mineflayer = require('mineflayer')
 const nbt = require('prismarine-nbt')
 const { pathfinder } = require('mineflayer-pathfinder')
