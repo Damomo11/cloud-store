@@ -461,7 +461,37 @@ function addPacketFields (types, names) {
   for (const name of names) fields[name] = 'packet_' + name
 }
 
-function patchProtocol (protocol, components263) {
+// 26.3：Particle id mapper 重排 + 新粒子数据结构补齐。
+// 真值：Via 粒子映射（data/via/26.3/particles.json，128 个，gen-via-26x 解码）+ Via
+// ParticleType.Fillers.fill26_2（vvfull 反编译）：
+//   - 26.3 id 区间整体位移：26.1 表 21=entity_effect/28=sonic_boom，26.3 实际 28=entity_effect/
+//     35=sonic_boom。旧补丁没动 Particle mapper → 元数据/world_particles 里的粒子 id 全读错：
+//     entity_effect 的 4 字节颜色 int 被丢掉 → "Chunk size is 21 but only 17 was read"（2026-11-18 部署实测，
+//     血量 16.0 + 药水粒子颜色的真实玩家 metadata）。
+//   - fill26_2 为 geyser 系补数据（GEYSER reader=i32，GEYSER_BASE=i32+f32；bootstrap 17/18 → lambda$static$15/16）：
+//     geyser_base/geyser_poof = i32+f32，geyser/geyser_plume = i32。
+//   - 其余 26.3 新粒子（sulfur_bubbles 等 9 个）无数据 → void（switch 无 default，缺字段会抛）。
+function patchParticleTypes (protocol, particles263) {
+  const particle = protocol.types.Particle
+  if (!particle) return
+  const mappings = {}
+  particles263.forEach((name, id) => { mappings[id] = name })
+  particle[1][0].type[1].mappings = mappings
+  const fields = particle[1][1].type[1].fields
+  if (fields.geyser === undefined) {
+    fields.geyser = ['container', [{ name: 'value', type: 'i32' }]]
+    fields.geyser_base = ['container', [{ name: 'value', type: 'i32' }, { name: 'scale', type: 'f32' }]]
+    fields.geyser_poof = ['container', [{ name: 'value', type: 'i32' }, { name: 'scale', type: 'f32' }]]
+    fields.geyser_plume = ['container', [{ name: 'value', type: 'i32' }]]
+    for (const name of ['sulfur_bubbles', 'noxious_gas', 'noxious_gas_cloud', 'red_poplar_leaves',
+      'orange_poplar_leaves', 'yellow_poplar_leaves', 'trial_spawner_detection',
+      'trial_spawner_detection_ominous', 'sulfur_cube_goo']) {
+      fields[name] = 'void'
+    }
+  }
+}
+
+function patchProtocol (protocol, components263, particles263) {
   // 1) 包 id 表移位（已与 Via ClientboundPackets26_3 / ServerboundPackets26_3 枚举逐 id 对齐验证）
   const pc = protocol.play.toClient.types
   rewritePacketMapper(pc, [
@@ -511,6 +541,9 @@ function patchProtocol (protocol, components263) {
 
   // 3) 组件表 + 结构
   patchSlotComponentTypes(protocol, components263)
+
+  // 4) 粒子 id 表 + 数据结构（26.3 位移 + geyser 系新增）
+  patchParticleTypes(protocol, particles263)
 
   return protocol
 }

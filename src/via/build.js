@@ -15,6 +15,7 @@ function loadData () {
     blocks: read('blocks.json'),
     entities: read('entities.json'),
     components: read('data_component_type.json'),
+    particles: read('particles.json'),
     chain: read('id-chain-26.1-to-26.3.json').registries,
     newBlockStates: read('new-block-states.json'),
     blockProps: read('new-block-props.json').blocks
@@ -171,7 +172,8 @@ function build263 (base) {
   out.version = buildVersion(base)
   out.protocol = require('./protocol-patch').patchProtocol(
     JSON.parse(JSON.stringify(base.protocol)),
-    data.components
+    data.components,
+    data.particles.names263
   )
   // recipes/entityLoot 等沿用 26.1（bot 不依赖其 26.3 增量）
   return out
