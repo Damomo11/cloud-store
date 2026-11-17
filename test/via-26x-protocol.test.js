@@ -157,3 +157,24 @@ test('指纹稳定：容器内容的数字 itemId 归一到稳定全名（跨目
     '旧目录数字 id 与新目录名字冲突的行应跳过迁移'
   )
 })
+
+test('spawn_entity 玩家包：26.3 线上 id(159) 解析后命中玩家实体（tpa 后挂链根）', () => {
+  const pair = makePair('play', 'toClient')
+  const { params } = roundTrip(pair, 'spawn_entity', {
+    entityId: 42,
+    objectUUID: '069a79f4-44e9-4726-a5be-fca90e38aaf5',
+    type: 159, // 26.3 player 线上 id
+    x: -81582.35, y: 191.0, z: -40531.5,
+    velocity: { present: 1, x: 0, y: 0, z: 0 },
+    pitch: 0, yaw: 70, headPitch: 0,
+    objectData: 0
+  })
+  assert.strictEqual(params.type, 159)
+  assert.strictEqual(params.objectUUID, '069a79f4-44e9-4726-a5be-fca90e38aaf5')
+  // 复刻 mineflayer entities.js:228 的判定：entityDataByInternalId[type].type === 'player'
+  const md = require('minecraft-data')('26.3')
+  const entityDataByInternalId = Object.fromEntries(md.entitiesArray.map(e => [e.internalId, e]))
+  const entityData = entityDataByInternalId[params.type]
+  assert.ok(entityData, `spawn_entity type=${params.type} 在 internalId 表查不到（玩家实体不会挂链）`)
+  assert.strictEqual(entityData.type, 'player', 'spawn_entity 玩家包应走 addNewPlayer 分支')
+})

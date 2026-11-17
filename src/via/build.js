@@ -127,9 +127,15 @@ function rebuildEntities (data, base) {
   const byName = indexByName(base.entities)
   return data.entities.names263.map((name, id) => {
     const old = byName.get(name)
-    if (old) return { ...old, id }
+    // internalId 是线上 id（mc-data 现代格式里 26.1 基线 internalId === id 全表成立）。
+    // mineflayer entities.js 用 entityDataByInternalId[spawn_entity.type] 判断是否玩家：
+    // 漏改会让 26.3 线上 id 查 26.1 internalId，player(159) 查不到 → addNewNonPlayer
+    // 分支 → entity.username 不设置、bot.players[名字].entity 不挂链 →
+    // tpa 后 resolvePlayerEntity 全兜底落空（"丢前瞄准失败：找不到玩家"）。
+    // id 碰撞的实体（如 26.3 poplar_boat=90）还会拿到 26.1 同 id 实体的错误碰撞箱。
+    if (old) return { ...old, id, internalId: id }
     const known = NEW_ENTITY_SIZES[name] ?? { type: 'mob', height: 0.5, width: 0.5 }
-    return { id, name, displayName: name, ...known, newVia26x: true }
+    return { id, internalId: id, name, displayName: name, ...known, newVia26x: true }
   })
 }
 
