@@ -93,7 +93,7 @@ server.on('login', (client) => {
     pitch: 0, yaw: 90, headPitch: 0, objectData: 0
   }))
   step(1200, 'rel_entity_move +1格', () => client.write('rel_entity_move', {
-    entityId: 61, properties: 1, delta: { dX: 4096, dY: 0, dZ: 0 }
+    entityId: 61, properties: 'steps0g', delta: { dX: 4096, dY: 0, dZ: 0 }
   }))
   step(1500, 'sync LINEAR →(100.5,64,-200.25)', () => client.write('sync_entity_position', {
     entityId: 61, pathType: 0, path: { x: 100.5, y: 64, z: -200.25 }, yaw: 45, pitch: -10, onGround: true
@@ -114,7 +114,7 @@ server.on('login', (client) => {
     })
   })
   step(2400, 'entity_move_look stepped@目的地', () => client.write('entity_move_look', {
-    entityId: 61, properties: 2, delta: { tickOffset: 3, dX: 128, dY: -64, dZ: -128 }, yaw: 70, pitch: -20
+    entityId: 61, properties: 'steps1', delta: { steps: [{ tickOffset: 3, dX: 128, dY: -64, dZ: -128 }] }, yaw: 70, pitch: -20
   }))
   step(2800, 'sync STEPPED@目的地', () => client.write('sync_entity_position', {
     entityId: 61, pathType: 1, path: { steps: [{ x: -95970.0, y: 185.0, z: -95890.0, tickOffset: 0 }] }, yaw: 0, pitch: 0, onGround: true

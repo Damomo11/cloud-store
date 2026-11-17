@@ -10,12 +10,14 @@
 //    （2026-11-18 部署实测：9112b09 带 move 扁平化但玩家实体坐标仍 NaN）。改包型与顺序无关。
 //
 // 1b. rel_entity_move / entity_move_look 读侧扁平化（prependListener，先于 mineflayer 执行）：
-//    26.3 把 delta 收进 properties 之后的 VecDelta（解析成嵌套 packet.delta.{tickOffset?,dX,dY,dZ}），
-//    mineflayer entities.js 按 26.1 顶层 packet.dX/dY/dZ 读（entities.js:303/322）→
-//    translate(undefined/4096) = NaN → 每个走动实体的第一个 move 包就把坐标污染成 NaN
-//    （sync_entity_position 只在 >8 格位移/定期才来，救不回来 → "玩家=NaN,NaN,NaN"，
-//    lookAt(NaN) 后 bot 朝向 NaN → invalid_player_movement 踢出，2026-11-18 部署实测）。
-//    用 prependListener 把 delta 拷回顶层，老版本包（已是顶层）原样放行。
+//    26.3 的 properties 是打包位段（onGround(bit0) | stepCount<<1，ClientboundMoveEntityPacket
+//    packProperties），VecDelta：stepCount=0 → {dX,dY,dZ}；>0 → {steps:[{tickOffset,dX,dY,dZ}×N]}
+//    （2026-11-18 实测 tsl 服发 properties=4 双步包，按 0-3 模式枚举解析会余 7 字节/步报
+//    partial packet、整包丢弃）。mineflayer entities.js 按 26.1 顶层 packet.dX/dY/dZ 读
+//    （entities.js:303/322）→ translate(undefined/4096) = NaN → 走动实体坐标被污染（2026-11-18
+//    部署实测 → "玩家=NaN,NaN,NaN" → lookAt(NaN) → invalid_player_movement 踢出）。
+//    用 prependListener 把 delta 拷回顶层：LINEAR 直拷，STEPPED 取各步之和（mineflayer
+//    每包应用一次位移），onGround 从分支名后缀恢复；老版本包（已是顶层）原样放行。
 //
 // 2. 写侧适配（nmp 的 'packet' 事件先于具体包事件发出，所以这里能在 mineflayer 写之前缓存数据）：
 //    - accept_teleportation：26.3 = [teleportId, x, y, z, yRot, xRot]，mineflayer physics.js
@@ -74,12 +76,23 @@ function installRepairSync (bot) {
   bot._client.prependListener('sync_entity_position', flattenSyncPath)
 
   // ---- 读侧：rel_entity_move / entity_move_look delta 扁平化（先于 mineflayer 执行）----
+  // 26.3 的 properties 是打包位段（onGround(bit0) | stepCount<<1），经 protocol-patch 的
+  // mapper 解析后这里是 'steps<N>[g]' 分支名；delta 在 stepCount=0 时是
+  // {dX,dY,dZ}（LINEAR），>0 时是 {steps:[{tickOffset,dX,dY,dZ}×N]}（STEPPED）。
+  // mineflayer 每包只应用一次位移，多步路径取各步之和作为总位移。
   const flattenMoveDelta = (packet) => {
     if (!packet || packet.dX !== undefined) return // 老 26.1 格式已是顶层
     const d = packet.delta || {}
-    packet.dX = d.dX ?? 0
-    packet.dY = d.dY ?? 0
-    packet.dZ = d.dZ ?? 0
+    if (Array.isArray(d.steps) && d.steps.length) {
+      packet.dX = d.steps.reduce((sum, step) => sum + (step?.dX || 0), 0)
+      packet.dY = d.steps.reduce((sum, step) => sum + (step?.dY || 0), 0)
+      packet.dZ = d.steps.reduce((sum, step) => sum + (step?.dZ || 0), 0)
+    } else {
+      packet.dX = d.dX ?? 0
+      packet.dY = d.dY ?? 0
+      packet.dZ = d.dZ ?? 0
+    }
+    if (typeof packet.properties === 'string') packet.onGround = packet.properties.endsWith('g')
   }
   bot._client.prependListener('rel_entity_move', flattenMoveDelta)
   bot._client.prependListener('entity_move_look', flattenMoveDelta)

@@ -76,8 +76,8 @@ feed('spawn_entity', {
   objectData: 0
 }, 'spawn_entity player@仓库')
 console.log(`     entity[61]=${posOf(61)} | players.entity=${linkOf('MoMortis1917')}`)
-// 3) rel_entity_move：properties=1 线性 dX=+4096（+1 格）
-feed('rel_entity_move', { entityId: 61, properties: 1, delta: { dX: 4096, dY: 0, dZ: 0 } }, 'rel_entity_move +1格')
+// 3) rel_entity_move：properties=1（onGround|stepCount=0）线性 dX=+4096（+1 格）
+feed('rel_entity_move', { entityId: 61, properties: 'steps0g', delta: { dX: 4096, dY: 0, dZ: 0 } }, 'rel_entity_move +1格')
 console.log(`     entity[61]=${posOf(61)}`)
 // 4) sync_entity_position LINEAR 到 (100, 64, -200)
 feed('sync_entity_position', {
@@ -86,7 +86,7 @@ feed('sync_entity_position', {
 console.log(`     entity[61]=${posOf(61)}`)
 // 5) entity_move_look：properties=2 stepped（tickOffset 3 + delta）
 feed('entity_move_look', {
-  entityId: 61, properties: 2, delta: { tickOffset: 3, dX: 128, dY: -64, dZ: -128 }, yaw: 70, pitch: -20
+  entityId: 61, properties: 'steps1', delta: { steps: [{ tickOffset: 3, dX: 128, dY: -64, dZ: -128 }] }, yaw: 70, pitch: -20
 }, 'entity_move_look stepped')
 console.log(`     entity[61]=${posOf(61)}`)
 // 6) sync_entity_position STEPPED（1 步）
