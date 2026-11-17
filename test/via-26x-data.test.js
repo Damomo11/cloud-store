@@ -76,3 +76,22 @@ test('新方块属性与状态段联动', () => {
   // 状态段总数与属性表覆盖一致
   assert.strictEqual(Object.keys(states).length, Object.keys(props).length)
 })
+
+test('26.3 实体表 internalId 与 id 一致（mineflayer 玩家实体挂链依赖）', () => {
+  require('../src/via').activate()
+  const md = require('minecraft-data')
+  const d = md('26.3')
+  const stale = d.entitiesArray.filter(e => e.internalId !== e.id)
+  assert.strictEqual(stale.length, 0,
+    `internalId 未随 26.3 重排更新的实体：${stale.slice(0, 5).map(e => `${e.name}(${e.internalId})`).join(',')}`)
+  // mineflayer entities.js: entityDataByInternalId[spawn_entity.type] 判定玩家；
+  // 查不到走 addNewNonPlayer → entity.username 不设置 → resolvePlayerEntity 全兜底落空
+  const byInternalId = Object.fromEntries(d.entitiesArray.map(e => [e.internalId, e]))
+  const player = byInternalId[159]
+  assert.ok(player, '26.3 线上玩家实体 id(159) 必须能按 internalId 查到')
+  assert.strictEqual(player.type, 'player')
+  assert.strictEqual(player.name, 'player')
+  // id 碰撞回归锚：26.3 poplar_boat=106（26.1 同 id 是 lingering_potion），
+  // 若 internalId 漏改，线上 id 106 会拿到 26.1 lingering_potion 的错误碰撞箱
+  assert.strictEqual(byInternalId[106]?.name, 'poplar_boat', '线上 id 106 应解析为 poplar_boat')
+})
