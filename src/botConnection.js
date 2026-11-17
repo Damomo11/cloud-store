@@ -138,9 +138,12 @@ function installFatalProtocolPacketCapture (bot, options = {}) {
 // by scanning arbitrary packet bytes (which may belong to custom_data or lore).
 // The extra byte is TAG_Int_Array (11); 11,10 at an NBT root would declare an
 // impossibly large array. The following TAG_Compound is the entity data.
+// 26.3 的 bees 组件结构与 1.21.11 相同（BeehiveBlockEntity$Occupant: NBT + 2×VARINT，
+// 2026-11 从 26.3 客户端反编译核对），同样适用本修复。
+const BEE_REPAIR_VERSIONS = new Set(['1.21.11', '26.3'])
 function parseBeeContainerPacket (client, deserializer, parsePacketBuffer, buffer) {
   const ctx = deserializer.proto?.readCtx
-  if (client.version !== '1.21.11' || client.state !== 'play' ||
+  if (!BEE_REPAIR_VERSIONS.has(client.version) || client.state !== 'play' ||
       typeof ctx?.SlotComponent !== 'function' || typeof ctx.anonymousNbt !== 'function') {
     const legacy = repairLegacyBeePrefix(buffer)
     return { packet: parsePacketBuffer(legacy?.packet || buffer), repairedCount: legacy?.repairedCount || 0 }

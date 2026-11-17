@@ -58,6 +58,10 @@ function createBot (config, onMsaCode) {
 
   const bot = mineflayer.createBot(options)
 
+  // 26.3 的 sync_entity_position 没有 26.1 的速度字段，mineflayer 处理器会 NaN；
+  // 在 mineflayer 处理器之后注册修复监听（详见 via/sync-compat.js）
+  require('./via/sync-compat').installRepairSync(bot)
+
   // 1.21.6+ 需在 configuration 阶段声明 servux 通道（详见 servux.js 注释）
   hookEarlyChannelRegister(bot)
 

@@ -163,7 +163,9 @@ async function main () {
   }
   report['id链式映射'] = chainReport
 
-  // ===== 新方块的状态段：链式映射值域之外的 id = 新状态，按 backport-ids 的状态数分配 =====
+  // ===== 新方块的状态段：链式映射值域之外的 id = 新状态（空洞位置本身即真实位置），
+  // 归属按 26.3 客户端 Blocks.java 的真实注册序认领（backport-ids.json 的文件键序 ≠ 注册序，
+  // 2026-11 审计发现旧逻辑把 sulfur 分到 poplar_planks 的 27 号段、全表 118 块错位）=====
   const backport = JSON.parse(fs.readFileSync(
     path.join(VFP_ROOT, 'src', 'main', 'resources', 'assets', 'viafabricplus', 'data', 'backport-ids.json'),
     'utf8'
@@ -174,12 +176,28 @@ async function main () {
   const freeIds = []
   for (let id = 0; id < totalStates; id++) if (!used.has(id)) freeIds.push(id)
   const newBlocks = backport['26.3'].block_states || {}
+  const registrationOrder = JSON.parse(fs.readFileSync(
+    path.join(__dirname, 'new-block-registration-order.json'), 'utf8'
+  )).order
+  const missing = newBlocks && Object.keys(newBlocks).filter(n => !registrationOrder.includes(n))
+  const extra = registrationOrder.filter(n => !(n in newBlocks))
+  if (!newBlocks || missing.length || extra.length) {
+    throw new Error(`[gen-via-26x] 新方块集合与真实注册序不一致 missing=${JSON.stringify(missing)} extra=${JSON.stringify(extra)}，26.x 版本变了？需重新提取 scripts/new-block-registration-order.json`)
+  }
   const assign = {}
   let cursor = 0
-  for (const [name, states] of Object.entries(newBlocks)) {
-    // backport 的 states 数组长度 = 该方块状态数；按新方块注册顺序在空闲 id 段连续分配
+  for (const name of registrationOrder) {
+    const states = newBlocks[name]
+    // backport 的 states 数组长度 = 该方块状态数；按真实注册序连续认领空闲段
     const count = Math.max(1, states.length)
     assign[name] = { count, firstStateId: freeIds[cursor] ?? -1 }
+    // 认领的段必须全部是空洞，否则说明注册序或状态数与真实表不符
+    for (let i = 0; i < count; i++) {
+      const id = freeIds[cursor + i]
+      if (id === undefined || used.has(id)) {
+        throw new Error(`[gen-via-26x] ${name} 认领的状态段 ${freeIds[cursor]}+${i} 与真实链映射冲突，注册序/状态数需人工核对`)
+      }
+    }
     cursor += count
   }
   fs.writeFileSync(path.join(OUT_DIR, 'new-block-states.json'), JSON.stringify({
@@ -188,7 +206,24 @@ async function main () {
     assigned: cursor,
     blocks: assign
   }))
-  report['新方块状态段'] = `空闲 ${freeIds.length} 个，分配 ${cursor} 个${cursor === freeIds.length ? '（吻合）' : '（!不吻合，需人工核对）'}`
+  report['新方块状态段'] = `空闲 ${freeIds.length} 个，按真实注册序分配 ${cursor} 个${cursor === freeIds.length ? '（吻合）' : '（!不吻合，需人工核对）'}`
+
+  // ===== 新方块真实属性（hardness/noCollision/noOcclusion）：scripts/new-block-props-source.json，
+  // 从 26.3 客户端 Blocks.java 反编译提取（2026-11 审计）。校验集合与生成的新方块一致后写入运行时数据 =====
+  const blockPropsSource = JSON.parse(fs.readFileSync(
+    path.join(__dirname, 'new-block-props-source.json'), 'utf8'
+  ))
+  const propNames = Object.keys(blockPropsSource)
+  const propMissing = propNames.filter(n => !(n in newBlocks))
+  const propExtra = Object.keys(newBlocks).filter(n => !propNames.includes(n))
+  if (propMissing.length || propExtra.length) {
+    throw new Error(`[gen-via-26x] 新方块属性表与 backport-ids 不一致 missing=${JSON.stringify(propMissing)} extra=${JSON.stringify(propExtra)}，需重新提取`)
+  }
+  fs.writeFileSync(path.join(OUT_DIR, 'new-block-props.json'), JSON.stringify({
+    note: '26.3 真实方块属性（26.3 客户端 Blocks.java）；noCollision/noOcclusion 决定 boundingBox/transparent',
+    blocks: blockPropsSource
+  }))
+  report['新方块属性'] = `${propNames.length} 条（hardness/noCollision/noOcclusion）`
 
   // ===== 26.3 新物品/新方块中文翻译：从 Mortis 语言文件合并进 bot 的 data/zh_cn.json =====
   const vfpLangDir = path.join(VFP_ROOT, 'src', 'main', 'resources', 'assets', 'viafabricplus', 'lang')

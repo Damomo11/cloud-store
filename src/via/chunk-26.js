@@ -74,7 +74,25 @@ class ChunkSection26 extends ChunkSectionBase {
   }
 }
 
-// 26.x 的 ChunkColumn：继承 1.18 实现，仅重写 section 二进制解析
+// 26.x 的 ChunkColumn：继承 1.18 实现，重写 section 二进制解析 + 光照掩码兼容。
+// 26.3 光照掩码从 varint 长度 i64 数组改成了 BIT_SET（varint 字节数 + 字节数组，
+// protocol-patch 里用 buffer 类型解析成 Buffer），而 prismarine-chunk 的
+// loadParsedLight 要 BigInt 长数组（BitArray.fromLongArray），这里做转换。
+function bitsetToLongs (buf) {
+  // 输出 protodef i64 数组的元素形状 [hi, lo]（BitArrayNoSpan.fromLongArray 按此索引）。
+  // Java BitSet.toByteArray 的每个 long 是小端 8 字节，且字节数是最小长度（需补零对齐）。
+  const longs = []
+  const n = Math.ceil(buf.length / 8)
+  for (let i = 0; i < n; i++) {
+    let lo = 0
+    let hi = 0
+    for (let b = 0; b < 4; b++) lo |= (buf[i * 8 + b] ?? 0) << (8 * b)
+    for (let b = 0; b < 4; b++) hi |= (buf[i * 8 + 4 + b] ?? 0) << (8 * b)
+    longs.push([hi | 0, lo | 0]) // 转有符号 32 位，与 protodef i64 一致
+  }
+  return longs
+}
+
 function build26ChunkColumn (registry) {
   const BaseChunkColumn = chunkFactory(registry)
   const noSizePrefix = registry.version['>=']('1.21.5')
@@ -88,6 +106,15 @@ function build26ChunkColumn (registry) {
         this.sections[i] = ChunkSection26.read(reader, this.maxBitsPerBlock, noSizePrefix)
         this.biomes[i] = BiomeSection.read(reader, this.maxBitsPerBiome, noSizePrefix)
       }
+    }
+
+    loadParsedLight (skyLight, blockLight, skyLightMask, blockLightMask, emptySkyLightMask, emptyBlockLightMask) {
+      const conv = m => (Buffer.isBuffer(m) ? bitsetToLongs(m) : m)
+      return super.loadParsedLight(
+        skyLight, blockLight,
+        conv(skyLightMask), conv(blockLightMask),
+        conv(emptySkyLightMask), conv(emptyBlockLightMask)
+      )
     }
   }
 }
