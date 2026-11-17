@@ -81,6 +81,7 @@ function rebuildBlocks (data, base) {
       transparent: true,
       emitLight: 0,
       filterLight: 0,
+      shapes: [], // prismarine-block/movements 直接读 shapes.length，缺了就炸
       minStateId,
       maxStateId: seg && seg.firstStateId >= 0 ? seg.firstStateId + seg.count - 1 : -1,
       states: [],
@@ -116,6 +117,18 @@ function build263 (base) {
   out.items = rebuildItems(data, base)
   out.blocks = rebuildBlocks(data, base)
   out.entities = rebuildEntities(data, base)
+  // 新方块补进 blockCollisionShapes：prismarine-block 按名字查这张表，
+  // 查不到会把 block.shapes 覆盖成 undefined（movements 读 .length 就炸）。
+  // 1 = 全方块碰撞（保守值，寻路绕开新方块；0 是空碰撞会让 bot 走进树里被服务器卡住）。
+  // 深拷贝 blocks —— base 的表是 data.js 共享对象，不能污染 26.1。
+  const bcs = base.blockCollisionShapes
+  if (bcs && bcs.blocks) {
+    const blocks = { ...bcs.blocks }
+    for (const b of out.blocks) {
+      if (b.newVia26x && blocks[b.name] === undefined) blocks[b.name] = 1
+    }
+    out.blockCollisionShapes = { blocks, shapes: bcs.shapes }
+  }
   out.version = buildVersion(base)
   out.protocol = require('./protocol-patch').patchProtocol(
     JSON.parse(JSON.stringify(base.protocol)),

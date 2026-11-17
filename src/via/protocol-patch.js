@@ -207,18 +207,31 @@ function patchFieldTypes (protocol) {
     }
   }
 
-  // 26.3：declare_recipes 尾部 + brewing_input / brewing_reagent
-  const recipes = play.packet_declare_recipes
-  const recipeList = recipes[1]
-  if (!recipeList.some(f => f.name === 'brewingInput')) {
-    const brewingEntryType = ['container', [
-      { name: 'ingredient', type: 'string' },
-      { name: 'slotIds', type: ['array', { countType: 'varint', type: 'varint' }] }
+  // 26.3：declare_recipes 尾部追加 brewing_input / brewing_reagent 两条目
+  // （Via Protocol26_2To26_3:181-189：size+2，每条 = string + varint[]，位置在整个包尾、
+  //  stoneCutterRecipes 之后 —— 与 26.1 recipes 条目同构，不带 array count 前缀）
+  const recipes = play.packet_declare_recipes[1]
+  if (!recipes.some(f => f.name === 'brewingInput')) {
+    const brewingEntry = () => ['container', [
+      { name: 'name', type: 'string' },
+      { name: 'items', type: ['array', { countType: 'varint', type: 'varint' }] }
     ]]
-    recipeList.push(
-      { name: 'brewingInput', type: ['array', { countType: 'varint', type: brewingEntryType }] },
-      { name: 'brewingReagent', type: ['array', { countType: 'varint', type: brewingEntryType }] }
+    recipes.push(
+      { name: 'brewingInput', type: brewingEntry() },
+      { name: 'brewingReagent', type: brewingEntry() }
     )
+  }
+
+  // 26.3：SlotDisplay 的 tag 分支 STRING → HolderSet
+  // （Via RecipeDisplayRewriter26_3.handleTag → handleIngredient，即 Types.HOLDER_SET；
+  //  线上格式 = varint 前缀 0 → string，>0 → N 个 varint，与 native registryEntryHolderSet 一致）
+  const slotDisplay = play.SlotDisplay
+  const dataSwitch = slotDisplay?.[1]?.find(f => f.name === 'data')?.type?.[1]
+  if (dataSwitch?.fields?.tag === 'string') {
+    dataSwitch.fields.tag = ['registryEntryHolderSet', {
+      base: { name: 'name', type: 'string' },
+      otherwise: { name: 'ids', type: 'varint' }
+    }]
   }
 
   // 26.2：spectate_entity 的 entityId → optional varint（包已在 patchProtocol 改名 SPECTATOR_ACTION）
