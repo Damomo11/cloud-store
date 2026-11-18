@@ -731,7 +731,8 @@ test('shulker storage strips nested bee container components', () => {
   })
 
   const storedEntry = JSON.parse(normalized.metaJson).components[0].data.contents[0]
-  assert.equal(storedEntry.itemId, beeNest.id)
+  // 落库即全名：带蜂数据的杂牌归一到 bee_nest 的全名字符串（跨版本稳定形状）。
+  assert.equal(storedEntry.itemId, `minecraft:${beeNest.name}`)
   assert.deepEqual(storedEntry.components, [])
   assert.deepEqual(storedEntry.removeComponents, [])
   assert.equal(storedEntry.addedComponentCount, 0)

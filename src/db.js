@@ -3,6 +3,12 @@ const path = require('node:path')
 const crypto = require('node:crypto')
 const { AsyncLocalStorage } = require('node:async_hooks')
 const Database = require('better-sqlite3')
+const { stableStringify } = require('./utils')
+
+// 26.3 via 首次部署时刻（2026-11-17 18:37:29 +08:00 = UTC 10:37:29，本地 commit
+// 0727790）。items.created_at 早于它的行，metaJson 容器内容数字是 1.21.11
+// 目录编码；晚于它的是 26.x 编码。迁移按行时代各用对应目录翻译成全名字符串。
+const VIA263_DEPLOY_UTC = '2026-11-17 10:37:29'
 
 class StoreDb {
   constructor (dbPath, config) {
@@ -537,6 +543,10 @@ class StoreDb {
       return { deferred: true }
     }
     this.catalogMigrationDeferred = true
+    // 先全名化存量容器内容（item_key 不动）：metaJson 里没有目录数字后，
+    // 下方 canonicalizeItemKeys 的跨目录歧义检测（metaHasVersionAmbiguous
+    // ContainerEntries）自然恒 false，历史行不再跳过迁移。
+    this.translateStoredShulkerEntriesToFullNames()
     const migrated = this.canonicalizeItemKeys()
     if (migrated.moved > 0) {
       console.log(`Canonicalized ${migrated.moved} item keys, merged ${migrated.mergedBalances} balance rows`)
@@ -544,6 +554,47 @@ class StoreDb {
     const indexed = this.rebuildShulkerContentIndex()
     this.catalogMigrationDeferred = false
     return { ...migrated, indexed }
+  }
+
+  // 存量潜影盒 metaJson 的容器内容数字 itemId → 全名字符串（详见 itemCatalog.
+  // translateStoredContainerEntriesToFullNames）。item_key 保持不变：翻译后
+  // 重算指纹的输入与当年完全一致。幂等：字符串条目跳过，跑过一遍后再跑为 no-op。
+  translateStoredShulkerEntriesToFullNames () {
+    if (!this.catalog) return { skipped: 'no-catalog' }
+    const majorVersion = String(this.catalog.mcData?.version?.majorVersion || '')
+    // 1.21.11 会话没有"新旧目录"概念（其字典就是入账字典），不迁移。
+    if (!majorVersion.startsWith('26.')) return { skipped: 'not-26x' }
+    const legacy = this.catalog.legacy12111Catalog?.() || null
+    const rows = this.db.prepare(`
+      SELECT item_key AS itemKey, item_id AS itemId, meta_json AS metaJson, created_at AS createdAt
+      FROM items
+      WHERE item_id LIKE '%shulker_box'
+    `).all()
+    const updateMeta = this.db.prepare('UPDATE items SET meta_json = ? WHERE item_key = ?')
+    let translated = 0
+    let unresolved = 0
+    let rewritten = 0
+    this.transaction(() => {
+      for (const row of rows) {
+        const meta = this.catalog.parseStoredJson(row.metaJson, {})
+        if (!meta || typeof meta !== 'object') continue
+        // 部署前入账 → 1.21.11 目录编码（legacy 翻译）；部署后 → 当前目录。
+        // 两个目录解不出的数字（异常值）原样保留，绝不错译。
+        const reg = row.createdAt < VIA263_DEPLOY_UTC ? (legacy || this.catalog.mcData) : this.catalog.mcData
+        const counts = this.catalog.translateStoredContainerEntriesToFullNames(row.itemId, meta, reg)
+        translated += counts.translated
+        unresolved += counts.unresolved
+        const nextJson = stableStringify(this.catalog.sanitizeMetaForStorage(row.itemId, meta))
+        if (nextJson !== row.metaJson) {
+          updateMeta.run(nextJson, row.itemKey)
+          rewritten++
+        }
+      }
+    })
+    if (translated || unresolved) {
+      console.log(`[catalog] 潜影盒存量内容全名化：${translated} 条数字翻译（${unresolved} 条两目录均缺失，留数字待重扫重录），重写 ${rewritten} 行 meta_json，item_key 不变`)
+    }
+    return { translated, unresolved, rewritten, rows: rows.length }
   }
 
   runDeferredMigrations () {
