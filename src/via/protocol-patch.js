@@ -85,6 +85,20 @@ const TRIM_PATTERN_HOLDER = ['registryEntryHolder', {
   }
 }]
 
+// 263 instrument/jukebox_playable：1.21.11 的 container[bool hasHolder, switch] 包装被删，
+// data 直接就是 Holder（ByteBufCodecs.holder：varint 0=inline，非 0=registry id-1）。
+// 实证：barrel@-23046,-53,-24781 的 window_items 羊角组件 wire=单字节 04（by-id 乐器 3），
+// 26.1 旧读法幻读 12 字节导致整包错位 PartialReadError。
+// inline 分支复用 26.1 的 InstrumentData（durabilityDamage 已注入）/JukeboxSongData。
+const INSTRUMENT_HOLDER263 = ['registryEntryHolder', {
+  baseName: 'instrumentId',
+  otherwise: { name: 'data', type: 'InstrumentData' }
+}]
+const JUKEBOX_SONG_HOLDER263 = ['registryEntryHolder', {
+  baseName: 'songId',
+  otherwise: { name: 'data', type: 'JukeboxSongData' }
+}]
+
 const NEW_COMPONENT_TYPES = {
   sulfur_cube_content: 'ItemStackTemplate263', // 26.3 新增：item template（26.1 已有 ItemStackTemplate，同构）
   provides_pottery_pattern: 'varint',
@@ -114,7 +128,9 @@ const REMOVED_COMPONENTS_263 = ['map_color', 'swing_animation']
 const CHANGED_COMPONENTS_263 = {
   pot_decorations: 'PotDecorations263',
   provides_trim_material: 'TrimMaterialHolder263',
-  trim: 'Trim263'
+  trim: 'Trim263',
+  instrument: INSTRUMENT_HOLDER263,
+  jukebox_playable: JUKEBOX_SONG_HOLDER263
 }
 
 function patchSlotComponentTypes (protocol, components263) {
