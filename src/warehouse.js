@@ -2944,6 +2944,39 @@ class Warehouse {
     }
   }
 
+  // 按坐标对单个木桶做 Servux 隔空读取（!servux探测-- x y z）：服务器原始 NBT
+  // 条目 vs 解析结果逐条对照。不需要 bot 走到该桶——查询直接按方块坐标发；
+  // 未登记的坐标也照常探测（只跳过 db 登记信息）。
+  async debugServuxChestAt (x, y, z) {
+    const settings = this.config.timing?.servux || {}
+    const client = new ServuxClient(this.bot._client, {
+      handshakeTimeoutMs: Number(settings.handshakeTimeoutMs ?? 5000),
+      perTick: Number(settings.perTickPackets ?? 4),
+      maxInFlight: Number(settings.maxInFlight ?? 100),
+      requestTimeoutMs: Number(settings.requestTimeoutMs ?? 5000)
+    })
+    try {
+      const usable = await client.handshake()
+      if (!usable) return { note: 'servux 握手不可用（bot 断线或服务器未响应 servux:litematics）' }
+      const { map: results } = await client.queryBlocks([new Vec3(x, y, z)])
+      const outcome = results.get(`${x},${y},${z}`)
+      if (!outcome?.ok) {
+        return { chest: `${x},${y},${z}`, note: String(outcome?.reason || 'no_response') }
+      }
+      const entries = Array.isArray(outcome.compound?.Items) ? outcome.compound.Items : []
+      const chest = this.db.listChests().find(c => c.x === x && c.y === y && c.z === z) || null
+      return {
+        chest: `${x},${y},${z}`,
+        registered: chest ? `${chest.blockName}（已登记）` : '未登记',
+        rawCount: entries.length,
+        rawEntries: entries,
+        parsed: this.servuxItemsToSlots(outcome.compound)
+      }
+    } finally {
+      client.destroy()
+    }
+  }
+
   // Servux 方块实体 NBT 的 Items → 与开箱路径同形状的槽位列表。
   servuxItemsToSlots (compound) {
     const entries = Array.isArray(compound?.Items) ? compound.Items : []
