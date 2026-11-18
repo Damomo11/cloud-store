@@ -303,6 +303,7 @@ class Warehouse {
       })
       const container = await this.openContainerAt(chest)
       let movedInChest = 0
+      let returnEvidencePending = false
       const noSpaceKeys = new Set()
       try {
         const confirmedDeposit = options.requireServerEvidence ? createConfirmedDepositor(this, options.check, container) : null
@@ -322,6 +323,10 @@ class Warehouse {
                 noSpaceKeys.add(key)
                 continue
               }
+            }
+            if (options.requireServerEvidence && options.onPendingReturnChest && !returnEvidencePending) {
+              options.onPendingReturnChest(chest.chestId)
+              returnEvidencePending = true
             }
             const moved = confirmedDeposit ? await confirmedDeposit(container, item) : await this.tryDepositInto(container, item)
             // Reuse a negative capacity result only across synchronous checks.
@@ -353,6 +358,7 @@ class Warehouse {
       }
 
       if (options.requireServerEvidence) await this.verifyCraftContainer(chest)
+      if (returnEvidencePending) options.onPendingReturnChest(null)
       options.check?.()
 
       if (movedInChest <= 0) {
@@ -395,6 +401,17 @@ class Warehouse {
       error.uncertainTransfer = true
       throw error
     }
+  }
+
+  async refreshUnconfirmedCraftReturn (chest) {
+    const snapshot = await readServerContainer(this, chest, this.catalog, this.bot)
+    const localPlayer = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
+    if (!this.sameCraftItems(snapshot.playerItems, localPlayer) || this.bot.currentWindow || this.bot.inventory.selectedItem ||
+      this.bot.inventory.slots?.slice(0, 5).some(Boolean)) {
+      throw new Error('合成回库复核的服务端背包快照与当前背包不一致。')
+    }
+    this.noteChestMutation(chest.chestId)
+    this.db.replaceChestSlots(chest.chestId, snapshot.chestSlots)
   }
 
   // Reuse the already confirmed craft barrel window when every piece of

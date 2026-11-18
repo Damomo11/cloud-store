@@ -30,6 +30,7 @@ function fixture (options = {}) {
   let packetMode = options.packetMode
   if (options.withdraw) db.replaceChestSlots(chest.chestId, [{ ...catalog.fromPrismarineItem(server.chest), slot: 0, amount: 4 }])
   let opens = 0
+  const openedChestIds = []
   let withdrawals = 0
   let current
   bot.clickWindow = async (slot, mouseButton, mode) => {
@@ -76,8 +77,9 @@ function fixture (options = {}) {
     }
     return 4
   }
-  warehouse.openContainerAt = async () => {
+  warehouse.openContainerAt = async chest => {
     opens++
+    openedChestIds.push(chest.chestId)
     current = windows.createWindow(7 + opens, options.containerType || 'minecraft:generic_9x3', 'Barrel')
     current.updateSlot(0, server.chest)
     current.updateSlot(current.inventoryStart, server.player)
@@ -111,7 +113,7 @@ function fixture (options = {}) {
     }
     return current
   }
-  return { db, bot, warehouse, catalog, config, chest, server, opens: () => opens,
+  return { db, bot, warehouse, catalog, config, chest, server, opens: () => opens, openedChestIds,
     withdrawals: () => withdrawals, setPacketMode: value => { packetMode = value }, close: () => db.close() }
 }
 
@@ -355,14 +357,46 @@ test('strict withdrawal does not credit unexplained extra stock to momo', async 
 })
 
 
-test('recovery does not rescan after a completed deposit leaves a storing journal', async () => {
+test('recovery cannot finish a return while the affected barrel still lacks server evidence', async () => {
   const f = fixture({ packetMode: 'missing' })
   try {
     const { controller, operation, ledger } = storingOperation(f)
     await assert.rejects(controller.store(operation), /服务端|server|快照/)
     f.warehouse.goHomeIfAway = async () => {}
+    await assert.rejects(controller.recover(), /服务端|server|快照/)
+    assert.equal(ledger.pending().length, 1)
+    assert.equal(ledger.get(operation.id).data.pendingReturnChestId, f.chest.chestId)
+    f.setPacketMode('valid')
     assert.equal((await controller.recover()).status, 'recovered')
     assert.equal(ledger.pending().length, 0)
-    assert.equal(f.opens(), 2, 'recovery must not reopen every registered barrel')
+  } finally { f.close() }
+})
+
+test('recovery rechecks an uncertain return even with an empty backpack instead of deducting stale stock', async () => {
+  const f = fixture({ modern: true, transferMode: 'missing' })
+  try {
+    const held = f.catalog.aggregatePrismarineItems(f.bot.inventory.items())
+    f.db.addBalanceItems('alice', held)
+    f.db.upsertChest({ chestId: '99,64,0', x: 99, y: 64, z: 0, blockName: 'barrel' })
+    const { controller, operation, ledger } = storingOperation(f)
+    const write = f.bot._client.write
+    f.bot._client.write = (...args) => {
+      assert.equal(ledger.get(operation.id).data.pendingReturnChestId, f.chest.chestId)
+      write(...args)
+    }
+    await assert.rejects(controller.store(operation), error => error.uncertainTransfer)
+    assert.equal(ledger.get(operation.id).data.pendingReturnChestId, f.chest.chestId)
+    assert.equal(f.server.chest.count, 4)
+    assert.equal(f.bot.inventory.items().length, 0)
+    f.warehouse.goHomeIfAway = async () => {}
+    const restarted = new CraftController({ ...f, ledger: new CraftLedger(f.db), executor: { isBusy: () => false }, botId: 'bot-a' })
+    const result = await restarted.recover()
+    assert.equal(result.status, 'recovered')
+    assert.equal(Boolean(result.diffRegistered), false)
+    assert.equal(f.db.listChestSlots().find(row => row.slot === 0)?.amount, 4)
+    assert.equal(f.db.getBalance('alice', held[0].itemKey), 4)
+    assert.equal(f.db.db.prepare('SELECT COUNT(*) AS n FROM inventory_mismatches').get().n, 0)
+    assert.equal(ledger.pending().length, 0)
+    assert.deepEqual(f.openedChestIds, [f.chest.chestId, f.chest.chestId])
   } finally { f.close() }
 })

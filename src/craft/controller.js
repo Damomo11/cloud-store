@@ -927,6 +927,23 @@ class CraftController {
     }
   }
 
+  async depositReturn (operation, check) {
+    const deposited = await this.warehouse.depositAllPossible({
+      requireServerEvidence: true,
+      craftBatch: true,
+      ...(check ? { check } : {}),
+      // Persist before the first click so even a disconnect between the
+      // physical move and its confirmation can recover the exact barrel.
+      onPendingReturnChest: chestId => {
+        const data = { ...operation.data }
+        if (chestId === null) delete data.pendingReturnChestId
+        else data.pendingReturnChestId = chestId
+        operation = this.ledger.checkpoint(operation.id, 'storing', data)
+      }
+    })
+    return { deposited, operation }
+  }
+
   async store (operation, check = () => {}, stepId = null) {
     return this.measurePhase('return', { operationId: operation.id, stepId }, async () => {
       check()
@@ -939,7 +956,8 @@ class CraftController {
       })
       const baseline = this.physicalTotals()
       operation = this.ledger.checkpoint(operation.id, 'storing', { ...operation.data, held: before, physicalTotals: baseline })
-      const deposited = await this.warehouse.depositAllPossible({ requireServerEvidence: true, check, craftBatch: true })
+      const { deposited, operation: verified } = await this.depositReturn(operation, check)
+      operation = verified
       check()
       if (!same(this.physicalTotals(), baseline)) throw new Error('合成回库实物总量校验失败。')
       const held = this.inventory()
@@ -1060,7 +1078,17 @@ class CraftController {
     check()
     await this.warehouse.goHomeIfAway()
     check()
-    if (!this.db.listChests().length) throw new Error('恢复没有可用的入库木桶；请先登记可用容器。')
+    const chests = this.db.listChests()
+    if (!chests.length) throw new Error('恢复没有可用的入库木桶；请先登记可用容器。')
+    if (operation.data.pendingReturnChestId != null) {
+      const chest = chests.find(value => value.chestId === operation.data.pendingReturnChestId)
+      if (!chest) throw new Error('合成回库待复核的木桶未登记，无法核对本次转移。')
+      await this.warehouse.refreshUnconfirmedCraftReturn(chest)
+      const data = { ...operation.data }
+      delete data.pendingReturnChestId
+      operation = this.ledger.checkpoint(operation.id, operation.phase, data)
+      check()
+    }
     if (!saved) {
       operation = this.ledger.checkpoint(operation.id, operation.phase, { ...operation.data, recoveryIntent: {
         phase: operation.data.recoveryPhase || operation.phase,
@@ -1075,7 +1103,8 @@ class CraftController {
       recoveryBaseline: baseline
     })
     this.debug('controller.recovery_return_start', { operationId: operation.id, items: this.summarizeItems(this.inventory()) })
-    const deposited = await this.warehouse.depositAllPossible({ requireServerEvidence: true, craftBatch: true })
+    const { deposited, operation: verified } = await this.depositReturn(operation)
+    operation = verified
     check()
     if (this.inventory().length) throw new Error('仓库空间不足，恢复的物品保留在机器人背包并等待恢复。')
     this.assertCleanInventory()
