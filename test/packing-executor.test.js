@@ -152,7 +152,10 @@ test('packs mixed 64/16/1 stacks and preserves a named colored physical box', as
   const result = await f.executor.execute(f)
   assert.equal(result.product.itemId, 'minecraft:blue_shulker_box')
   assert.equal(result.product.amount, 1)
-  assert.equal(JSON.parse(result.product.metaJson).components.find(value => value.type === 'custom_name').data.value, 'Owned box')
+  // custom_name 的 NBT typed 包装（{type:'string',value:...}）被形状对齐
+  // （sanitizeMetaForStorage 收口）解码成裸 string——1.21.11 与 26.x 协议都是
+  // anonymousNbt wire，双路统一 decode 后指纹恒等（2026-11-18 形状统一案）。
+  assert.equal(JSON.parse(result.product.metaJson).components.find(value => value.type === 'custom_name').data, 'Owned box')
   assert.deepEqual(result.packedInputs, f.inputs)
   assert.deepEqual(f.menu.slots.slice(0, 5).map(value => value?.count), [64, 1, 16, 1, undefined])
   assert.equal(f.shifts, 4)
