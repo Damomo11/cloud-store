@@ -153,6 +153,49 @@ test('a component-only change supersedes a confirmation', async () => {
   await assert.rejects(f.click(f.window, f.source, 0, 0, () => {}), { recoveryRequired: true })
 })
 
+for (const event of ['set_player_inventory', 'set_slot']) {
+  for (const changed of [false, true]) {
+    test(`${event} compares vanilla hotbar indices with the matching menu slot (changed=${changed})`, async () => {
+      const f = fixture(true)
+      const stone = new Item(registry.itemsByName.stone.id, 1)
+      f.window.updateSlot(f.window.inventoryStart + 27, stone)
+      f.accepted.items[f.window.inventoryStart + 27] = Item.toNotch(stone)
+      f.bot._client.write = () => {
+        f.emit(f.accepted)
+        const item = changed ? notch(null) : Item.toNotch(stone)
+        f.bot._client.emit(event, event === 'set_slot' ? { windowId: -2, slot: 0, item } : { slotId: 0, contents: item })
+      }
+      const result = f.click(f.window, f.source, 0, 1, () => {}, slots => !slots[f.source])
+      if (changed) await assert.rejects(result, { recoveryRequired: true })
+      else await result
+    })
+  }
+}
+
+test('delta comparison does not discard components normalized out of warehouse item keys', async () => {
+  const f = fixture()
+  const hive = new Item(registry.itemsByName.beehive.id, 1)
+  f.window.updateSlot(f.source, hive)
+  f.accepted.carriedItem = Item.toNotch(hive)
+  const changed = new Item(hive.type, 1)
+  changed.components = [{ type: 'custom_name', data: { type: 'string', value: 'changed' } }]
+  assert.equal(catalog.fromPrismarineItem(hive).itemKey, catalog.fromPrismarineItem(changed).itemKey)
+  f.bot._client.write = () => {
+    f.emit(f.accepted)
+    f.bot._client.emit('set_cursor_item', { contents: Item.toNotch(changed) })
+  }
+  await assert.rejects(f.click(f.window, f.source, 0, 0, () => {}), { recoveryRequired: true })
+})
+
+test('malformed component counts cannot reuse a full confirmation', async () => {
+  const f = fixture()
+  f.bot._client.write = () => {
+    f.emit(f.accepted)
+    f.bot._client.emit('set_cursor_item', { contents: { ...f.accepted.carriedItem, addedComponentCount: 1 } })
+  }
+  await assert.rejects(f.click(f.window, f.source, 0, 0, () => {}), { recoveryRequired: true })
+})
+
 test('close accepts identical slot and empty-cursor notifications after its full snapshot', async () => {
   const f = fixture()
   const packet = { windowId: 0, stateId: 2, items: f.window.slots.map(notch), carriedItem: notch(null) }
