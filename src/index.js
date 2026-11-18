@@ -464,12 +464,15 @@ function launchBot (state) {
     if (lastDisconnectReason) console.warn(`[client] connection closed: ${lastDisconnectReason}`)
   })
 
-  // 调试：协议解析炸（PartialReadError）时把 wire 原始字节落盘（data/via-window-dump.txt）
+  // 调试：协议解析炸（PartialReadError）时把 wire 原始 hex 打到终端实时日志
   // 背景：FullPacketParser._transform 对 partialReadError 只 console.log + cb() 吞包，
-  // client 层 'error' 事件根本收不到（#149 的钩子因此失效）。
-  // 改法：monkey-patch deserializer.parsePacketBuffer，catch 时拿到原始 buffer 落盘再原样抛回。
-  const deserializer = bot._client?.deserializer
-  if (deserializer && typeof deserializer.parsePacketBuffer === 'function' && !deserializer.__viaDumpPatched) {
+  // client 层 'error' 事件收不到（#149 钩子因此失效）。
+  // 改法：monkey-patch deserializer.parsePacketBuffer，catch 时打印 wire hex 再原样抛回。
+  // 坑：重连会重建 bot._client 与 deserializer，一次性 patch 会丢（d89bc56 在重连后哑火）；
+  // 故挂 spawn 每次安装，幂等标记 __viaDumpPatched 在实例上，新实例会被重新 patch。
+  const installViaDumpHook = () => {
+    const deserializer = bot._client?.deserializer
+    if (!deserializer || typeof deserializer.parsePacketBuffer !== 'function' || deserializer.__viaDumpPatched) return
     const origParse = deserializer.parsePacketBuffer.bind(deserializer)
     deserializer.__viaDumpPatched = true
     deserializer.parsePacketBuffer = (buffer) => {
@@ -477,22 +480,15 @@ function launchBot (state) {
         return origParse(buffer)
       } catch (e) {
         if (e?.partialReadError && buffer?.length) {
-          try {
-            const dumpPath = path.join('data', 'via-window-dump.txt')
-            const lines = [
-              `=== ${new Date().toISOString()} PartialReadError field=${e.field ?? '?'} len=${buffer.length} ===`,
-              buffer.toString('hex').replace(/(..)/g, '$1 ').trim()
-            ]
-            fs.appendFileSync(dumpPath, lines.join('\n') + '\n', 'utf8')
-            console.warn(`[via] 协议解析炸 wire 已落盘 data/via-window-dump.txt（${buffer.length} 字节）: ${e.message?.slice(0, 90)}`)
-          } catch (writeErr) {
-            console.warn('[via] dump 写入失败:', writeErr.message)
-          }
+          console.log(`[via] 解析炸 wire hex（len=${buffer.length}）: ${buffer.toString('hex').replace(/(..)/g, '$1 ').trim()}`)
         }
         throw e
       }
     }
+    console.log('[via] dump 钩子已安装（deserializer 已 patch）')
   }
+  installViaDumpHook()
+  bot.on('spawn', installViaDumpHook)
 
   bot.on('kicked', reason => {
     clearInterval(loginWatchdog)
