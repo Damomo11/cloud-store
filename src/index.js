@@ -569,7 +569,13 @@ function launchBot (state) {
 
 function setupRegistryExport (bot, catalog, db) {
   bot._client?.on('registry_data', packet => {
-    const exported = exportEnchantmentRegistry(packet, catalog)
+    // 必须用"当前生效"字典而不是闭包捕获的 catalog：后者是启动初始版
+    // （config.server.version，如 1.21.11），第二只 bot / 掉线重连触发
+    // registry_data 时若用它刷全表，26.3 新物品（sulfur 等）display_name
+    // 会被写成小写英文；而重连的 login 已因版本相同跳过切换，没人再刷回
+    // 中文，Web 库存表就卡在英文直到 !同步（2026-11-19 热重载后 sulfur 案）。
+    const active = db.catalog || catalog
+    const exported = exportEnchantmentRegistry(packet, active)
     if (!exported) return
 
     const filePath = path.resolve(process.cwd(), 'data', 'server-enchantments.json')
@@ -578,9 +584,9 @@ function setupRegistryExport (bot, catalog, db) {
     console.log(`[registry] exported ${exported.count} server enchantments to ${filePath}`)
     logEnchantmentRegistry(exported.enchantments)
 
-    const loaded = catalog.reloadServerEnchantments(filePath)
+    const loaded = active.reloadServerEnchantments(filePath)
     console.log(`[registry] reloaded ${loaded} server enchantment mappings`)
-    const refreshed = db.refreshItemDisplayNames(catalog)
+    const refreshed = db.refreshItemDisplayNames(active)
     if (refreshed > 0) {
       console.log(`[registry] refreshed ${refreshed} stored item display names`)
     }
