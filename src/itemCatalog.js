@@ -1127,26 +1127,39 @@ class ItemCatalog {
   extractEnchantments (components) {
     const result = []
     const seen = new Set()
+    const push = parsed => {
+      if (!parsed) return
+      const key = `${parsed.name}:${parsed.level}`
+      if (seen.has(key)) return
+      seen.add(key)
+      result.push(parsed)
+    }
+    // components 时代（1.20.5+）：附魔组件 data 直接是 {全名: 级} 的 map——
+    // 既没有 enchantments 键也没有 levels 键，walkValue 的老形状分支扫不到，
+    // 附魔书的 displayName 从 1.21 全量 components 化起一直 fallback 成裸名
+    // "附魔书"（2026-11 实测 nova_structures/swift_sneak 均丢明细）。
+    if (Array.isArray(components)) {
+      for (const component of components) {
+        const type = component?.type
+        if (type !== 'enchantments' && type !== 'stored_enchantments') continue
+        const data = component?.data
+        if (!data || typeof data !== 'object' || Array.isArray(data)) continue
+        for (const [name, level] of Object.entries(data)) {
+          if (typeof level !== 'number' || !Number.isFinite(level) || level <= 0) continue
+          push(this.parseEnchantmentEntry({ id: name, level }))
+        }
+      }
+    }
     this.walkValue(components, value => {
       if (!value || typeof value !== 'object') return
       if (Array.isArray(value.enchantments)) {
         for (const entry of value.enchantments) {
-          const parsed = this.parseEnchantmentEntry(entry)
-          if (!parsed) continue
-          const key = `${parsed.name}:${parsed.level}`
-          if (seen.has(key)) continue
-          seen.add(key)
-          result.push(parsed)
+          push(this.parseEnchantmentEntry(entry))
         }
       }
       if (value.levels && typeof value.levels === 'object') {
         for (const [name, level] of Object.entries(value.levels)) {
-          const parsed = this.parseEnchantmentEntry({ id: name, level })
-          if (!parsed) continue
-          const key = `${parsed.name}:${parsed.level}`
-          if (seen.has(key)) continue
-          seen.add(key)
-          result.push(parsed)
+          push(this.parseEnchantmentEntry({ id: name, level }))
         }
       }
     })
