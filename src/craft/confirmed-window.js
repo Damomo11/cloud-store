@@ -1,5 +1,7 @@
 'use strict'
 
+const { isDeepStrictEqual } = require('node:util')
+const { serialize, deserialize } = require('node:v8')
 const { shortKey } = require('../traceLog')
 const { isEmptySlot } = require('../packing/protocol')
 
@@ -46,14 +48,42 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
     return value
   }
   const windowId = packet => packet.windowId ?? packet.containerId
-  const incrementalListeners = (id, invalidate) => {
-    const onSlot = packet => {
-      if ([id, 0, -1, 255, -2, 254].includes(windowId(packet))) invalidate()
+  const incrementalListeners = (window, snapshot, invalidate) => {
+    // A repeated value does not supersede a complete server snapshot. Changed,
+    // malformed or unrepresented values still require a fresh full response.
+    const compare = (raw, select) => {
+      const current = snapshot()
+      if (!current) return
+      try {
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw) ||
+          (registry.supportFeature('itemsWithComponents')
+            ? !Number.isSafeInteger(raw.itemCount) || raw.itemCount < 0 || (raw.itemCount === 0 && !isEmptySlot(raw))
+            : typeof raw.present !== 'boolean')) throw new Error('invalid slot')
+        const expected = select(current)
+        if (expected === undefined || !isDeepStrictEqual(raw, expected)) invalidate()
+      } catch { invalidate() }
     }
+    const playerSlot = slot => window === bot.inventory ? slot
+      : Number.isInteger(slot) && slot >= 9 && slot < 45 ? window.inventoryStart + slot - 9 : -1
+    // Direct inventory packets use vanilla Inventory indices, unlike menu slots.
+    const inventorySlot = slot => !Number.isInteger(slot) || slot < 0 || slot > 40 ? -1
+      : slot < 9 ? slot + 36 : slot < 36 ? slot : slot < 40 ? 44 - slot : 45
+    const compareSlot = (raw, slot) => compare(raw, current =>
+      Number.isInteger(slot) && slot >= 0 && slot < current.rawSlots.length ? current.rawSlots[slot] : undefined)
+    const onSlot = packet => {
+      const id = windowId(packet)
+      if (id === -1 || id === 255) {
+        if (packet.slot !== -1) invalidate()
+        else compare(packet.item, current => current.rawCarried)
+      } else if (id === window.id) compareSlot(packet.item, packet.slot)
+      else if (id === 0) compareSlot(packet.item, playerSlot(packet.slot))
+      else if (id === -2 || id === 254) compareSlot(packet.item, playerSlot(inventorySlot(packet.slot)))
+    }
+    const onCursor = packet => compare(packet.contents, current => current.rawCarried)
     return [
       ['set_slot', onSlot], ['container_set_slot', onSlot],
-      ['set_cursor_item', invalidate], ['container_set_cursor_item', invalidate],
-      ['set_player_inventory', invalidate]
+      ['set_cursor_item', onCursor], ['container_set_cursor_item', onCursor],
+      ['set_player_inventory', packet => compareSlot(packet.contents, playerSlot(inventorySlot(packet.slotId)))]
     ]
   }
 
@@ -151,7 +181,8 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
           ? accept(slots, carried)
           : equal(cursor, carried) && expected.every((value, index) => index === 0 || equal(value, slots[index]))
         if (matches) {
-          confirmed = { slots, carried, stateId: packet.stateId }
+          confirmed = { slots, carried, stateId: packet.stateId,
+            rawSlots: deserialize(serialize(raw)), rawCarried: deserialize(serialize(packet.carriedItem)) }
           confirmationMs ??= performance.now() - startedAt
         } else {
           rejectedResponseCount++
@@ -162,7 +193,7 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
     }
     const listeners = [
       ['window_items', onContent], ['container_set_content', onContent],
-      ...incrementalListeners(window.id, invalidate)
+      ...incrementalListeners(window, () => confirmed, invalidate)
     ]
     for (const [name, listener] of listeners) bot._client.on(name, listener)
     const expires = Date.now() + timeoutMs
@@ -217,8 +248,9 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
     let responseCount = 0
     let finished = false
     let confirmed = false
+    let snapshot = null
     let timer
-    const invalidate = () => { confirmed = false }
+    const invalidate = () => { confirmed = false; snapshot = null }
     const finish = accepted => {
       if (finished) return
       finished = true
@@ -240,13 +272,14 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
         window.selectedItem = copy(carried)
         bot.inventory.selectedItem = copy(carried)
         confirmed = !carried && !decoded.slice(0, 5).some(Boolean)
+        if (confirmed) snapshot = { rawSlots: deserialize(serialize(slots)), rawCarried: deserialize(serialize(packet.carriedItem)) }
         // Keep observing the rest of this response burst before resolving.
         if (confirmed) queueMicrotask(() => { if (confirmed) finish(true) })
       } catch { /* Recovery must reread an undecodable window. */ }
     }
     const listeners = [
       ['window_items', content], ['container_set_content', content],
-      ...incrementalListeners(0, invalidate)
+      ...incrementalListeners(bot.inventory, () => snapshot, invalidate)
     ]
     for (const [name, listener] of listeners) bot._client.on(name, listener)
     timer = setTimeout(() => finish(false), Math.max(1, Number(config?.craft?.confirmTimeoutMs) || 5000))
