@@ -473,9 +473,10 @@ test('quick shulker opening right-clicks the box inside the inventory with an em
 test('taking a shulker waits for the delayed inventory update after the barrel closes', async () => {
   const boxInfo = { itemKey: 'box-key', itemId: 'minecraft:purple_shulker_box', displayName: '紫色潜影盒' }
   const box = { name: 'purple_shulker_box', slot: 36, count: 1, normalized: boxInfo }
-  let inventory = []
+  const existing = { ...box, slot: 9 }
+  let inventory = [existing]
   const container = {
-    close: () => setTimeout(() => { inventory = [box] }, 25)
+    close: () => setTimeout(() => { inventory = [existing, box] }, 25)
   }
   const bot = { inventory: { items: () => inventory } }
   const catalog = { fromPrismarineItem: item => ({ ...item.normalized, amount: item.count }) }
@@ -507,6 +508,29 @@ test('quick shulker opening refuses when the inventory has no shulker box', asyn
   const warehouse = new Warehouse(bot, {}, {}, config)
 
   await assert.rejects(warehouse.openQuickShulkerWindow(), /背包中找不到/)
+})
+
+test('quick opening a tracked source does not click an identical box in another slot', async () => {
+  const other = { slot: 9, count: 1, normalized: { itemKey: 'source-box', itemId: 'minecraft:shulker_box' } }
+  const bot = { inventory: { items: () => [other] }, clickWindow: () => assert.fail('clicked a different box') }
+  const catalog = { fromPrismarineItem: item => item.normalized, isShulkerBox: () => true }
+  const warehouse = new Warehouse(bot, {}, catalog, structuredClone(DEFAULT_CONFIG))
+
+  await assert.rejects(warehouse.openQuickShulkerWindow('source-box', 18), /背包中找不到/)
+})
+
+test('a transient changed frame still allows rechecking the current source box after timeout', async () => {
+  const itemId = 'minecraft:shulker_box'
+  const original = { slot: 18, count: 1, normalized: { itemKey: 'old', itemId } }
+  const changed = { ...original, normalized: { itemKey: 'changed', itemId } }
+  let reads = 0
+  const bot = { inventory: { items: () => [reads++ === 0 ? changed : original] } }
+  const catalog = { fromPrismarineItem: item => item.normalized, extractShulkerContents: () => [] }
+  const config = structuredClone(DEFAULT_CONFIG)
+  config.timing.inventoryUpdateTimeoutMs = 500
+  const warehouse = new Warehouse(bot, {}, catalog, config)
+
+  assert.equal(await warehouse.waitForChangedShulkerItem('old', itemId, 18, 'target', 3), original)
 })
 
 test('quick shulker opening returns the cursor box and retries when no window opens', async () => {
@@ -1377,7 +1401,8 @@ test('a bad NBT frame after extraction is rechecked by reopening the box and com
   const oldBox = { slot: 36, count: 1, normalized: oldBoxInfo }
   const newBoxInfo = { itemKey: 'new-box', itemId: oldBoxInfo.itemId, displayName: '潜影盒' }
   const newBox = { slot: 36, count: 1, normalized: newBoxInfo }
-  let inventory = [oldBox]
+  const other = { slot: 9, count: 1, normalized: { ...oldBoxInfo, itemKey: 'other-box' } }
+  let inventory = [other, oldBox]
   let nbtFixed = false
   const operations = []
   const db = {
@@ -1405,14 +1430,16 @@ test('a bad NBT frame after extraction is rechecked by reopening the box and com
   const warehouse = new Warehouse(bot, db, catalog, config)
   warehouse.takeOneShulkerFromChest = async () => oldBox
   let opens = 0
-  warehouse.openQuickShulkerWindow = async () => {
+  warehouse.openQuickShulkerWindow = async (key, slot) => {
     opens++
     if (opens === 1) {
       return {
         items: () => [{ normalized: { ...target }, slot: 0, count: 5 }],
-        close: () => { inventory = [newBox, ...inventory.filter(item => item !== oldBox)] }
+        close: () => { inventory = inventory.map(item => item === oldBox ? newBox : item) }
       }
     }
+    assert.equal(key, newBoxInfo.itemKey, 'recheck must open the source box')
+    assert.equal(slot, newBox.slot)
     return {
       items: () => [{ normalized: { ...target }, slot: 0, count: 3 }],
       close: () => { nbtFixed = true }
@@ -1424,7 +1451,7 @@ test('a bad NBT frame after extraction is rechecked by reopening the box and com
     }
     return amount
   }
-  warehouse.returnShulkerToChest = async () => { inventory = [] }
+  warehouse.returnShulkerToChest = async (_chest, item) => { assert.equal(item, newBox) }
 
   const result = await warehouse.withdrawFromShulkerBoxes({
     withdrawMode: 'shulker_extract',
@@ -1478,6 +1505,7 @@ test('extraction mismatch recovery returns the overdrawn amount back into the bo
     allocation: { itemKey: target.itemKey },
     sourceKey: 'old-box',
     sourceItem: { itemId: boxInfo.itemId },
+    sourceSlot: box.slot,
     available: 5,
     planned: 2,
     inventoryBaseline: 0
@@ -1518,6 +1546,7 @@ test('extraction mismatch recovery reports unresolved when the box NBT still dis
     allocation: { itemKey: target.itemKey },
     sourceKey: 'old-box',
     sourceItem: { itemId: boxInfo.itemId },
+    sourceSlot: box.slot,
     available: 5,
     planned: 2,
     inventoryBaseline: 0

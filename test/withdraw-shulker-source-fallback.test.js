@@ -77,7 +77,11 @@ function createFixture ({ realBoxPhysical = true, realRow = true } = {}) {
   config.timing.containerSettleMs = 0
 
   const warehouse = new Warehouse({ username: 'BotA', inventory: { items: () => [] } }, db, catalog, config)
-  warehouse.takeOneShulkerFromChest = async () => ({ name: 'shulker_box', slot: 36, count: 1 })
+  warehouse.takeOneShulkerFromChest = async () => {
+    const box = { name: 'shulker_box', slot: 36, count: 1 }
+    warehouse.bot.inventory.items = () => [box]
+    return box
+  }
   warehouse.equipItemInHand = async () => {}
   warehouse.openQuickShulkerWindow = async () => ({
     inventoryStart: 27,

@@ -1492,6 +1492,10 @@ class Warehouse {
 
           let quickWindow = null
           let boxToReturn = sourceBox
+          // The quick-open plugin keeps the source box in its inventory slot
+          // while updating its contents and fingerprint.
+          const sourceSlot = sourceBox.slot
+          const liveSourceBox = () => this.findInventoryShulkerAt(sourceSlot, sourceItem.itemId)
           let returned = false
           let repackState = ''
           try {
@@ -1504,7 +1508,7 @@ class Warehouse {
             let available = 0
             const maxOpenAttempts = Math.max(1, Number(this.config.timing?.quickShulkerOpenAttempts ?? 3))
             for (let openAttempt = 1; openAttempt <= maxOpenAttempts; openAttempt++) {
-              quickWindow = await this.openQuickShulkerWindow(sourceKey)
+              quickWindow = await this.openQuickShulkerWindow(sourceKey, sourceSlot)
               available = await this.waitForContainerItemCount(quickWindow, allocation.itemKey)
               if (available > 0) break
               this.debug(`quick shulker window empty (attempt ${openAttempt}/${maxOpenAttempts}) source=${sourceKey} target=${allocation.itemKey}`)
@@ -1576,7 +1580,7 @@ class Warehouse {
                   })
                   quickWindow.close()
                   quickWindow = null
-                  boxToReturn = this.findInventoryItemByKey(sourceKey) || sourceBox
+                  boxToReturn = liveSourceBox()
                   await this.returnShulkerToChest(chest, boxToReturn)
                   returned = true
                   continue
@@ -1625,7 +1629,8 @@ class Warehouse {
             if (moved <= 0) {
               if (repackState) this.db.clearShulkerRepackRecovery(this.botId)
               repackState = ''
-              boxToReturn = this.findInventoryItemByKey(sourceKey) || sourceBox
+              boxToReturn = liveSourceBox()
+              if (!boxToReturn) throw new Error('源潜影盒已不在原背包槽位。')
               // 盒里实际取不到目标物品：用手上盒子的真实 NBT 重建这个盒的内容记录，
               // 让记录与实物对齐，后续任务不再按旧记录扑空；
               // 若只是卡顿误读（盒里其实有），NBT 同样能还原正确记录，不会误清。
@@ -1643,6 +1648,7 @@ class Warehouse {
             boxToReturn = await this.waitForChangedShulkerItem(
               sourceKey,
               sourceItem.itemId,
+              sourceSlot,
               allocation.itemKey,
               Math.max(0, Number(available) - Number(moved))
             )
@@ -1654,6 +1660,7 @@ class Warehouse {
               decision: `取完后盒子内容已变化（新短码 ${shortKey(newBox.itemKey)}），按 NBT 校验剩余数量`
             })
             try {
+              if (newBox.itemKey === sourceKey) throw new Error('潜影盒仍显示取物前的内容，需要复核。')
               this.verifyShulkerExtraction(newBox, allocation.itemKey, available, moved)
             } catch (verifyError) {
               // NBT 校验失败不代表实物一定出错：关所有容器、重开该盒、按窗口实物
@@ -1664,6 +1671,7 @@ class Warehouse {
                 targetItem,
                 sourceKey,
                 sourceItem,
+                sourceSlot,
                 available,
                 planned: toTake,
                 moved,
@@ -1723,7 +1731,7 @@ class Warehouse {
               quickWindow = null
             }
             if (/already has a pending shulker repack recovery|unresolved shulker repack recovery/i.test(String(error?.message || ''))) {
-              const recoverableBox = this.findInventoryShulker(sourceItem.itemId, sourceKey) || boxToReturn
+              const recoverableBox = liveSourceBox()
               try {
                 await this.returnShulkerToChest(chest, recoverableBox)
                 returned = true
@@ -1733,10 +1741,10 @@ class Warehouse {
               }
             }
             if (repackState === 'prepared') {
-              const changedBox = this.findInventoryShulker(sourceItem.itemId, sourceKey) || boxToReturn
+              const changedBox = liveSourceBox()
               try {
                 const recovery = this.db.getShulkerRepackRecovery(this.botId)
-                if (recovery) {
+                if (recovery && changedBox) {
                   this.resolvePreparedShulkerRepackFromItem(recovery, changedBox)
                   repackState = this.db.getShulkerRepackRecovery(this.botId)?.state || ''
                 }
@@ -1745,7 +1753,7 @@ class Warehouse {
               }
             }
             if (!returned) {
-              const recoverableBox = this.findInventoryShulker(sourceItem.itemId, sourceKey) || boxToReturn
+              const recoverableBox = liveSourceBox()
               try {
                 await this.returnShulkerToChest(chest, recoverableBox)
               } catch (returnError) {
@@ -1854,6 +1862,7 @@ class Warehouse {
 
   async takeOneShulkerFromChest (chest, itemKey, preferredSlots = []) {
     const container = await this.openContainerAt(chest)
+    const occupied = new Set()
     let moved = 0
     try {
       const available = this.countContainerItem(container, itemKey)
@@ -1869,6 +1878,11 @@ class Warehouse {
       if (available <= 0) {
         this.refreshChestSnapshot(chest, container)
         return null
+      }
+      for (const item of this.bot.inventory.items()) occupied.add(item.slot)
+      for (let slot = 9; slot < 45; slot++) {
+        const windowSlot = this.windowSlotFromBotInventorySlot(container, slot)
+        if (windowSlot !== null && container.slots?.[windowSlot]) occupied.add(slot)
       }
       moved = await this.tryWithdrawExactFrom(container, itemKey, 1, preferredSlots)
       await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
@@ -1894,7 +1908,7 @@ class Warehouse {
         ? `机器人背包已满，没有空槽从 ${this.describeChest(chest)} 取潜影盒。`
         : `从 ${this.describeChest(chest)} 取潜影盒失败，实际取出 ${moved} 个。`)
     }
-    const item = await this.waitForInventoryItemByKey(itemKey)
+    const item = await this.waitForInventoryItemByKey(itemKey, occupied)
     if (!item) {
       this.trace('error', 'shulker_take_box_failed', {
         chest: this.describeChest(chest),
@@ -1953,15 +1967,20 @@ class Warehouse {
     return this.bot.inventory.items().find(item => this.catalog.fromPrismarineItem(item).itemKey === itemKey) || null
   }
 
-  async waitForInventoryItemByKey (itemKey, timeoutMs = null) {
-    const timeout = Math.max(500, Number(timeoutMs ?? this.config.timing?.inventoryUpdateTimeoutMs ?? 2000))
+  async waitForInventoryItemByKey (itemKey, occupied) {
+    const timeout = Math.max(500, Number(this.config.timing?.inventoryUpdateTimeoutMs ?? 2000))
     const deadline = Date.now() + timeout
+    const findNew = () => {
+      const matches = this.bot.inventory.items().filter(item => !occupied.has(item.slot) &&
+        item.count === 1 && this.catalog.fromPrismarineItem(item).itemKey === itemKey)
+      return matches.length === 1 ? matches[0] : null
+    }
     while (Date.now() < deadline) {
-      const item = this.findInventoryItemByKey(itemKey)
+      const item = findNew()
       if (item) return item
       await sleep(50)
     }
-    return this.findInventoryItemByKey(itemKey)
+    return findNew()
   }
 
   async waitForInventorySlotDecrease (slot, itemId, before, options = {}) {
@@ -1989,23 +2008,20 @@ class Warehouse {
     }) || null
   }
 
-  findInventoryShulker (itemId, preferredItemKey = '') {
-    const candidates = this.bot.inventory.items().filter(item => {
-      const normalized = this.catalog.fromPrismarineItem(item)
-      return normalized.itemId === itemId && this.catalog.isShulkerBox(normalized.itemId)
-    })
-    return candidates.find(item => this.catalog.fromPrismarineItem(item).itemKey !== preferredItemKey) ||
-      candidates.find(item => this.catalog.fromPrismarineItem(item).itemKey === preferredItemKey) || null
+  findInventoryShulkerAt (slot, itemId) {
+    if (!Number.isInteger(slot)) return null
+    const item = this.bot.inventory.items().find(item => item.slot === slot)
+    return item?.count === 1 && this.catalog.fromPrismarineItem(item).itemId === itemId ? item : null
   }
 
-  async waitForChangedShulkerItem (oldItemKey, itemId, targetItemKey = '', expectedTargetAmount = null) {
+  async waitForChangedShulkerItem (oldItemKey, itemId, sourceSlot, targetItemKey = '', expectedTargetAmount = null) {
     const timeoutMs = Math.max(500, Number(this.config.timing?.inventoryUpdateTimeoutMs || 2000))
     const deadline = Date.now() + timeoutMs
-    let changedItem = null
+    let receivedChange = false
     while (Date.now() < deadline) {
-      const item = this.findInventoryShulker(itemId, oldItemKey)
+      const item = this.findInventoryShulkerAt(sourceSlot, itemId)
       if (item && this.catalog.fromPrismarineItem(item).itemKey !== oldItemKey) {
-        changedItem = item
+        receivedChange = true
         if (!targetItemKey || expectedTargetAmount === null) return item
         const normalized = this.catalog.fromPrismarineItem(item)
         const amount = this.catalog.extractShulkerContents(normalized)
@@ -2015,7 +2031,8 @@ class Warehouse {
       }
       await sleep(50)
     }
-    if (changedItem) return changedItem
+    const item = this.findInventoryShulkerAt(sourceSlot, itemId)
+    if (item && (receivedChange || this.catalog.fromPrismarineItem(item).itemKey !== oldItemKey)) return item
     throw new Error('快捷潜影盒内容已取出，但客户端没有收到盒子内容更新。')
   }
 
@@ -2033,13 +2050,16 @@ class Warehouse {
   // 快捷开盒手势：光标为空时右键点击背包内的潜影盒（与玩家在物品栏 GUI 里
   // 空手右键盒子相同），由服务器的快捷开盒插件打开盒子窗口；
   // 关闭用 window.close()（即按 E/ESC 的关闭容器包）。
-  async openQuickShulkerWindow (expectedItemKey = '') {
+  async openQuickShulkerWindow (expectedItemKey = '', sourceSlot = null) {
     if (this.bot.currentWindow) {
       this.bot.closeWindow(this.bot.currentWindow)
       await sleep(150)
     }
-    const box = (expectedItemKey && this.findInventoryItemByKey(expectedItemKey)) ||
-      this.findAnyInventoryShulker()
+    const findBox = () => sourceSlot === null
+      ? (expectedItemKey && this.findInventoryItemByKey(expectedItemKey)) || this.findAnyInventoryShulker()
+      : this.bot.inventory.items().find(item => item.slot === sourceSlot && item.count === 1 &&
+        this.catalog.fromPrismarineItem(item).itemKey === expectedItemKey)
+    const box = findBox()
     if (!box) throw new Error('背包中找不到可快捷打开的潜影盒。')
     await this.clearCursorBeforeClick()
     const normalized = this.catalog.fromPrismarineItem(box)
@@ -2047,6 +2067,7 @@ class Warehouse {
 
     const timeoutMs = Math.max(500, Number(this.config.timing?.openContainerTimeoutMs || 8000))
     for (let attempt = 1; attempt <= 2; attempt++) {
+      if (sourceSlot !== null && !findBox()) throw new Error('源潜影盒已不在原背包槽位。')
       const windowPromise = this.waitForWindowOpen(timeoutMs)
       // 空光标右键背包格：普通点击 mode 0 + 右键 button 1
       await this.bot.clickWindow(box.slot, 1, 0)
@@ -2090,7 +2111,7 @@ class Warehouse {
   // 快捷开盒取物后的 NBT 校验失败，先别急着报错：关闭所有容器，重新打开该盒，
   // 以服务器窗口实物复核盒内数量，并对照拆盒前的背包基线核对到手量；
   // 取多了放回盒内、取少了补取，复核闭合后按真实数量继续；仍对不上账才算确定异常。
-  async recoverShulkerExtractionMismatch ({ allocation, sourceKey, sourceItem, available, planned, inventoryBaseline }) {
+  async recoverShulkerExtractionMismatch ({ allocation, sourceKey, sourceItem, sourceSlot, available, planned, inventoryBaseline }) {
     const settleMs = Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250))
     this.trace('decision', 'shulker_verify_mismatch_recover', {
       sourceBox: { key: sourceKey, keyTail: shortKey(sourceKey) },
@@ -2105,10 +2126,10 @@ class Warehouse {
         await sleep(settleMs)
       }
       // 2. 找到背包里的盒子（内容可能已变化）并重新打开
-      let boxItem = this.findInventoryShulker(sourceItem.itemId, sourceKey)
+      let boxItem = this.findInventoryShulkerAt(sourceSlot, sourceItem.itemId)
       if (!boxItem) return { resolved: false, reason: '背包中找不到该潜影盒，无法复核' }
       const boxKey = this.catalog.fromPrismarineItem(boxItem).itemKey
-      const window = await this.openQuickShulkerWindow(boxKey)
+      const window = await this.openQuickShulkerWindow(boxKey, sourceSlot)
       try {
         await sleep(settleMs)
         // 3. 读盒内目标物品：实际取出 = 原有 - 盒内剩余
@@ -2171,7 +2192,7 @@ class Warehouse {
         // 7. 关窗后重读盒子 NBT，与窗口读数一致才认可
         window.close()
         await sleep(settleMs)
-        boxItem = this.findInventoryShulker(sourceItem.itemId, sourceKey)
+        boxItem = this.findInventoryShulkerAt(sourceSlot, sourceItem.itemId)
         if (!boxItem) return { resolved: false, reason: '复核后背包中找不到该潜影盒' }
         const newBox = this.catalog.fromPrismarineItem(boxItem)
         const nbtAmount = this.catalog.extractShulkerContents(newBox)

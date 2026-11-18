@@ -61,7 +61,10 @@ function createFixture () {
   config.timing.containerSettleMs = 0
 
   const warehouse = new Warehouse({ username: 'BotA', inventory: { items: () => [] } }, db, catalog, config)
-  warehouse.takeOneShulkerFromChest = async () => ({ ...boxHeldItem })
+  warehouse.takeOneShulkerFromChest = async () => {
+    warehouse.bot.inventory.items = () => [boxHeldItem]
+    return boxHeldItem
+  }
   warehouse.equipItemInHand = async () => {}
   warehouse.openQuickShulkerWindow = async () => {
     openCalls.push(1)
@@ -77,7 +80,6 @@ function createFixture () {
     return 0
   }
   warehouse.tryWithdrawExactFrom = async () => 0
-  warehouse.findInventoryItemByKey = () => ({ ...boxHeldItem })
   warehouse.returnShulkerToChest = async (chest, item) => {
     returnedBoxes.push(item)
     return { ...BOX_RECORD }
