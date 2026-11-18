@@ -2176,7 +2176,12 @@ class CloudStoreService {
         cancelled = true
         break
       }
-      const residual = continueWithDeposit
+      // 交货后背包里的剩余物品（玩家趁交货塞的杂物、塞回来的多余同款）统一按
+      // 取货 owner 记账入库，与 !存取 一致：玩家塞的同款物品记回 owner 账正好
+      // 抵消其被 drop 计划误扣的部分，账实一致；杂物也不再落成无主实物。
+      // 修装备的经验瓶例外：没用完的瓶来自本单取货计划、从未扣账，无账回收
+      // 才能保持账实一致，记账反而虚增。
+      const residual = (deliveryMode !== 'repair')
         ? await this.warehouse.depositInventoryForOwner(storageOwner.uuid, storageOwner.username)
         : await this.warehouse.depositInventoryWithoutBalance('withdraw_residual_return', `owner=${storageOwner.uuid}, actor=${username}, target=${deliveryTarget}, batch=${index + 1}/${batches.length}`)
       if (residual.deposited.length) {
@@ -2184,7 +2189,7 @@ class CloudStoreService {
           ? `取货期间收到的物品已先存入${this.ownerScopeName(storageOwner)}：${this.formatDepositSummary(residual.deposited)}。`
           : (deliveryMode === 'repair'
               ? `有未用完的经验瓶已回收入库；这部分没有从${this.ownerSubjectName(storageOwner)}扣除。`
-              : `有未成功丢出的物品已回收入库；这部分没有从${this.ownerSubjectName(storageOwner)}扣除。`))
+              : `背包剩余的物品已存回${this.ownerScopeName(storageOwner)}并计入${this.ownerSubjectName(storageOwner)}的账单：${this.formatDepositSummary(residual.deposited)}。`))
       }
     }
 
