@@ -1091,6 +1091,19 @@ class ItemCatalog {
     return loaded
   }
 
+  // 服务器资源包语言合并：只补 language 字典里没有的键（客户端版 zh_cn.json
+  // 已命中的翻译优先），返回补进来的条数。附魔注册表 describe 翻译靠这张表。
+  mergeLanguage (extra) {
+    let added = 0
+    for (const [key, value] of Object.entries(extra || {})) {
+      if (key in this.language) continue
+      if (value == null) continue
+      this.language[key] = value
+      added++
+    }
+    return added
+  }
+
   loadServerEnchantments (file) {
     if (!file) return 0
     const filePath = path.resolve(process.cwd(), file)

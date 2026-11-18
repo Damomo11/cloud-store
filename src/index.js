@@ -36,6 +36,7 @@ const { installPlayerLoadedReport } = require('./playerLoaded')
 const { logLocalError } = require('./localErrorLog')
 const { configureTraceLog } = require('./traceLog')
 const { installConsoleLogBuffer } = require('./consoleLogBuffer')
+const { watchPackLanguage } = require('./packLang')
 
 function createBot (config, onMsaCode) {
   const options = {
@@ -372,6 +373,24 @@ function launchBot (state) {
   })
   setupRegistryExport(bot, catalog, db)
 
+  // 服务器资源包语言提取：mineflayer 只回状态不真下载，自定义内容（dnt 系附魔等）
+  // 的中文翻译客户端是从资源包 lang 文件里拿的。真下载解析出来补进当前字典，
+  // 再用缓存的注册表包重导附魔翻译并刷新显示名。
+  watchPackLanguage(bot, {
+    onLang: (merged) => {
+      const active = db.catalog || catalog
+      const added = active.mergeLanguage(merged)
+      console.log(`[packLang] merged ${added} new translations into item catalog`)
+      const packet = bot._lastEnchantmentRegistryPacket
+      if (packet) {
+        const exported = exportEnchantmentRegistry(packet, active)
+        if (exported) applyEnchantmentRegistry(exported, active, db)
+      } else {
+        db.refreshItemDisplayNames(active)
+      }
+    }
+  })
+
   const loginWatchdog = setInterval(() => {
     if (state.bot !== bot) {
       clearInterval(loginWatchdog)
@@ -577,20 +596,25 @@ function setupRegistryExport (bot, catalog, db) {
     const active = db.catalog || catalog
     const exported = exportEnchantmentRegistry(packet, active)
     if (!exported) return
-
-    const filePath = path.resolve(process.cwd(), 'data', 'server-enchantments.json')
-    fs.mkdirSync(path.dirname(filePath), { recursive: true })
-    fs.writeFileSync(filePath, JSON.stringify(exported, null, 2), 'utf8')
-    console.log(`[registry] exported ${exported.count} server enchantments to ${filePath}`)
-    logEnchantmentRegistry(exported.enchantments)
-
-    const loaded = active.reloadServerEnchantments(filePath)
-    console.log(`[registry] reloaded ${loaded} server enchantment mappings`)
-    const refreshed = db.refreshItemDisplayNames(active)
-    if (refreshed > 0) {
-      console.log(`[registry] refreshed ${refreshed} stored item display names`)
-    }
+    // 缓存注册表包：资源包语言提取完成后用它重导（dnt 系附魔翻译在包里）。
+    bot._lastEnchantmentRegistryPacket = packet
+    applyEnchantmentRegistry(exported, active, db)
   })
+}
+
+function applyEnchantmentRegistry (exported, active, db) {
+  const filePath = path.resolve(process.cwd(), 'data', 'server-enchantments.json')
+  fs.mkdirSync(path.dirname(filePath), { recursive: true })
+  fs.writeFileSync(filePath, JSON.stringify(exported, null, 2), 'utf8')
+  console.log(`[registry] exported ${exported.count} server enchantments to ${filePath}`)
+  logEnchantmentRegistry(exported.enchantments)
+
+  const loaded = active.reloadServerEnchantments(filePath)
+  console.log(`[registry] reloaded ${loaded} server enchantment mappings`)
+  const refreshed = db.refreshItemDisplayNames(active)
+  if (refreshed > 0) {
+    console.log(`[registry] refreshed ${refreshed} stored item display names`)
+  }
 }
 
 function logEnchantmentRegistry (enchantments, batchSize = 12) {
