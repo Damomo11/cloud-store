@@ -464,6 +464,26 @@ function launchBot (state) {
     if (lastDisconnectReason) console.warn(`[client] connection closed: ${lastDisconnectReason}`)
   })
 
+  // 调试：window_items 解析炸时把 wire 原始字节落盘（data/via-window-dump.txt）
+  // 触发即说明 26.3 伪协议 Slot/组件定义与真实 wire 不匹配，dump 后可手解定位缺口。
+  bot._client?.on('error', err => {
+    const field = err?.field || ''
+    if (!field.includes('window_items')) return
+    const buf = err.buffer
+    if (!buf || !buf.length) return
+    const dumpPath = path.join('data', 'via-window-dump.txt')
+    const lines = [
+      `=== ${new Date().toISOString()} field=${field} len=${buf.length} ===`,
+      buf.toString('hex').replace(/(..)/g, '$1 ').trim()
+    ]
+    try {
+      fs.appendFileSync(dumpPath, lines.join('\n') + '\n', 'utf8')
+      console.warn(`[via] window_items 解析失败 wire 已落盘 data/via-window-dump.txt（${buf.length} 字节）`)
+    } catch (e) {
+      console.warn('[via] window_items dump 写入失败:', e.message)
+    }
+  })
+
   bot.on('kicked', reason => {
     clearInterval(loginWatchdog)
     if (state.bot !== bot) return
