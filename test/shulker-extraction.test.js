@@ -519,6 +519,20 @@ test('quick opening a tracked source does not click an identical box in another 
   await assert.rejects(warehouse.openQuickShulkerWindow('source-box', 18), /背包中找不到/)
 })
 
+test('a transient changed frame still allows rechecking the current source box after timeout', async () => {
+  const itemId = 'minecraft:shulker_box'
+  const original = { slot: 18, count: 1, normalized: { itemKey: 'old', itemId } }
+  const changed = { ...original, normalized: { itemKey: 'changed', itemId } }
+  let reads = 0
+  const bot = { inventory: { items: () => [reads++ === 0 ? changed : original] } }
+  const catalog = { fromPrismarineItem: item => item.normalized, extractShulkerContents: () => [] }
+  const config = structuredClone(DEFAULT_CONFIG)
+  config.timing.inventoryUpdateTimeoutMs = 500
+  const warehouse = new Warehouse(bot, {}, catalog, config)
+
+  assert.equal(await warehouse.waitForChangedShulkerItem('old', itemId, 18, 'target', 3), original)
+})
+
 test('quick shulker opening returns the cursor box and retries when no window opens', async () => {
   const bot = new EventEmitter()
   const box = { name: 'purple_shulker_box', slot: 30, count: 1 }

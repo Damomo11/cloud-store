@@ -1660,6 +1660,7 @@ class Warehouse {
               decision: `取完后盒子内容已变化（新短码 ${shortKey(newBox.itemKey)}），按 NBT 校验剩余数量`
             })
             try {
+              if (newBox.itemKey === sourceKey) throw new Error('潜影盒仍显示取物前的内容，需要复核。')
               this.verifyShulkerExtraction(newBox, allocation.itemKey, available, moved)
             } catch (verifyError) {
               // NBT 校验失败不代表实物一定出错：关所有容器、重开该盒、按窗口实物
@@ -1860,8 +1861,8 @@ class Warehouse {
   }
 
   async takeOneShulkerFromChest (chest, itemKey, preferredSlots = []) {
-    const occupied = new Set(this.bot.inventory.items().map(item => item.slot))
     const container = await this.openContainerAt(chest)
+    const occupied = new Set()
     let moved = 0
     try {
       const available = this.countContainerItem(container, itemKey)
@@ -1877,6 +1878,11 @@ class Warehouse {
       if (available <= 0) {
         this.refreshChestSnapshot(chest, container)
         return null
+      }
+      for (const item of this.bot.inventory.items()) occupied.add(item.slot)
+      for (let slot = 9; slot < 45; slot++) {
+        const windowSlot = this.windowSlotFromBotInventorySlot(container, slot)
+        if (windowSlot !== null && container.slots?.[windowSlot]) occupied.add(slot)
       }
       moved = await this.tryWithdrawExactFrom(container, itemKey, 1, preferredSlots)
       await sleep(Math.max(0, Number(this.config.timing?.containerSettleMs ?? 250)))
@@ -2011,9 +2017,11 @@ class Warehouse {
   async waitForChangedShulkerItem (oldItemKey, itemId, sourceSlot, targetItemKey = '', expectedTargetAmount = null) {
     const timeoutMs = Math.max(500, Number(this.config.timing?.inventoryUpdateTimeoutMs || 2000))
     const deadline = Date.now() + timeoutMs
+    let receivedChange = false
     while (Date.now() < deadline) {
       const item = this.findInventoryShulkerAt(sourceSlot, itemId)
       if (item && this.catalog.fromPrismarineItem(item).itemKey !== oldItemKey) {
+        receivedChange = true
         if (!targetItemKey || expectedTargetAmount === null) return item
         const normalized = this.catalog.fromPrismarineItem(item)
         const amount = this.catalog.extractShulkerContents(normalized)
@@ -2024,7 +2032,7 @@ class Warehouse {
       await sleep(50)
     }
     const item = this.findInventoryShulkerAt(sourceSlot, itemId)
-    if (item && this.catalog.fromPrismarineItem(item).itemKey !== oldItemKey) return item
+    if (item && (receivedChange || this.catalog.fromPrismarineItem(item).itemKey !== oldItemKey)) return item
     throw new Error('快捷潜影盒内容已取出，但客户端没有收到盒子内容更新。')
   }
 
