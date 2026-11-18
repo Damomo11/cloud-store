@@ -158,11 +158,43 @@ class ItemCatalog {
   }
 
   // Servux NBT 组件值 → 协议路形状。custom_data 解码 NBT typed 树；block_state
-  // 先解码 typed 包装（properties 在 .value 里）再转协议平 map。协议形状输入
-  // （无 typed 特征）原样返回，幂等。
+  // 先解码 typed 包装（properties 在 .value 里）再转协议平 map；附魔组件
+  // （enchantments/stored_enchantments）map 形状翻成协议数字 id 数组。协议
+  // 形状输入（无 typed 特征）原样返回，幂等。
   alignServuxComponentShape (type, value) {
+    if (type === 'enchantments' || type === 'stored_enchantments') return this.enchantmentsDataToProtocol(value)
     if (type === 'block_state') return this.blockStateDataToProtocol(this.decodeNbtValue(value))
     return this.decodeNbtValue(value)
+  }
+
+  // 附魔组件双路形状对齐（2026-11-18 shell_breaker 附魔书 924806/34e301e7
+  // 分裂案）：Servux NBT 是 {附魔名:等级} map，协议开窗是
+  // {enchantments:[{id:数字,level}]} 数组（协议 varint id）。同一件物品两条
+  // 路字面不同 → key 分裂：sync 按 Servux 指纹建账，取货开窗读协议指纹 →
+  // actual=0 → 修账扣账 → 越修越少。map 翻成协议形状（附魔名查
+  // server-enchantments 映射表得数字 id），两种形状统一按 id 升序（双路
+  // 序列化顺序无保证，排序后字面恒等；单附魔排序无影响，历史协议形状 key
+  // 不变，Servux 存量迁移重算即与协议档案合并）。查不到的附魔名原样返回，
+  // 交给 !同步 重扫重录兜底，绝不错译 id。
+  enchantmentsDataToProtocol (value) {
+    const decoded = this.decodeNbtValue(value)
+    if (Array.isArray(decoded?.enchantments)) {
+      const list = decoded.enchantments.map(entry =>
+        (entry && typeof entry === 'object') ? { id: entry.id, level: entry.level } : entry)
+      list.sort((a, b) => (a?.id ?? 0) - (b?.id ?? 0))
+      return { ...decoded, enchantments: list }
+    }
+    if (!decoded || typeof decoded !== 'object' || Array.isArray(decoded)) return decoded
+    const entries = Object.entries(decoded)
+    if (!entries.length) return decoded
+    const list = []
+    for (const [name, level] of entries) {
+      const mapping = this.serverEnchantmentsByName.get(String(name).replace(/^minecraft:/, ''))
+      if (!mapping) return decoded
+      list.push({ id: mapping.id, level: Number(level) })
+    }
+    list.sort((a, b) => a.id - b.id)
+    return { enchantments: list }
   }
 
   // Servux NBT typed 树 → 裸 JSON（协议路的解码结果形状）。NBT 类型名白名单
