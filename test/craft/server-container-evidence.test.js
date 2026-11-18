@@ -52,7 +52,7 @@ test('craft window evidence can be reused only while revision, owner, cursor and
   }
 })
 
-async function retainedFixture (afterContent, options = { keepEvidence: true }) {
+async function retainedFixture (afterContent, options = { keepEvidence: true }, fillHotbar = false) {
   const catalog = new ItemCatalog('1.21.11')
   const Item = require('prismarine-item')(catalog.mcData)
   const container = windows.createWindow(5, 'minecraft:generic_9x3', 'Barrel')
@@ -62,12 +62,17 @@ async function retainedFixture (afterContent, options = { keepEvidence: true }) 
     currentWindow: container,
     inventory: windows.createWindow(0, 'minecraft:inventory', 'Inventory')
   }
-  const content = { windowId: 5, stateId: 1, items: container.slots.map(Item.toNotch), carriedItem: Item.toNotch(null) }
+  if (fillHotbar) {
+    const item = new Item(catalog.mcData.itemsByName.stone.id, 1)
+    container.updateSlot(container.inventoryStart + 27, item)
+    bot.inventory.updateSlot(36, item)
+  }
+  const content = { windowId: 5, stateId: 1, items: container.slots.map(value => value ? Item.toNotch(value) : { itemCount: 0 }), carriedItem: { itemCount: 0 } }
   const warehouse = {
     openContainerAt: async () => {
       bot._client.emit('open_window', { windowId: 5 })
       bot._client.emit('window_items', content)
-      afterContent?.(bot._client, content)
+      afterContent?.(bot._client, content, Item.toNotch(new Item(catalog.mcData.itemsByName.stone.id, 1)))
       return container
     },
     closeContainerQuietly: () => {}
@@ -77,14 +82,74 @@ async function retainedFixture (afterContent, options = { keepEvidence: true }) 
 }
 
 for (const [label, name, packet] of [
-  ['current slot update', 'set_slot', () => ({ windowId: 5, slot: 0, item: { itemCount: 0 } })],
-  ['slot update alias', 'container_set_slot', () => ({ containerId: 5, slot: 0, item: { itemCount: 0 } })],
+  ['current slot update', 'set_slot', (content, held) => ({ windowId: 5, slot: 0, item: held })],
+  ['slot update alias', 'container_set_slot', (content, held) => ({ containerId: 5, slot: 0, item: held })],
   ['cursor update', 'set_cursor_item', () => ({})],
   ['incomplete full content', 'window_items', () => ({ windowId: 5, items: [] })],
   ['missing cursor', 'window_items', content => ({ windowId: 5, items: content.items })]
 ]) {
   test(`default opening evidence rejects a snapshot superseded by ${label}`, async () => {
-    await assert.rejects(retainedFixture((client, content) => client.emit(name, packet(content)), {}))
+    await assert.rejects(retainedFixture((client, content, held) => client.emit(name, packet(content, held)), {}))
+  })
+}
+
+for (const [event, packet] of [
+  ['set_slot', { windowId: 5, slot: 0, item: { itemCount: 0 } }],
+  ['container_set_slot', { containerId: 5, slot: 0, item: { itemCount: 0 } }],
+  ['set_slot', { windowId: -1, slot: -1, item: { itemCount: 0 } }],
+  ['set_slot', { windowId: 0, slot: 36, item: { itemCount: 0 } }],
+  ['set_slot', { windowId: -2, slot: 0, item: { itemCount: 0 } }],
+  ['set_player_inventory', { slotId: 0, contents: { itemCount: 0 } }],
+  ['set_cursor_item', { contents: { itemCount: 0 } }],
+  ['container_set_cursor_item', { contents: { itemCount: 0 } }]
+]) {
+  test(`opening and retained evidence survive identical ${event} ${JSON.stringify(packet)}`, async () => {
+    const opened = await retainedFixture(client => client.emit(event, packet), {})
+    assert.equal(opened.evidence, null)
+    const f = await retainedFixture(client => client.emit(event, packet))
+    try {
+      assert.equal(f.evidence.isReusable(), true)
+      f.bot._client.emit(event, packet)
+      assert.equal(f.evidence.isReusable(), true)
+    } finally { f.evidence.dispose() }
+  })
+}
+
+test('identical deltas cannot restore invalidated retained evidence', async () => {
+  const f = await retainedFixture()
+  try {
+    f.bot._client.emit('set_cursor_item', { contents: f.held })
+    f.bot._client.emit('set_cursor_item', { contents: { itemCount: 0 } })
+    assert.equal(f.evidence.isReusable(), false)
+  } finally { f.evidence.dispose() }
+})
+
+test('retained player inventory deltas use vanilla hotbar numbering', async () => {
+  const f = await retainedFixture(null, { keepEvidence: true }, true)
+  try {
+    assert.equal(f.evidence.isReusable(), true)
+    f.bot._client.emit('set_player_inventory', { slotId: 0, contents: f.held })
+    assert.equal(f.evidence.isReusable(), true)
+    f.bot._client.emit('set_player_inventory', { slotId: 0, contents: { itemCount: 0 } })
+    assert.equal(f.evidence.isReusable(), false)
+  } finally { f.evidence.dispose() }
+})
+
+test('retained duplicate comparison preserves component-count differences', async () => {
+  const f = await retainedFixture(null, { keepEvidence: true }, true)
+  try {
+    f.bot._client.emit('set_player_inventory', { slotId: 0, contents: { ...f.held, addedComponentCount: 1 } })
+    assert.equal(f.evidence.isReusable(), false)
+  } finally { f.evidence.dispose() }
+})
+
+for (const packet of [
+  { windowId: 5, slot: 99, item: { itemCount: 0 } },
+  { windowId: 5, slot: 0, item: { itemCount: 0, unexpected: true } },
+  { windowId: -2, slot: 41, item: { itemCount: 0 } }
+]) {
+  test(`malformed or unrepresented opening delta invalidates evidence ${JSON.stringify(packet)}`, async () => {
+    await assert.rejects(retainedFixture(client => client.emit('set_slot', packet)))
   })
 }
 

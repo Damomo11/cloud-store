@@ -1,6 +1,8 @@
 'use strict'
 
 const { serialize, deserialize } = require('node:v8')
+const { isDeepStrictEqual } = require('node:util')
+const { isEmptySlot } = require('../packing/protocol')
 
 function sameSnapshotSlots (left = [], right = []) {
   const normalize = values => values
@@ -63,7 +65,8 @@ async function openServerContainer (warehouse, chest, catalog, bot, options = {}
   if (typeof client?.on !== 'function' || typeof client?.removeListener !== 'function') {
     throw new Error('缺少服务端容器快照观察。')
   }
-  const Item = require('prismarine-item')(bot.registry || catalog.mcData)
+  const registry = bot.registry || catalog.mcData
+  const Item = require('prismarine-item')(registry)
   const opened = new Set()
   const packets = []
   const revision = currentRevision(warehouse, chest.chestId)
@@ -118,16 +121,40 @@ async function openServerContainer (warehouse, chest, catalog, bot, options = {}
       }
     }
   }
+  // Opening can emit its full packet before openContainerAt resolves. Compare
+  // against that saved packet as well as during a retained window's lifetime.
+  const compare = (raw, select) => {
+    const full = packets.at(-1)
+    if (!full || !raw || typeof raw !== 'object' || Array.isArray(raw)) return invalidate()
+    if (registry.supportFeature('itemsWithComponents')
+      ? !Number.isSafeInteger(raw.itemCount) || raw.itemCount < 0 || (raw.itemCount === 0 && !isEmptySlot(raw))
+      : typeof raw.present !== 'boolean') return invalidate()
+    const expected = select(full)
+    if (expected === undefined || !isDeepStrictEqual(raw, expected)) invalidate()
+  }
+  const slotValue = (full, slot) => Number.isInteger(slot) && slot >= 0 && slot < full.items.length ? full.items[slot] : undefined
+  const playerSlotValue = (full, slot) => {
+    const start = full.items.length - 36
+    return start > 0 && Number.isInteger(slot) && slot >= 9 && slot < 45 ? slotValue(full, start + slot - 9) : undefined
+  }
+  const inventorySlot = slot => !Number.isInteger(slot) || slot < 0 || slot > 40 ? -1
+    : slot < 9 ? slot + 36 : slot < 36 ? slot : slot < 40 ? 44 - slot : 45
   const onSlot = packet => {
     const id = windowId(packet)
-    if (opened.has(id) || [0, -1, 255, -2, 254].includes(id)) invalidate()
+    if (id === -1 || id === 255) {
+      if (packet.slot !== -1) invalidate()
+      else compare(packet.item, full => full.carriedItem)
+    } else if (opened.has(id)) compare(packet.item, full => slotValue(full, packet.slot))
+    else if (id === 0) compare(packet.item, full => playerSlotValue(full, packet.slot))
+    else if (id === -2 || id === 254) compare(packet.item, full => playerSlotValue(full, inventorySlot(packet.slot)))
   }
+  const onCursor = packet => compare(packet.contents, full => full.carriedItem)
   const listeners = [
     ['open_window', onOpen], ['open_screen', onOpen],
     ['window_items', onItems], ['container_set_content', onItems],
     ['set_slot', onSlot], ['container_set_slot', onSlot],
-    ['set_cursor_item', invalidate], ['container_set_cursor_item', invalidate],
-    ['set_player_inventory', invalidate]
+    ['set_cursor_item', onCursor], ['container_set_cursor_item', onCursor],
+    ['set_player_inventory', packet => compare(packet.contents, full => playerSlotValue(full, inventorySlot(packet.slotId)))]
   ]
   for (const [event, listener] of listeners) client.on(event, listener)
   let container
