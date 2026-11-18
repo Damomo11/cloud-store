@@ -551,6 +551,19 @@ class CloudStoreService {
       })
       return
     }
+    // 清空背包同样绕过任务队列：每只机器人收到指令各自清理自己的背包，
+    // 忙碌或有待恢复记录的会跳过，避免打断进行中的任务或误动任务物品。
+    if (normalizedCommand === '!清空背包') {
+      if (!this.isAdmin(username)) {
+        this.msg(username, '你没有权限清空机器人背包。')
+        return
+      }
+      this.handleClearBackpack(username).catch(error => {
+        console.error(`[clear-backpack:${this.botId}] failed:`, error)
+        this.msg(username, `${this.bot.username || this.botId} 清空背包失败：${error.message}`)
+      })
+      return
+    }
     // 玩家输入记录：原样保留玩家怎么输入的（公屏/私聊渠道、原始文本），
     // 后续是受理还是被去重/繁忙拦截，也挂在同一个 command trace 上。
     const inputTrace = startTrace({
@@ -1044,6 +1057,34 @@ class CloudStoreService {
     if (text.startsWith('!取物品') || text.startsWith('!取')) {
       const owner = this.defaultStorageOwnerForPlayer(this.getPlayer(username))
       await this.enqueueTask(username, 'withdraw', worker => worker.handleWithdraw(username, text, owner), taskOptions)
+    }
+  }
+
+  // !清空背包：把机器人身上的物品全部以 momo 兜底账存入云仓库，
+  // 物理入库同时刷新对应木桶的库存记录。用于清理机器人意外捡拾的杂物。
+  async handleClearBackpack (username) {
+    const botName = this.bot.username || this.botId
+    if (this.active || this.recoveringFromDeath) {
+      this.msg(username, `${botName} 正在执行任务，先让它干完活再清背包。`)
+      return
+    }
+    const pendingRecovery = this.db.getRecoveryTask?.(this.botId) || this.db.hasPendingPacking?.(this.botId) || this.db.hasPendingCraft?.(this.botId)
+    if (pendingRecovery) {
+      this.msg(username, `${botName} 有未完成的任务恢复记录，背包物品要先走自动恢复流程，暂不手动清理。`)
+      return
+    }
+    const held = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
+    if (!held.length) {
+      this.msg(username, `${botName} 背包空空的，没有需要清理的物品。`)
+      return
+    }
+    const result = await this.warehouse.depositInventoryForOwner(this.config.momoOwner, 'momo')
+    if (result.deposited.length) {
+      console.warn(`[clear-backpack:${this.botId}] ${botName} cleared: ${this.formatItemList(result.deposited)}`)
+      this.msg(username, `${botName} 背包已清空：${this.formatItemList(result.deposited)} 已存入仓库并记入 momo 兜底账。`)
+    }
+    if (result.leftover?.length) {
+      this.msg(username, `${botName} 还有 ${this.formatItemList(result.leftover)} 未能入库，请检查仓库空间。`)
     }
   }
 
@@ -5069,6 +5110,7 @@ class CloudStoreService {
       '减少',
       '清空库存',
       '清理库存',
+      '清空背包',
       '同步木桶',
       '同步仓库',
       '同步',
