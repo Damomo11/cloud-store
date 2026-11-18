@@ -82,7 +82,7 @@ test('staggered restarts notify once and a later reload of the same version can 
   await lateReload
   assert.equal(await f.deliver(), false, 'the late restart must not recreate the reminder')
   assert.equal(f.sent.length, 1)
-  assert.match(f.sent[0][1], /热重载完成/)
+  assert.match(f.sent[0][1], /已有机器人用新代码上线/)
 
   await f.reload()
   assert.equal(await f.deliver(), true, 'a new request after delivery is a new reload round')

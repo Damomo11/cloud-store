@@ -178,7 +178,7 @@ async function deliverHotReloadNotify (service, {
     })
     if (!info) return false
     const version = gitHeadShort(cwd) || (typeof info.version === 'string' ? info.version : '')
-    service.msg(info.target, `热重载完成：机器人已用新代码上线${version ? `，当前版本 ${version}` : ''}。`)
+    service.msg(info.target, `热重载回执：已有机器人用新代码上线${version ? `，当前版本 ${version}` : ''}。`)
     log(`[hotreload] 完成提醒已发送给 ${info.target}${version ? `（版本 ${version}）` : ''}`)
     return true
   } catch {
