@@ -556,9 +556,11 @@ class StoreDb {
     return { ...migrated, indexed }
   }
 
-  // 存量潜影盒 metaJson 的容器内容数字 itemId → 全名字符串（详见 itemCatalog.
-  // translateStoredContainerEntriesToFullNames）。item_key 保持不变：翻译后
-  // 重算指纹的输入与当年完全一致。幂等：字符串条目跳过，跑过一遍后再跑为 no-op。
+  // 存量 metaJson 的嵌套物品数字 itemId → 全名字符串（详见 itemCatalog.
+  // translateStoredContainerEntriesToFullNames）。item_key 保持不变：这些
+  // 条目不参与指纹归一，行内 key 无人重算。幂等：字符串条目跳过，跑过
+  // 一遍后再跑为 no-op。扫描范围：潜影盒 + 任何带嵌套条目的行（收纳袋
+  // bundle_contents / 弩 charged_projectiles——2026-11-18 实测 9 条残留）。
   translateStoredShulkerEntriesToFullNames () {
     if (!this.catalog) return { skipped: 'no-catalog' }
     const majorVersion = String(this.catalog.mcData?.version?.majorVersion || '')
@@ -566,9 +568,10 @@ class StoreDb {
     if (!majorVersion.startsWith('26.')) return { skipped: 'not-26x' }
     const legacy = this.catalog.legacy12111Catalog?.() || null
     const rows = this.db.prepare(`
-      SELECT item_key AS itemKey, item_id AS itemId, meta_json AS metaJson, created_at AS createdAt
+      SELECT item_key AS itemKey, item_id AS itemId, meta_json AS metaJson, created_at as createdAt
       FROM items
       WHERE item_id LIKE '%shulker_box'
+         OR meta_json LIKE '%"itemId":%'
     `).all()
     const updateMeta = this.db.prepare('UPDATE items SET meta_json = ? WHERE item_key = ?')
     let translated = 0

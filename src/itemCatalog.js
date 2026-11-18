@@ -261,21 +261,41 @@ class ItemCatalog {
   // 原样（返回计数，交给 !同步 重扫重录兜底，绝不错译名字）。
   translateStoredContainerEntriesToFullNames (itemId, meta, reg) {
     const counts = { translated: 0, unresolved: 0 }
-    if (!this.isShulkerBox(itemId)) return counts
     const components = Array.isArray(meta?.components) ? meta.components : []
-    const container = components.find(component => component?.type === 'container')
-    const entries = Array.isArray(container?.data?.contents) ? container.data.contents : null
-    if (!entries) return counts
     const dictionary = reg || this.mcData
-    for (const entry of entries) {
-      if (!entry || typeof entry !== 'object' || typeof entry.itemId === 'string') continue
-      if (!Number.isInteger(entry.itemId)) continue
-      const name = this.itemNameByNumericId(dictionary, entry.itemId)
-      if (!name) { counts.unresolved++; continue }
-      entry.itemId = `minecraft:${name}`
-      counts.translated++
+    // 嵌套物品容器不止潜影盒 container 一种：收纳袋 bundle_contents、
+    // 弩 charged_projectiles 的条目同形状（{itemId, itemCount, ...}）。存量
+    // 翻译覆盖全部三种，metaJson 里从此不携带任何目录数字。item_key 不受
+    // 影响：这些条目不参与指纹归一（normalize 只认 container），行内 key
+    // 无人重算，重扫重录时全删全插自然换新。
+    for (const component of components) {
+      const type = component?.type
+      if (type !== 'container' && type !== 'bundle_contents' && type !== 'charged_projectiles') continue
+      // 潜影盒 container 保持原有 gate：非盒物品的 container 组件
+      // （理论上不存在，防御性跳过）。
+      if (type === 'container' && !this.isShulkerBox(itemId)) continue
+      const entries = this.nestedItemEntryList(component)
+      if (!entries) continue
+      for (const entry of entries) {
+        if (!entry || typeof entry !== 'object' || typeof entry.itemId === 'string') continue
+        if (!Number.isInteger(entry.itemId)) continue
+        const name = this.itemNameByNumericId(dictionary, entry.itemId)
+        if (!name) { counts.unresolved++; continue }
+        entry.itemId = `minecraft:${name}`
+        counts.translated++
+      }
     }
     return counts
+  }
+
+  // 嵌套物品条目列表：协议 data 可为裸数组（开箱路径），Servux NBT 转形状后
+  // 带 contents（container/bundle_contents）或 projectiles（charged_projectiles）键。
+  nestedItemEntryList (component) {
+    const data = component?.data
+    if (Array.isArray(data)) return data
+    if (Array.isArray(data?.contents)) return data.contents
+    if (Array.isArray(data?.projectiles)) return data.projectiles
+    return null
   }
 
   // 迁移期跨目录内容签名（2026-11-18 椰汁橙 16417 多余/15329 缺失案例）：
@@ -766,6 +786,19 @@ class ItemCatalog {
       return {
         ...component,
         data: this.summarizeBeeComponent(type, component.data)
+      }
+    }
+
+    // 其它嵌套物品容器（收纳袋 bundle_contents / 弩 charged_projectiles）：
+    // 条目同样落库即全名（containerEntryFullItemId），metaJson 不落数字。
+    if (type === 'bundle_contents' || type === 'charged_projectiles') {
+      const entries = this.nestedItemEntryList(component)
+      if (entries) {
+        const list = entries.map(entry => this.containerEntryFullItemId(entry))
+        const data = Array.isArray(component.data)
+          ? list
+          : { ...component.data, [Array.isArray(component.data?.contents) ? 'contents' : 'projectiles']: list }
+        return { ...component, data }
       }
     }
 
