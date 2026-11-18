@@ -464,25 +464,35 @@ function launchBot (state) {
     if (lastDisconnectReason) console.warn(`[client] connection closed: ${lastDisconnectReason}`)
   })
 
-  // 调试：window_items 解析炸时把 wire 原始字节落盘（data/via-window-dump.txt）
-  // 触发即说明 26.3 伪协议 Slot/组件定义与真实 wire 不匹配，dump 后可手解定位缺口。
-  bot._client?.on('error', err => {
-    const field = err?.field || ''
-    if (!field.includes('window_items')) return
-    const buf = err.buffer
-    if (!buf || !buf.length) return
-    const dumpPath = path.join('data', 'via-window-dump.txt')
-    const lines = [
-      `=== ${new Date().toISOString()} field=${field} len=${buf.length} ===`,
-      buf.toString('hex').replace(/(..)/g, '$1 ').trim()
-    ]
-    try {
-      fs.appendFileSync(dumpPath, lines.join('\n') + '\n', 'utf8')
-      console.warn(`[via] window_items 解析失败 wire 已落盘 data/via-window-dump.txt（${buf.length} 字节）`)
-    } catch (e) {
-      console.warn('[via] window_items dump 写入失败:', e.message)
+  // 调试：协议解析炸（PartialReadError）时把 wire 原始字节落盘（data/via-window-dump.txt）
+  // 背景：FullPacketParser._transform 对 partialReadError 只 console.log + cb() 吞包，
+  // client 层 'error' 事件根本收不到（#149 的钩子因此失效）。
+  // 改法：monkey-patch deserializer.parsePacketBuffer，catch 时拿到原始 buffer 落盘再原样抛回。
+  const deserializer = bot._client?.deserializer
+  if (deserializer && typeof deserializer.parsePacketBuffer === 'function' && !deserializer.__viaDumpPatched) {
+    const origParse = deserializer.parsePacketBuffer.bind(deserializer)
+    deserializer.__viaDumpPatched = true
+    deserializer.parsePacketBuffer = (buffer) => {
+      try {
+        return origParse(buffer)
+      } catch (e) {
+        if (e?.partialReadError && buffer?.length) {
+          try {
+            const dumpPath = path.join('data', 'via-window-dump.txt')
+            const lines = [
+              `=== ${new Date().toISOString()} PartialReadError field=${e.field ?? '?'} len=${buffer.length} ===`,
+              buffer.toString('hex').replace(/(..)/g, '$1 ').trim()
+            ]
+            fs.appendFileSync(dumpPath, lines.join('\n') + '\n', 'utf8')
+            console.warn(`[via] 协议解析炸 wire 已落盘 data/via-window-dump.txt（${buffer.length} 字节）: ${e.message?.slice(0, 90)}`)
+          } catch (writeErr) {
+            console.warn('[via] dump 写入失败:', writeErr.message)
+          }
+        }
+        throw e
+      }
     }
-  })
+  }
 
   bot.on('kicked', reason => {
     clearInterval(loginWatchdog)
