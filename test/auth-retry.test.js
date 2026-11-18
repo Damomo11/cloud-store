@@ -18,3 +18,8 @@ test('Microsoft auth rate-limit retries use capped exponential backoff with jitt
   assert.equal(microsoftAuthRetryDelayMs(2, 10000, () => 0.5), 60000)
   assert.equal(microsoftAuthRetryDelayMs(9, 10000, () => 1), 300000)
 })
+
+test('recognizes a non-JSON session authentication rate limit from Yggdrasil', () => {
+  assert.equal(isMicrosoftAuthRateLimitError(new Error('Response is not JSON. Status code: 429')), true)
+  assert.equal(isMicrosoftAuthRateLimitError(new Error('Response is not JSON. Status code: 502')), false)
+})
