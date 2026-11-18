@@ -185,10 +185,19 @@ class ItemCatalog {
   }
 
   fromContainerEntry (entry) {
-    if (!entry || !Number.isInteger(entry.itemId)) return null
-    const entryItemId = this.isBeeContainerEntry(entry) ? this.canonicalBeeContainerItemId(entry) : entry.itemId
-    const item = this.mcData.items[entryItemId]
+    if (!entry) return null
+    // 字符串全名（迁移后/落库即全名的新账形状）：按名建档，不再查数字目录。
+    // 数字（存量旧形状）：按当前目录解，蜂箱条目归一到 bee_nest。
+    let item = null
+    if (typeof entry.itemId === 'string') {
+      const name = entry.itemId.replace(/^minecraft:/, '')
+      item = this.mcData.itemsByName[name] || null
+    } else if (Number.isInteger(entry.itemId)) {
+      const entryItemId = this.isBeeContainerEntry(entry) ? this.canonicalBeeContainerItemId(entry) : entry.itemId
+      item = this.mcData.items[entryItemId] || null
+    }
     if (!item) return null
+    const entryItemId = item.id
 
     const itemId = `minecraft:${item.name}`
     const components = Array.isArray(entry.components) && entry.components.length ? entry.components : null
@@ -242,6 +251,31 @@ class ItemCatalog {
       }
     }
     return reg.__itemsByIdMap
+  }
+
+  // 存量 metaJson 的容器条目数字 → 全名字符串，按“入账时代”的目录翻译：
+  // reg 传该行时代的字典（26.3 部署前的老行传 1.21.11 目录，之后传当前目录）。
+  // 翻译后 normalizeContainerEntryForFingerprint 走字符串原样分支，参与哈希的
+  // 输入与当年“数字→当年目录→全名”完全一致：历史 itemKey 不变，只把存储形状
+  // 换成跨版本稳定形式。字符串条目原样跳过（幂等）。目录解不出的数字保留
+  // 原样（返回计数，交给 !同步 重扫重录兜底，绝不错译名字）。
+  translateStoredContainerEntriesToFullNames (itemId, meta, reg) {
+    const counts = { translated: 0, unresolved: 0 }
+    if (!this.isShulkerBox(itemId)) return counts
+    const components = Array.isArray(meta?.components) ? meta.components : []
+    const container = components.find(component => component?.type === 'container')
+    const entries = Array.isArray(container?.data?.contents) ? container.data.contents : null
+    if (!entries) return counts
+    const dictionary = reg || this.mcData
+    for (const entry of entries) {
+      if (!entry || typeof entry !== 'object' || typeof entry.itemId === 'string') continue
+      if (!Number.isInteger(entry.itemId)) continue
+      const name = this.itemNameByNumericId(dictionary, entry.itemId)
+      if (!name) { counts.unresolved++; continue }
+      entry.itemId = `minecraft:${name}`
+      counts.translated++
+    }
+    return counts
   }
 
   // 迁移期跨目录内容签名（2026-11-18 椰汁橙 16417 多余/15329 缺失案例）：
@@ -742,16 +776,47 @@ class ItemCatalog {
   }
 
   sanitizeShulkerContainerEntry (entry) {
-    if (!entry || !Number.isInteger(entry.itemId)) return entry
-    if (!this.isBeeContainerEntry(entry)) return entry
-    return {
-      ...entry,
-      itemId: this.canonicalBeeContainerItemId(entry),
-      addedComponentCount: 0,
-      components: [],
-      removeComponents: [],
-      removedComponentCount: 0
+    if (!entry || typeof entry !== 'object') return entry
+    if (this.isBeeContainerEntry(entry)) {
+      return {
+        ...entry,
+        // 蜂箱内容（蜜蜂活动数据）不稳定：抹平成固定形状。itemId 用全名字符串
+        // 统一形状——beehive/bee_nest 本名保留，仅带蜂数据的非蜂箱杂牌归一到
+        // bee_nest（与 canonicalBeeContainerItemId 同语义，保证盒内盒外同 key；
+        // 1.21.11 时代存的数字形状由对账 canonicalize 的 move 合并兜底）。
+        itemId: this.canonicalBeeContainerFullItemId(entry),
+        addedComponentCount: 0,
+        components: [],
+        removeComponents: [],
+        removedComponentCount: 0
+      }
     }
+    return this.containerEntryFullItemId(entry)
+  }
+
+  // 蜂箱容器条目的全名版 canonical（与 canonicalBeeContainerItemId 同语义）：
+  // 本尊蜂箱（beehive/bee_nest）保留原名，带蜂数据的杂牌物品归一到 bee_nest。
+  canonicalBeeContainerFullItemId (entry) {
+    const nestedItem = this.mcData.items[entry.itemId]
+    const nestedItemId = nestedItem ? `minecraft:${nestedItem.name}` : null
+    if (this.isBeeContainer(nestedItemId)) return nestedItemId
+    return `minecraft:${this.mcData.itemsByName.bee_nest?.name || 'bee_nest'}`
+  }
+
+  // 容器条目 itemId 落库即全名：数字（当前会话协议解码的目录编码）→ 当前字典
+  // → 全名字符串；字符串原样归一。metaJson 从此不携带任何目录的数字编码，
+  // 跨版本指纹稳定：normalizeContainerEntryForFingerprint 本来就把数字翻成
+  // 全名再参与哈希，同一件实物“数字直算”与“全名直算”输入恒等、key 不变。
+  // 解不出的数字原样保留，交给 !同步 重扫重录兜底。
+  containerEntryFullItemId (entry) {
+    if (typeof entry?.itemId === 'string') {
+      if (!entry.itemId) return entry
+      return { ...entry, itemId: entry.itemId.startsWith('minecraft:') ? entry.itemId : `minecraft:${entry.itemId}` }
+    }
+    if (!Number.isInteger(entry?.itemId)) return entry
+    const name = this.itemNameByNumericId(this.mcData, entry.itemId)
+    if (!name) return entry
+    return { ...entry, itemId: `minecraft:${name}` }
   }
 
   isBeeContainerEntry (entry) {
