@@ -494,8 +494,33 @@ class ItemCatalog {
       : meta
     const base = this.isShulkerBox(itemId) ? this.normalizeShulkerMetaForFingerprint(canonicalMeta) : canonicalMeta
     const stripped = this.stripVolatileMetaForFingerprint(itemId, base)
+    // tobyscamera 相机物品指纹锚定稳定组件，文本组件剥离（见 stripTobysTextComponentsForFingerprint）。
+    if (this.hasTobysCameraMediaId(stripped)) {
+      return this.sortMetaComponentsForFingerprint(this.stripTobysTextComponentsForFingerprint(stripped))
+    }
     if (this.isNoteBlock(itemId)) return this.canonicalNoteBlockMetaForFingerprint(stripped)
     return this.sortMetaComponentsForFingerprint(stripped)
+  }
+
+  // tobyscamera 相机物品（相片袋/照片）：custom_data 组件含 tobyscamera:media_id。
+  hasTobysCameraMediaId (meta) {
+    if (!Array.isArray(meta?.components)) return false
+    return meta.components.some(component =>
+      component?.type === 'custom_data' &&
+      component.data && typeof component.data === 'object' &&
+      typeof component.data['tobyscamera:media_id'] === 'string')
+  }
+
+  // 相机物品的文本组件（lore/custom_name）会被插件原地清写——实测相片袋
+  // 04ec8f867 的 lore 文本被清空后指纹漂移成 3be52c0ba，账本认旧指纹导致
+  // 开桶读不到实物（actual=0）、取货失败并触发修账。指纹改为只锚定稳定
+  // 组件（custom_data 的 media_id 身份 + map_id 预览图）；lore/custom_name
+  // 从指纹中剥离。物品展示名与建档走原始 metaJson，不受剥离影响。
+  stripTobysTextComponentsForFingerprint (meta) {
+    if (!Array.isArray(meta?.components)) return meta
+    const components = meta.components.filter(component =>
+      component?.type !== 'lore' && component?.type !== 'custom_name')
+    return { ...meta, components }
   }
 
   normalizeItemMetadata (metadata) {
