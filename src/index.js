@@ -669,6 +669,14 @@ function simplifyNbtValue (value) {
 function registryEnchantmentDisplayName (data, name, catalog) {
   const description = data?.description
   if (description) {
+    // 数据包附魔的 description 常是纯字符串中文描述（supersteve2333:shell_breaker
+    // 的 registry data 里 description="碎壳"）——之前只认 text/translate/fallback
+    // 对象形状，纯字符串漏接，displayName 回退裸名，附魔书就显示成
+    // "supersteve2333:shell_breaker一"（8 月 34e301e7 档）。接住后走
+    // refreshItemDisplayNames 链，存量书名自动刷成"碎壳一"。
+    if (typeof description === 'string' && description.trim()) {
+      return description.trim()
+    }
     if (typeof description.text === 'string' && description.text.trim()) {
       return description.text.trim()
     }
