@@ -976,6 +976,12 @@ class CloudStoreService {
       return
     }
 
+    if (text.startsWith('!servux探测--')) {
+      // 注意放在 '!servux探测' 之前：带 -- 后缀的也以它为前缀
+      await this.handleServuxChestProbe(username, text)
+      return
+    }
+
     if (text.startsWith('!servux探测')) {
       await this.handleServuxProbe(username)
       return
@@ -3221,6 +3227,47 @@ class CloudStoreService {
         if (service.active?.borrowedBySync === coordinator.botId) service.active = null
       }
     }
+  }
+
+  // !servux探测-- x y z：管理员诊断用。按坐标对单个木桶做 Servux 隔空读取，
+  // 服务器原始 NBT 条目 vs 解析结果逐条对照（解析含完整指纹输入 itemKey +
+  // metaJson），与账本登记信息一并输出到终端实时日志（web 面板可见）。
+  // 不需要 bot 走到该桶——Servux 查询直接按方块坐标发。支持负数坐标，
+  // 如：!servux探测-- -12 65 127
+  async handleServuxChestProbe (username, text) {
+    if (!this.isAdmin(username)) {
+      this.msg(username, '你没有权限使用探测命令。')
+      return
+    }
+    const parts = text.split(/\s+/).filter(Boolean)
+    const nums = parts.slice(1).map(Number)
+    if (nums.length !== 3 || !nums.every(Number.isInteger)) {
+      this.msg(username, '用法：!servux探测-- x y z（支持负数，如 !servux探测-- -12 65 127）')
+      return
+    }
+    const [x, y, z] = nums
+    this.msg(username, `开始探测木桶 (${x}, ${y}, ${z})，结果输出到终端实时日志。`)
+    const log = line => console.log(`[servux桶探测] ${line}`)
+    try {
+      const sample = await this.warehouse.debugServuxChestAt(x, y, z)
+      if (sample.note) {
+        log(`by=${username} 木桶 (${x}, ${y}, ${z})：${sample.note}`)
+        this.msg(username, `探测结果已输出到终端实时日志。`)
+        return
+      }
+      log(`by=${username} === 木桶 ${sample.chest} | db 登记：${sample.registered} ===`)
+      log(`服务器条目总数=${sample.rawCount}`)
+      for (const raw of sample.rawEntries) log(`  raw:    ${JSON.stringify(raw).slice(0, 1000)}`)
+      for (const parsed of sample.parsed) {
+        log(`  parsed: ${JSON.stringify({ itemId: parsed.itemId, displayName: parsed.displayName, amount: parsed.amount, slot: parsed.slot })}`)
+        log(`          key=${parsed.itemKey}`)
+        log(`          metaJson=${(parsed.metaJson && JSON.stringify(parsed.metaJson)).slice(0, 1000)}`)
+      }
+      log(`=== 探测结束（raw ${sample.rawCount} 条，解析 ${sample.parsed.length} 条）===`)
+    } catch (error) {
+      log(`探测异常：${error && error.message}`)
+    }
+    this.msg(username, '探测结果已输出到终端实时日志。')
   }
 
   // !servux探测：管理员诊断用。发 register + 握手，然后监听 6 秒内所有到达的
