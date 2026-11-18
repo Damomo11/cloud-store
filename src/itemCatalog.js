@@ -120,8 +120,93 @@ class ItemCatalog {
       const type = key.replace(/^minecraft:/, '')
       // 容器组件（潜影盒内容）转成协议形状，保证盒内物品索引两条路径一个指纹
       if (type === 'container') return { type, data: this.nbtContainerDataToProtocol(value) }
+      // 其它组件的形状对齐（NBT typed 解码 / block_state properties 转平 map）
+      // 统一在 sanitizeMetaForStorage 收口（全路径必经、幂等），这里只转数组形状。
       return { type, data: value }
     })
+  }
+
+  // 存量 metaJson（协议数组形状）的组件树形状对齐：顶层组件 + 盒内条目组件
+  // 递归走 alignServuxComponentShape，与运行时（sanitizeMetaForStorage 收口）
+  // 共用同一转换，保证迁移重算的指纹与新入账恒等。协议形状输入幂等 no-op。
+  // （2026-11-18 minecraft:string 三指纹分裂案：Servux 路 typed/properties 形状
+  // vs 协议路 flat/map 形状，同一物品两条路字面不同 → key 分裂。）
+  alignStoredComponentShapesDeep (meta) {
+    const alignComponents = components => {
+      if (!Array.isArray(components)) return components
+      return components.map(component => {
+        if (!component || typeof component !== 'object') return component
+        const type = component.type
+        let data = this.alignServuxComponentShape(type, component.data)
+        if (type === 'container' && data && typeof data === 'object' && Array.isArray(data.contents)) {
+          data = {
+            ...data,
+            contents: data.contents.map(entry => {
+              if (!entry || typeof entry !== 'object') return entry
+              // 协议空槽 padding（{itemCount:0} 无 components 键）原样保留：
+              // packing 层的空槽判定依赖这个键形，不能擅自补键。
+              if (!Array.isArray(entry.components)) return entry
+              return { ...entry, components: alignComponents(entry.components) }
+            })
+          }
+        }
+        return { ...component, data }
+      })
+    }
+    if (!meta || typeof meta !== 'object') return meta
+    return { ...meta, components: alignComponents(meta.components) }
+  }
+
+  // Servux NBT 组件值 → 协议路形状。custom_data 解码 NBT typed 树；block_state
+  // 先解码 typed 包装（properties 在 .value 里）再转协议平 map。协议形状输入
+  // （无 typed 特征）原样返回，幂等。
+  alignServuxComponentShape (type, value) {
+    if (type === 'block_state') return this.blockStateDataToProtocol(this.decodeNbtValue(value))
+    return this.decodeNbtValue(value)
+  }
+
+  // Servux NBT typed 树 → 裸 JSON（协议路的解码结果形状）。NBT 类型名白名单
+  // 判定：craftengine 在 custom_data 里存的 JSON（{"type":0,...} 数字 type）
+  // 不是 typed 包装，不误伤；byteArray 解成纯数组（协议路 wire 即纯数组）。
+  decodeNbtValue (node) {
+    const NBT_TYPES = new Set(['compound', 'list', 'byteArray', 'intArray', 'longArray',
+      'string', 'byte', 'short', 'int', 'long', 'float', 'double'])
+    if (!node || typeof node !== 'object' || Array.isArray(node)) return node
+    if (typeof node.type === 'string' && NBT_TYPES.has(node.type)) {
+      switch (node.type) {
+        case 'compound': {
+          const out = {}
+          for (const [k, v] of Object.entries(node.value || {})) out[k] = this.decodeNbtValue(v)
+          return out
+        }
+        case 'list':
+          return (Array.isArray(node.value?.value) ? node.value.value : []).map(v => this.decodeNbtValue(v))
+        case 'byteArray': case 'intArray': case 'longArray':
+          return Array.isArray(node.value) ? node.value.map(Number) : (node.value ?? [])
+        case 'string':
+          return node.value ?? ''
+        default:
+          return node.value ?? null
+      }
+    }
+    // 无 type 特征的普通对象（如 NBT list<compound> 的裸条目 {name:typed, value:typed}）：
+    // 递归剥每个字段的 typed 包装。craftengine 的 JSON（{"type":0,...} 数字 type）走到
+    // 这里递归无损（裸值原样返回），与协议路同一函数处理 → 双路字面恒等。
+    const out = {}
+    for (const [k, v] of Object.entries(node)) out[k] = this.decodeNbtValue(v)
+    return out
+  }
+
+  // block_state 组件：Servux NBT 形状 {properties:[{name,value}]} → 协议平 map
+  // {name: value}。协议形状（无 properties 数组）原样返回。
+  blockStateDataToProtocol (value) {
+    const props = Array.isArray(value?.properties) ? value.properties : null
+    if (!props) return value
+    const out = {}
+    for (const prop of props) {
+      if (prop && typeof prop.name === 'string') out[prop.name] = prop.value
+    }
+    return out
   }
 
   // 容器组件数据 → 协议形状 { contents: [{ itemId, itemCount, components }] }。
@@ -736,6 +821,9 @@ class ItemCatalog {
 
   sanitizeMetaForStorage (itemId, meta = {}) {
     if (this.isBeeContainer(itemId)) return this.fixedBeeContainerMeta()
+    // 形状对齐收口（全路径必经）：Servux NBT typed / block_state properties →
+    // 协议路平形状，两条读取路径对同一物品产出字面恒等的 metaJson。
+    meta = this.alignStoredComponentShapesDeep(meta)
     const components = Array.isArray(meta?.components)
       ? meta.components.map(component => this.sanitizeComponentForStorage(itemId, component)).filter(Boolean)
       : meta?.components
