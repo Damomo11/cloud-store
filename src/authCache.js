@@ -22,7 +22,9 @@ function isMinecraftProfileAuthError (error) {
 function isMicrosoftAuthRateLimitError (error) {
   const message = String(error?.message || error || '')
   const status = Number(error?.status || error?.statusCode || error?.response?.status || 0)
-  return status === 429 || (/\b429\b|Too Many Requests/i.test(message) && /login_with_xbox|authentication|minecraftservices/i.test(message))
+  // Yggdrasil's session join error can carry the HTTP status only in its message.
+  return status === 429 || /^Response is not JSON\. Status code: 429$/i.test(message) ||
+    (/\b429\b|Too Many Requests/i.test(message) && /login_with_xbox|authentication|minecraftservices/i.test(message))
 }
 
 function microsoftAuthRetryDelayMs (attempt, reconnectDelayMs, random = Math.random) {
