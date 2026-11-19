@@ -625,7 +625,16 @@ class ItemCatalog {
         // custom_effects 条目两路形状不同，必须逐条归一（unifyCustomEffectEntryForFingerprint），
         // 不能原样透传——透传则 Servux 字符串名形状与开窗数字形状各算各的 key
         //（2026-11-20 漂浮药水案：a1da56 隔空形状 vs 9669a5f 开窗形状分裂）。
-        out.customEffects = customEffects.map(effect => this.unifyCustomEffectEntryForFingerprint(effect))
+        // 多效果列表还要排序：sortNestedItemComponentsForFingerprint 只排 components/
+        // removeComponents，customEffects 保原序，两路顺序不一致会分裂（对抗审查实证），
+        // 按稳定字符串排序让指纹与列表顺序无关（单效果排序不变，key 不会漂）。
+        const unifiedEffects = customEffects.map(effect => this.unifyCustomEffectEntryForFingerprint(effect))
+        unifiedEffects.sort((a, b) => {
+          const sa = stableStringify(a)
+          const sb = stableStringify(b)
+          return sa < sb ? -1 : sa > sb ? 1 : 0
+        })
+        out.customEffects = unifiedEffects
       }
       // 无相关字段（如别的 mod 组件）时保原引用；有相关字段一律输出统一形状
       //（幂等：统一形状再跑一遍键值不变）。注：键名对齐后必须输出 out，
