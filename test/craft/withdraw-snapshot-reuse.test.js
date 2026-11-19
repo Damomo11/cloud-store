@@ -5,12 +5,13 @@ const assert = require('node:assert/strict')
 const { EventEmitter } = require('node:events')
 const windows = require('prismarine-windows')('1.21.11')
 const injectInventory = require('mineflayer/lib/plugins/inventory')
+const { CraftController } = require('../../src/craft/controller')
 const Warehouse = require('../../src/warehouse')
 const StoreDb = require('../../src/db')
 const ItemCatalog = require('../../src/itemCatalog')
 const { DEFAULT_CONFIG } = require('../../src/config')
 
-function fixture ({ mutateRevision = false, sendContent = true, rejectTransfer = false, dirtyCraftSlot = false } = {}) {
+function fixture ({ mutateRevision = false, sendContent = true, rejectTransfer = false, dirtyCraftSlot = false, afterOpen } = {}) {
   const config = structuredClone(DEFAULT_CONFIG)
   config.server.version = '1.21.11'
   config.timing.containerSettleMs = 0
@@ -57,6 +58,7 @@ function fixture ({ mutateRevision = false, sendContent = true, rejectTransfer =
     openCalls++
     bot._client.emit('open_window', { windowId: server.id, inventoryType: server.type, windowTitle: 'Barrel' })
     emitContent()
+    afterOpen?.(bot)
     return bot.currentWindow
   }
   return {
@@ -85,6 +87,36 @@ async function runBatch (options, verify) {
 
 test('craft batch reuses confirmed content with real clicks and inventory mirrored only on close', async () => {
   await runBatch({}, f => assert.equal(f.openCalls, 1))
+})
+
+test('failed craft withdrawal logs window and invalidating packet metadata', async () => {
+  const f = fixture({ afterOpen: bot => bot._client.emit('set_cursor_item', {
+    contents: { itemCount: 1, itemId: f.catalog.mcData.itemsByName.stone.id }
+  }) })
+  const events = []
+  try {
+    await assert.rejects(CraftController.prototype.measurePhase.call({
+      debug: (event, details) => events.push({ event, ...details })
+    }, 'withdraw', { operationId: 'craft:test', stepId: '0:0+4' }, () => f.warehouse.withdrawCraftBatchAllocationsLocked([
+      { itemKey: f.stoneKey, amount: 4 }
+    ], { requireServerEvidence: true })), /没有收到当前容器完整的服务端快照/)
+    const failure = events.find(event => event.event === 'controller.phase_failure')
+    const snapshot = failure.containerSnapshot
+    assert.equal(snapshot.reason, 'no_current_content')
+    assert.equal(snapshot.protocolVersion, 774)
+    assert.equal(snapshot.windowId, 5)
+    assert.equal(snapshot.currentWindowId, 5)
+    assert.equal(snapshot.expectedSlotCount, 63)
+    assert.equal(snapshot.chestId, 'source')
+    assert.deepEqual(snapshot.lastInvalidation.previousContent, { windowId: 5, stateId: 1, slotCount: 63 })
+    assert.deepEqual(JSON.parse(JSON.stringify(snapshot.packets)), [
+      { event: 'open_window', windowId: 5 },
+      { event: 'window_items', windowId: 5, stateId: 1, slotCount: 63 },
+      { event: 'set_cursor_item', invalidated: true }
+    ])
+    assert.equal(f.db.listChestSlots().find(row => row.slot === 0).amount, 12)
+    assert.deepEqual(f.listenerCounts(), f.initialListeners)
+  } finally { f.db.close() }
 })
 test('craft batch reopens a barrel when its revision changes during transfer', async () => {
   await runBatch({ mutateRevision: true }, f => assert.equal(f.openCalls, 2))
