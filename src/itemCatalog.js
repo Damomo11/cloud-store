@@ -859,7 +859,14 @@ class ItemCatalog {
   shouldKeepComponentForFingerprint (component) {
     if (!component || typeof component !== 'object') return false
     const type = component.type
-    return !['custom_data'].includes(type)
+    // 盒内条目指纹剥两类波动组件：
+    // - custom_data：craftengine network_data 等插件附加数据，附加时机不定，
+    //   同一批物品隔天读就从无到有（2026-11 音符盒案：09:14 存入读 null 组件，
+    //   次日实物全带 network_data）。
+    // - block_state：放置状态（音符盒乐器/音高、雕纹书的纹样等），调音/放置
+    //   即变；且 Servux 直形状 {instrument…} 与协议开窗 {name, properties} 包装
+    //   形状两路字面不同（同盒 9230058e vs 1dd06b 分裂 → 取货 21 次回退全败）。
+    return !['custom_data', 'block_state'].includes(type)
   }
 
   normalizeComponentForFingerprint (component) {
