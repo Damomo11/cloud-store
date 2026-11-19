@@ -1464,6 +1464,26 @@ test('a non-Error rejection after craft starts still carries recovery evidence',
   await assert.rejects(f.executor.execute({ step: stickStep }), error => error.recoveryRequired === true && /network failure/.test(error.message) && Array.isArray(error.before))
 })
 
+test('identical final inventory and cursor updates do not prevent confirmation', async () => {
+  const f = fixture([item('oak_planks', 2)], [item('stick', 4)])
+  const craft = f.bot.craft
+  f.config.craft.confirmTimeoutMs = 300
+  f.config.craft.settleMs = 80
+  let updates
+  f.bot.craft = async (...args) => {
+    await craft(...args)
+    updates = setInterval(() => {
+      f.bot._client.emit('set_slot', { windowId: 0, slot: 9, item: Item.toNotch(item('stick', 4)) })
+      f.bot._client.emit('set_cursor_item', { contents: Item.toNotch(null) })
+    }, 5)
+  }
+  try {
+    const result = await f.executor.execute({ step: stickStep })
+    assert.deepEqual(result.after.map(({ itemId, amount }) => [itemId, amount]), [['minecraft:stick', 4]])
+    assert.equal(f.debugEvents.find(({ event }) => event === 'executor.inventory_confirmed')?.details.source, 'window_updates')
+  } finally { clearInterval(updates) }
+})
+
 test('server evidence must remain stable instead of accepting a transient predicted match', async () => {
   const f = fixture([item('oak_planks', 2)], [item('stick', 4)])
   const craft = f.bot.craft
