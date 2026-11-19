@@ -60,6 +60,26 @@ function containerSnapshot (container, catalog, bot) {
   }
 }
 
+function repeatsOpeningPlayerState (packet, full, container) {
+  const start = container?.inventoryStart
+  const end = container?.inventoryEnd
+  const items = packet?.items ?? packet?.slots
+  if (!full || full.windowId !== container?.id || !Number.isInteger(start) || start <= 0 || end - start !== 36 ||
+      full.items.length !== end || !Array.isArray(items) || items.length !== 46 ||
+      !isEmptySlot(full.carriedItem) || !isEmptySlot(packet.carriedItem)) return false
+  // Window 0 also contains the crafting grid, equipment and offhand. The
+  // barrel does not describe those slots, so accept only an empty extra area.
+  for (let slot = 0; slot < items.length; slot++) {
+    const item = items[slot]
+    if (slot < 9 || slot === 45) {
+      if (!isEmptySlot(item)) return false
+    } else if (!Number.isSafeInteger(item?.itemCount) || item.itemCount < 0 ||
+      (item.itemCount === 0 && !isEmptySlot(item)) ||
+      !isDeepStrictEqual(item, full.items[start + slot - 9])) return false
+  }
+  return true
+}
+
 async function openServerContainer (warehouse, chest, catalog, bot, options = {}) {
   const client = bot._client
   if (typeof client?.on !== 'function' || typeof client?.removeListener !== 'function') {
@@ -106,7 +126,11 @@ async function openServerContainer (warehouse, chest, catalog, bot, options = {}
     packets.length = 0
   }
   const onItems = packet => {
-    if (keepEvidence && windowId(packet) === 0) invalidate()
+    if (keepEvidence && windowId(packet) === 0) {
+      if (inventoryEnd === null && registry.supportFeature('itemsWithComponents') &&
+          repeatsOpeningPlayerState(packet, packets.at(-1), bot.currentWindow)) return
+      invalidate()
+    }
     if (!opened.has(windowId(packet))) return
     invalidate()
     const items = packet?.items ?? packet?.slots
