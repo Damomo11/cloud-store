@@ -11,9 +11,9 @@ const Item = require('prismarine-item')(registry)
 const windows = require('prismarine-windows')('1.21.11')
 const notch = value => value ? Item.toNotch(value) : { itemCount: 0 }
 
-function fixture (container = false) {
+function fixture (container = false, { table = false, allowPacking = false } = {}) {
   const inventory = windows.createWindow(0, 'minecraft:inventory', 'Inventory')
-  const window = container ? windows.createWindow(5, 'minecraft:generic_9x3', 'Barrel') : inventory
+  const window = container ? windows.createWindow(5, table ? 'minecraft:crafting' : 'minecraft:generic_9x3', 'Container') : inventory
   const source = container ? window.inventoryStart : 9
   const stone = new Item(registry.itemsByName.stone.id, 1)
   window.updateSlot(source, stone)
@@ -27,7 +27,7 @@ function fixture (container = false) {
     }
   })
   const click = createConfirmedWindowClicker(bot, catalog, { craft: { confirmTimeoutMs: 20 } }, undefined,
-    { allowContainer: container })
+    { allowContainer: container && !table, allowPacking })
   const slots = window.slots.map(notch)
   const accepted = { windowId: window.id, stateId: 2, items: structuredClone(slots), carriedItem: notch(container ? null : stone) }
   accepted.items[source] = notch(null)
@@ -139,6 +139,53 @@ test('an identical delta cannot restore a confirmation invalidated by a changed 
     f.bot._client.emit('set_player_inventory', { slotId: 9, contents: Item.toNotch(new Item(registry.itemsByName.diamond.id, 1)) })
     f.bot._client.emit('set_player_inventory', { slotId: 9, contents: notch(null) })
   }
+  await assert.rejects(f.click(f.window, f.source, 0, 1, () => {}, slots => !slots[f.source]), { recoveryRequired: true })
+})
+
+function playerRefresh (f) {
+  return { windowId: 0, stateId: 3, carriedItem: structuredClone(f.accepted.carriedItem),
+    items: [...Array.from({ length: 9 }, () => notch(null)), ...structuredClone(f.accepted.items.slice(-36)), notch(null)] }
+}
+
+for (const table of [false, true]) {
+  test(`${table ? 'workbench' : 'craft return'} keeps a full click confirmation across an identical player refresh`, async () => {
+    const f = fixture(true, { table })
+    f.bot._client.write = () => setImmediate(() => { f.emit(f.accepted); f.emit(playerRefresh(f)) })
+    await f.click(f.window, f.source, 0, 1, () => {}, (slots, cursor) => !cursor && !slots[f.source] && slots[0]?.name === 'stone')
+    assert.equal(f.window.slots[0].name, 'stone')
+    assert.equal(f.bot.inventory.slots[9], null)
+  })
+}
+
+for (const [label, supersede] of [
+  ['changed item, even if followed by a duplicate', f => {
+    const update = playerRefresh(f)
+    update.items[9] = Item.toNotch(new Item(registry.itemsByName.stone.id, 1))
+    f.emit(update)
+    f.emit(playerRefresh(f))
+  }],
+  ['missing cursor', f => {
+    const update = playerRefresh(f)
+    delete update.carriedItem
+    f.emit(update)
+  }],
+  ['occupied offhand', f => {
+    const update = playerRefresh(f)
+    update.items[45] = Item.toNotch(new Item(registry.itemsByName.stone.id, 1))
+    f.emit(update)
+  }],
+  ['changed cursor', f => f.emit({ ...playerRefresh(f), carriedItem: Item.toNotch(new Item(registry.itemsByName.stone.id, 1)) })]
+]) {
+  test(`a full player refresh cannot preserve click confirmation with ${label}`, async () => {
+    const f = fixture(true)
+    f.bot._client.write = () => { f.emit(f.accepted); supersede(f) }
+    await assert.rejects(f.click(f.window, f.source, 0, 1, () => {}, slots => !slots[f.source]), { recoveryRequired: true })
+  })
+}
+
+test('packing container clicks still invalidate confirmation on a player refresh', async () => {
+  const f = fixture(true, { allowPacking: true })
+  f.bot._client.write = () => { f.emit(f.accepted); f.emit(playerRefresh(f)) }
   await assert.rejects(f.click(f.window, f.source, 0, 1, () => {}, slots => !slots[f.source]), { recoveryRequired: true })
 })
 
