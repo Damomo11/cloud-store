@@ -58,8 +58,9 @@ function fixture ({ mutateRevision = false, sendContent = true, rejectTransfer =
     openCalls++
     bot._client.emit('open_window', { windowId: server.id, inventoryType: server.type, windowTitle: 'Barrel' })
     emitContent()
+    const opened = bot.currentWindow
     afterOpen?.(bot)
-    return bot.currentWindow
+    return opened
   }
   return {
     warehouse, bot, db, server, catalog, stoneKey: stoneRow.itemKey,
@@ -114,6 +115,27 @@ test('failed craft withdrawal logs window and invalidating packet metadata', asy
       { event: 'window_items', windowId: 5, stateId: 1, slotCount: 63 },
       { event: 'set_cursor_item', invalidated: true }
     ])
+    assert.equal(f.db.listChestSlots().find(row => row.slot === 0).amount, 12)
+    assert.deepEqual(f.listenerCounts(), f.initialListeners)
+  } finally { f.db.close() }
+})
+
+test('failed craft opening does not overwrite the inventory refreshed after a server close', async () => {
+  const f = fixture({ afterOpen: bot => {
+    const Item = require('prismarine-item')(bot.registry)
+    bot._client.emit('close_window', { windowId: bot.currentWindow.id })
+    const items = Array.from({ length: 46 }, () => ({ itemCount: 0 }))
+    items[36] = Item.toNotch(new Item(bot.registry.itemsByName.iron_ingot.id, 1))
+    bot._client.emit('window_items', { windowId: 0, stateId: 2, items, carriedItem: { itemCount: 0 } })
+  } })
+  const writes = []
+  f.bot._client.write = (name, packet) => writes.push([name, packet.windowId])
+  try {
+    await assert.rejects(f.warehouse.withdrawCraftBatchAllocationsLocked([
+      { itemKey: f.stoneKey, amount: 4 }
+    ], { requireServerEvidence: true }), error => error.uncertainTransfer === true)
+    assert.equal(f.bot.inventory.slots[36]?.name, 'iron_ingot')
+    assert.deepEqual(writes, [])
     assert.equal(f.db.listChestSlots().find(row => row.slot === 0).amount, 12)
     assert.deepEqual(f.listenerCounts(), f.initialListeners)
   } finally { f.db.close() }
