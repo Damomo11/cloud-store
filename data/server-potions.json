@@ -1,8 +1,9 @@
 {
   "source": "manual-anchors",
-  "note": "26.x 登录 registry_data 不同步 potion（静态注册表），数字<->名字映射手工锚定；与 registry_data 自动导出格式一致，若服务器某天同步了 minecraft:potion，applyPotionRegistry 会整体覆盖本文件。锚点依据：槽位重合实证 1a7d(potionId:12,x13槽) 与 c1ce82(potion:long_fire_resistance,x13槽) 为同批实物。",
+  "note": "26.x 登录 registry_data 不同步 potion（静态注册表），数字<->名字映射手工锚定；与 registry_data 自动导出格式一致，若服务器某天同步了 minecraft:potion，applyPotionRegistry 会整体覆盖本文件。锚点依据：槽位重合实证——12=long_fire_resistance（1a7d x13槽 ≡ c1ce82 x13槽）、37=long_invisibility（56a75c x38槽4桶 ≡ 02:03 开窗实测 potionId:37 x384桶）。",
   "registryId": "minecraft:potion",
   "potions": [
-    { "id": 12, "key": "minecraft:long_fire_resistance", "name": "long_fire_resistance" }
+    { "id": 12, "key": "minecraft:long_fire_resistance", "name": "long_fire_resistance" },
+    { "id": 37, "key": "minecraft:long_invisibility", "name": "long_invisibility" }
   ]
 }
