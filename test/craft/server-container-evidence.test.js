@@ -159,6 +159,41 @@ test('default opening ignores unrelated player-menu full content', async () => {
   assert.equal(f.bot._client.eventNames().length, 0)
 })
 
+function playerMenuContent (content) {
+  const empty = { itemCount: 0 }
+  return {
+    windowId: 0, stateId: 2, carriedItem: empty,
+    items: [...Array(9).fill(empty), ...content.items.slice(-36), empty]
+  }
+}
+
+test('craft opening keeps its barrel snapshot when a complete player refresh repeats the same state', async () => {
+  const f = await retainedFixture((client, content) => client.emit('window_items', playerMenuContent(content)), { keepEvidence: true }, true)
+  try {
+    assert.equal(f.evidence.current().stateId, 1)
+    assert.equal(f.evidence.isReusable(), true)
+    f.bot._client.emit('window_items', playerMenuContent(f.content))
+    assert.equal(f.evidence.isReusable(), false)
+  } finally { f.evidence.dispose() }
+})
+
+for (const [label, change] of [
+  ['changed backpack', (packet, item) => { packet.items[9] = item }],
+  ['occupied crafting grid', (packet, item) => { packet.items[1] = item }],
+  ['occupied offhand', (packet, item) => { packet.items[45] = item }],
+  ['held cursor', (packet, item) => { packet.carriedItem = item }],
+  ['missing cursor', packet => { delete packet.carriedItem }],
+  ['short player window', packet => { packet.items.pop() }]
+]) {
+  test(`craft opening still rejects a player refresh with ${label}`, async () => {
+    await assert.rejects(retainedFixture((client, content, item) => {
+      const packet = playerMenuContent(content)
+      change(packet, item)
+      client.emit('window_items', packet)
+    }), /没有收到当前容器完整的服务端快照/)
+  })
+}
+
 for (const [label, name, packet] of [
   ['legacy cursor update', 'set_slot', f => ({ windowId: -1, slot: -1, item: f.held })],
   ['unsigned cursor update', 'set_slot', f => ({ windowId: 255, slot: -1, item: f.held })],
