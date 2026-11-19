@@ -157,7 +157,10 @@ class CraftController {
       this.debug('controller.phase_complete', { ...details, phase, elapsedMs: performance.now() - startedAt })
       return result
     } catch (cause) {
-      this.debug('controller.phase_failure', { ...details, phase, elapsedMs: performance.now() - startedAt, message: cause?.message || String(cause) })
+      this.debug('controller.phase_failure', {
+        ...details, phase, elapsedMs: performance.now() - startedAt, message: cause?.message || String(cause),
+        ...(cause?.containerSnapshot ? { containerSnapshot: cause.containerSnapshot } : {})
+      })
       throw cause
     }
   }

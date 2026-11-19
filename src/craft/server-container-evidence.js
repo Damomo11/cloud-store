@@ -71,6 +71,9 @@ async function openServerContainer (warehouse, chest, catalog, bot, options = {}
   const packets = []
   const revision = currentRevision(warehouse, chest.chestId)
   const keepEvidence = options.keepEvidence === true
+  let openingPackets = keepEvidence ? [] : null
+  let lastInvalidation
+  let failureReason = 'open_failed'
   let latest = null
   let decodeError = null
   let disposed = false
@@ -155,7 +158,28 @@ async function openServerContainer (warehouse, chest, catalog, bot, options = {}
     ['set_slot', onSlot], ['container_set_slot', onSlot],
     ['set_cursor_item', onCursor], ['container_set_cursor_item', onCursor],
     ['set_player_inventory', packet => compare(packet.contents, full => playerSlotValue(full, inventorySlot(packet.slotId)))]
-  ]
+  ].map(([event, handler]) => [event, packet => {
+    if (!openingPackets) return handler(packet)
+    const previous = packets.at(-1)
+    handler(packet)
+    const items = packet?.items ?? packet?.slots
+    const metadata = {
+      event,
+      windowId: windowId(packet),
+      stateId: packet?.stateId,
+      slot: packet?.slot ?? packet?.slotId,
+      slotCount: Array.isArray(items) ? items.length : undefined
+    }
+    if (previous && !packets.length) {
+      metadata.invalidated = true
+      lastInvalidation = {
+        ...metadata,
+        previousContent: { windowId: previous.windowId, stateId: previous.stateId, slotCount: previous.items.length }
+      }
+    }
+    openingPackets.push(metadata)
+    if (openingPackets.length > 12) openingPackets.shift()
+  }])
   for (const [event, listener] of listeners) client.on(event, listener)
   let container
   let handedOff = false
@@ -166,10 +190,14 @@ async function openServerContainer (warehouse, chest, catalog, bot, options = {}
     inventoryStart = start
     inventoryEnd = end
     const packet = packets.findLast(value => value.windowId === container?.id)
-    if (!Number.isInteger(start) || !Number.isInteger(end) || end - start !== 36 || !packet || packet.items.length !== end || bot.currentWindow !== container) {
-      throw new Error('没有收到当前容器完整的服务端快照。')
-    }
+    failureReason = !Number.isInteger(start) || !Number.isInteger(end) || end - start !== 36 ? 'invalid_inventory_bounds'
+      : !packet ? 'no_current_content'
+        : packet.items.length !== end ? 'slot_count_mismatch'
+          : bot.currentWindow !== container ? 'window_changed' : null
+    if (failureReason) throw new Error('没有收到当前容器完整的服务端快照。')
+    failureReason = 'missing_cursor'
     if (!Object.hasOwn(packet, 'carriedItem')) throw new Error('服务端容器快照缺少光标状态。')
+    failureReason = 'invalid_snapshot'
     let chestSlots
     let playerItems
     try {
@@ -183,6 +211,7 @@ async function openServerContainer (warehouse, chest, catalog, bot, options = {}
       throw new Error(`无法解码服务端容器快照：${error.message}`)
     }
     if (decodeError) throw new Error(`无法持续解码服务端容器快照：${decodeError.message}`)
+    failureReason = 'local_snapshot_failed'
     const initialBotPlayerItems = keepEvidence ? containerSnapshot(container, catalog, bot)?.botPlayerItems : null
     const evidence = {
       revision,
@@ -208,8 +237,27 @@ async function openServerContainer (warehouse, chest, catalog, bot, options = {}
       return { container, chestSlots, playerItems, evidence: null }
     }
     handedOff = true
+    openingPackets = null
+    lastInvalidation = null
     return { container, chestSlots, playerItems, evidence }
   } catch (error) {
+    if (openingPackets && Object.isExtensible(error)) {
+      const diagnostics = {
+        reason: failureReason,
+        chestId: chest.chestId,
+        version: client.version ?? bot.version,
+        protocolVersion: client.protocolVersion ?? registry.version?.version,
+        windowId: container?.id,
+        currentWindowId: bot.currentWindow?.id ?? null,
+        isCurrentWindow: !!container && bot.currentWindow === container,
+        inventoryStart,
+        expectedSlotCount: inventoryEnd,
+        receivedSlotCount: packets.findLast(value => value.windowId === container?.id)?.items.length,
+        lastInvalidation,
+        packets: openingPackets
+      }
+      try { error.containerSnapshot = diagnostics } catch { /* Keep the original failure and cleanup. */ }
+    }
     if (container) warehouse.closeContainerQuietly(container)
     throw error
   } finally {
