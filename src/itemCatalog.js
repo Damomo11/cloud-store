@@ -164,7 +164,18 @@ class ItemCatalog {
   alignServuxComponentShape (type, value) {
     if (type === 'enchantments' || type === 'stored_enchantments') return this.enchantmentsDataToProtocol(value)
     if (type === 'block_state') return this.blockStateDataToProtocol(this.decodeNbtValue(value))
+    // tooltip_display 的 hidden_components 在服务器侧是无序集合：同一件物品
+    // 两次读的顺序都不同（2026-11 绿牛药水案：同款药水每次 sync 算出新 key，
+    // 一天建出 10+ 个档），双路（协议/Servux）与每次重读的字面都对不上。
+    // 收口统一排序，形状稳定、幂等。
+    if (type === 'tooltip_display') return this.tooltipDisplayDataToProtocol(value)
     return this.decodeNbtValue(value)
+  }
+
+  tooltipDisplayDataToProtocol (value) {
+    const decoded = this.decodeNbtValue(value)
+    if (!Array.isArray(decoded?.hidden_components)) return decoded
+    return { ...decoded, hidden_components: [...decoded.hidden_components].sort() }
   }
 
   // 附魔组件双路形状对齐（2026-11-18 shell_breaker 附魔书 924806/34e301e7
@@ -203,7 +214,13 @@ class ItemCatalog {
   decodeNbtValue (node) {
     const NBT_TYPES = new Set(['compound', 'list', 'byteArray', 'intArray', 'longArray',
       'string', 'byte', 'short', 'int', 'long', 'float', 'double'])
-    if (!node || typeof node !== 'object' || Array.isArray(node)) return node
+    if (!node || typeof node !== 'object') return node
+    // 数组元素也要递归剥壳：协议路（1.21.5+ item components 部分字段走 NBT，
+    // 如 lore）给的 data 可能直接是 typed 元素数组，此前数组原样返回导致
+    // typed 形状进了存档、与 Servux 路（剥平）分裂——2026-11 指南针
+    // 1d0a96(协议 typed lore)/5a12a7(Servux 平 lore) 同一只物品两个 key。
+    // 平形状元素递归是无损 no-op，幂等。
+    if (Array.isArray(node)) return node.map(item => this.decodeNbtValue(item))
     if (typeof node.type === 'string' && NBT_TYPES.has(node.type)) {
       switch (node.type) {
         case 'compound': {
