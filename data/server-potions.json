@@ -1,9 +1,26 @@
 {
-  "source": "manual-anchors",
-  "note": "26.x 登录 registry_data 不同步 potion（静态注册表），数字<->名字映射手工锚定；与 registry_data 自动导出格式一致，若服务器某天同步了 minecraft:potion，applyPotionRegistry 会整体覆盖本文件。锚点依据：槽位重合实证——12=long_fire_resistance（1a7d x13槽 ≡ c1ce82 x13槽）、37=long_invisibility（56a75c x38槽4桶 ≡ 02:03 开窗实测 potionId:37 x384桶）。",
+  "source": "slot-overlap-proof",
+  "note": "26.x 登录 registry_data 不同步 potion（静态注册表），数字<->名字映射靠槽位实证锚定。2026-11-20 修正：整表由同桶同槽配对生成（备份库 bak-20260922 数字档 229 槽 vs 快照 prerollback-1118-0528 字符串档 240 槽，177 槽 0 冲突），并经开窗 trace 交叉验证（长隐身 38 瓶开窗实读 potionId:7，指纹 4021a6 三码合一）。重要修正：37=weakness（旧表 37=long_invisibility 为误读，开窗实读 7）；12 与旧表一致。未配上数字（6/19/27/29）库里无存量，遇到再补。若服务器某天同步了 minecraft:potion，applyPotionRegistry 会整体覆盖本文件。",
   "registryId": "minecraft:potion",
   "potions": [
+    { "id": 0, "key": "minecraft:water", "name": "water" },
+    { "id": 3, "key": "minecraft:awkward", "name": "awkward" },
+    { "id": 7, "key": "minecraft:long_invisibility", "name": "long_invisibility" },
+    { "id": 11, "key": "minecraft:fire_resistance", "name": "fire_resistance" },
     { "id": 12, "key": "minecraft:long_fire_resistance", "name": "long_fire_resistance" },
-    { "id": 37, "key": "minecraft:long_invisibility", "name": "long_invisibility" }
+    { "id": 13, "key": "minecraft:swiftness", "name": "swiftness" },
+    { "id": 15, "key": "minecraft:strong_swiftness", "name": "strong_swiftness" },
+    { "id": 20, "key": "minecraft:long_turtle_master", "name": "long_turtle_master" },
+    { "id": 22, "key": "minecraft:water_breathing", "name": "water_breathing" },
+    { "id": 24, "key": "minecraft:healing", "name": "healing" },
+    { "id": 25, "key": "minecraft:strong_healing", "name": "strong_healing" },
+    { "id": 28, "key": "minecraft:poison", "name": "poison" },
+    { "id": 31, "key": "minecraft:regeneration", "name": "regeneration" },
+    { "id": 33, "key": "minecraft:strong_regeneration", "name": "strong_regeneration" },
+    { "id": 34, "key": "minecraft:strength", "name": "strength" },
+    { "id": 36, "key": "minecraft:strong_strength", "name": "strong_strength" },
+    { "id": 37, "key": "minecraft:weakness", "name": "weakness" },
+    { "id": 40, "key": "minecraft:slow_falling", "name": "slow_falling" },
+    { "id": 45, "key": "minecraft:infested", "name": "infested" }
   ]
 }
