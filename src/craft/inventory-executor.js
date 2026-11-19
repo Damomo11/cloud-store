@@ -1,5 +1,7 @@
 'use strict'
 
+const { isDeepStrictEqual } = require('node:util')
+const { serialize, deserialize } = require('node:v8')
 const Vec3 = require('vec3')
 const { standardRecipeOutputs, withStandardRecipeOutputs } = require('./recipe-outputs')
 const { readServerContainer } = require('./server-container-evidence')
@@ -1076,6 +1078,7 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
     if (typeof bot._client?.on !== 'function') throw error('authoritative craft server updates are unavailable')
     const ranges = new Map([[0, { start: 9, end: 45 }]])
     const shadow = new Map()
+    const rawPlayerSlots = new Map()
     for (let slot = 9; slot < 45; slot++) {
       const value = bot.inventory.slots[slot]
       if (value) shadow.set(slot - 9, catalog.fromPrismarineItem(value))
@@ -1087,6 +1090,7 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
     let invalid = false
     let cursorKnown = false
     let cursor = null
+    let rawCursor
     let cursorEpoch = -1
     const slotVersions = new Map()
     const windowSlots = new Map()
@@ -1136,10 +1140,16 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
       }
       const inventorySlot = index >= range.start && index < range.end
       if (inventorySlot) {
-        if (normalized) shadow.set(index - range.start, normalized)
-        else shadow.delete(index - range.start)
+        const playerSlot = index - range.start
+        if (normalized) shadow.set(playerSlot, normalized)
+        else shadow.delete(playerSlot)
+        // A duplicate still supplies fresh evidence for this click, but only
+        // a wire value change should restart the final stability timer.
+        if (!rawPlayerSlots.has(playerSlot) || !isDeepStrictEqual(raw, rawPlayerSlots.get(playerSlot))) {
+          try { rawPlayerSlots.set(playerSlot, deserialize(serialize(raw))) } catch { invalid = true; return }
+          version++
+        }
         updateEpoch = operation.clickEpoch
-        version++
       }
       if (changed && (craftSlot || inventorySlot)) {
         emitDebug('executor.server_slot_update', {
@@ -1169,9 +1179,12 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
       if (raw === undefined) { invalid = true; return }
       try {
         cursor = Item.fromNotch(raw)
+        if (!cursorKnown || !isDeepStrictEqual(raw, rawCursor)) {
+          rawCursor = deserialize(serialize(raw))
+          version++
+        }
         cursorKnown = true
         cursorEpoch = operation.clickEpoch
-        version++
         emitDebug('executor.server_cursor_update', { item: itemSummary(cursor && catalog.fromPrismarineItem(cursor)) })
       } catch { invalid = true }
     }
@@ -1225,6 +1238,7 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
       acceptSnapshot: serverSnapshot => {
         const window = serverSnapshot.container
         shadow.clear()
+        rawPlayerSlots.clear()
         for (let index = window.inventoryStart; index < window.inventoryEnd; index++) {
           const value = window.slots[index]
           if (value) shadow.set(index - window.inventoryStart, catalog.fromPrismarineItem(value))
