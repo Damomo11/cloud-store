@@ -60,24 +60,27 @@ function containerSnapshot (container, catalog, bot) {
   }
 }
 
-function repeatsOpeningPlayerState (packet, full, container) {
+function repeatsPlayerState (packet, rawSlots, rawCarried, container) {
   const start = container?.inventoryStart
   const end = container?.inventoryEnd
   const items = packet?.items ?? packet?.slots
-  if (!full || full.windowId !== container?.id || !Number.isInteger(start) || start <= 0 || end - start !== 36 ||
-      full.items.length !== end || !Array.isArray(items) || items.length !== 46 ||
-      !isEmptySlot(full.carriedItem) || !isEmptySlot(packet.carriedItem)) return false
+  if (!Number.isInteger(start) || start <= 0 || end - start !== 36 || rawSlots?.length !== end ||
+      !Array.isArray(items) || items.length !== 46 || !sameModernSlot(packet.carriedItem, rawCarried)) return false
   // Window 0 also contains the crafting grid, equipment and offhand. The
   // barrel does not describe those slots, so accept only an empty extra area.
   for (let slot = 0; slot < items.length; slot++) {
     const item = items[slot]
     if (slot < 9 || slot === 45) {
       if (!isEmptySlot(item)) return false
-    } else if (!Number.isSafeInteger(item?.itemCount) || item.itemCount < 0 ||
-      (item.itemCount === 0 && !isEmptySlot(item)) ||
-      !isDeepStrictEqual(item, full.items[start + slot - 9])) return false
+    } else if (!sameModernSlot(item, rawSlots[start + slot - 9])) return false
   }
   return true
+}
+
+function sameModernSlot (item, expected) {
+  return !!item && typeof item === 'object' && !Array.isArray(item) &&
+    Number.isSafeInteger(item.itemCount) && item.itemCount >= 0 &&
+    (item.itemCount !== 0 || isEmptySlot(item)) && isDeepStrictEqual(item, expected)
 }
 
 async function openServerContainer (warehouse, chest, catalog, bot, options = {}) {
@@ -130,8 +133,10 @@ async function openServerContainer (warehouse, chest, catalog, bot, options = {}
   }
   const onItems = packet => {
     if (keepEvidence && windowId(packet) === 0) {
-      if (inventoryEnd === null && registry.supportFeature('itemsWithComponents') &&
-          repeatsOpeningPlayerState(packet, packets.at(-1), bot.currentWindow)) return
+      const full = packets.at(-1)
+      if (inventoryEnd === null && registry.supportFeature('itemsWithComponents') && full &&
+          full.windowId === bot.currentWindow?.id && isEmptySlot(full.carriedItem) &&
+          repeatsPlayerState(packet, full.items, full.carriedItem, bot.currentWindow)) return
       invalidate()
     }
     if (!opened.has(windowId(packet))) return
@@ -303,6 +308,7 @@ async function readServerContainer (warehouse, chest, catalog, bot) {
 
 module.exports = {
   canReuseCraftWindow,
+  repeatsPlayerState,
   snapshotCraftWindow: containerSnapshot,
   openServerContainer,
   readServerContainer

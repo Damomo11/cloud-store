@@ -4,6 +4,7 @@ const { isDeepStrictEqual } = require('node:util')
 const { serialize, deserialize } = require('node:v8')
 const { shortKey } = require('../traceLog')
 const { isEmptySlot } = require('../packing/protocol')
+const { repeatsPlayerState } = require('./server-container-evidence')
 
 // Scoped to crafting. Modern menu clicks do not acknowledge correctly predicted
 // input/cursor changes. A mismatched stateId still applies the click, then makes
@@ -160,7 +161,9 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
     const invalidate = () => { confirmed = null }
     const onContent = packet => {
       if (windowId(packet) !== window.id) {
-        if (windowId(packet) === 0) invalidate()
+        if (windowId(packet) === 0 && confirmed && (options.allowPacking || bot.currentWindow !== window ||
+            !registry.supportFeature('itemsWithComponents') ||
+            !repeatsPlayerState(packet, confirmed.rawSlots, confirmed.rawCarried, window))) invalidate()
         return
       }
       // Only the latest relevant response may authorize mirroring state. A
