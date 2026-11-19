@@ -355,7 +355,11 @@ class ItemCatalog {
     const nbtJson = stableStringify(nbt)
     const metaJson = stableStringify(meta)
     const fingerprintMeta = this.normalizeMetaForFingerprint(itemId, meta)
-    const fingerprint = sha1(stableStringify({ itemId, nbtJson, metaJson: stableStringify(fingerprintMeta) }))
+    // 与 fromPrismarineItem 同公式：nbt 走 normalizeNbtForFingerprint 再进哈希。
+    // 此前盒内读直接用 sanitize 后的 nbtJson——耐久物品的合成 Damage NBT
+    // 进了字面，与散货路（走 normalize）恒分裂（2026-11 打火石 03:51 三档）。
+    const fingerprintNbt = this.normalizeNbtForFingerprint(itemId, nbt)
+    const fingerprint = sha1(stableStringify({ itemId, nbtJson: stableStringify(fingerprintNbt), metaJson: stableStringify(fingerprintMeta) }))
     const amount = Number.parseInt(entry.itemCount ?? entry.count ?? 0, 10)
     if (!Number.isFinite(amount) || amount <= 0) return null
 
@@ -542,13 +546,32 @@ class ItemCatalog {
       ? { ...meta, metadata: this.normalizeItemMetadata(meta.metadata) }
       : meta
     const base = this.isShulkerBox(itemId) ? this.normalizeShulkerMetaForFingerprint(canonicalMeta) : canonicalMeta
-    const stripped = this.stripVolatileMetaForFingerprint(itemId, base)
+    // 耐久物品先剥 damage：耐久随使用漂移，同种物品一堆耐久 key
+    //（2026-11 打火石案：24 个档，取货开窗与账对不上 → actual=0 → 修账扣账）。
+    const undamaged = this.isDurableItem(itemId) ? this.stripDamageComponentsForFingerprint(base) : base
+    const stripped = this.stripVolatileMetaForFingerprint(itemId, undamaged)
     // tobyscamera 相机物品指纹锚定稳定组件，文本组件剥离（见 stripTobysTextComponentsForFingerprint）。
     if (this.hasTobysCameraMediaId(stripped)) {
       return this.sortMetaComponentsForFingerprint(this.stripTobysTextComponentsForFingerprint(stripped))
     }
     if (this.isNoteBlock(itemId)) return this.canonicalNoteBlockMetaForFingerprint(stripped)
     return this.sortMetaComponentsForFingerprint(stripped)
+  }
+
+  // 耐久物品（maxDurability 的工具/武器/护甲/潜影盒壳等）。1.21.5+ 的
+  // 身份字段全在 components（custom_name/lore/附魔/custom_data），nbt 只剩
+  // 合成的 legacy Damage；damage 从指纹剥离后满耐久与磨损版并档。
+  isDurableItem (itemId) {
+    const simple = this.normalizeItemId(itemId).replace(/^minecraft:/, '')
+    return Boolean(this.mcData.itemsByName[simple]?.maxDurability)
+  }
+
+  // damage 组件从指纹剥离（存档 metaJson 原样保留，展示不受影响）。
+  stripDamageComponentsForFingerprint (meta) {
+    if (!meta || typeof meta !== 'object' || !Array.isArray(meta.components)) return meta
+    const kept = meta.components.filter(component => component?.type !== 'damage')
+    if (kept.length === meta.components.length) return meta
+    return { ...meta, components: kept.length ? kept : null }
   }
 
   // tobyscamera 相机物品（相片袋/照片）：custom_data 组件含 tobyscamera:media_id。
@@ -577,6 +600,10 @@ class ItemCatalog {
   }
 
   normalizeNbtForFingerprint (itemId, nbt) {
+    // 耐久物品的 nbt 只剩合成 legacy Damage（0 或磨损值）：damage 已从指纹
+    // 剥离，nbt 也不参与——否则同一件工具会因「有无 Damage NBT」再分裂
+    //（2026-11 打火石档：同 damage 值的行 NBT=null vs {"Damage":typed 0} 两个 key）。
+    if (this.isDurableItem(itemId)) return null
     return (this.isShulkerBox(itemId) || this.isBeeContainer(itemId)) ? null : nbt
   }
 
