@@ -282,7 +282,7 @@ async function openServerContainer (warehouse, chest, catalog, bot, options = {}
       }
       try { error.containerSnapshot = diagnostics } catch { /* Keep the original failure and cleanup. */ }
     }
-    if (container) warehouse.closeContainerQuietly(container)
+    if (container && bot.currentWindow === container) warehouse.closeContainerQuietly(container)
     throw error
   } finally {
     if (!handedOff) {
