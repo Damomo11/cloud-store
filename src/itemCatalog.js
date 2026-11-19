@@ -549,7 +549,12 @@ class ItemCatalog {
     // 耐久物品先剥 damage：耐久随使用漂移，同种物品一堆耐久 key
     //（2026-11 打火石案：24 个档，取货开窗与账对不上 → actual=0 → 修账扣账）。
     const undamaged = this.isDurableItem(itemId) ? this.stripDamageComponentsForFingerprint(base) : base
-    const stripped = this.stripVolatileMetaForFingerprint(itemId, undamaged)
+    // 散货级再剥 block_state（盒内条目 3541e23 已剥）：放置状态不进库存身份，
+    // 且 26.x 桶 NBT 快照丢物品组件（Servux 读桶）而协议开窗带组件——同一根
+    // 线 sync 写 3099d1fa、开窗实测 a6530f2f，取货按账本开 7 桶全扑空 5/5 卡死
+    //（2026-11 线案）。剥后两路都归一成无 block_state 形状，桶档重算即合并。
+    const noBlockState = this.stripBlockStateComponentsForFingerprint(itemId, undamaged)
+    const stripped = this.stripVolatileMetaForFingerprint(itemId, noBlockState)
     // tobyscamera 相机物品指纹锚定稳定组件，文本组件剥离（见 stripTobysTextComponentsForFingerprint）。
     if (this.hasTobysCameraMediaId(stripped)) {
       return this.sortMetaComponentsForFingerprint(this.stripTobysTextComponentsForFingerprint(stripped))
@@ -570,6 +575,17 @@ class ItemCatalog {
   stripDamageComponentsForFingerprint (meta) {
     if (!meta || typeof meta !== 'object' || !Array.isArray(meta.components)) return meta
     const kept = meta.components.filter(component => component?.type !== 'damage')
+    if (kept.length === meta.components.length) return meta
+    return { ...meta, components: kept.length ? kept : null }
+  }
+
+  // block_state 组件从指纹剥离（散货级；盒内条目在 shouldKeepComponentForFingerprint 剥）。
+  // 音符盒跳过：block_state 由 canonicalNoteBlockMetaForFingerprint 统一固定默认值，
+  // 提前剥掉会改变 canonical 分支的输入形状。
+  stripBlockStateComponentsForFingerprint (itemId, meta) {
+    if (this.isNoteBlock(itemId)) return meta
+    if (!meta || typeof meta !== 'object' || !Array.isArray(meta.components)) return meta
+    const kept = meta.components.filter(component => component?.type !== 'block_state')
     if (kept.length === meta.components.length) return meta
     return { ...meta, components: kept.length ? kept : null }
   }
@@ -887,7 +903,15 @@ class ItemCatalog {
 
   sortMetaComponentsForFingerprint (meta) {
     if (!meta || typeof meta !== 'object') return meta
-    return this.sortNestedItemComponentsForFingerprint(meta)
+    // 顶层空组件归一：波动组件剥完剩下的 [](如线案的 custom_data 空壳滤除后)
+    // 与无组件的 null 是同一物品，必须同指纹。sanitize 对空数组转 null，
+    // 但带组件再剥完的路径输出 [] —— 不归一的话同一根线 sync 记 3099d1fa
+    // (null 形)、开窗算 6c29925a([] 形)，两个 key 互相找不到。
+    let normalized = meta
+    if (Array.isArray(normalized.components) && normalized.components.length === 0) {
+      normalized = { ...normalized, components: null }
+    }
+    return this.sortNestedItemComponentsForFingerprint(normalized)
   }
 
   sortNestedItemComponentsForFingerprint (value) {
