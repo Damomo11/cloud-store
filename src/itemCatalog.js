@@ -17,6 +17,9 @@ class ItemCatalog {
     // 服务器 potion registry（登录 registry_data 导出）：药水 potion_contents 的
     // 协议数字 id ↔ 字符串名互转用。26.x 本地字典无 potion registry，只能靠导出。
     this.serverPotionIdByName = new Map()
+    // 服务器 mob_effect registry（登录 registry_data 导出）：potion_contents
+    // custom_effects 条目的效果协议数字 id ↔ 字符串名互转用（同 potion 一套）。
+    this.serverEffectIdByName = new Map()
 
     for (const item of Object.values(this.mcData.itemsByName)) {
       const itemId = `minecraft:${item.name}`
@@ -45,6 +48,10 @@ class ItemCatalog {
     const loadedServerPotions = this.loadServerPotions('data/server-potions.json')
     if (loadedServerPotions > 0) {
       console.log(`Loaded ${loadedServerPotions} server potion mappings`)
+    }
+    const loadedServerEffects = this.loadServerEffects('data/server-effects.json')
+    if (loadedServerEffects > 0) {
+      console.log(`Loaded ${loadedServerEffects} server effect mappings`)
     }
   }
 
@@ -614,7 +621,12 @@ class ItemCatalog {
       const customName = entry.custom_name ?? entry.customName
       if (customName != null && customName !== '') out.customName = customName
       const customEffects = entry.custom_effects ?? entry.customEffects
-      if (Array.isArray(customEffects) && customEffects.length) out.customEffects = customEffects
+      if (Array.isArray(customEffects) && customEffects.length) {
+        // custom_effects 条目两路形状不同，必须逐条归一（unifyCustomEffectEntryForFingerprint），
+        // 不能原样透传——透传则 Servux 字符串名形状与开窗数字形状各算各的 key
+        //（2026-11-20 漂浮药水案：a1da56 隔空形状 vs 9669a5f 开窗形状分裂）。
+        out.customEffects = customEffects.map(effect => this.unifyCustomEffectEntryForFingerprint(effect))
+      }
       // 无相关字段（如别的 mod 组件）时保原引用；有相关字段一律输出统一形状
       //（幂等：统一形状再跑一遍键值不变）。注：键名对齐后必须输出 out，
       // 否则 custom_color 会被 same 短路成"无变化"（绿牛案首测 FAIL 教训）。
@@ -623,6 +635,44 @@ class ItemCatalog {
     const allSame = unified.every((u, i) => u === list[i])
     if (allSame) return data
     return Array.isArray(data) ? unified : unified[0]
+  }
+
+  // custom_effects 单条形状归一。同一效果两条读取路径形状不同：
+  //  - 协议开窗（prismarine 1.21.5+ EffectInstance）：{id: 24, details: {ambient,
+  //    amplifier, duration, hiddenEffect, showIcon, showParticles}}，字段全带默认值
+  //  - Servux NBT：{id: 'minecraft:levitation', duration, show_icon}，默认值不写
+  //  输出统一：{id: <数字>} + 非默认字段；默认值（amplifier 0 / ambient false /
+  //  showIcon true / showParticles true / duration 0 / hiddenEffect null）一律剥。
+  //  字符串名靠服务器 mob_effect registry（loadServerEffects）转数字；无映射时
+  //  保字符串原样（同形状恒等，不误并，等登录导出后补跑迁移再并）。
+  unifyCustomEffectEntryForFingerprint (effect) {
+    if (!effect || typeof effect !== 'object' || Array.isArray(effect)) return effect
+    // 开窗把实例字段包在 details 里，Servux 平铺；两个形状的 id 都在顶层。
+    const nested = effect.details && typeof effect.details === 'object' && !Array.isArray(effect.details)
+      ? effect.details
+      : effect
+    const out = {}
+    const id = effect.id != null ? effect.id : nested.id
+    if (Number.isFinite(id)) {
+      out.id = id
+    } else if (typeof id === 'string' && id) {
+      const name = id.replace(/^minecraft:/, '')
+      const numericId = this.serverEffectIdByName.get(name)
+      out.id = Number.isFinite(numericId) ? numericId : id
+    }
+    if (Number.isFinite(nested.duration) && nested.duration !== 0) out.duration = nested.duration
+    if (Number.isFinite(nested.amplifier) && nested.amplifier !== 0) out.amplifier = nested.amplifier
+    if (nested.ambient === true) out.ambient = true
+    const showIcon = nested.showIcon ?? nested.show_icon
+    if (showIcon === false || showIcon === 0) out.showIcon = false
+    const showParticles = nested.showParticles ?? nested.show_particles
+    if (showParticles === false || showParticles === 0) out.showParticles = false
+    const hiddenEffect = nested.hiddenEffect ?? nested.hidden_effect
+    if (hiddenEffect && typeof hiddenEffect === 'object' && !Array.isArray(hiddenEffect)) {
+      const unifiedHidden = this.unifyCustomEffectEntryForFingerprint(hiddenEffect)
+      if (unifiedHidden && typeof unifiedHidden === 'object') out.hiddenEffect = unifiedHidden
+    }
+    return Object.keys(out).length ? out : effect
   }
 
   // 耐久物品（maxDurability 的工具/武器/护甲/潜影盒壳等）。1.21.5+ 的
@@ -1377,6 +1427,35 @@ class ItemCatalog {
   reloadServerPotions (file = 'data/server-potions.json') {
     this.serverPotionIdByName.clear()
     return this.loadServerPotions(file)
+  }
+
+  // 服务器 mob_effect registry 导出文件（登录 registry_data → data/server-effects.json）
+  // → 效果名字 → 数字 id 映射。custom_effects 条目的 Servux 字符串名转协议数字 id 用。
+  loadServerEffects (file) {
+    if (!file) return 0
+    const filePath = path.resolve(process.cwd(), file)
+    if (!fs.existsSync(filePath)) return 0
+    let data
+    try {
+      data = JSON.parse(fs.readFileSync(filePath, 'utf8'))
+    } catch {
+      return 0
+    }
+    const entries = Array.isArray(data?.effects) ? data.effects : []
+    let loaded = 0
+    for (const entry of entries) {
+      const numericId = Number.parseInt(entry?.id, 10)
+      const name = String(entry?.name || entry?.key || '').replace(/^minecraft:/, '')
+      if (!Number.isFinite(numericId) || !name) continue
+      this.serverEffectIdByName.set(name, numericId)
+      loaded++
+    }
+    return loaded
+  }
+
+  reloadServerEffects (file = 'data/server-effects.json') {
+    this.serverEffectIdByName.clear()
+    return this.loadServerEffects(file)
   }
 
   getDisplayName (itemId) {

@@ -607,8 +607,17 @@ function setupRegistryExport (bot, catalog, db) {
     // 药水案：两形状分裂 → 取货 7 桶全扑空。
     const active = db.catalog || catalog
     const exportedPotions = exportPotionRegistry(packet)
-    if (!exportedPotions) return
-    applyPotionRegistry(exportedPotions, active, db)
+    if (exportedPotions) {
+      applyPotionRegistry(exportedPotions, active, db)
+      return
+    }
+    // minecraft:mob_effect registry：custom_effects 条目两路形状（开窗数字 id
+    // vs Servux 字符串名）归一同理靠这份映射。2026-11-20 漂浮药水案：
+    // a1da56（隔空）vs 9669a5f（开窗）两 key 分裂 → 取货开桶全扑空、修账留悬空。
+    const exportedEffects = exportEffectRegistry(packet)
+    if (exportedEffects) {
+      applyEffectRegistry(exportedEffects, active, db)
+    }
   })
 }
 
@@ -649,6 +658,47 @@ function exportPotionRegistry (packet) {
     exportedAt: new Date().toISOString(),
     count: potions.length,
     potions
+  }
+}
+
+// mob_effect registry 导出/应用：custom_effects 归一需要的效果名→数字 id 映射，
+// 同 potion 一套（写盘 → 重载映射 → 补跑指纹迁移让两代 custom_effects 档当场并 key）。
+function applyEffectRegistry (exported, catalog, db) {
+  const filePath = path.resolve(process.cwd(), 'data', 'server-effects.json')
+  fs.mkdirSync(path.dirname(filePath), { recursive: true })
+  fs.writeFileSync(filePath, JSON.stringify(exported, null, 2), 'utf8')
+  console.log(`[registry] exported ${exported.count} server effects to ${filePath}`)
+  const loaded = catalog.reloadServerEffects(filePath)
+  console.log(`[registry] reloaded ${loaded} server effect mappings`)
+  // 登录晚于启动迁移：字符串形状的 custom_effects 档在启动那轮转不了数字 id，
+  // 这里补跑一次指纹迁移（幂等），让 a1da56/9669a5f 类两代档当场并 key。
+  if (typeof db?.canonicalizeItemKeys === 'function') {
+    try {
+      const merged = db.canonicalizeItemKeys(catalog)
+      if (merged > 0) console.log(`[registry] effect migration merged ${merged} item keys`)
+    } catch (err) {
+      console.log(`[registry] effect migration retry failed: ${err.message}`)
+    }
+  }
+}
+
+function exportEffectRegistry (packet) {
+  const registryId = String(packet?.id || packet?.registryId || '')
+  if (registryId !== 'minecraft:mob_effect' && registryId !== 'mob_effect') return null
+  const entries = Array.isArray(packet.entries) ? packet.entries : []
+  const effects = entries
+    .map((entry, index) => {
+      const key = String(entry?.key || entry?.name || '')
+      if (!key) return null
+      return { id: index, key, name: key.replace(/^minecraft:/, '') }
+    })
+    .filter(Boolean)
+  return {
+    source: 'server_registry_data',
+    registryId,
+    exportedAt: new Date().toISOString(),
+    count: effects.length,
+    effects
   }
 }
 
