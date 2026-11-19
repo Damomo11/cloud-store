@@ -832,9 +832,15 @@ class ItemCatalog {
 
     const fixedBeeContainer = this.isBeeContainerEntry(entry)
     const isBreweryX = this.isBreweryXMeta({ components: entry.components })
+    // 耐久条目的 damage 同顶层剥离（8f317b2 只做了散货/盒外，盒内条目漏了）：
+    // 迁移重算与运行时读盒（fromContainerEntry→normalizeMetaForFingerprint 剥）
+    // 必须同形，否则同一只盒 8 月旧档与重读各算各的 key（音符盒 05b1b67f 案：
+    // 账上 22 个盒、桶里读出的是新 key，取货全部回退失败）。
+    const entryIsDurable = !fixedBeeContainer && this.isDurableItem(fingerprintItemId)
     const components = !fixedBeeContainer && Array.isArray(entry.components)
       ? entry.components
         .filter(component => this.shouldKeepComponentForFingerprint(component))
+        .filter(component => !(entryIsDurable && component?.type === 'damage'))
         .map(component => this.normalizeContainerComponentForFingerprint(component, isBreweryX))
       : []
     components.sort((a, b) => this.compareFingerprintValues(a, b))
