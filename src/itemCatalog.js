@@ -14,6 +14,9 @@ class ItemCatalog {
     this.language = {}
     this.serverEnchantmentsById = new Map()
     this.serverEnchantmentsByName = new Map()
+    // 服务器 potion registry（登录 registry_data 导出）：药水 potion_contents 的
+    // 协议数字 id ↔ 字符串名互转用。26.x 本地字典无 potion registry，只能靠导出。
+    this.serverPotionIdByName = new Map()
 
     for (const item of Object.values(this.mcData.itemsByName)) {
       const itemId = `minecraft:${item.name}`
@@ -38,6 +41,10 @@ class ItemCatalog {
     const loadedServerEnchantments = this.reloadServerEnchantments(languageConfig.serverEnchantmentsFile || 'data/server-enchantments.json')
     if (loadedServerEnchantments > 0) {
       console.log(`Loaded ${loadedServerEnchantments} server enchantment mappings`)
+    }
+    const loadedServerPotions = this.loadServerPotions('data/server-potions.json')
+    if (loadedServerPotions > 0) {
+      console.log(`Loaded ${loadedServerPotions} server potion mappings`)
     }
   }
 
@@ -555,12 +562,67 @@ class ItemCatalog {
     //（2026-11 线案）。剥后两路都归一成无 block_state 形状，桶档重算即合并。
     const noBlockState = this.stripBlockStateComponentsForFingerprint(itemId, undamaged)
     const stripped = this.stripVolatileMetaForFingerprint(itemId, noBlockState)
+    // 药水 potion_contents 两代形状归一：8月开窗解码（potionId 数字 + 驼峰空字段）
+    // vs Servux/26.x（potion 字符串）。不归一则同一瓶药水 sync 记 c1ce82、开窗
+    // 算 2138bb，取货按账本开 7 桶全扑空（2026-11-20 长抗火药水案）。空字段一律
+    // 剥，非空字段键名对齐驼峰（协议解码风格，8月存档大头）。
+    const potionUnified = this.unifyPotionContentsForFingerprint(stripped)
     // tobyscamera 相机物品指纹锚定稳定组件，文本组件剥离（见 stripTobysTextComponentsForFingerprint）。
-    if (this.hasTobysCameraMediaId(stripped)) {
-      return this.sortMetaComponentsForFingerprint(this.stripTobysTextComponentsForFingerprint(stripped))
+    if (this.hasTobysCameraMediaId(potionUnified)) {
+      return this.sortMetaComponentsForFingerprint(this.stripTobysTextComponentsForFingerprint(potionUnified))
     }
-    if (this.isNoteBlock(itemId)) return this.canonicalNoteBlockMetaForFingerprint(stripped)
-    return this.sortMetaComponentsForFingerprint(stripped)
+    if (this.isNoteBlock(itemId)) return this.canonicalNoteBlockMetaForFingerprint(potionUnified)
+    return this.sortMetaComponentsForFingerprint(potionUnified)
+  }
+
+  // potion_contents 组件指纹归一：顶层组件里 type === 'potion_contents' 的
+  // data 逐条过 unifyPotionContentsDataForFingerprint。只动指纹，存档形状原样。
+  unifyPotionContentsForFingerprint (meta) {
+    if (!meta || typeof meta !== 'object' || !Array.isArray(meta.components)) return meta
+    let changed = false
+    const components = meta.components.map(component => {
+      if (component?.type !== 'potion_contents') return component
+      const unified = this.unifyPotionContentsDataForFingerprint(component.data)
+      if (unified === component.data) return component
+      changed = true
+      return { ...component, data: unified }
+    })
+    return changed ? { ...meta, components } : meta
+  }
+
+  // 一条 potion_contents data 的形状归一。输入可能形状：
+  //  - 协议开窗解码（8月起稳定）：{potionId: 12, customEffects: [], customColor: null, customName: null}
+  //  - Servux NBT：{potion: 'minecraft:long_fire_resistance'}（空字段 NBT 不写）
+  // 输出统一：{potionId?: <数字>} + 非空字段驼峰。字符串名靠服务器 potion registry
+  // （loadServerPotions）转数字；无映射时保字符串原样（同形状恒等，不误并）。
+  unifyPotionContentsDataForFingerprint (data) {
+    const list = Array.isArray(data) ? data : [data]
+    if (!list.length) return data
+    const unified = list.map(entry => {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return entry
+      const out = {}
+      if (entry.potion != null) {
+        const name = String(entry.potion).replace(/^minecraft:/, '')
+        const numericId = this.serverPotionIdByName.get(name)
+        if (Number.isFinite(numericId)) out.potionId = numericId
+        else out.potion = entry.potion
+      } else if (entry.potionId != null) {
+        out.potionId = entry.potionId
+      }
+      const customColor = entry.custom_color ?? entry.customColor
+      if (customColor != null) out.customColor = customColor
+      const customName = entry.custom_name ?? entry.customName
+      if (customName != null && customName !== '') out.customName = customName
+      const customEffects = entry.custom_effects ?? entry.customEffects
+      if (Array.isArray(customEffects) && customEffects.length) out.customEffects = customEffects
+      // 无相关字段（如别的 mod 组件）时保原引用；有相关字段一律输出统一形状
+      //（幂等：统一形状再跑一遍键值不变）。注：键名对齐后必须输出 out，
+      // 否则 custom_color 会被 same 短路成"无变化"（绿牛案首测 FAIL 教训）。
+      return Object.keys(out).length ? out : entry
+    })
+    const allSame = unified.every((u, i) => u === list[i])
+    if (allSame) return data
+    return Array.isArray(data) ? unified : unified[0]
   }
 
   // 耐久物品（maxDurability 的工具/武器/护甲/潜影盒壳等）。1.21.5+ 的
@@ -1276,6 +1338,36 @@ class ItemCatalog {
     this.serverEnchantmentsById.clear()
     this.serverEnchantmentsByName.clear()
     return this.loadServerEnchantments(file)
+  }
+
+  // 服务器 potion registry 导出文件（登录 registry_data → data/server-potions.json）
+  // → 名字 → 数字 id 映射。指纹归一用它把 Servux 字符串形状转成协议数字形状，
+  // 或反向对齐（见 unifyPotionContentsDataForFingerprint）。
+  loadServerPotions (file) {
+    if (!file) return 0
+    const filePath = path.resolve(process.cwd(), file)
+    if (!fs.existsSync(filePath)) return 0
+    let data
+    try {
+      data = JSON.parse(fs.readFileSync(filePath, 'utf8'))
+    } catch {
+      return 0
+    }
+    const entries = Array.isArray(data?.potions) ? data.potions : []
+    let loaded = 0
+    for (const entry of entries) {
+      const numericId = Number.parseInt(entry?.id, 10)
+      const name = String(entry?.name || entry?.key || '').replace(/^minecraft:/, '')
+      if (!Number.isFinite(numericId) || !name) continue
+      this.serverPotionIdByName.set(name, numericId)
+      loaded++
+    }
+    return loaded
+  }
+
+  reloadServerPotions (file = 'data/server-potions.json') {
+    this.serverPotionIdByName.clear()
+    return this.loadServerPotions(file)
   }
 
   getDisplayName (itemId) {

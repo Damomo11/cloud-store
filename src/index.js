@@ -600,6 +600,45 @@ function setupRegistryExport (bot, catalog, db) {
     bot._lastEnchantmentRegistryPacket = packet
     applyEnchantmentRegistry(exported, active, db)
   })
+  bot._client?.on('registry_data', packet => {
+    // minecraft:potion registry：26.x 本地字典无 potion registry，开窗协议
+    // 解码 potion_contents 用数字 id，Servux NBT 用字符串名——药水指纹归一
+    // 靠这份导出的 id↔名映射（data/server-potions.json）。2026-11-20 长抗火
+    // 药水案：两形状分裂 → 取货 7 桶全扑空。
+    const active = db.catalog || catalog
+    const exportedPotions = exportPotionRegistry(packet)
+    if (!exportedPotions) return
+    applyPotionRegistry(exportedPotions, active)
+  })
+}
+
+function applyPotionRegistry (exported, catalog) {
+  const filePath = path.resolve(process.cwd(), 'data', 'server-potions.json')
+  fs.mkdirSync(path.dirname(filePath), { recursive: true })
+  fs.writeFileSync(filePath, JSON.stringify(exported, null, 2), 'utf8')
+  console.log(`[registry] exported ${exported.count} server potions to ${filePath}`)
+  const loaded = catalog.reloadServerPotions(filePath)
+  console.log(`[registry] reloaded ${loaded} server potion mappings`)
+}
+
+function exportPotionRegistry (packet) {
+  const registryId = String(packet?.id || packet?.registryId || '')
+  if (registryId !== 'minecraft:potion' && registryId !== 'potion') return null
+  const entries = Array.isArray(packet.entries) ? packet.entries : []
+  const potions = entries
+    .map((entry, index) => {
+      const key = String(entry?.key || entry?.name || '')
+      if (!key) return null
+      return { id: index, key, name: key.replace(/^minecraft:/, '') }
+    })
+    .filter(Boolean)
+  return {
+    source: 'server_registry_data',
+    registryId,
+    exportedAt: new Date().toISOString(),
+    count: potions.length,
+    potions
+  }
 }
 
 function applyEnchantmentRegistry (exported, active, db) {
