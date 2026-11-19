@@ -1,0 +1,8 @@
+{
+  "source": "db-pairing-proof",
+  "note": "26.x 登录 registry_data 不同步 mob_effect（同 potion 属静态注册表，见 server-potions.json），效果数字<->名字映射靠数据库实证配对：漂浮药水案 a1da56（Servux 字符串 id='minecraft:levitation'）× 9669a5f（开窗数字 id=24）custom_color 13565951 / custom_name 'dnt_levitation' / duration 200 全同 = 同一只药水，故 levitation=24。breweryx 出现新效果未配对时不会误并（字符串/数字保原样各自恒等），遇到再补。若服务器某天同步了 minecraft:mob_effect，applyEffectRegistry 会整体覆盖本文件。",
+  "registryId": "minecraft:mob_effect",
+  "effects": [
+    { "id": 24, "key": "minecraft:levitation", "name": "levitation" }
+  ]
+}
