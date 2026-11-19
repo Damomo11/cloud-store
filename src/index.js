@@ -608,17 +608,28 @@ function setupRegistryExport (bot, catalog, db) {
     const active = db.catalog || catalog
     const exportedPotions = exportPotionRegistry(packet)
     if (!exportedPotions) return
-    applyPotionRegistry(exportedPotions, active)
+    applyPotionRegistry(exportedPotions, active, db)
   })
 }
 
-function applyPotionRegistry (exported, catalog) {
+function applyPotionRegistry (exported, catalog, db) {
   const filePath = path.resolve(process.cwd(), 'data', 'server-potions.json')
   fs.mkdirSync(path.dirname(filePath), { recursive: true })
   fs.writeFileSync(filePath, JSON.stringify(exported, null, 2), 'utf8')
   console.log(`[registry] exported ${exported.count} server potions to ${filePath}`)
   const loaded = catalog.reloadServerPotions(filePath)
   console.log(`[registry] reloaded ${loaded} server potion mappings`)
+  // 登录晚于启动迁移：字符串形状的药水档在启动那轮转不了数字 id，这里
+  // 补跑一次指纹迁移（幂等，stable 档零开销），让 1a7d/c1ce82 类两代档
+  // 当场并 key，不必等下次热重载。
+  if (typeof db?.canonicalizeItemKeys === 'function') {
+    try {
+      const merged = db.canonicalizeItemKeys(catalog)
+      if (merged > 0) console.log(`[registry] potion migration merged ${merged} item keys`)
+    } catch (err) {
+      console.log(`[registry] potion migration retry failed: ${err.message}`)
+    }
+  }
 }
 
 function exportPotionRegistry (packet) {
