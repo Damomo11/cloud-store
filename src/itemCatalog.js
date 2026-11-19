@@ -955,7 +955,16 @@ class ItemCatalog {
   }
 
   normalizeContainerComponentForFingerprint (component, isBreweryX) {
-    const normalized = this.normalizeComponentForFingerprint(component)
+    let normalized = this.normalizeComponentForFingerprint(component)
+    // 盒内药水条目同顶层归一（potion_contents 数字↔字符串两代形状）：散货在
+    // normalizeMetaForFingerprint→unifyPotionContentsForFingerprint 归一，盒内
+    // 条目此前漏了——同一只装药水的盒子 8 月旧档（Servux 字符串形状）与开窗
+    // 重读（数字形状）各算各的 key，账上盒子悬空、桶里实物对不上，拆盒取药
+    // 必败（2026-11-20 虚弱药水拆盒案：账 9302fb7b、桶里实物 8f8932fd）。
+    if (normalized?.type === 'potion_contents') {
+      const unified = this.unifyPotionContentsDataForFingerprint(normalized.data)
+      if (unified !== normalized.data) normalized = { ...normalized, data: unified }
+    }
     if (!isBreweryX || component?.type !== 'tooltip_display') return normalized
     return {
       ...normalized,
@@ -1388,6 +1397,9 @@ class ItemCatalog {
     const beeContainerName = this.describeBeeContainer(itemId, item.components)
     if (beeContainerName) return beeContainerName
 
+    const potionVariantName = this.describePotionVariant(itemId, item.components)
+    if (potionVariantName) return potionVariantName
+
     if (this.normalizeItemId(itemId) === 'minecraft:enchanted_book') {
       const enchantments = this.extractEnchantments(item.components)
       if (enchantments.length) {
@@ -1407,6 +1419,9 @@ class ItemCatalog {
 
     const beeContainerName = this.describeBeeContainer(itemId, meta.components)
     if (beeContainerName) return beeContainerName
+
+    const potionVariantName = this.describePotionVariant(itemId, meta.components)
+    if (potionVariantName) return potionVariantName
 
     if (this.normalizeItemId(itemId) === 'minecraft:enchanted_book') {
       const enchantments = this.extractEnchantments(meta.components)
@@ -1440,6 +1455,35 @@ class ItemCatalog {
     const count = this.extractBeeCountFromComponents(components)
     if (!count) return ''
     return `${this.getDisplayName(itemId)}（含蜂${count}）`
+  }
+
+  // 药水细分展示：从 potion_contents 读种类，查语言表
+  // item.minecraft.<物品>.effect.<名>（weakness→虚弱药水/water→水瓶）。
+  // long_/strong_ 前缀剥掉拼"延长/强化"。数字 potionId 用服务器 potion
+  // registry 反查名字（未配锚的数字反查不到，返回 '' 退回基础名）。
+  describePotionVariant (itemId, components) {
+    const simple = this.normalizeItemId(itemId).replace(/^minecraft:/, '')
+    if (!['potion', 'splash_potion', 'lingering_potion'].includes(simple)) return ''
+    const potionComponent = Array.isArray(components)
+      ? components.find(component => component?.type === 'potion_contents')
+      : null
+    const data = potionComponent?.data
+    if (!data || typeof data !== 'object') return ''
+    let name = null
+    if (data.potion != null) {
+      name = String(data.potion).replace(/^minecraft:/, '')
+    } else if (data.potionId != null) {
+      for (const [potionName, numericId] of this.serverPotionIdByName) {
+        if (numericId === data.potionId) { name = potionName; break }
+      }
+    }
+    if (!name) return ''
+    let suffix = ''
+    if (name.startsWith('long_')) { suffix = '（延长）'; name = name.slice(5) }
+    else if (name.startsWith('strong_')) { suffix = '（强化）'; name = name.slice(7) }
+    const localized = this.language[`item.minecraft.${simple}.effect.${name}`]
+    if (!localized) return ''
+    return suffix ? `${localized}${suffix}` : localized
   }
 
   extractBeeCountFromComponents (components) {
