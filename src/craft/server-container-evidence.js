@@ -77,10 +77,14 @@ function repeatsPlayerState (packet, rawSlots, rawCarried, container) {
   return true
 }
 
-function sameModernSlot (item, expected) {
+function validModernSlot (item) {
   return !!item && typeof item === 'object' && !Array.isArray(item) &&
     Number.isSafeInteger(item.itemCount) && item.itemCount >= 0 &&
-    (item.itemCount !== 0 || isEmptySlot(item)) && isDeepStrictEqual(item, expected)
+    (item.itemCount !== 0 || isEmptySlot(item))
+}
+
+function sameModernSlot (item, expected) {
+  return validModernSlot(item) && isDeepStrictEqual(item, expected)
 }
 
 async function openServerContainer (warehouse, chest, catalog, bot, options = {}) {
@@ -94,15 +98,19 @@ async function openServerContainer (warehouse, chest, catalog, bot, options = {}
   const packets = []
   const revision = currentRevision(warehouse, chest.chestId)
   const keepEvidence = options.keepEvidence === true
+  const validateOffhand = options.validateOffhand === true
   let openingPackets = keepEvidence ? [] : null
   let lastInvalidation
   let failureReason = 'open_failed'
   let latest = null
   let decodeError = null
   let disposed = false
+  let openingOffhand = null
+  let offhandMismatch = false
   const windowId = packet => packet?.windowId ?? packet?.containerId
   let inventoryStart = null
   let inventoryEnd = null
+  const emptySlot = () => registry.supportFeature('itemsWithComponents') ? { itemCount: 0 } : { present: false }
   const decodePacket = packet => {
     if (!Array.isArray(packet?.items) || !Number.isInteger(inventoryStart) || !Number.isInteger(inventoryEnd) ||
       packet.items.length !== inventoryEnd || !Object.hasOwn(packet, 'carriedItem')) return null
@@ -124,6 +132,14 @@ async function openServerContainer (warehouse, chest, catalog, bot, options = {}
     packets.length = 0
     latest = null
     decodeError = null
+    offhandMismatch = false
+    if (validateOffhand) {
+      const slots = bot.inventory?.slots
+      const current = Array.isArray(slots) && slots.length > 45 ? slots[45] : null
+      openingOffhand = Array.isArray(slots) && slots.length > 45
+        ? current ? Item.toNotch(current) : emptySlot()
+        : null
+    } else openingOffhand = null
     if (Number.isInteger(windowId(packet))) opened.add(windowId(packet))
   }
   const invalidate = () => {
@@ -132,16 +148,19 @@ async function openServerContainer (warehouse, chest, catalog, bot, options = {}
     packets.length = 0
   }
   const onItems = packet => {
-    if (keepEvidence && windowId(packet) === 0) {
+    const id = windowId(packet)
+    const items = packet?.items ?? packet?.slots
+    if (validateOffhand && id === 0 && Array.isArray(items) && items.length === 46 &&
+        (!openingOffhand || !matchesExpected(items[45], openingOffhand))) offhandMismatch = true
+    if (keepEvidence && id === 0) {
       const full = packets.at(-1)
       if (inventoryEnd === null && registry.supportFeature('itemsWithComponents') && full &&
           full.windowId === bot.currentWindow?.id && isEmptySlot(full.carriedItem) &&
           repeatsPlayerState(packet, full.items, full.carriedItem, bot.currentWindow)) return
       invalidate()
     }
-    if (!opened.has(windowId(packet))) return
+    if (!opened.has(id)) return
     invalidate()
-    const items = packet?.items ?? packet?.slots
     if (Array.isArray(items)) {
       const copy = deserialize(serialize({ ...packet, windowId: windowId(packet), items }))
       packets.push(copy)
@@ -155,14 +174,21 @@ async function openServerContainer (warehouse, chest, catalog, bot, options = {}
   }
   // Opening can emit its full packet before openContainerAt resolves. Compare
   // against that saved packet as well as during a retained window's lifetime.
+  const validRawSlot = raw => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return false
+    return registry.supportFeature('itemsWithComponents') ? validModernSlot(raw) : typeof raw.present === 'boolean'
+  }
+  const matchesExpected = (raw, expected) => validRawSlot(raw) && expected !== undefined &&
+    isDeepStrictEqual(raw, expected)
   const compare = (raw, select) => {
     const full = packets.at(-1)
-    if (!full || !raw || typeof raw !== 'object' || Array.isArray(raw)) return invalidate()
-    if (registry.supportFeature('itemsWithComponents')
-      ? !Number.isSafeInteger(raw.itemCount) || raw.itemCount < 0 || (raw.itemCount === 0 && !isEmptySlot(raw))
-      : typeof raw.present !== 'boolean') return invalidate()
-    const expected = select(full)
-    if (expected === undefined || !isDeepStrictEqual(raw, expected)) invalidate()
+    if (!full || !matchesExpected(raw, select(full))) return invalidate()
+  }
+  const compareOffhand = raw => {
+    if (!openingOffhand || !matchesExpected(raw, openingOffhand)) {
+      offhandMismatch = true
+      invalidate()
+    }
   }
   const slotValue = (full, slot) => Number.isInteger(slot) && slot >= 0 && slot < full.items.length ? full.items[slot] : undefined
   const playerSlotValue = (full, slot) => {
@@ -177,17 +203,27 @@ async function openServerContainer (warehouse, chest, catalog, bot, options = {}
       if (packet.slot !== -1) invalidate()
       else compare(packet.item, full => full.carriedItem)
     } else if (opened.has(id)) compare(packet.item, full => slotValue(full, packet.slot))
+    else if (id === 0 && packet.slot === 45 && validateOffhand) compareOffhand(packet.item)
     else if (id === 0 && packet.slot === 45 && isEmptySlot(packet.item)) return
     else if (id === 0) compare(packet.item, full => playerSlotValue(full, packet.slot))
-    else if (id === -2 || id === 254) compare(packet.item, full => playerSlotValue(full, inventorySlot(packet.slot)))
+    else if (id === -2 || id === 254) {
+      const slot = inventorySlot(packet.slot)
+      if (slot === 45 && validateOffhand) compareOffhand(packet.item)
+      else compare(packet.item, full => playerSlotValue(full, slot))
+    }
   }
   const onCursor = packet => compare(packet.contents, full => full.carriedItem)
+  const onPlayerInventory = packet => {
+    const slot = inventorySlot(packet.slotId)
+    if (slot === 45 && validateOffhand) compareOffhand(packet.contents)
+    else compare(packet.contents, full => playerSlotValue(full, slot))
+  }
   const listeners = [
     ['open_window', onOpen], ['open_screen', onOpen],
     ['window_items', onItems], ['container_set_content', onItems],
     ['set_slot', onSlot], ['container_set_slot', onSlot],
     ['set_cursor_item', onCursor], ['container_set_cursor_item', onCursor],
-    ['set_player_inventory', packet => compare(packet.contents, full => playerSlotValue(full, inventorySlot(packet.slotId)))]
+    ['set_player_inventory', onPlayerInventory]
   ].map(([event, handler]) => [event, packet => {
     if (!openingPackets) return handler(packet)
     const previous = packets.at(-1)
@@ -241,6 +277,14 @@ async function openServerContainer (warehouse, chest, catalog, bot, options = {}
       throw new Error(`无法解码服务端容器快照：${error.message}`)
     }
     if (decodeError) throw new Error(`无法持续解码服务端容器快照：${decodeError.message}`)
+    if (offhandMismatch) {
+      failureReason = 'offhand_changed'
+      throw new Error('开窗期间副手状态发生变化。')
+    }
+    if (validateOffhand && !openingOffhand) {
+      failureReason = 'offhand_baseline_unavailable'
+      throw new Error('开窗时无法确认副手状态。')
+    }
     failureReason = 'local_snapshot_failed'
     const initialBotPlayerItems = keepEvidence ? containerSnapshot(container, catalog, bot)?.botPlayerItems : null
     const evidence = {
@@ -255,7 +299,7 @@ async function openServerContainer (warehouse, chest, catalog, bot, options = {}
         serverSnapshot: decodeError ? null : latest,
         localSnapshot: containerSnapshot(container, catalog, bot),
         initialBotPlayerItems
-      }),
+      }) && (!validateOffhand || !offhandMismatch),
       dispose: () => {
         if (disposed) return
         disposed = true
@@ -283,6 +327,9 @@ async function openServerContainer (warehouse, chest, catalog, bot, options = {}
         inventoryStart,
         expectedSlotCount: inventoryEnd,
         receivedSlotCount: packets.findLast(value => value.windowId === container?.id)?.items.length,
+        offhandValidationEnabled: validateOffhand,
+        offhandBaselineAvailable: !validateOffhand || !!openingOffhand,
+        offhandMismatch,
         lastInvalidation,
         packets: openingPackets
       }
@@ -297,8 +344,8 @@ async function openServerContainer (warehouse, chest, catalog, bot, options = {}
   }
 }
 
-async function readServerContainer (warehouse, chest, catalog, bot) {
-  const snapshot = await openServerContainer(warehouse, chest, catalog, bot)
+async function readServerContainer (warehouse, chest, catalog, bot, options = {}) {
+  const snapshot = await openServerContainer(warehouse, chest, catalog, bot, options)
   try {
     warehouse.closeContainerQuietly(snapshot.container)
   } finally {
