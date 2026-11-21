@@ -4298,9 +4298,11 @@ class CloudStoreService {
       .filter(item => item.itemId === 'minecraft:enchanted_book')
       .map(item => {
         const meta = this.catalog.parseStoredJson(item.metaJson, {})
-        const enchantment = this.catalog.extractEnchantments(meta.components)
+        const enchantments = this.catalog.extractEnchantments(meta.components)
+        const enchantment = enchantments
           .find(entry => String(entry.displayName || '').toLowerCase() === query.toLowerCase())
-        return enchantment ? { item, level: Number(enchantment.level || 0) } : null
+        if (!enchantment) return null
+        return { item, level: Number(enchantment.level || 0), pure: enchantments.length === 1 }
       })
       .filter(Boolean)
       .filter(candidate => ownerUuids.some(ownerUuid => {
@@ -4309,15 +4311,19 @@ class CloudStoreService {
         const shulkers = this.db.getOwnerShulkersContainingItemKey(ownerUuid, candidate.item.itemKey)
         return shulkers.length > 0
       }))
-      .sort((a, b) => b.level - a.level)
+      .sort((a, b) => (b.level - a.level) || (b.pure - a.pure))
 
     if (!candidates.length) return null
+    // 同为最高级时，裸附魔名（如“耐久”）优先返回只含这一条附魔的纯附魔书，
+    // 不再让“耐久三”与“耐久三+其他”并列报不够精确；纯书并列多条才报。
     const highest = candidates.filter(candidate => candidate.level === candidates[0].level)
-    if (highest.length > 1) {
-      const names = highest.map(candidate => this.formatCandidateForWithdraw(candidate.item)).slice(0, 5).join('，')
+    const pureHighest = highest.filter(candidate => candidate.pure)
+    const pool = pureHighest.length ? pureHighest : highest
+    if (pool.length > 1) {
+      const names = pool.map(candidate => this.formatCandidateForWithdraw(candidate.item)).slice(0, 5).join('，')
       throw new Error(`最高等级附魔书不够精确：${query}，匹配到 ${names}`)
     }
-    const item = highest[0].item
+    const item = pool[0].item
     return {
       itemKey: item.itemKey,
       itemId: item.itemId,
