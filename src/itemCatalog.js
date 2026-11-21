@@ -615,14 +615,45 @@ class ItemCatalog {
     return changed ? { ...meta, components } : meta
   }
 
-  // 一份 fireworks data 的 explosions 形状归一（盒内条目同款归一复用：
-  // normalizeContainerComponentForFingerprint）。flight_duration 等顶层字段
-  // 两路一致，只动 explosions 数组。
+  // 一份 fireworks data 的形状归一（盒内条目同款归一复用：
+  // normalizeContainerComponentForFingerprint）。三个分裂维度
+  // （2026-11-21 烟花案 DB 实证，第一版只修条目默认值、漏了前两个）：
+  //  - data 顶层键名：开窗 flightDuration（驼峰）vs Servux flight_duration
+  //    （下划线，8 月存档大头）——同一批烟花 22346f vs 26f446 各算各的 key。
+  //  - 无爆炸烟花：开窗 explosions:[]（空数组）vs Servux 无键——95d6f3 账面
+  //    64 实物 0，实物全被算进 9f0248（无键形状）。
+  //  - 爆炸条目默认值字段：开窗带 fadeColors/hasTrail/hasTwinkle 默认值 vs
+  //    Servux 不写。
+  // 统一目标（对齐 8 月存档形状，历史 key 不漂移）：下划线 flight_duration +
+  // 无爆炸时无 explosions 键 + 剥默认值的爆炸条目。幂等：统一形状再跑
+  // 一遍返回原引用。
   unifyFireworksDataForFingerprint (data) {
-    if (!data || typeof data !== 'object' || !Array.isArray(data.explosions)) return data
-    const unified = data.explosions.map(entry => this.unifyFireworkExplosionForFingerprint(entry))
-    if (unified.every((entry, index) => entry === data.explosions[index])) return data
-    return { ...data, explosions: unified }
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return data
+    let out = data
+    let touched = false
+    const rewrite = () => {
+      if (!touched) {
+        out = { ...out }
+        touched = true
+      }
+    }
+    if (out.flightDuration != null) {
+      rewrite()
+      if (out.flight_duration == null) out.flight_duration = out.flightDuration
+      delete out.flightDuration
+    }
+    if (Array.isArray(out.explosions) && !out.explosions.length) {
+      rewrite()
+      delete out.explosions
+    }
+    if (Array.isArray(out.explosions)) {
+      const unified = out.explosions.map(entry => this.unifyFireworkExplosionForFingerprint(entry))
+      if (!unified.every((entry, index) => entry === out.explosions[index])) {
+        rewrite()
+        out.explosions = unified
+      }
+    }
+    return touched ? out : data
   }
 
   // 单条 explosion 归一。同一发烟花两条读取路径形状不同（2026-11-21 烟花案，
