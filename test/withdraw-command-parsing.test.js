@@ -7,8 +7,10 @@ function createFixture () {
   const items = [
     enchantedBook('durability-1', '耐久一', '耐久', 1),
     enchantedBook('durability-3', '耐久三', '耐久', 3),
+    enchantedBook('durability-3-alt', '耐久三', '耐久', 3),
     enchantedBook('durability-5', '耐久五', '耐久', 5),
-    enchantedBook('efficiency-5', '效率五', '效率', 5)
+    enchantedBook('efficiency-5', '效率五', '效率', 5),
+    compositeBook('durability-3-mending', '耐久三，经验修补', [['耐久', 3], ['经验修补', 1]])
   ]
   const looseStock = new Map()
   const shulkerStock = new Set()
@@ -57,13 +59,17 @@ function createFixture () {
 }
 
 function enchantedBook (itemKey, displayName, enchantmentName, level) {
+  return compositeBook(itemKey, displayName, [[enchantmentName, level]])
+}
+
+function compositeBook (itemKey, displayName, entries) {
   return {
     itemKey,
     itemId: 'minecraft:enchanted_book',
     displayName,
     metaJson: JSON.stringify({
       components: {
-        enchantments: [{ displayName: enchantmentName, level }]
+        enchantments: entries.map(([name, level]) => ({ displayName: name, level }))
       }
     })
   }
@@ -159,4 +165,26 @@ test('Arabic suffix after an enchantment name is quantity', () => {
     ['durability-1', 2],
     ['efficiency-5', 3]
   ])
+})
+
+test('bare enchantment name prefers the pure book over composite at the same level', () => {
+  const fixture = createFixture()
+  fixture.stockLoose('durability-3', 10)
+  fixture.stockLoose('durability-3-mending', 10)
+
+  const [request] = fixture.service.parseWithdraw('耐久', 'player-1', fixture.owner)
+
+  assert.equal(request.itemKey, 'durability-3')
+  assert.equal(request.displayName, '耐久三')
+})
+
+test('bare enchantment name falls back to composite book when pure book is absent', () => {
+  const fixture = createFixture()
+  fixture.stockLoose('durability-1', 10)
+  fixture.stockLoose('durability-3-mending', 10)
+
+  const [request] = fixture.service.parseWithdraw('耐久', 'player-1', fixture.owner)
+
+  assert.equal(request.itemKey, 'durability-3-mending')
+  assert.equal(request.displayName, '耐久三，经验修补')
 })
