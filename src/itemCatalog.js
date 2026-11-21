@@ -574,12 +574,14 @@ class ItemCatalog {
     // 算 2138bb，取货按账本开 7 桶全扑空（2026-11-20 长抗火药水案）。空字段一律
     // 剥，非空字段键名对齐驼峰（协议解码风格，8月存档大头）。
     const potionUnified = this.unifyPotionContentsForFingerprint(stripped)
+    // 烟花 fireworks explosions 默认值字段两路形状归一（见 unifyFireworkExplosionForFingerprint）。
+    const fireworksUnified = this.unifyFireworksForFingerprint(potionUnified)
     // tobyscamera 相机物品指纹锚定稳定组件，文本组件剥离（见 stripTobysTextComponentsForFingerprint）。
-    if (this.hasTobysCameraMediaId(potionUnified)) {
-      return this.sortMetaComponentsForFingerprint(this.stripTobysTextComponentsForFingerprint(potionUnified))
+    if (this.hasTobysCameraMediaId(fireworksUnified)) {
+      return this.sortMetaComponentsForFingerprint(this.stripTobysTextComponentsForFingerprint(fireworksUnified))
     }
-    if (this.isNoteBlock(itemId)) return this.canonicalNoteBlockMetaForFingerprint(potionUnified)
-    return this.sortMetaComponentsForFingerprint(potionUnified)
+    if (this.isNoteBlock(itemId)) return this.canonicalNoteBlockMetaForFingerprint(fireworksUnified)
+    return this.sortMetaComponentsForFingerprint(fireworksUnified)
   }
 
   // potion_contents 组件指纹归一：顶层组件里 type === 'potion_contents' 的
@@ -595,6 +597,68 @@ class ItemCatalog {
       return { ...component, data: unified }
     })
     return changed ? { ...meta, components } : meta
+  }
+
+  // fireworks 组件（烟花火箭）指纹归一：顶层组件里 type === 'fireworks' 的
+  // data.explosions 逐条过 unifyFireworkExplosionForFingerprint。只动指纹，
+  // 存档形状原样（同 potion_contents 一套）。
+  unifyFireworksForFingerprint (meta) {
+    if (!meta || typeof meta !== 'object' || !Array.isArray(meta.components)) return meta
+    let changed = false
+    const components = meta.components.map(component => {
+      if (component?.type !== 'fireworks') return component
+      const unified = this.unifyFireworksDataForFingerprint(component.data)
+      if (unified === component.data) return component
+      changed = true
+      return { ...component, data: unified }
+    })
+    return changed ? { ...meta, components } : meta
+  }
+
+  // 一份 fireworks data 的 explosions 形状归一（盒内条目同款归一复用：
+  // normalizeContainerComponentForFingerprint）。flight_duration 等顶层字段
+  // 两路一致，只动 explosions 数组。
+  unifyFireworksDataForFingerprint (data) {
+    if (!data || typeof data !== 'object' || !Array.isArray(data.explosions)) return data
+    const unified = data.explosions.map(entry => this.unifyFireworkExplosionForFingerprint(entry))
+    if (unified.every((entry, index) => entry === data.explosions[index])) return data
+    return { ...data, explosions: unified }
+  }
+
+  // 单条 explosion 归一。同一发烟花两条读取路径形状不同（2026-11-21 烟花案，
+  // DB 实证 22346f vs e669b5）：
+  //  - 开窗协议解码：全字段带默认值 {colors, fadeColors: [], hasTrail: false,
+  //    hasTwinkle: false, shape}
+  //  - Servux NBT：默认值不写 {colors, shape}
+  // 默认值一律剥（fadeColors 空数组、hasTrail/hasTwinkle false）；非默认值
+  // 保留且键名对齐驼峰（协议解码风格，同 potion 一套）。colors/shape 两路已
+  // 同形，原样透传。幂等：统一形状再跑一遍返回原引用。
+  unifyFireworkExplosionForFingerprint (entry) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return entry
+    let touched = false
+    const out = {}
+    for (const [key, value] of Object.entries(entry)) {
+      if (key === 'fadeColors' || key === 'fade_colors') {
+        if (Array.isArray(value) && !value.length) { touched = true; continue }
+        out.fadeColors = value
+        if (key === 'fade_colors') touched = true
+        continue
+      }
+      if (key === 'hasTrail' || key === 'has_trail') {
+        if (value === false || value === 0) { touched = true; continue }
+        out.hasTrail = value
+        if (key === 'has_trail') touched = true
+        continue
+      }
+      if (key === 'hasTwinkle' || key === 'has_twinkle') {
+        if (value === false || value === 0) { touched = true; continue }
+        out.hasTwinkle = value
+        if (key === 'has_twinkle') touched = true
+        continue
+      }
+      out[key] = value
+    }
+    return touched ? out : entry
   }
 
   // 一条 potion_contents data 的形状归一。输入可能形状：
@@ -1022,6 +1086,14 @@ class ItemCatalog {
     // 必败（2026-11-20 虚弱药水拆盒案：账 9302fb7b、桶里实物 8f8932fd）。
     if (normalized?.type === 'potion_contents') {
       const unified = this.unifyPotionContentsDataForFingerprint(normalized.data)
+      if (unified !== normalized.data) normalized = { ...normalized, data: unified }
+    }
+    // 盒内烟花条目同顶层归一（fireworks explosions 默认值字段两路形状）：同
+    // potion_contents 拆盒案——散货在 normalizeMetaForFingerprint→
+    // unifyFireworksForFingerprint 归一，盒内漏了则装烟花的盒子两路各算各的
+    // key（2026-11-21 烟花案连带：源盒 e0a48e 在桶里实际 key 全变）。
+    if (normalized?.type === 'fireworks') {
+      const unified = this.unifyFireworksDataForFingerprint(normalized.data)
       if (unified !== normalized.data) normalized = { ...normalized, data: unified }
     }
     if (!isBreweryX || component?.type !== 'tooltip_display') return normalized

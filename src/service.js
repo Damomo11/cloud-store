@@ -3940,14 +3940,23 @@ class CloudStoreService {
     if (supplementNames.length) {
       notices.push(`个人仓库库存不足，已自动从组织仓库 ${[...new Set(supplementNames)].join('、')} 补取。`)
     }
+    // 同名（不同 NBT 变种）请求逐条成消息会连刷同文案（2026-11-21 烟花案：
+    // Web 取货同 key 请求 10 条只满足 1 条，玩家连收 9 条重复拒绝）。
+    // 按显示名合并加总，一条说清总量。
+    const remainingByName = new Map()
     for (const request of remainingRequests) {
-      const totalWanted = Number(request.requestedAmount || request.amount || 0)
-      const got = Math.max(0, totalWanted - Number(request.amount || 0))
       const displayName = request.displayName || this.catalog.getDisplayName(request.itemId)
+      const agg = remainingByName.get(displayName) || { wanted: 0, covered: 0 }
+      agg.wanted += Number(request.requestedAmount || request.amount || 0)
+      agg.covered += Number(request.amount || 0)
+      remainingByName.set(displayName, agg)
+    }
+    for (const [displayName, agg] of remainingByName) {
+      const got = Math.max(0, agg.wanted - agg.covered)
       if (got > 0) {
         notices.push(`个人仓库和组织仓库合计只有 ${got} 个${displayName}，将尽量取出。`)
       } else {
-        notices.push(`个人仓库和组织仓库都没有 ${displayName}，无法取出 ${totalWanted} 个。`)
+        notices.push(`个人仓库和组织仓库都没有 ${displayName}，无法取出 ${agg.wanted} 个。`)
       }
     }
 
@@ -4154,18 +4163,30 @@ class CloudStoreService {
     const inventoryFullKeys = new Set(
       (missingItems || []).filter(item => item.inventoryFull).map(item => item.itemKey)
     )
-    const notices = []
+    // 同 coverage key 在 planned 里可能多条（分批分配），每条都会算出同一个
+    // 总缺口——先按 key 去重再算；同名不同变种（key 不同、显示名相同）此前靠
+    // 全文 Set 去重，把各变种的缺量压成单变种量（2026-11-21 烟花案：三个变种
+    // 各缺 64 实缺 192 只报 64）。改为按（显示名，是否背包满）合并加总。
+    const missingByPlanKey = new Map()
     for (const item of planned) {
-      const missing = (plannedByKey.get(this.withdrawCoverageKey(item)) || 0) - (deliveredByKey.get(this.withdrawCoverageKey(item)) || 0)
-      if (missing > 0) {
-        const name = item.requestDisplayName || item.displayName || this.catalog.getDisplayName(item.itemId)
-        const full = inventoryFullKeys.has(item.itemKey) || inventoryFullKeys.has(item.requestItemKey)
-        notices.push(full
-          ? `${name} 机器人背包已满，少取 ${missing} 个；仓库有货未扣库存，可稍后单独再取。`
-          : `${name} 仓库实际库存不足，少取 ${missing} 个；只扣除实际交付数量。`)
-      }
+      const planKey = this.withdrawCoverageKey(item)
+      if (missingByPlanKey.has(planKey)) continue
+      const missing = (plannedByKey.get(planKey) || 0) - (deliveredByKey.get(planKey) || 0)
+      if (missing <= 0) continue
+      const name = item.requestDisplayName || item.displayName || this.catalog.getDisplayName(item.itemId)
+      const full = inventoryFullKeys.has(item.itemKey) || inventoryFullKeys.has(item.requestItemKey)
+      missingByPlanKey.set(planKey, { name, full, missing })
     }
-    return [...new Set(notices)]
+    const noticesByName = new Map()
+    for (const entry of missingByPlanKey.values()) {
+      const aggKey = `${entry.full ? 1 : 0}|${entry.name}`
+      const agg = noticesByName.get(aggKey) || { name: entry.name, full: entry.full, missing: 0 }
+      agg.missing += entry.missing
+      noticesByName.set(aggKey, agg)
+    }
+    return [...noticesByName.values()].map(entry => entry.full
+      ? `${entry.name} 机器人背包已满，少取 ${entry.missing} 个；仓库有货未扣库存，可稍后单独再取。`
+      : `${entry.name} 仓库实际库存不足，少取 ${entry.missing} 个；只扣除实际交付数量。`)
   }
 
   withdrawCoverageKey (item) {
