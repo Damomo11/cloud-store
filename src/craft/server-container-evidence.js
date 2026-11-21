@@ -177,6 +177,7 @@ async function openServerContainer (warehouse, chest, catalog, bot, options = {}
       if (packet.slot !== -1) invalidate()
       else compare(packet.item, full => full.carriedItem)
     } else if (opened.has(id)) compare(packet.item, full => slotValue(full, packet.slot))
+    else if (id === 0 && packet.slot === 45 && isEmptySlot(packet.item)) return
     else if (id === 0) compare(packet.item, full => playerSlotValue(full, packet.slot))
     else if (id === -2 || id === 254) compare(packet.item, full => playerSlotValue(full, inventorySlot(packet.slot)))
   }
