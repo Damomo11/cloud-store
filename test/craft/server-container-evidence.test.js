@@ -52,7 +52,10 @@ test('craft window evidence can be reused only while revision, owner, cursor and
   }
 })
 
-async function retainedFixture (afterContent, options = { keepEvidence: true }, fillHotbar = false) {
+async function retainedFixture (afterContent, options, { fillHotbar = false, fillOffhand = false, omitInventorySlots = false } = {}) {
+  const openOptions = options === undefined
+    ? { keepEvidence: true, validateOffhand: true }
+    : { validateOffhand: true, ...options }
   const catalog = new ItemCatalog('1.21.11')
   const Item = require('prismarine-item')(catalog.mcData)
   const container = windows.createWindow(5, 'minecraft:generic_9x3', 'Barrel')
@@ -67,6 +70,8 @@ async function retainedFixture (afterContent, options = { keepEvidence: true }, 
     container.updateSlot(container.inventoryStart + 27, item)
     bot.inventory.updateSlot(36, item)
   }
+  if (omitInventorySlots) delete bot.inventory.slots
+  if (fillOffhand) bot.inventory.updateSlot(45, new Item(catalog.mcData.itemsByName.dirt.id, 1))
   const content = { windowId: 5, stateId: 1, items: container.slots.map(value => value ? Item.toNotch(value) : { itemCount: 0 }), carriedItem: { itemCount: 0 } }
   const warehouse = {
     openContainerAt: async () => {
@@ -77,8 +82,15 @@ async function retainedFixture (afterContent, options = { keepEvidence: true }, 
     },
     closeContainerQuietly: () => {}
   }
-  const { evidence } = await openServerContainer(warehouse, { chestId: 'source' }, catalog, bot, options)
-  return { bot, evidence, content, held: Item.toNotch(new Item(catalog.mcData.itemsByName.stone.id, 1)) }
+  const { evidence } = await openServerContainer(warehouse, { chestId: 'source' }, catalog, bot, openOptions)
+  return {
+    bot,
+    evidence,
+    content,
+    held: Item.toNotch(new Item(catalog.mcData.itemsByName.stone.id, 1)),
+    offhand: Item.toNotch(bot.inventory.slots[45]),
+    emptyOffhand: { itemCount: 0 }
+  }
 }
 
 for (const [label, name, packet] of [
@@ -126,7 +138,7 @@ test('identical deltas cannot restore invalidated retained evidence', async () =
 })
 
 test('retained player inventory deltas use vanilla hotbar numbering', async () => {
-  const f = await retainedFixture(null, { keepEvidence: true }, true)
+  const f = await retainedFixture(null, { keepEvidence: true }, { fillHotbar: true })
   try {
     assert.equal(f.evidence.isReusable(), true)
     f.bot._client.emit('set_player_inventory', { slotId: 0, contents: f.held })
@@ -136,8 +148,103 @@ test('retained player inventory deltas use vanilla hotbar numbering', async () =
   } finally { f.evidence.dispose() }
 })
 
+for (const [label, event, packet] of [
+  ['window slot', 'set_slot', f => ({ windowId: 0, slot: 45, item: f.offhand })],
+  ['player inventory', 'set_player_inventory', f => ({ slotId: 40, contents: f.offhand })],
+  ['legacy inventory slot', 'set_slot', f => ({ windowId: -2, slot: 40, item: f.offhand })]
+]) {
+  test(`retained offhand deltas preserve identical opening state through ${label}`, async () => {
+    const f = await retainedFixture(null, { keepEvidence: true }, { fillOffhand: true })
+    try {
+      assert.equal(f.evidence.isReusable(), true)
+      f.bot._client.emit(event, packet(f))
+      assert.equal(f.evidence.isReusable(), true)
+    } finally { f.evidence.dispose() }
+  })
+}
+
+test('retained empty offhand refresh is accepted only when it was already empty', async () => {
+  const f = await retainedFixture(null, { keepEvidence: true })
+  try {
+    f.bot._client.emit('set_slot', { windowId: 0, slot: 45, item: f.emptyOffhand })
+    assert.equal(f.evidence.isReusable(), true)
+  } finally { f.evidence.dispose() }
+})
+
+test('retained offhand replacement invalidates evidence even when the slot stays occupied', async () => {
+  const f = await retainedFixture(null, { keepEvidence: true }, { fillOffhand: true })
+  try {
+    f.bot._client.emit('set_slot', { windowId: 0, slot: 45, item: f.held })
+    assert.equal(f.evidence.isReusable(), false)
+  } finally { f.evidence.dispose() }
+})
+
+for (const [label, event, packet] of [
+  ['cleared window slot', 'set_slot', f => ({ windowId: 0, slot: 45, item: f.emptyOffhand })],
+  ['cleared player inventory', 'set_player_inventory', f => ({ slotId: 40, contents: f.emptyOffhand })],
+  ['changed legacy inventory slot', 'set_slot', f => ({ windowId: -2, slot: 40, item: f.emptyOffhand })]
+]) {
+  test(`retained offhand changes invalidate evidence through ${label}`, async () => {
+    const f = await retainedFixture(null, { keepEvidence: true }, { fillOffhand: true })
+    try {
+      f.bot._client.emit(event, packet(f))
+      assert.equal(f.evidence.isReusable(), false)
+    } finally { f.evidence.dispose() }
+  })
+}
+
+test('retained offhand updates reject malformed empty-slot payloads', async () => {
+  const f = await retainedFixture(null, { keepEvidence: true })
+  try {
+    f.bot._client.emit('set_slot', { windowId: 0, slot: 45, item: { itemCount: 0, unexpected: true } })
+    assert.equal(f.evidence.isReusable(), false)
+  } finally { f.evidence.dispose() }
+})
+
+test('a changed offhand cannot be hidden by a later full barrel refresh', async () => {
+  const f = await retainedFixture()
+  try {
+    f.bot._client.emit('set_slot', { windowId: 0, slot: 45, item: f.held })
+    f.bot._client.emit('window_items', { ...f.content, stateId: 2 })
+    assert.equal(f.evidence.isReusable(), false)
+  } finally { f.evidence.dispose() }
+})
+
+test('a changed offhand in a full player refresh cannot be hidden by a barrel refresh', async () => {
+  const f = await retainedFixture()
+  try {
+    const player = playerMenuContent(f.content)
+    player.items[45] = f.held
+    f.bot._client.emit('window_items', player)
+    f.bot._client.emit('window_items', { ...f.content, stateId: 2 })
+    assert.equal(f.evidence.isReusable(), false)
+  } finally { f.evidence.dispose() }
+})
+
+test('opening rejects an offhand change even when a fresh barrel snapshot follows', async () => {
+  await assert.rejects(retainedFixture((client, content, held) => {
+    client.emit('set_slot', { windowId: 0, slot: 45, item: held })
+    client.emit('window_items', { ...content, stateId: 2 })
+  }), /副手状态发生变化/)
+})
+
+test('opening fails closed when the offhand baseline is unavailable', async () => {
+  await assert.rejects(
+    retainedFixture(null, { keepEvidence: true }, { omitInventorySlots: true }),
+    /开窗时无法确认副手状态/
+  )
+})
+
+test('shared non-craft reads preserve empty offhand handling when validation is disabled', async () => {
+  const f = await retainedFixture(null, { keepEvidence: true, validateOffhand: false })
+  try {
+    f.bot._client.emit('set_slot', { windowId: 0, slot: 45, item: f.emptyOffhand })
+    assert.equal(f.evidence.isReusable(), true)
+  } finally { f.evidence.dispose() }
+})
+
 test('retained duplicate comparison preserves component-count differences', async () => {
-  const f = await retainedFixture(null, { keepEvidence: true }, true)
+  const f = await retainedFixture(null, { keepEvidence: true }, { fillHotbar: true })
   try {
     f.bot._client.emit('set_player_inventory', { slotId: 0, contents: { ...f.held, addedComponentCount: 1 } })
     assert.equal(f.evidence.isReusable(), false)
@@ -169,7 +276,7 @@ function playerMenuContent (content) {
 }
 
 test('craft opening keeps its barrel snapshot when a complete player refresh repeats the same state', async () => {
-  const f = await retainedFixture((client, content) => client.emit('window_items', playerMenuContent(content)), { keepEvidence: true }, true)
+  const f = await retainedFixture((client, content) => client.emit('window_items', playerMenuContent(content)), { keepEvidence: true }, { fillHotbar: true })
   try {
     assert.equal(f.evidence.current().stateId, 1)
     assert.equal(f.evidence.isReusable(), true)

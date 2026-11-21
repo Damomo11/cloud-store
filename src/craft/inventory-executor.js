@@ -1304,7 +1304,7 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
     emitDebug('executor.inventory_confirmation_fallback', { elapsedMs: performance.now() - startedAt,
       resultObserved: current.resultObserved, cursorKnown: current.cursorKnown, updateEpoch: current.updateEpoch, clickEpoch: operation.clickEpoch })
     try {
-      serverSnapshot = await readServerContainer(warehouse, chests[0], catalog, bot)
+      serverSnapshot = await readServerContainer(warehouse, chests[0], catalog, bot, { validateOffhand: true })
     } catch (cause) {
       throw error('authoritative server craft inventory and cursor snapshot was not confirmed', true, cause)
     }

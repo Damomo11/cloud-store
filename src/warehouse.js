@@ -389,7 +389,7 @@ class Warehouse {
       const expectedChest = this.db.listChestSlots().filter(row => row.chestId === chest.chestId && row.slot !== null)
         .map(row => ({ slot: row.slot, itemKey: row.itemKey, amount: row.amount }))
       const expectedPlayer = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
-      const snapshot = await readServerContainer(this, chest, this.catalog, this.bot)
+      const snapshot = await readServerContainer(this, chest, this.catalog, this.bot, { validateOffhand: true })
       this.db.replaceChestSlots(chest.chestId, snapshot.chestSlots)
       const localPlayer = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
       if (!this.sameCraftChestSlots(snapshot.chestSlots, expectedChest) || !this.sameCraftItems(snapshot.playerItems, expectedPlayer) ||
@@ -404,7 +404,7 @@ class Warehouse {
   }
 
   async refreshUnconfirmedCraftReturn (chest) {
-    const snapshot = await readServerContainer(this, chest, this.catalog, this.bot)
+    const snapshot = await readServerContainer(this, chest, this.catalog, this.bot, { validateOffhand: true })
     const localPlayer = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
     if (!this.sameCraftItems(snapshot.playerItems, localPlayer) || this.bot.currentWindow || this.bot.inventory.selectedItem ||
       this.bot.inventory.slots?.slice(0, 5).some(Boolean)) {
@@ -429,7 +429,7 @@ class Warehouse {
 
     let reopened
     try {
-      reopened = await openServerContainer(this, chest, this.catalog, this.bot, { keepEvidence: true })
+      reopened = await openServerContainer(this, chest, this.catalog, this.bot, { keepEvidence: true, validateOffhand: true })
     } catch (error) {
       error.uncertainTransfer = true
       throw error
@@ -1133,7 +1133,7 @@ class Warehouse {
       let transferAttempted = false
       try {
         let snapshot
-        try { snapshot = await openServerContainer(this, chest, this.catalog, this.bot, { keepEvidence: true }) } catch (error) {
+        try { snapshot = await openServerContainer(this, chest, this.catalog, this.bot, { keepEvidence: true, validateOffhand: true }) } catch (error) {
           error.uncertainTransfer = true
           throw error
         }
