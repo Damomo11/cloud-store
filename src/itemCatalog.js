@@ -599,40 +599,76 @@ class ItemCatalog {
     return changed ? { ...meta, components } : meta
   }
 
-  // fireworks 组件（烟花火箭）指纹归一：顶层组件里 type === 'fireworks' 的
-  // data.explosions 逐条过 unifyFireworkExplosionForFingerprint。只动指纹，
-  // 存档形状原样（同 potion_contents 一套）。
+  // fireworks（烟花火箭）+ firework_explosion（烟火之星）组件指纹归一：顶层
+  // 组件里对应 type 的 data 过归一。只动指纹，存档形状原样（同 potion_contents 一套）。
   unifyFireworksForFingerprint (meta) {
     if (!meta || typeof meta !== 'object' || !Array.isArray(meta.components)) return meta
     let changed = false
     const components = meta.components.map(component => {
-      if (component?.type !== 'fireworks') return component
-      const unified = this.unifyFireworksDataForFingerprint(component.data)
-      if (unified === component.data) return component
-      changed = true
-      return { ...component, data: unified }
+      if (component?.type === 'fireworks') {
+        const unified = this.unifyFireworksDataForFingerprint(component.data)
+        if (unified === component.data) return component
+        changed = true
+        return { ...component, data: unified }
+      }
+      // 烟火之星：data 即单条 explosion 形状，同烟花条目一套归一（2026-11-21
+      // 二次实证：570280a1 协议风带默认值 vs b22fd917 NBT 风无默认值，两代并存）。
+      if (component?.type === 'firework_explosion') {
+        const unified = this.unifyFireworkExplosionForFingerprint(component.data)
+        if (unified === component.data) return component
+        changed = true
+        return { ...component, data: unified }
+      }
+      return component
     })
     return changed ? { ...meta, components } : meta
   }
 
-  // 一份 fireworks data 的 explosions 形状归一（盒内条目同款归一复用：
-  // normalizeContainerComponentForFingerprint）。flight_duration 等顶层字段
-  // 两路一致，只动 explosions 数组。
+  // 一份 fireworks data 的形状归一（盒内条目同款归一复用：
+  // normalizeContainerComponentForFingerprint）。两代读取路径形状不同
+  // （2026-11-21 烟花案二次实证，DB 逐字对比）：
+  //  - 26.3 会话组件解码形状（15:14 同步 07:14 行）：{explosions:[{colors,
+  //    fadeColors: [], hasTrail: false, hasTwinkle: false, shape}],
+  //    flightDuration: 1}——驼峰顶层键名，空爆炸写空数组，条目全带默认值
+  //  - NBT 直形状（11-18 存档大头，账本余额所在）：{explosions:[{colors, shape}],
+  //    flight_duration: 1}——下划线，无爆炸无键，条目默认值不写
+  // 统一目标 = NBT 直形状（历史 key 不漂移）：flightDuration→flight_duration、
+  // 空 explosions 删键、条目剥默认值。幂等：统一形状再跑一遍返回原引用。
   unifyFireworksDataForFingerprint (data) {
-    if (!data || typeof data !== 'object' || !Array.isArray(data.explosions)) return data
-    const unified = data.explosions.map(entry => this.unifyFireworkExplosionForFingerprint(entry))
-    if (unified.every((entry, index) => entry === data.explosions[index])) return data
-    return { ...data, explosions: unified }
+    if (!data || typeof data !== 'object' || Array.isArray(data)) return data
+    let out = data
+    let touched = false
+    const rewrite = () => {
+      if (!touched) {
+        out = { ...out }
+        touched = true
+      }
+    }
+    if (out.flightDuration != null) {
+      rewrite()
+      if (out.flight_duration == null) out.flight_duration = out.flightDuration
+      delete out.flightDuration
+    }
+    if (Array.isArray(out.explosions) && !out.explosions.length) {
+      rewrite()
+      delete out.explosions
+    }
+    if (Array.isArray(out.explosions)) {
+      const unified = out.explosions.map(entry => this.unifyFireworkExplosionForFingerprint(entry))
+      if (!unified.every((entry, index) => entry === out.explosions[index])) {
+        rewrite()
+        out.explosions = unified
+      }
+    }
+    return touched ? out : data
   }
 
-  // 单条 explosion 归一。同一发烟花两条读取路径形状不同（2026-11-21 烟花案，
-  // DB 实证 22346f vs e669b5）：
-  //  - 开窗协议解码：全字段带默认值 {colors, fadeColors: [], hasTrail: false,
-  //    hasTwinkle: false, shape}
-  //  - Servux NBT：默认值不写 {colors, shape}
-  // 默认值一律剥（fadeColors 空数组、hasTrail/hasTwinkle false）；非默认值
-  // 保留且键名对齐驼峰（协议解码风格，同 potion 一套）。colors/shape 两路已
-  // 同形，原样透传。幂等：统一形状再跑一遍返回原引用。
+  // 单条 explosion 归一（烟花条目 + 烟火之星 firework_explosion 共用）。
+  // 默认值字段一律剥（fadeColors/fade_colors 空数组、hasTrail/hasTrail false、
+  // hasTwinkle/has_twinkle false——两种键名风格都认，26.3 组件解码产驼峰、
+  // NBT 直形状产下划线）；非默认值保留且键名统一 NBT 下划线风格，与顶层
+  // flight_duration 统一目标一致。colors/shape 两路已同形，原样透传。
+  // 幂等：统一形状再跑一遍返回原引用。
   unifyFireworkExplosionForFingerprint (entry) {
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return entry
     let touched = false
@@ -640,20 +676,20 @@ class ItemCatalog {
     for (const [key, value] of Object.entries(entry)) {
       if (key === 'fadeColors' || key === 'fade_colors') {
         if (Array.isArray(value) && !value.length) { touched = true; continue }
-        out.fadeColors = value
-        if (key === 'fade_colors') touched = true
+        out.fade_colors = value
+        if (key === 'fadeColors') touched = true
         continue
       }
       if (key === 'hasTrail' || key === 'has_trail') {
         if (value === false || value === 0) { touched = true; continue }
-        out.hasTrail = value
-        if (key === 'has_trail') touched = true
+        out.has_trail = value
+        if (key === 'hasTrail') touched = true
         continue
       }
       if (key === 'hasTwinkle' || key === 'has_twinkle') {
         if (value === false || value === 0) { touched = true; continue }
-        out.hasTwinkle = value
-        if (key === 'has_twinkle') touched = true
+        out.has_twinkle = value
+        if (key === 'hasTwinkle') touched = true
         continue
       }
       out[key] = value
@@ -1088,12 +1124,14 @@ class ItemCatalog {
       const unified = this.unifyPotionContentsDataForFingerprint(normalized.data)
       if (unified !== normalized.data) normalized = { ...normalized, data: unified }
     }
-    // 盒内烟花条目同顶层归一（fireworks explosions 默认值字段两路形状）：同
-    // potion_contents 拆盒案——散货在 normalizeMetaForFingerprint→
-    // unifyFireworksForFingerprint 归一，盒内漏了则装烟花的盒子两路各算各的
-    // key（2026-11-21 烟花案连带：源盒 e0a48e 在桶里实际 key 全变）。
-    if (normalized?.type === 'fireworks') {
-      const unified = this.unifyFireworksDataForFingerprint(normalized.data)
+    // 盒内烟花/烟火之星条目同顶层归一（同 potion_contents 拆盒案——散货在
+    // normalizeMetaForFingerprint→unifyFireworksForFingerprint 归一，盒内漏了
+    // 则装烟花的盒子两路各算各的 key，2026-11-21 烟花案连带：源盒 e0a48e 在
+    // 桶里实际 key 全变）。
+    if (normalized?.type === 'fireworks' || normalized?.type === 'firework_explosion') {
+      const unified = normalized.type === 'fireworks'
+        ? this.unifyFireworksDataForFingerprint(normalized.data)
+        : this.unifyFireworkExplosionForFingerprint(normalized.data)
       if (unified !== normalized.data) normalized = { ...normalized, data: unified }
     }
     if (!isBreweryX || component?.type !== 'tooltip_display') return normalized
