@@ -941,6 +941,7 @@ class CraftController {
     const deposited = await this.warehouse.depositAllPossible({
       requireServerEvidence: true,
       craftBatch: true,
+      onCraftDepositDebug: (event, details) => this.debug(event, { ...details, operationId: operation.id, transfer: 'deposit' }),
       ...(check ? { check } : {}),
       // Persist before the first click so even a disconnect between the
       // physical move and its confirmation can recover the exact barrel.
