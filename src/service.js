@@ -795,7 +795,12 @@ class CloudStoreService {
 
   handleTeleportRequestMessage (message) {
     const text = String(message || '').trim()
-    const match = text.match(/^([A-Za-z0-9_]{3,16})\s+请求传送到你的位置$/)
+    // 服务器统一聊天前缀（「≡ TSL »」等）后 tpa 提示挂在行首前缀之后；
+    // 与 findCommandAtChatBodyStart 同款：取最后一个箭头之后的正文再匹配。
+    // 新文本尾部带“ （60 秒内有效） [接受] [拒绝]”，句式开头唯一，不锚定尾部。
+    const arrowIndex = Math.max(text.lastIndexOf('>'), text.lastIndexOf('»'))
+    const body = arrowIndex >= 0 ? text.slice(arrowIndex + 1).trim() : text
+    const match = body.match(/^([A-Za-z0-9_]{3,16})\s+请求传送到你的位置/)
     if (!match) return false
 
     const username = match[1]
