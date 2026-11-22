@@ -651,3 +651,19 @@ test('cancelling while closing a recovery window prevents a later cursor click',
     assert.equal(f.db.getBalance('alice', f.before[0].itemKey), 2)
   } finally { f.close() }
 })
+
+test('recovery cancellation reaches the return deposit before another item moves', async () => {
+  const f = fixture({})
+  try {
+    const deposit = f.warehouse.depositAllPossible
+    f.warehouse.depositAllPossible = async options => {
+      f.controller.cancel('disconnected during recovery return')
+      options.check?.()
+      return deposit(options)
+    }
+    await assert.rejects(f.controller.recover(), /disconnected during recovery return/)
+    assert.equal(f.deposits(), 0)
+    assert.equal(f.ledger.pending().length, 1)
+    assert.equal(f.controller.inventory()[0].amount, 4)
+  } finally { f.close() }
+})

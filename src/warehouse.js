@@ -325,6 +325,7 @@ class Warehouse {
                 continue
               }
             }
+            if (options.craftBatch) options.check?.()
             if (options.requireServerEvidence && options.onPendingReturnChest && !returnEvidencePending) {
               options.onPendingReturnChest(chest.chestId)
               returnEvidencePending = true
