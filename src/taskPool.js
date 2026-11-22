@@ -145,12 +145,16 @@ class BotTaskPool {
         !(sticky.botId && this.hasInFlightPacking(sticky.botId)) &&
         !(sticky.botId && this.hasInFlightCraft(sticky.botId)) && !sticky.recoveringFromDeath && !sticky.emergencyRescueActive ? sticky : null
     }
-    // 私聊进来的业务任务绑定接收私信的机器人；该机器人掉线后退回任意空闲机器人，避免任务卡死。
-    if (task.stickyWorker && this.workers.has(task.stickyWorker)) {
-      const sticky = task.stickyWorker
-      return sticky.ready && !sticky.active && !this.inFlight.has(sticky) && !(sticky.botId && this.hasInFlightPacking(sticky.botId)) && !sticky.recoveringFromDeath && !sticky.emergencyRescueActive ? sticky : null
-    }
-    return [...this.workers].find(candidate => candidate.ready && !candidate.active && !this.inFlight.has(candidate) && !(candidate.botId && this.hasInFlightPacking(candidate.botId)) && !candidate.recoveringFromDeath && !candidate.emergencyRescueActive) || null
+    // 私聊进来的业务任务优先发给接收私信的机器人；它忙或身上挂着未恢复的
+    // 合成记录时，退回任意空闲机器人，避免一条恢复循环把队列粘死
+    // （2026-11-22 活塞恢复期间全站排队，空闲机器人空转 19 分钟）。
+    const sticky = task.stickyWorker && this.workers.has(task.stickyWorker) ? task.stickyWorker : null
+    const available = candidate => candidate.ready && !candidate.active && !this.inFlight.has(candidate) &&
+      !(candidate.botId && this.hasInFlightPacking(candidate.botId)) &&
+      !candidate.recoveringFromDeath && !candidate.emergencyRescueActive &&
+      !candidate.db?.hasPendingCraft?.(candidate.botId)
+    if (sticky && available(sticky)) return sticky
+    return [...this.workers].find(available) || null
   }
 
   hasInFlightPacking (botId = '') {
@@ -220,16 +224,13 @@ class BotTaskPool {
 
   dispatch () {
     if (this.fused) return
-    if ([...this.inFlight.values()].some(task => task.exclusive)) return
-    if ([...this.workers].some(worker => worker.active?.exclusive)) return
     for (let index = 0; index < this.queue.length; index++) {
       const task = this.queue[index]
       const worker = this.eligibleWorkerForTask(task)
-      // An offline/busy recovery owner cannot start yet. Keep its bot binding,
-      // but only make it a global barrier once that recovery can actually run.
+      // exclusive 任务只互斥 exclusive：起跑前仍要求全池空闲，但拿不到就
+      // 跳过排队等待，不再作为全局屏障饿死后面的普通任务。
       if (task.exclusive) {
-        if (task.type === 'craft_recovery' && !worker) continue
-        if (this.inFlight.size || [...this.workers].some(current => current.active) || !worker) break
+        if (this.inFlight.size || [...this.workers].some(current => current.active) || !worker) continue
         this.queue.splice(index, 1)
         this.run(worker, task)
         return
