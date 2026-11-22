@@ -119,12 +119,12 @@ function fixture (options = {}) {
     withdrawals: () => withdrawals, setPacketMode: value => { packetMode = value }, close: () => db.close() }
 }
 
-function storingOperation (f) {
+function storingOperation (f, emitDebug) {
   const held = f.catalog.aggregatePrismarineItems(f.bot.inventory.items())
   const ledger = new CraftLedger(f.db)
   const operation = ledger.begin({ id: 'craft:strict-deposit', botId: 'bot-a', owner: { uuid: 'alice' },
     allocations: [], data: { held, pending: null, physicalTotals: held, stepIndex: 0 } })
-  const controller = new CraftController({ ...f, ledger, executor: { isBusy: () => false }, botId: 'bot-a' })
+  const controller = new CraftController({ ...f, ledger, executor: { isBusy: () => false }, botId: 'bot-a', debugCraft: emitDebug })
   return { controller, operation, ledger }
 }
 
@@ -275,6 +275,20 @@ test('controller store marks ready after a matching server deposit snapshot', as
     const { controller, operation } = storingOperation(f)
     assert.equal((await controller.store(operation)).phase, 'ready')
     assert.equal(f.opens(), 2)
+  } finally { f.close() }
+})
+
+test('controller logs incomplete server click evidence for the pending return barrel', async () => {
+  const f = fixture({ modern: true, transferMode: 'missing' })
+  const events = []
+  try {
+    const { controller, operation, ledger } = storingOperation(f, (event, details) => events.push({ event, ...details }))
+    await assert.rejects(controller.store(operation), /server did not confirm/)
+    const timeout = events.find(entry => entry.event === 'executor.window_confirmation_timeout')
+    assert.deepEqual([timeout?.operationId, timeout?.chestId, timeout?.transfer], [operation.id, f.chest.chestId, 'deposit'])
+    assert.equal(timeout.responseCount, 1)
+    assert.equal(timeout.incompleteResponseCount, 1)
+    assert.equal(ledger.get(operation.id).data.pendingReturnChestId, f.chest.chestId)
   } finally { f.close() }
 })
 
