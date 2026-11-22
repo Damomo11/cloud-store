@@ -293,13 +293,16 @@ test('recovery completes a deposit whose first confirmation packet was missing',
   } finally { f.close() }
 })
 
-test('a pending craft prevents sync from rewriting chest slots before reconciliation', async () => {
+test('sync rewrites chest slots without the old global craft lockout', async () => {
   const f = fixture()
   try {
     storingOperation(f)
     const scan = { blocks: [], snapshots: [] }
-    await assert.rejects(f.warehouse.applyWarehouseScan(scan, 1, { allowShrink: true }), /合成|craft/)
-    assert.equal(f.db.listChests().length, 1)
+    // 新行为（2026-11-22 拆锁）：pending 恢复记录不再阻塞同步——在途键
+    // 在对账里剔除（deferredForCraft），其余照常落库。
+    await assert.doesNotReject(f.warehouse.applyWarehouseScan(scan, 1, { allowShrink: true }))
+    // blocks 为空 → clearChests 清空登记；同步本身照常执行。
+    assert.equal(f.db.listChests().length, 0)
   } finally { f.close() }
 })
 

@@ -95,7 +95,6 @@ test('a new craft first recovers its own pending journal before the upstream glo
 
 test('ordinary task inventory guard is evaluated for its own bot context', async () => {
   let recovered = false, ran = false
-  let checkedBot = ''
   const service = Object.assign(Object.create(Service.prototype), {
     botId: 'healthy', db: {
       assertNoPendingCraft: () => { throw new Error('pending craft owned by offline') },
@@ -103,10 +102,12 @@ test('ordinary task inventory guard is evaluated for its own bot context', async
       runWithCommandContext: (_id, fn) => fn(),
       runWithBotContext: (_context, fn) => fn()
     },
-    withBotContext: fn => { checkedBot = 'healthy'; return fn() },
+    withBotContext: fn => fn(),
     getCraftController: () => ({ recover: async () => { recovered = true } })
   })
-  service.db.assertNoPendingCraft = () => { if (checkedBot !== 'healthy') throw new Error('bot context missing') }
+  service.db.assertNoPendingCraft = (_operationId, actingBotId) => {
+    if (actingBotId !== 'healthy') throw new Error('acting bot id missing')
+  }
   await service.runExclusive('Alice', 'withdraw', () => { ran = true })
   assert.equal(recovered, false)
   assert.equal(ran, true)

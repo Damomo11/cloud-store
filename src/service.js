@@ -48,7 +48,7 @@ async function recoverAndResumeCraft (service, controller) {
       const settled = await controller.settleResumeFailure(recovered.operationId, resumeError)
       const resumeFailedSettled = settled.status === 'recovered'
       return { ...settled, recoveredOperationId: recovered.operationId,
-        ...(resumeFailedSettled ? { resumeFailedSettled } : {}), resumeFailure: resumeError.message }
+        ...(resumeFailedSettled ? { resumeFailedSettled: true } : {}), resumeFailure: resumeError.message }
     }
     throw resumeError
   }
@@ -1238,7 +1238,7 @@ class CloudStoreService {
         await this.withBotContext(() => recoverAndResumeCraft(this, this.getCraftController()))
       }
       if (active.cancelled || active.dead || this.connectionInvalidated) throw new Error('机器人生命周期已变化，任务已取消。')
-      if (type !== 'craft_recovery') this.withBotContext(() => this.db.assertNoPendingCraft?.())
+      if (type !== 'craft_recovery') this.db.assertNoPendingCraft?.('', this.botId)
       const migration = this.db.runDeferredMigrations?.()
       if (migration?.catalogError || migration?.offlineIdentityError) {
         throw new Error('恢复后的库存身份迁移尚未完成，请检查日志并重试。')
@@ -2671,12 +2671,12 @@ class CloudStoreService {
       const canStart = !this.taskPool || Boolean(this.taskPool.eligibleWorkerForTask({ type: 'craft_recovery', stickyWorker }))
       const task = Promise.resolve(this.enqueueTask(username, 'craft_recovery', async worker => {
         const result = await recoverAndResumeCraft(worker, worker.getCraftController())
-        this.msg(username, result.status === 'empty'
+        this.msg(username, result.resumeFailedSettled
+          ? (result.diffRegistered
+              ? `机器人 ${botId} 的续跑失败；实物差异已记入 momo 并登记库存异常，恢复记录已释放，可重新提交合成。`
+              : `机器人 ${botId} 的续跑失败；已按核验后的实物状态记账并释放恢复记录，可重新提交合成。`)
+          : result.status === 'empty'
           ? `机器人 ${botId} 没有待恢复的合成任务。`
-          : result.resumeFailedSettled
-            ? (result.diffRegistered
-                ? `机器人 ${botId} 的续跑失败；实物差异已记入 momo 并登记库存异常，恢复记录已释放，可重新提交合成。`
-                : `机器人 ${botId} 的续跑失败；已按核验后的实物状态记账并释放恢复记录，可重新提交合成。`)
           : result.resumedFromRecovery
             ? '已核对中断时的物品，并从上次确认位置继续完成原合成订单。'
             : result.status === 'recovery_required'
@@ -2685,7 +2685,7 @@ class CloudStoreService {
             ? '合成中断状态已核验，物品已回云仓；对账差异已登记库存异常，请在 Web 管理页复核；可重新提交合成。'
             : '合成中断状态已核验，物品已回云仓；可重新提交合成。')
         return result
-      }, { stickyWorker }))
+      }, { exclusive: true, stickyWorker }))
       if (canStart) outcomes.push(await task)
       else {
         this.msg(username, `已为 ${botId} 排队恢复，等待原机器人上线并结束旧操作；恢复完成前仍按原有规则保护库存。`)
@@ -2711,7 +2711,7 @@ class CloudStoreService {
         const result = await this.enqueueTask(admin, 'craft_recovery', async worker => {
           const outcome = await recoverAndResumeCraft(worker, worker.getCraftController())
           return outcome
-        }, { stickyWorker: this })
+        }, { exclusive: true, stickyWorker: this })
         // recover() 重试失败会按库存差异登记销账（不再锁库），status recovered
         // 含 diffRegistered=true 时要提示管理员有差异登记待复核。
         const notice = result?.resumedFromRecovery
@@ -3609,11 +3609,12 @@ class CloudStoreService {
           ? `，Servux隔空读${result.servuxRead}个桶${result.servuxMissed > 0 ? `（漏读${result.servuxMissed}个已保留旧记录）` : ''}`
           : ''
         const packingText = result.deferredForPacking?.length ? `，${result.deferredForPacking.length}种物品待装盒恢复结算后再对账` : ''
+        const craftText = result.deferredForCraft?.length ? `，${result.deferredForCraft.length}种物品待合成恢复结算后再对账` : ''
         const driftRepair = result.driftRepair
         const driftRepairText = driftRepair?.repaired
           ? `，兜底回填${driftRepair.movedAmount}/${driftRepair.repaired}种`
           : ''
-        this.msg(username, `同步完成：木桶${result.chestCount}，打开${result.openedChestCount}，重读${result.rescanCount || 0}${failureText}${parallelText}${servuxText}，多余${addedAmount}/${this.itemTypeCount(result.addedToMomo)}种，缺失${unresolvedAmount}/${this.itemTypeCount(result.unresolved)}种${driftRepairText}${packingText}。详情见Web管理页。`)
+        this.msg(username, `同步完成：木桶${result.chestCount}，打开${result.openedChestCount}，重读${result.rescanCount || 0}${failureText}${parallelText}${servuxText}，多余${addedAmount}/${this.itemTypeCount(result.addedToMomo)}种，缺失${unresolvedAmount}/${this.itemTypeCount(result.unresolved)}种${driftRepairText}${packingText}${craftText}。详情见Web管理页。`)
         traceSummary(trace, {
           status: 'ok',
           chests: result.chestCount,

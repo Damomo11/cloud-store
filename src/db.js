@@ -537,7 +537,7 @@ class StoreDb {
   }
 
   applyCatalogMigration () {
-    this.assertNoPendingCraft()
+    this.assertNoPendingCraftStrict()
     if (this.hasPendingPacking()) {
       this.catalogMigrationDeferred = true
       return { deferred: true }
@@ -649,7 +649,7 @@ class StoreDb {
   }
 
   canonicalizeItemKeys () {
-    this.assertNoPendingCraft()
+    this.assertNoPendingCraftStrict()
     if (this.hasPendingPacking()) {
       this.catalogMigrationDeferred = true
       return { deferred: true, moved: 0, mergedBalances: 0 }
@@ -1746,7 +1746,7 @@ class StoreDb {
   // 管理员在 Web 页确认后调用；游戏内 upsertPlayer 只登记冲突，不自动合并。
   // 方向由调用方决定：一般把“库存多/更常用”的号留作 primary。
   mergePlayerIdentities (primaryUuid, secondaryUuid, adminUsername = '') {
-    this.assertNoPendingCraft()
+    this.assertNoPendingCraftStrict()
     if (this.hasPendingPacking()) {
       const owners = this.db.prepare("SELECT owner_json AS ownerJson FROM packing_operations WHERE state NOT IN ('completed','failed')").all()
       if (owners.some(row => [String(primaryUuid || '').trim(), String(secondaryUuid || '').trim()].includes(JSON.parse(row.ownerJson).uuid))) {
@@ -2499,7 +2499,7 @@ class StoreDb {
   }
 
   deleteOwnerWarehouseToMomo (ownerUuid, ownerUsername, warehouseType, adminUsername, deleteWarehouse) {
-    this.assertNoPendingCraft()
+    this.assertNoPendingCraftStrict()
     this.assertPackingOwnerMutable(ownerUuid)
     if (!ownerUuid || ownerUuid === this.momoOwner) throw new Error('不能删除该仓库。')
     const items = this.getOwnerBalances(ownerUuid)
@@ -2534,7 +2534,7 @@ class StoreDb {
   }
 
   renameCustomWarehouse (name, newName) {
-    this.assertNoPendingCraft()
+    this.assertNoPendingCraftStrict()
     const warehouse = this.getCustomWarehouse(name)
     if (!warehouse) throw new Error(`找不到仓库：${name}`)
     const nextName = String(newName || '').trim()
@@ -2927,18 +2927,89 @@ class StoreDb {
       .all().map(row => String(row.botId || ''))
   }
 
-  assertNoPendingCraft (allowedOperationId = '') {
-    const context = this.transactionContext.getStore() || {}
-    const botId = String(context.botId || '')
-    if (!this.hasPendingCraft(botId)) return
-    const conditions = ["state NOT IN ('completed','complete','failed')"]
-    const params = []
-    if (botId) { conditions.push('bot_id = ?'); params.push(botId) }
-    if (allowedOperationId) { conditions.push('id <> ?'); params.push(String(allowedOperationId)) }
-    if (!this.db.prepare(`SELECT 1 FROM craft_operations WHERE ${conditions.join(' AND ')} LIMIT 1`).get(...params)) return
-    const owners = botId ? [botId] : this.pendingCraftBotIds().filter(Boolean)
+  // 在途合成/恢复记录仍占用的物品键集合 = 该记录可能还在动的账：
+  // 预留行（inventory_reservations）+ 背包持有（data.held/pending.before）+
+  // 实物基线（physicalTotals/recoveryBaseline/recoveryIntent.baseline）+
+  // 待确认转化（pending.expectedConsumed/expectedProduced）。
+  // 其他机器人做同步对账时剔除这些键（同 packing 的 deferredKeys 语义）：
+  // 恢复中机器人的背包物品不在桶里，不剔除会被同步当成"缺失"抽干账面
+  //（2026-11-22 生产事故：xmcbot01 恢复记录挂着期间 !存/取 被全库锁死）。
+  pendingCraftReconciliationKeys ({ excludeOperationId = '' } = {}) {
+    const keys = new Set()
+    if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='craft_operations'").get()) return keys
+    const collect = value => {
+      if (!value || typeof value !== 'object') return
+      if (value.itemKey) keys.add(String(value.itemKey))
+    }
+    const rows = this.db.prepare(`
+      SELECT id, data_json AS dataJson FROM craft_operations
+      WHERE state NOT IN ('completed','complete','failed') AND id <> ?
+    `).all(String(excludeOperationId || ''))
+    const walk = value => {
+      if (Array.isArray(value)) { for (const entry of value) walk(entry); return }
+      if (!value || typeof value !== 'object') return
+      collect(value)
+    }
+    for (const row of rows) {
+      let data = null
+      try { data = JSON.parse(row.dataJson || '{}') } catch { continue }
+      walk(data.held)
+      walk(data.physicalTotals)
+      walk(data.recoveryBaseline)
+      walk(data.recoveryIntent?.baseline)
+      walk(data.pending?.before)
+      walk(data.pending?.expectedConsumed)
+      walk(data.pending?.expectedProduced)
+    }
+    if (this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='inventory_reservations'").get()) {
+      const reserved = this.db.prepare(`
+        SELECT DISTINCT r.item_key AS itemKey
+        FROM inventory_reservations r
+        JOIN craft_operations c ON c.id = r.reservation_id
+        WHERE c.state NOT IN ('completed','complete','failed') AND c.id <> ?
+      `).all(String(excludeOperationId || ''))
+      for (const value of reserved) {
+        if (value?.itemKey) keys.add(String(value.itemKey))
+      }
+    }
+    return keys
+  }
+
+  craftOperationBotId (operationId = '') {
+    if (!operationId) return ''
+    if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='craft_operations'").get()) return ''
+    return String(this.db.prepare('SELECT bot_id AS botId FROM craft_operations WHERE id = ?').get(String(operationId))?.botId || '')
+  }
+
+  // 管理员/维护路径的全局合成锁：身份合并、仓库删除/改名、清空库存、目录迁移
+  // 会改写恢复记录引用的 item_key/身份结构，属于低频高危操作，保持全库阻断
+  //（旧行为不变）。玩家业务（存/取/同步）走 assertNoPendingCraft 的机器人锁。
+  assertNoPendingCraftStrict (allowedOperationId = '') {
+    if (!this.hasPendingCraft()) return
+    if (allowedOperationId && !this.db.prepare("SELECT 1 FROM craft_operations WHERE state NOT IN ('completed','complete','failed') AND id <> ? LIMIT 1").get(String(allowedOperationId))) return
+    const owners = this.pendingCraftBotIds().filter(Boolean)
     const suffix = owners.length ? `（待恢复记录所属机器人：${owners.join('、')}）` : ''
     throw new Error('合成仍在进行或等待恢复；为保护物品归属，暂停库存变更和同步，请执行 !合成恢复。' + suffix)
+  }
+
+  // 业务路径的机器人级合成锁：只有"待恢复记录所属机器人自己"被拦
+  //（它不能在恢复完成前改自己的账）；其他机器人照常存/取/同步。
+  // 在途机器人的实物与账由两道软隔离保护：
+  //  1. inventory_reservations 预留行让其他机器人的取货拿不到在途原料；
+  //  2. 同步对账剔除 pendingCraftReconciliationKeys（同 packing 的
+  //     deferredForPacking 语义），在途物品不参与对账，不产生假缺失/假多余。
+  // 库存可能出现对账差异（登记异常留痕），但业务不因一条恢复记录停摆。
+  // allowedOperationId/craftOperationId 非空 = 恢复对账事务自己：放行，
+  // 它要结算的恰恰是自己的键（其他在途记录的键由 craftDeferredKeys 剔除）。
+  assertNoPendingCraft (allowedOperationId = '', actingBotId = '') {
+    const context = this.transactionContext.getStore() || {}
+    const operationId = String(allowedOperationId || context.craftOperationId || '')
+    if (operationId && this.craftOperationBotId(operationId)) return
+    const botId = String(actingBotId || context.botId || '')
+    if (botId && this.pendingCraftBotIds().includes(botId)) {
+      throw new Error(`本机器人存在待恢复的合成记录（待恢复机器人：${botId}）；请先执行 !合成恢复。`)
+    }
+    // 其他机器人在途：放行。预留行挡住跨领，对账剔除在途键。
   }
 
   adjustBalance (ownerUuid, itemKey, delta) {
@@ -3607,7 +3678,7 @@ class StoreDb {
   }
 
   clearInventoryData () {
-    this.assertNoPendingCraft()
+    this.assertNoPendingCraftStrict()
     const counts = {
       balances: this.db.prepare('SELECT COUNT(*) AS count FROM balances').get().count,
       chestSlots: this.db.prepare('SELECT COUNT(*) AS count FROM chest_slots').get().count,
@@ -3962,10 +4033,17 @@ class StoreDb {
   reconcileTotalsToMomoAllowed (actualTotals, baselineTotals = null) {
     this.assertNoPendingCraft(this.transactionContext.getStore()?.craftOperationId || '')
     const deferredKeys = this.pendingPackingReconciliationKeys()
-    const ledgerRows = this.getLedgerTotals().filter(row => !deferredKeys.has(row.itemKey))
+    const context = this.transactionContext.getStore() || {}
+    // 恢复对账事务自己（craftOperationId 存在）结算自己的键，只剔除
+    // "其他"在途记录的键；普通同步对账剔除全部在途键。
+    const craftDeferredKeys = this.pendingCraftReconciliationKeys({
+      excludeOperationId: String(context.craftOperationId || '')
+    })
+    const deferKeys = row => !deferredKeys.has(row.itemKey) && !craftDeferredKeys.has(row.itemKey)
+    const ledgerRows = this.getLedgerTotals().filter(deferKeys)
     const ledger = new Map(ledgerRows.map(row => [row.itemKey, row]))
-    const actual = new Map(actualTotals.filter(row => !deferredKeys.has(row.itemKey)).map(row => [row.itemKey, row]))
-    const baseline = baselineTotals ? new Map(baselineTotals.filter(row => !deferredKeys.has(row.itemKey)).map(row => [row.itemKey, row])) : null
+    const actual = new Map(actualTotals.filter(deferKeys).map(row => [row.itemKey, row]))
+    const baseline = baselineTotals ? new Map(baselineTotals.filter(deferKeys).map(row => [row.itemKey, row])) : null
     const reference = baseline || ledger
     const keys = new Set([...reference.keys(), ...actual.keys()])
     const addedToMomo = []
@@ -4131,7 +4209,11 @@ class StoreDb {
       }
     })
 
-    return { addedToMomo, removedFromMomo, unresolved, driftRepair, diffSummary, ...(deferredKeys.size ? { deferredForPacking: [...deferredKeys] } : {}) }
+    return {
+      addedToMomo, removedFromMomo, unresolved, driftRepair, diffSummary,
+      ...(deferredKeys.size ? { deferredForPacking: [...deferredKeys] } : {}),
+      ...(craftDeferredKeys.size ? { deferredForCraft: [...craftDeferredKeys] } : {})
+    }
   }
 
   rowToItem (row) {

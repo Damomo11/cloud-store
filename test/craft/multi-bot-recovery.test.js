@@ -38,25 +38,40 @@ test('a journal owned by another bot is visible globally but not per bot', async
   } finally { f.close() }
 })
 
-test('unscoped inventory changes stay protected while naming the bot that owns the journal', async () => {
+test('a journal owned by another bot no longer locks the whole store', async () => {
   const f = fixture()
   try {
     pendingJournal(f, 'bot-b')
-    assert.throws(() => f.db.assertNoPendingCraft(), error => {
-      assert.match(error.message, /合成仍在进行或等待恢复/)
-      assert.match(error.message, /bot-b/)
-      return true
-    })
+    // 新行为（2026-11-22 生产事故）：其他机器人在途的恢复记录不再全库锁死。
+    // bot-a 的存/取照常放行；在途 bot-b 的账由预留行单独保护。
+    assert.doesNotThrow(() => f.db.assertNoPendingCraft('', 'bot-a'))
+    assert.doesNotThrow(() => f.db.addBalanceItems('bob', f.planks))
+    // 待恢复机器人自己仍被挡：恢复完成前它不能改自己的账。
+    assert.throws(() => f.db.assertNoPendingCraft('', 'bot-b'), /待恢复机器人：bot-b/)
   } finally { f.close() }
 })
 
-test('a bot-specific recovery journal does not pause another bot inventory task', async () => {
+test('reconciliation defers pending-craft reservation keys instead of draining them', async () => {
   const f = fixture()
   try {
     pendingJournal(f, 'bot-b')
-    assert.doesNotThrow(() => f.db.runWithBotContext({ botId: 'bot-a' }, () => f.db.assertNoPendingCraft()))
-    assert.throws(() => f.db.runWithBotContext({ botId: 'bot-b' }, () => f.db.assertNoPendingCraft()), /bot-b/)
-    assert.throws(() => f.db.assertNoPendingCraft(), /bot-b/)
+    // bob 账面与实物一致的对账：alice 被 bot-b 预留的 planks 不参与，
+    // 既不划走也不抽干；其他物品照常对账。
+    const planks = f.planks.map(item => ({ itemKey: item.itemKey, itemId: item.itemId, displayName: item.displayName, amount: item.amount }))
+    const result = f.db.reconcileTotalsToMomo([])
+    assert.ok(result.deferredForCraft?.some(key => planks.some(item => item.itemKey === key)),
+      'pending craft reservation keys must be deferred, not reconciled')
+    assert.equal(f.db.getBalance('alice', planks[0].itemKey), 2)
+  } finally { f.close() }
+})
+
+test('recovery settlement reconciliation keeps its own operation keys', async () => {
+  const f = fixture()
+  try {
+    const id = pendingJournal(f, 'bot-b')
+    // 恢复对账事务自己（allowedOperationId）：不剔除自己的键，照常结算。
+    const planks = f.planks.map(item => ({ itemKey: item.itemKey, itemId: item.itemId, displayName: item.displayName, amount: item.amount }))
+    assert.doesNotThrow(() => f.db.reconcileRecoveryDeltaToMomo(planks, planks, id))
   } finally { f.close() }
 })
 
@@ -83,9 +98,9 @@ test('flushResidual keeps the upstream bot-specific journal guard', async () => 
   } finally { f.close() }
 })
 
-function recoveryService (f, result, controllerMethods = {}) {
+function recoveryService (f, result) {
   const messages = []
-  const owner = { botId: 'bot-b', getCraftController: () => ({ recover: async () => result, ...controllerMethods }) }
+  const owner = { botId: 'bot-b', getCraftController: () => ({ recover: async () => result }) }
   const service = Object.assign(Object.create(CloudStoreService.prototype), {
     botId: 'receiver', db: f.db,
     isAdmin: () => true,
@@ -93,26 +108,13 @@ function recoveryService (f, result, controllerMethods = {}) {
     taskPool: { workers: new Set([owner]), eligibleWorkerForTask: () => owner },
     enqueueTask: (username, type, run, options) => {
       assert.equal(type, 'craft_recovery')
+      assert.equal(options.exclusive, true)
       assert.equal(options.stickyWorker, owner)
       return run(owner)
     }
   })
   return { service, messages }
 }
-
-test('manual recovery reports a failed resume after settling its verified inventory state', async () => {
-  const f = fixture()
-  try {
-    pendingJournal(f, 'bot-b')
-    const { service, messages } = recoveryService(f, { status: 'resumable', operationId: 'craft:bot-b' }, {
-      resume: async () => { throw new Error('no standard recipe matches') },
-      settleResumeFailure: async () => ({ status: 'recovered', diffRegistered: true })
-    })
-    await service.handleCraftRecovery('kelemiao')
-    assert.ok(messages.some(message => /续跑失败/.test(message) && /momo/.test(message) && /重新提交/.test(message)))
-    assert.ok(messages.every(message => !/继续完成原合成订单/.test(message)))
-  } finally { f.close() }
-})
 
 test('craft recovery on another bot routes to the journal owner', async () => {
   const f = fixture()

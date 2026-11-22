@@ -894,7 +894,9 @@ test('multi-step recipes keep intermediates reserved and return surplus output t
       batches++
       assert.equal(controller.ledger.pending().length, 1)
       assert.ok(controller.ledger.listCraftReservations(controller.ledger.pending()[0].id).length)
-      assert.throws(() => f.db.adjustBalance('alice', log.itemKey, 1), /合成|craft/)
+      // 新行为（2026-11-22 拆锁）：无 bot 上下文的裸 adjustBalance 放行；
+      // 在途机器人的机器人锁（botId 命中 pending 记录）才会拦截。
+      assert.doesNotThrow(() => f.db.adjustBalance('alice', log.itemKey, 1))
       return run(args)
     }
     const result = await controller.run({ actor: 'Alice', owner: { uuid: 'alice' }, item: 'stick', quantity: 5 })
@@ -978,7 +980,9 @@ test('full warehouse keeps settled outputs reserved and never issues a second de
     assert.equal(sticks.amount, 4)
     assert.equal(controller.ledger.pending().length, 1)
     assert.equal(controller.ledger.getCraftAvailableItems('alice').length, 0)
-    assert.throws(() => f.db.adjustBalance('bob', sticks.itemKey, 1), /合成|craft/)
+    // 新行为（2026-11-22 拆锁）：裸 adjustBalance 放行；产出由预留行
+    //（getCraftAvailableItems=0 可见）保护而非全局锁。
+    assert.doesNotThrow(() => f.db.adjustBalance('bob', sticks.itemKey, 1))
     assert.equal(f.db.db.prepare("SELECT COUNT(*) AS n FROM transactions WHERE type='craft_produce'").get().n, 1)
   } finally { f.db.close() }
 })
