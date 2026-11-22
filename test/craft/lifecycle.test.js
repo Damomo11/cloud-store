@@ -89,13 +89,18 @@ test('StoreDb blocks balance writes and sync while a craft operation is pending,
     const ledger = new CraftLedger(db)
     ledger.begin({ id: 'craft:guard', botId: 'bot-a', actor: 'Alice', owner: { uuid: 'alice' }, target: { name: 'stick', quantity: 4 }, allocations: [plank] })
     assert.equal(db.hasPendingCraft(), true)
-    assert.throws(() => db.addBalanceItems('bob', [plank]), /合成|craft/i)
-    assert.throws(() => db.reconcileTotalsToMomo(new Map()), /合成|craft/i)
+    // 新行为（2026-11-22 拆锁）：全局锁只在管理员路径（strict）保留；
+    // 业务路径按机器人拆分——bot-a 命中自己的 pending 记录被拦，
+    // 其他身份（无 bot 上下文/别的 bot）放行，账由预留行保护。
+    assert.throws(() => db.assertNoPendingCraft('', 'bot-a'), /待恢复机器人：bot-a/)
+    assert.doesNotThrow(() => db.addBalanceItems('bob', [plank]), 'other actors no longer locked out by a pending recovery journal')
+    const reconcile = db.reconcileTotalsToMomo([])
+    assert.ok(reconcile.deferredForCraft.includes(plank.itemKey), 'sync defers pending-craft reservation keys instead of locking')
     db.close()
     db = new StoreDb(filename, structuredClone(DEFAULT_CONFIG))
     assert.equal(db.hasPendingCraft(), true)
     assert.equal(db.db.prepare("SELECT amount FROM inventory_reservations WHERE reservation_id='craft:guard'").get().amount, 2)
-    assert.throws(() => db.addBalanceItems('bob', [plank]), /合成|craft/i)
+    assert.equal(db.getBalance('bob', plank.itemKey), 2)
   } finally {
     db.close()
     fs.rmSync(directory, { recursive: true, force: true })

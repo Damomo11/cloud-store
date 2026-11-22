@@ -35,15 +35,38 @@ function fixture (t) {
 test('recovery reconciles its own journal with upstream extra and missing allocation policy', t => {
   const f = fixture(t)
   f.begin()
-  assert.throws(() => f.db.reconcileTotalsToMomo([qty(diamond, 8), qty(stick, 4)]), /合成|pending/i)
+  // 新行为（2026-11-22 按机器人拆锁）：普通对账放行不再全库拒绝。该单
+  // allocations 为空，没有在途预留键，diamond 账面 10 vs 实扫 8 的缺额
+  // 按常规同步规则处理（登记 unresolved + 缺口扣账留痕）。
+  const plain = f.db.reconcileTotalsToMomo([qty(diamond, 8), qty(stick, 4)])
+  assert.deepEqual(plain.addedToMomo.map(item => item.itemKey), ['stick|plain'], 'non-pending keys reconcile normally')
+  assert.equal(plain.unresolved[0]?.itemKey, 'diamond|plain')
+  assert.equal(plain.unresolved[0]?.amount, 2)
+  // 之后的恢复对账结算（allowedOperationId=craft:a）沿用原校验：账面已被
+  // 第一次普通对账的"同步即扣"修正为 8，stick 也已划入 momo，第二次对账
+  // 是幂等空转（addedToMomo 空）。
   const result = f.db.reconcileTotalsToMomo([qty(diamond, 8), qty(stick, 4)], 'craft:a')
   assert.equal(f.db.getBalance('alice', diamond.itemKey), 8)
   assert.equal(f.db.getBalance(f.db.momoOwner, stick.itemKey), 4)
-  assert.equal(result.unresolved[0].amount, 2)
-  assert.equal(result.addedToMomo[0].amount, 4)
+  assert.deepEqual(result.addedToMomo, [])
   const missing = f.db.db.prepare("SELECT amount, balance_adjusted FROM inventory_mismatches WHERE kind = 'missing'").get()
   assert.deepEqual(missing, { amount: 2, balance_adjusted: 2 })
-  assert.throws(() => f.db.adjustBalance('alice', diamond.itemKey, 1), /合成|pending/i, 'recovery exemption does not escape its context')
+  // 新行为：craft:a 的恢复对账事务结束后不再有全局锁，普通 adjustBalance
+  // 放行（旧测试用它验证恢复豁免不逃逸；拆锁后这条路径由 pendingCraftBotIds
+  // 的机器人锁覆盖，见 multi-bot-recovery.test.js）。
+  assert.doesNotThrow(() => f.db.adjustBalance('alice', diamond.itemKey, 1))
+})
+
+test('plain reconciliation defers pending-craft reservation keys instead of draining them', t => {
+  const f = fixture(t)
+  // 与上一条同形状，但恢复单带着 diamond 预留：同步对账必须剔除该键，
+  // 不能把恢复中的原料当缺失抽干账面。
+  f.ledger.begin({ id: 'craft:r', botId: 'bot-a', owner: { uuid: 'alice', username: 'Alice' }, target: {},
+    allocations: [qty(diamond, 10)],
+    data: { held: [], pending: null, stepIndex: 0 } })
+  const result = f.db.reconcileTotalsToMomo([])
+  assert.ok(result.deferredForCraft?.includes(diamond.itemKey), 'pending craft reservation keys are reported as deferred')
+  assert.equal(f.db.getBalance('alice', diamond.itemKey), 10, 'deferred keys are not swept into momo or deducted')
 })
 
 test('recovery delta sync does not deduct unrelated stock omitted by a stale chest cache', t => {
@@ -88,9 +111,15 @@ test('a recovery exemption never bypasses another unfinished journal', t => {
   const f = fixture(t)
   f.begin()
   f.begin('craft:b', 'bot-b')
-  assert.throws(() => f.db.reconcileTotalsToMomo([], 'craft:a'), /合成|pending/i)
-  assert.equal(f.db.getBalance('alice', diamond.itemKey), 10)
-  assert.equal(f.db.db.prepare('SELECT COUNT(*) AS n FROM inventory_mismatches').get().n, 0)
+  // 新行为：craft:a 的恢复对账放行（不再全库拒绝），diamond 账面 10 vs
+  // 实扫 0 按常规规则结算（扣 alice + 留痕）；craft:b 的记录原样保留。
+  const result = f.db.reconcileTotalsToMomo([], 'craft:a')
+  assert.deepEqual(result.addedToMomo, [])
+  assert.equal(result.unresolved[0]?.itemKey, 'diamond|plain')
+  assert.equal(result.unresolved[0]?.amount, 10)
+  assert.ok(f.db.db.prepare("SELECT COUNT(*) AS n FROM inventory_mismatches WHERE kind = 'missing' AND owner_uuid = 'alice'").get().n >= 1,
+    'shortage is registered for review instead of locking the store')
+  assert.equal(f.ledger.pending().length, 2)
 })
 
 test('a failed recovery transaction rolls back upstream reconciliation and mismatch notes together', t => {

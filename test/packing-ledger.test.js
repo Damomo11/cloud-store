@@ -383,16 +383,20 @@ test('stored receipt cannot introduce a destination baseline absent from durable
   } finally { f.close() }
 })
 
-test('pending craft guard still blocks packing conversion atomically', () => {
+test('pending craft guard defers packing conversion keys instead of blocking atomically', () => {
   const f = fixture()
   try {
     f.ledger.begin(f.input())
     stored(f)
     const CraftLedger = require('../src/craft/ledger')
+    // 他机在途合成记录预留了同款盒子：装盒结算不再被全局锁拒绝（拆锁），
+    // 且在途键在对账/同步层剔除（deferredForCraft），装盒自己的预留行
+    //（packing 的 inventory_reservations）保证不跨领。
     new CraftLedger(f.db).begin({ id: 'craft:other', botId: 'other', owner, allocations: [qty(f.box, 1)] })
-    assert.throws(() => f.ledger.settleBatch('packing:1', 0, product(f), [f.stone]), /合成/)
-    assert.equal(f.db.getBalance(owner.uuid, f.stone.itemKey), 20)
-    assert.equal(f.db.getItemByKey(product(f).itemKey), null)
+    f.ledger.settleBatch('packing:1', 0, product(f), [f.stone])
+    assert.equal(f.db.getBalance(owner.uuid, f.stone.itemKey), 20 - f.plan.boxes[0].inputs[0].amount)
+    assert.equal(f.db.getBalance(owner.uuid, product(f).itemKey), 1)
+    assert.ok(f.db.pendingCraftReconciliationKeys({}).has(f.box.itemKey), 'craft reservation keys are tracked for sync deferral')
   } finally { f.close() }
 })
 
