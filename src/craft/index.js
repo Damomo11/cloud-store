@@ -17,11 +17,13 @@ function workstationFromConfig (config) {
 }
 // Olela supplies planning. Warehouse and CraftLedger own all physical storage
 // and accounting; internal movements do not create deposit/withdraw balances.
-function planToCraftCommand ({ item, quantity, available, config, forceCraft = false }) {
+function planToCraftCommand ({ item, quantity, available, config, forceCraft = false, bot }) {
   if (!Number.isSafeInteger(quantity) || quantity <= 0 || quantity > MAX_CRAFT_QUANTITY) {
     return { ok: false, reason: 'invalid_quantity' }
   }
-  const graph = getSharedGraph(config?.server?.version)
+  // The 26.3 connection uses recipes from the 26.1 snapshot.
+  const recipeVersion = bot?.registry?.version?.minecraftVersion === '26.3' ? '26.1' : config?.server?.version
+  const graph = getSharedGraph(recipeVersion)
   const cleanName = String(item).replace(/^minecraft:/, '')
   // forceCraft keeps planning when the target is already stocked: the planner
   // would otherwise satisfy the request from available stock and return zero

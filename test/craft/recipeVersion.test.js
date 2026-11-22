@@ -169,3 +169,16 @@ test('a registry recipe with an unknown input cannot become a partial free recip
 test('unsupported configured versions fail instead of silently using another catalog', () => {
   assert.throws(() => new RecipeGraph({ version: 'invalid-version' }), /version|版本|registry/i)
 })
+
+test('an explicit craft order on 26.3 uses the recipe source for the live connection', () => {
+  const { planToCraftCommand } = require('../../src/craft')
+  const request = {
+    item: 'name_tag', quantity: 1, available: { paper: 1, gold_nugget: 1 },
+    config: { server: { version: '1.21.11' } }, forceCraft: true
+  }
+  assert.equal(planToCraftCommand(request).ok, false)
+  const bot = { registry: { version: { minecraftVersion: '26.3' } } }
+  const order = planToCraftCommand({ ...request, bot })
+  assert.equal(order.ok, true)
+  assert.deepEqual(order.command.craftSteps[0].inputs.map(item => [item.names[0], item.count]).sort(), [['gold_nugget', 1], ['paper', 1]])
+})

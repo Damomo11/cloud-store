@@ -528,7 +528,7 @@ class CraftController {
         this.debug('controller.preflight_complete', { inventory: this.summarizeItems(this.inventory()) })
         const rows = this.availableItems(request.owner.uuid)
         const planningStartedAt = performance.now()
-        const planned = planToCraftCommand({ item: request.item, quantity: request.quantity, available: this.availableStock(request.owner.uuid), config: this.config, forceCraft: true })
+        const planned = planToCraftCommand({ item: request.item, quantity: request.quantity, available: this.availableStock(request.owner.uuid), config: this.config, forceCraft: true, bot: this.bot })
         this.debug('controller.planning_complete', { elapsedMs: performance.now() - planningStartedAt, ok: planned.ok })
         if (!planned.ok) {
           this.debug('controller.plan_rejected', {
