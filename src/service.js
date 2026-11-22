@@ -2487,7 +2487,7 @@ class CloudStoreService {
     const resolved = this.catalog.resolveName(alias.item?.itemId || parsed.itemName)
     const planned = require('./craft').planToCraftCommand({
       item: resolved.name, quantity: parsed.quantity,
-      available: this.availableCraftStock(owner.uuid), config: this.config, forceCraft: true
+      available: this.availableCraftStock(owner.uuid), config: this.config, forceCraft: true, bot: this.bot
     })
     if (!planned.ok) {
       this.debugCraft('service.plan_rejected', {
