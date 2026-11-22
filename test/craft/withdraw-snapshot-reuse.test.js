@@ -90,6 +90,22 @@ test('craft batch reuses confirmed content with real clicks and inventory mirror
   await runBatch({}, f => assert.equal(f.openCalls, 1))
 })
 
+test('craft batch accepts the live player slots when bot inventory still has an old mirror', async () => {
+  const f = fixture()
+  try {
+    const Item = require('prismarine-item')(f.catalog.mcData)
+    f.bot.inventory.updateSlot(9, new Item(f.catalog.mcData.itemsByName.dirt.id, 1))
+    const result = await f.warehouse.withdrawCraftBatchAllocationsLocked([{
+      itemKey: f.stoneKey,
+      amount: 4,
+      displayName: '石头'
+    }], { requireServerEvidence: true })
+    assert.deepEqual(result.withdrawn.map(value => [value.itemId, value.amount]), [['minecraft:stone', 4]])
+    assert.deepEqual(f.bot.inventory.items().map(value => [value.name, value.count]), [['stone', 4]])
+    assert.equal(f.bot.currentWindow, null)
+  } finally { f.db.close() }
+})
+
 test('failed craft withdrawal logs window and invalidating packet metadata', async () => {
   const f = fixture({ afterOpen: bot => bot._client.emit('set_cursor_item', {
     contents: { itemCount: 1, itemId: f.catalog.mcData.itemsByName.stone.id }
