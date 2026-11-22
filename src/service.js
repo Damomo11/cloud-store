@@ -62,6 +62,39 @@ async function recoverAndResumeCraft (service, controller) {
   return { ...resumed, resumedFromRecovery: true, recoveredOperationId: recovered.operationId }
 }
 
+// 服务器在 tpa 提示里附带的「点击即执行」按钮指令，藏在消息 JSON 的 extra 树里
+const RE_TSL_ACTION = /^\/tsl\s+(tpa|peek)\s+(accept|deny)\s+([A-Za-z0-9_-]+)$/
+
+// 递归捞出消息 JSON 里所有可点击执行的指令（1.20.2 及更早用 clickEvent.value，
+// 1.21.5+ 新组件格式用 click_event.command）
+function collectClickCommands (json, out = []) {
+  if (!json || typeof json !== 'object') return out
+  const click = json.clickEvent || json.click_event
+  if (click) {
+    const command = typeof click.command === 'string' ? click.command : click.value
+    const action = String(click.action || 'run_command')
+    if (typeof command === 'string' && (action === 'run_command' || action === 'runCommand')) {
+      out.push(command.trim())
+    }
+  }
+  const extra = json.extra || json.with
+  if (Array.isArray(extra)) extra.forEach(child => collectClickCommands(child, out))
+  return out
+}
+
+// 只认 /tsl <tpa|peek> <accept|deny> <令牌>：按钮命令来自服务器真实下发的
+// clickEvent，令牌对不上就执行不了，防止伪造聊天文本骗机器人跑别的指令
+function pickTslAction (commands, kind) {
+  const result = { accept: null, deny: null }
+  for (const command of commands || []) {
+    const match = RE_TSL_ACTION.exec(command)
+    if (!match || match[1] !== kind) continue
+    if (match[2] === 'accept') result.accept = command
+    else result.deny = command
+  }
+  return result
+}
+
 class CloudStoreService {
   constructor (bot, db, catalog, warehouse, config, taskPool = null, subscriptions = null) {
     this.bot = bot
@@ -140,7 +173,7 @@ class CloudStoreService {
     })
 
     this.bot.on('messagestr', (message, position, originalMessage, sender) => {
-      this.handleMessageString(message, position, sender)
+      this.handleMessageString(message, position, sender, originalMessage)
     })
 
     this.bot._client.on('player_chat', packet => {
@@ -723,7 +756,7 @@ class CloudStoreService {
     return false
   }
 
-  handleMessageString (message, position, sender) {
+  handleMessageString (message, position, sender, originalMessage) {
     if (this.config.debugRawChat) {
       const senderInfo = sender ? ` sender=${sender}` : ''
       console.log(`[messagestr:${position}]${senderInfo} ${message}`)
@@ -734,7 +767,7 @@ class CloudStoreService {
         (username, notice) => this.msg(username, notice))
       if (payment.matched) return
     }
-    if (this.handleTeleportRequestMessage(message)) return
+    if (this.handleTeleportRequestMessage(message, originalMessage)) return
 
     const whisper = this.parsePrivateMessage(message)
     if (whisper) {
@@ -793,11 +826,9 @@ class CloudStoreService {
     return { username, command }
   }
 
-  handleTeleportRequestMessage (message) {
+  handleTeleportRequestMessage (message, originalMessage) {
     const text = String(message || '').trim()
-    // 服务器统一聊天前缀（「≡ TSL »」等）后 tpa 提示挂在行首前缀之后；
-    // 与 findCommandAtChatBodyStart 同款：取最后一个箭头之后的正文再匹配。
-    // 新文本尾部带“ （60 秒内有效） [接受] [拒绝]”，句式开头唯一，不锚定尾部。
+    // 服务器统一聊天前缀（「≡ TSL »」等）：取最后一个箭头之后的正文再匹配
     const arrowIndex = Math.max(text.lastIndexOf('>'), text.lastIndexOf('»'))
     const body = arrowIndex >= 0 ? text.slice(arrowIndex + 1).trim() : text
     const match = body.match(/^([A-Za-z0-9_]{3,16})\s+请求传送到你的位置/)
@@ -809,9 +840,16 @@ class CloudStoreService {
       return true
     }
 
-    const command = (this.config.commands.tpaccept || '/tpaccept {player}').replace('{player}', username)
-    if (this.config.debugChat) console.log(`[tpa] accepting admin teleport request: ${command}`)
-    this.bot.chat(command)
+    // 新版插件用令牌应答：accept 指令（/tsl tpa accept <令牌>）只从服务器消息
+    // 自带的点击按钮（clickEvent）里抠；正文匹配但消息里没有按钮 = 旧格式或
+    // 伪造文本，一律不理。
+    const { accept } = pickTslAction(collectClickCommands(originalMessage?.json || originalMessage), 'tpa')
+    if (!accept) {
+      if (this.config.debugChat) console.log(`[tpa] no /tsl tpa accept button on teleport request from ${username}`)
+      return true
+    }
+    if (this.config.debugChat) console.log(`[tpa] accepting admin teleport request via ${accept}`)
+    this.bot.chat(accept)
     return true
   }
 
