@@ -85,6 +85,39 @@ test('confirmed click wakes immediately when the authoritative menu arrives', as
   }
 })
 
+test('confirmed container click keeps authoritative transfer when the server closes the menu', async () => {
+  const container = windows.createWindow(5, 'minecraft:generic_9x3', 'Barrel')
+  const inventory = windows.createWindow(0, 'minecraft:inventory', 'Inventory')
+  const value = new Item(registry.itemsByName.stick.id, 1)
+  container.updateSlot(27, value)
+  const client = new EventEmitter()
+  const bot = {
+    registry,
+    supportFeature: () => true,
+    inventory,
+    currentWindow: container,
+    _client: client
+  }
+  client.write = () => {}
+  const catalog = new ItemCatalog('1.21.11', {}, { serverEnchantmentsFile: '/missing-test-mappings.json' })
+  const click = createConfirmedWindowClicker(bot, catalog, { craft: { confirmTimeoutMs: 1000 } }, undefined, { allowContainer: true })
+  client.write = (name, packet) => {
+    assert.equal(name, 'window_click')
+    container.updateSlot(27, null)
+    container.updateSlot(0, value)
+    client.emit('window_items', {
+      windowId: container.id,
+      stateId: 1,
+      items: container.slots.map(Item.toNotch),
+      carriedItem: Item.toNotch(null)
+    })
+    bot.currentWindow = null
+  }
+  await click(container, 27, 0, 1, () => {}, (slots, cursor) => !slots[27] && slots[0] && !cursor)
+  assert.equal(container.slots[0].name, 'stick')
+  assert.deepEqual(bot.inventory.items(), [])
+})
+
 // Keep server slots and cursor separate from Mineflayer's predictions. Correct
 // modern clicks normally receive only result-slot updates; a mismatched stateId
 // requests the full menu state, including its authoritative carried item.
