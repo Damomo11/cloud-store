@@ -307,6 +307,7 @@ class Warehouse {
       let reopenAfterConfirmedClose = false
       const noSpaceKeys = new Set()
       try {
+        if (options.craftBatch) options.check?.()
         const confirmedDeposit = options.requireServerEvidence ? createConfirmedDepositor(this, options.check, container) : null
         let progress = true
         while (progress && this.bot.inventory.items().length) {
@@ -325,6 +326,7 @@ class Warehouse {
                 continue
               }
             }
+            if (options.craftBatch) options.check?.()
             if (options.requireServerEvidence && options.onPendingReturnChest && !returnEvidencePending) {
               options.onPendingReturnChest(chest.chestId)
               returnEvidencePending = true

@@ -1199,7 +1199,7 @@ class CraftController {
       recoveryBaseline: baseline, recoveryLedgerBaseline: this.recoveryLedgerBaseline(operation)
     })
     this.debug('controller.recovery_return_start', { operationId: operation.id, items: this.summarizeItems(this.inventory()) })
-    const { deposited, operation: verified } = await this.depositReturn(operation)
+    const { deposited, operation: verified } = await this.depositReturn(operation, check)
     operation = verified
     check()
     if (this.inventory().length) throw new Error('仓库空间不足，恢复的物品保留在机器人背包并等待恢复。')

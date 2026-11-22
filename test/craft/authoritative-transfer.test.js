@@ -414,3 +414,21 @@ test('recovery rechecks an uncertain return even with an empty backpack instead 
     assert.deepEqual(f.openedChestIds, [f.chest.chestId, f.chest.chestId])
   } finally { f.close() }
 })
+
+test('a cancelled craft return closes the just opened barrel without reopening it', async () => {
+  const f = fixture({ modern: true })
+  try {
+    const open = f.warehouse.openContainerAt
+    let cancelled = false
+    f.warehouse.openContainerAt = async chest => {
+      const window = await open(chest)
+      cancelled = true
+      return window
+    }
+    f.warehouse.containerFreeSpaceFor = () => 0
+    await assert.rejects(f.warehouse.depositAllPossible({ requireServerEvidence: true, craftBatch: true,
+      check: () => { if (cancelled) throw new Error('craft return cancelled') } }), /craft return cancelled/)
+    assert.equal(f.opens(), 1)
+    assert.equal(f.bot.currentWindow, null)
+  } finally { f.close() }
+})
