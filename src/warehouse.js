@@ -307,6 +307,7 @@ class Warehouse {
       let reopenAfterConfirmedClose = false
       const noSpaceKeys = new Set()
       try {
+        if (options.craftBatch) options.check?.()
         const confirmedDeposit = options.requireServerEvidence ? createConfirmedDepositor(this, options.check, container) : null
         let progress = true
         while (progress && this.bot.inventory.items().length) {
