@@ -1197,7 +1197,7 @@ class CloudStoreService {
         await this.withBotContext(() => recoverAndResumeCraft(this, this.getCraftController()))
       }
       if (active.cancelled || active.dead || this.connectionInvalidated) throw new Error('机器人生命周期已变化，任务已取消。')
-      if (type !== 'craft_recovery') this.db.assertNoPendingCraft?.()
+      if (type !== 'craft_recovery') this.db.assertNoPendingCraft?.('', this.botId)
       const migration = this.db.runDeferredMigrations?.()
       if (migration?.catalogError || migration?.offlineIdentityError) {
         throw new Error('恢复后的库存身份迁移尚未完成，请检查日志并重试。')
@@ -3560,11 +3560,12 @@ class CloudStoreService {
           ? `，Servux隔空读${result.servuxRead}个桶${result.servuxMissed > 0 ? `（漏读${result.servuxMissed}个已保留旧记录）` : ''}`
           : ''
         const packingText = result.deferredForPacking?.length ? `，${result.deferredForPacking.length}种物品待装盒恢复结算后再对账` : ''
+        const craftText = result.deferredForCraft?.length ? `，${result.deferredForCraft.length}种物品待合成恢复结算后再对账` : ''
         const driftRepair = result.driftRepair
         const driftRepairText = driftRepair?.repaired
           ? `，兜底回填${driftRepair.movedAmount}/${driftRepair.repaired}种`
           : ''
-        this.msg(username, `同步完成：木桶${result.chestCount}，打开${result.openedChestCount}，重读${result.rescanCount || 0}${failureText}${parallelText}${servuxText}，多余${addedAmount}/${this.itemTypeCount(result.addedToMomo)}种，缺失${unresolvedAmount}/${this.itemTypeCount(result.unresolved)}种${driftRepairText}${packingText}。详情见Web管理页。`)
+        this.msg(username, `同步完成：木桶${result.chestCount}，打开${result.openedChestCount}，重读${result.rescanCount || 0}${failureText}${parallelText}${servuxText}，多余${addedAmount}/${this.itemTypeCount(result.addedToMomo)}种，缺失${unresolvedAmount}/${this.itemTypeCount(result.unresolved)}种${driftRepairText}${packingText}${craftText}。详情见Web管理页。`)
         traceSummary(trace, {
           status: 'ok',
           chests: result.chestCount,

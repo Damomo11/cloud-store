@@ -3057,7 +3057,9 @@ class Warehouse {
   }
 
   async applyWarehouseScan (scan, radius, options = {}) {
-    this.db.assertNoPendingCraft?.()
+    // 全局合成锁已拆为按机器人（db.assertNoPendingCraft(actingBotId)）：
+    // 在途恢复机器人的预留键在对账里剔除（deferredForCraft），同步不再全库停摆。
+    this.db.assertNoPendingCraft?.('', this.db.transactionContext?.getStore?.()?.botId || '')
     const { blocks, snapshots } = scan
     this.assertConnectionHealthy()
 
