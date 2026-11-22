@@ -226,7 +226,10 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
         })
       }
       check()
-      if ((bot.currentWindow || bot.inventory) !== window) throw failure('craft window closed before server confirmation')
+      if ((bot.currentWindow || bot.inventory) !== window &&
+        !(options.allowContainer && !bot.currentWindow && confirmed)) {
+        throw failure('craft window closed before server confirmation')
+      }
       // Mineflayer's content listener updates slots, but not carriedItem. Also
       // mirror the table's 36 player slots so final verification sees real data.
       confirmed.slots.forEach((value, index) => window.updateSlot(index, copy(value)))
