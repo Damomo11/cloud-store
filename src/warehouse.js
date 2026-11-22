@@ -1147,7 +1147,6 @@ class Warehouse {
         const windowPlayer = this.catalog.aggregatePrismarineItems(container.items())
         if (!this.sameCraftChestSlots(snapshot.chestSlots, recorded) || !this.sameCraftChestSlots(snapshot.chestSlots, localChest) ||
           !this.sameCraftItems(snapshot.playerItems, windowPlayer) ||
-          !this.sameCraftItems(snapshot.playerItems, this.catalog.aggregatePrismarineItems(this.bot.inventory.items())) ||
           container.selectedItem || this.bot.currentWindow !== container) {
           this.closeContainerQuietly(container)
           const error = new Error('合成取料开箱时服务端实物与背包记录不一致，等待人工核对。')
