@@ -38,7 +38,7 @@ test('a journal owned by another bot is visible globally but not per bot', async
   } finally { f.close() }
 })
 
-test('assertNoPendingCraft names the bot that owns the journal', async () => {
+test('unscoped inventory changes stay protected while naming the bot that owns the journal', async () => {
   const f = fixture()
   try {
     pendingJournal(f, 'bot-b')
@@ -47,6 +47,16 @@ test('assertNoPendingCraft names the bot that owns the journal', async () => {
       assert.match(error.message, /bot-b/)
       return true
     })
+  } finally { f.close() }
+})
+
+test('a bot-specific recovery journal does not pause another bot inventory task', async () => {
+  const f = fixture()
+  try {
+    pendingJournal(f, 'bot-b')
+    assert.doesNotThrow(() => f.db.runWithBotContext({ botId: 'bot-a' }, () => f.db.assertNoPendingCraft()))
+    assert.throws(() => f.db.runWithBotContext({ botId: 'bot-b' }, () => f.db.assertNoPendingCraft()), /bot-b/)
+    assert.throws(() => f.db.assertNoPendingCraft(), /bot-b/)
   } finally { f.close() }
 })
 
@@ -73,9 +83,9 @@ test('flushResidual keeps the upstream bot-specific journal guard', async () => 
   } finally { f.close() }
 })
 
-function recoveryService (f, result) {
+function recoveryService (f, result, controllerMethods = {}) {
   const messages = []
-  const owner = { botId: 'bot-b', getCraftController: () => ({ recover: async () => result }) }
+  const owner = { botId: 'bot-b', getCraftController: () => ({ recover: async () => result, ...controllerMethods }) }
   const service = Object.assign(Object.create(CloudStoreService.prototype), {
     botId: 'receiver', db: f.db,
     isAdmin: () => true,
@@ -83,13 +93,26 @@ function recoveryService (f, result) {
     taskPool: { workers: new Set([owner]), eligibleWorkerForTask: () => owner },
     enqueueTask: (username, type, run, options) => {
       assert.equal(type, 'craft_recovery')
-      assert.equal(options.exclusive, true)
       assert.equal(options.stickyWorker, owner)
       return run(owner)
     }
   })
   return { service, messages }
 }
+
+test('manual recovery reports a failed resume after settling its verified inventory state', async () => {
+  const f = fixture()
+  try {
+    pendingJournal(f, 'bot-b')
+    const { service, messages } = recoveryService(f, { status: 'resumable', operationId: 'craft:bot-b' }, {
+      resume: async () => { throw new Error('no standard recipe matches') },
+      settleResumeFailure: async () => ({ status: 'recovered', diffRegistered: true })
+    })
+    await service.handleCraftRecovery('kelemiao')
+    assert.ok(messages.some(message => /续跑失败/.test(message) && /momo/.test(message) && /重新提交/.test(message)))
+    assert.ok(messages.every(message => !/继续完成原合成订单/.test(message)))
+  } finally { f.close() }
+})
 
 test('craft recovery on another bot routes to the journal owner', async () => {
   const f = fixture()

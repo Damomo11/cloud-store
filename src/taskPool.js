@@ -22,6 +22,8 @@ class BotTaskPool {
     this.workers = new Set()
     this.queue = []
     this.sequence = 0
+    this.fused = false
+    this.fuseDrain = null
     this.seenMessages = new Map()
     // Retain the execution lease even when death/reconnect changes worker.active
     // or unregisters a disconnected worker. Its network calls may still drain.
@@ -83,6 +85,10 @@ class BotTaskPool {
 
   enqueue (task) {
     return new Promise((resolve, reject) => {
+      if (this.fused) {
+        resolve(null)
+        return
+      }
       const queued = {
         ...task,
         id: ++this.sequence,
@@ -94,6 +100,36 @@ class BotTaskPool {
       task.onQueued?.(this.queue.length)
       this.dispatch()
     })
+  }
+
+  beginFuse (reason = 'admin task fuse') {
+    if (this.fuseDrain) return this.fuseDrain.result
+    this.fused = true
+    const cancelled = this.queue.splice(0)
+    for (const task of cancelled) task.resolve?.(null)
+    let resolveDrained
+    const drained = new Promise(resolve => { resolveDrained = resolve })
+    const result = { cancelledQueued: cancelled.length, stopRequested: 0, drained }
+    this.fuseDrain = { result, resolveDrained }
+    const workers = new Set([...this.inFlight.keys(), ...this.workers].filter(worker => worker.active))
+    for (const worker of workers) {
+      try {
+        if (worker.cancelActiveTask?.(reason)) result.stopRequested++
+      } catch (error) {
+        console.warn(`[task-fuse] failed to stop ${worker.botId || worker.bot?.username || 'worker'}: ${error.message}`)
+      }
+    }
+    this.resolveFuseDrain()
+    return result
+  }
+
+  resolveFuseDrain () {
+    if (!this.fused || this.inFlight.size || this.packingRecoveryLeases.size) return
+    const fuse = this.fuseDrain
+    if (!fuse) return
+    this.fused = false
+    this.fuseDrain = null
+    fuse.resolveDrained()
   }
 
   eligibleWorkerForTask (task) {
@@ -128,6 +164,7 @@ class BotTaskPool {
     try { return await fn() } finally {
       this.packingRecoveryLeases.delete(worker)
       this.resolvePackingDrainWaiters()
+      this.resolveFuseDrain()
       this.dispatch()
     }
   }
@@ -182,6 +219,7 @@ class BotTaskPool {
   }
 
   dispatch () {
+    if (this.fused) return
     if ([...this.inFlight.values()].some(task => task.exclusive)) return
     if ([...this.workers].some(worker => worker.active?.exclusive)) return
     for (let index = 0; index < this.queue.length; index++) {
@@ -219,6 +257,7 @@ class BotTaskPool {
       this.inFlight.delete(worker)
       this.resolveCraftDrainWaiters()
       this.resolvePackingDrainWaiters()
+      this.resolveFuseDrain()
       this.dispatch()
     }
   }

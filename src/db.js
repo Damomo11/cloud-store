@@ -2928,9 +2928,15 @@ class StoreDb {
   }
 
   assertNoPendingCraft (allowedOperationId = '') {
-    if (!this.hasPendingCraft()) return
-    if (allowedOperationId && !this.db.prepare("SELECT 1 FROM craft_operations WHERE state NOT IN ('completed','complete','failed') AND id <> ? LIMIT 1").get(String(allowedOperationId))) return
-    const owners = this.pendingCraftBotIds().filter(Boolean)
+    const context = this.transactionContext.getStore() || {}
+    const botId = String(context.botId || '')
+    if (!this.hasPendingCraft(botId)) return
+    const conditions = ["state NOT IN ('completed','complete','failed')"]
+    const params = []
+    if (botId) { conditions.push('bot_id = ?'); params.push(botId) }
+    if (allowedOperationId) { conditions.push('id <> ?'); params.push(String(allowedOperationId)) }
+    if (!this.db.prepare(`SELECT 1 FROM craft_operations WHERE ${conditions.join(' AND ')} LIMIT 1`).get(...params)) return
+    const owners = botId ? [botId] : this.pendingCraftBotIds().filter(Boolean)
     const suffix = owners.length ? `（待恢复记录所属机器人：${owners.join('、')}）` : ''
     throw new Error('合成仍在进行或等待恢复；为保护物品归属，暂停库存变更和同步，请执行 !合成恢复。' + suffix)
   }

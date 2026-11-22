@@ -189,6 +189,75 @@ test('recovery keeps the original reservation and resumes an unchanged interrupt
   } finally { f.close() }
 })
 
+test('failed resume can settle a safely returned journal and release its reservation', async () => {
+  const f = fixture({ held: [{ name: 'oak_planks', count: 2 }] })
+  try {
+    const progress = { stepIndex: 0, nextTrigger: 0 }
+    const plan = { target: { name: 'stick', quantity: 4 }, craftSteps: [{ times: 1 }] }
+    f.ledger.checkpoint('craft:server-evidence', 'crafting', {
+      held: f.before,
+      pending: { stepId: '0:0+1', before: f.before, expectedConsumed: f.before,
+        expectedProduced: f.products, triggers: 1, progressBefore: progress, progressAfter: { stepIndex: 1, nextTrigger: 0 } },
+      physicalTotals: f.before, stepIndex: 0, progress: progress, plan
+    })
+
+    assert.equal((await f.controller.recover()).status, 'resumable')
+    const result = await f.controller.settleResumeFailure('craft:server-evidence', new Error('recipe no longer matches'))
+
+    assert.equal(result.status, 'recovered')
+    assert.equal(f.ledger.pending().length, 0)
+    assert.equal(f.db.getBalance('alice', f.before[0].itemKey), 2)
+    assert.equal(f.db.getBalance(f.db.momoOwner, f.before[0].itemKey), 0)
+    assert.doesNotThrow(() => f.db.assertNoPendingCraft())
+  } finally { f.close() }
+})
+
+test('failed resume preserves the journal if another inventory task changes the snapshot before settlement', async () => {
+  const f = fixture({ held: [] })
+  try {
+    const operation = f.ledger.pending()[0]
+    f.ledger.checkpoint(operation.id, 'ready', { ...operation.data, held: [], pending: null,
+      physicalTotals: f.before, recoveryBaseline: f.before,
+      recoveryIntent: { phase: 'crafting', baseline: f.before, observed: [] } })
+    f.controller.recover = async () => ({ status: 'resumable', operationId: operation.id })
+    let lockCalls = 0
+    f.warehouse.withWarehouseLock = async fn => {
+      lockCalls++
+      if (lockCalls === 1) {
+        f.db.replaceChestSlots(f.chest.chestId, f.products.map((item, slot) => ({ ...item, slot })))
+      }
+      return fn()
+    }
+
+    await assert.rejects(f.controller.settleResumeFailure(operation.id, new Error('recipe no longer matches')))
+
+    assert.equal(lockCalls, 1, 'settlement reacquires the shared warehouse mutex')
+    assert.equal(f.ledger.pending().length, 1, 'uncertain differences keep the recovery journal')
+    assert.equal(f.db.getBalance(f.db.momoOwner, f.products[0].itemKey), 0, 'no unrelated changes are moved to momo')
+  } finally { f.close() }
+})
+
+test('cancelling failed-resume settlement keeps the recovery journal and balances unchanged', async () => {
+  const f = fixture({ held: [] })
+  try {
+    const operation = f.ledger.pending()[0]
+    f.ledger.checkpoint(operation.id, 'ready', { ...operation.data, held: [], pending: null,
+      physicalTotals: f.before, recoveryBaseline: f.before,
+      recoveryIntent: { phase: 'crafting', baseline: f.before, observed: [] } })
+    f.controller.recover = async () => ({ status: 'resumable', operationId: operation.id })
+    f.warehouse.withWarehouseLock = async fn => {
+      f.controller.cancel('task fuse')
+      return fn()
+    }
+
+    await assert.rejects(f.controller.settleResumeFailure(operation.id, new Error('recipe no longer matches')), /task fuse/)
+
+    assert.equal(f.ledger.pending().length, 1)
+    assert.equal(f.db.getBalance('alice', f.before[0].itemKey), 2)
+    assert.equal(f.db.getBalance(f.db.momoOwner, f.products[0].itemKey), 0)
+  } finally { f.close() }
+})
+
 test('recovery atomically confirms a proven batch and resumes after it', async () => {
   const f = fixture({})
   try {
@@ -384,6 +453,25 @@ test('fallback sync fixes balances before releasing the recovery journal', async
     assert.equal(f.ledger.pending().length, 0)
     assert.equal(f.openAttempts(), 0, 'fallback reconciliation must not rescan unrelated registered chests')
     assert.doesNotThrow(() => f.db.assertNoPendingCraft())
+  } finally { f.close() }
+})
+
+test('recovery settles verified physical differences even when the retry error is not a mismatch', async () => {
+  const f = fixture({ held: [] })
+  try {
+    const operation = f.ledger.pending()[0]
+    f.ledger.checkpoint(operation.id, 'ready', { ...operation.data, held: [], pending: null,
+      recoveryIntent: { phase: 'crafting', baseline: f.before, observed: [] } })
+    f.db.replaceChestSlots(f.chest.chestId, f.products.map((item, slot) => ({ ...item, slot })))
+    f.controller.recoverLocked = async () => { throw new Error('temporary recovery read failure') }
+
+    const result = await f.controller.recover()
+
+    assert.equal(result.status, 'recovered')
+    assert.equal(result.diffRegistered, true)
+    assert.equal(f.db.getBalance('alice', f.before[0].itemKey), 0)
+    assert.equal(f.db.getBalance(f.db.momoOwner, f.products[0].itemKey), f.products[0].amount)
+    assert.equal(f.ledger.pending().length, 0)
   } finally { f.close() }
 })
 

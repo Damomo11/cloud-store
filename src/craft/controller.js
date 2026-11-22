@@ -1038,7 +1038,11 @@ class CraftController {
   }
 
   canSettleRecoveryFailure (error) {
-    return Boolean(error?.recoveryMismatch && this.ledger.pending(this.botId).length === 1 &&
+    const operation = this.ledger.pending(this.botId)[0]
+    const baseline = operation?.data?.recoveryIntent?.baseline || operation?.data?.recoveryBaseline || operation?.data?.physicalTotals
+    return Boolean(!error?.cancelled && this.ledger.pending(this.botId).length === 1 &&
+      Array.isArray(baseline) && (operation?.data?.recoveryIntent || operation?.data?.recoveryBaseline) &&
+      operation?.data?.pendingReturnChestId == null && !this.inventory().length &&
       !this.hasInventoryResidue() && this.db.listChests().length)
   }
 
@@ -1049,13 +1053,58 @@ class CraftController {
     if (!Array.isArray(baseline)) throw new Error('恢复差异结算缺少原始实物基线。')
     return this.ledger.transaction(() => {
       check()
-      const result = this.db.reconcileRecoveryDeltaToMomo(baseline, actual, operation.id)
+      const result = this.db.runWithBotContext
+        ? this.db.runWithBotContext({ botId: this.botId }, () => this.db.reconcileRecoveryDeltaToMomo(baseline, actual, operation.id))
+        : this.db.reconcileRecoveryDeltaToMomo(baseline, actual, operation.id)
       this.ledger.checkpoint(operation.id, 'ready', { ...operation.data, held: [], pending: null,
         physicalTotals: actual, recoveryBaseline: baseline, recoveryReconciled: true })
       this.ledger.finish(operation.id, 'failed', `恢复对账重试 ${RECOVER_RETRY_ATTEMPTS} 次未通过，已同步实物账目并登记差异：${error.message}`)
       return { status: 'recovered', operationId: operation.id,
         diffRegistered: Boolean(result.addedToMomo.length || result.removedFromMomo.length || result.unresolved.length) }
     })
+  }
+
+  async settleResumeFailure (operationId, error) {
+    const id = String(operationId || '')
+    const current = this.ledger.get(id)
+    if (!current || current.botId !== this.botId || this.ledger.pending(this.botId).length !== 1) throw error
+    const recovery = await this.recover()
+    if (recovery.status !== 'resumable') return recovery
+    if (this.active) throw new Error(`续跑失败后无法安全核验实物差异，恢复记录仍保留：${error.message}`)
+    const lease = { abort: new AbortController() }
+    this.active = lease
+    const check = () => {
+      if (lease.abort.signal.aborted) {
+        const reason = lease.abort.signal.reason
+        if (reason instanceof Error) reason.cancelled = true
+        throw reason
+      }
+      this.warehouse.assertConnectionHealthy?.()
+    }
+    try {
+      return await this.warehouse.withWarehouseLock(async () => {
+        check()
+        const operation = this.ledger.get(id)
+        const baseline = operation?.data?.recoveryIntent?.baseline || operation?.data?.recoveryBaseline || operation?.data?.physicalTotals
+        const expectedActual = operation?.data?.physicalTotals
+        const actual = this.physicalTotals()
+        if (!operation || operation.botId !== this.botId || this.ledger.pending(this.botId).length !== 1 ||
+          !Array.isArray(baseline) || !Array.isArray(expectedActual) || !same(actual, expectedActual) ||
+          operation.phase !== 'ready' || operation.data.pending || operation.data.pendingReturnChestId != null ||
+          operation.data.held?.length || this.inventory().length || this.hasInventoryResidue() || !this.db.listChests().length) {
+          throw new Error(`续跑失败后仓库实物状态已变化，无法安全核验差异；恢复记录仍保留：${error.message}`)
+        }
+        this.debug('controller.resume_failure_settlement', {
+          operationId: id,
+          message: error.message,
+          actual: this.summarizeItems(actual)
+        })
+        check()
+        return this.settleRecoveryDiff(error, actual, check)
+      })
+    } finally {
+      if (this.active === lease) this.active = null
+    }
   }
 
   async recoverLocked (check) {

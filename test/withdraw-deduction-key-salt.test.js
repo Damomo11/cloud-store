@@ -60,6 +60,7 @@ function createService (ServiceClass, db, options = {}) {
       inventory = [{ ...ITEM, count: 1 }]
       return { withdrawn: [{ ...ITEM, amount: 1 }], missing: [], unlocated: [], searchedUnlocatedBarrels: 0 }
     },
+    depositInventoryForOwner: async () => ({ deposited: [], leftover: [] }),
     depositInventoryWithoutBalance: async () => {
       inventory = []
       return { deposited: [], leftover: [] }
