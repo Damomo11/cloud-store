@@ -18,8 +18,21 @@ const MAX_SAFE_FRAGMENTED_PLACEMENT_CLICKS = 96
 // controller supplies the batch's concrete inputs in an empty bag.
 function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = () => {}) {
   let active = null
-  const registry = bot.registry || catalog.mcData
-  const Item = require('prismarine-item')(registry)
+  let registry = bot.registry || catalog.mcData
+  let Item = require('prismarine-item')(registry)
+  // 字典热切换：bot login 后按协商版本换字典时，executor 闭包里的 catalog 与
+  // 数字 registry/Item 必须一起换（26.3 部署前初始字典是 1.21.11，resolveName
+  // 拿 1.21.11 的数字 id 喂 26.3 的 bot.recipesAll → 查成完全不相干的配方：
+  // piston 的 id 在 26.3 是 orange_concrete_slab，ingredient_mismatch 循环失败）。
+  const setCatalog = nextCatalog => {
+    if (!nextCatalog || nextCatalog === catalog) return
+    catalog = nextCatalog
+    const nextRegistry = bot.registry || nextCatalog.mcData
+    if (nextRegistry !== registry) {
+      registry = nextRegistry
+      Item = require('prismarine-item')(registry)
+    }
+  }
   const confirmedClick = createConfirmedWindowClicker(bot, catalog, config, emitDebug)
   const snapshot = () => catalog.aggregatePrismarineItems(bot.inventory.items())
 
@@ -1672,7 +1685,7 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
     }
   }
 
-  return { execute, preview, cancel, compactInventoryStacks, isBusy: () => active !== null }
+  return { execute, preview, cancel, compactInventoryStacks, setCatalog, isBusy: () => active !== null }
 }
 
 module.exports = { createInventoryExecutor }

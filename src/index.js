@@ -345,6 +345,9 @@ function launchBot (state) {
     if (!db.catalog) return
     warehouse.setCatalog(db.catalog)
     service.setCatalog(db.catalog)
+    // executor 的 catalog/registry/Item 一起切到协商版本，否则数字 id 跨字典
+    // 错位（合成会拿旧字典的 id 查新 registry 的配方）。
+    bot._craftingExecutor?.setCatalog?.(db.catalog)
     warehouseCatalogVersion = negotiated
     console.log(`[via] warehouse/service 物品字典已切换到 ${negotiated}`)
   })
