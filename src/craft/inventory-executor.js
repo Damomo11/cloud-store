@@ -188,13 +188,47 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
       (entry.metadata == null || Number.isSafeInteger(entry.metadata))
   }
 
+  // Some vanilla recipes are represented by Mineflayer with one concrete
+  // member of an item tag (for example oak planks), while the planner may have
+  // reserved another member (for example cherry planks). Keep this equivalence
+  // deliberately narrow: only the vanilla planks family is interchangeable.
+  function ingredientFamily (id) {
+    const name = registry.items[id]?.name
+    return name && /^[a-z0-9_]+_planks$/.test(name) ? 'minecraft:planks' : `minecraft:item:${id}`
+  }
+
+  function normalizeRecipeVariants (recipe, declaredInputs) {
+    const declaredByFamily = new Map()
+    for (const input of declaredInputs) {
+      const family = ingredientFamily(input.id ?? input.type)
+      const ids = declaredByFamily.get(family) || new Set()
+      ids.add(input.id ?? input.type)
+      declaredByFamily.set(family, ids)
+    }
+    const recipeInputFamilies = new Set()
+    for (const value of recipe.inShape?.flat() || recipe.ingredients || []) {
+      if (validItem(value)) recipeInputFamilies.add(ingredientFamily(value.id))
+    }
+    const replace = value => {
+      if (!validItem(value)) return value
+      const ids = declaredByFamily.get(ingredientFamily(value.id))
+      return ids?.size === 1 ? { ...value, id: ids.values().next().value } : value
+    }
+    const normalized = { ...recipe }
+    if (recipe.inShape) normalized.inShape = recipe.inShape.map(row => row.map(replace))
+    if (recipe.ingredients) normalized.ingredients = recipe.ingredients.map(replace)
+    if (recipe.delta) normalized.delta = recipe.delta.map(value =>
+      value.count < 0 && recipeInputFamilies.has(ingredientFamily(value.id)) ? replace(value) : value)
+    return normalized
+  }
+
   function matchesMetadata (requirements, items, triggers) {
     const remaining = items.map(entry => ({ ...entry, remaining: entry.count }))
     // Satisfy specific metadata before wildcards so a wildcard cannot consume
     // the only item satisfying a later, more specific recipe slot.
     for (const input of [...requirements].sort((a, b) => Number(a.metadata == null) - Number(b.metadata == null))) {
       for (let index = 0; index < triggers; index++) {
-        const source = remaining.find(entry => entry.remaining > 0 && entry.type === input.id &&
+        const source = remaining.find(entry => entry.remaining > 0 && ingredientFamily(entry.type) === ingredientFamily(input.id ?? input.type) &&
           (input.metadata == null || entry.metadata === input.metadata))
         if (!source) return false
         source.remaining--
@@ -209,10 +243,12 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
       if (recipe?.result?.id !== declared.result.type || recipe.result.count !== declared.result.count ||
         recipe.requiresTable !== step.requiresTable) continue
       let executable
-      try { executable = withStandardRecipeOutputs(registry, recipe) } catch { continue }
+      try {
+        executable = withStandardRecipeOutputs(registry, normalizeRecipeVariants(recipe, declared.inputs))
+      } catch { continue }
       const materials = recipeMaterials(executable)
       if (!materials || !sameAmounts(materials.inputs.map(input => ({ ...input, amount: input.amount * declared.triggers })),
-        declared.inputs, entry => entry.id ?? entry.type) ||
+        declared.inputs, entry => ingredientFamily(entry.id ?? entry.type)) ||
         !matchesMetadata(materials.inputs, items, declared.triggers)) continue
       const expected = catalog.aggregatePrismarineItems(standardRecipeOutputs(registry, executable).map(entry => new Item(entry.id, entry.count, entry.metadata)))
       return { recipe: executable, expected }

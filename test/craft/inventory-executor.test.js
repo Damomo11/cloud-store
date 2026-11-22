@@ -1035,6 +1035,47 @@ test('3x3 crafting navigates through Warehouse and passes the validated table bl
   assert.equal(f.calls.find(call => Array.isArray(call) && call[0] === 'craft')[3], f.table)
 })
 
+test('piston preview accepts the planner-selected cherry planks recipe variant', () => {
+  const f = fixture([
+    item('cherry_planks', 3), item('cobblestone', 4), item('iron_ingot', 1), item('redstone', 1)
+  ], [item('piston', 1)])
+  const step = {
+    requiresTable: true,
+    result: { name: 'piston', count: 1 },
+    inputs: [
+      { names: ['cherry_planks'], count: 3 },
+      { names: ['cobblestone'], count: 4 },
+      { names: ['iron_ingot'], count: 1 },
+      { names: ['redstone'], count: 1 }
+    ]
+  }
+  assert.deepEqual(amounts(f.executor.preview(step).expectedProduced), [['minecraft:piston', 1]])
+})
+
+test('piston execution adapts a concrete oak-planks recipe to cherry-planks inventory', async () => {
+  const f = fixture([
+    item('cherry_planks', 3), item('cobblestone', 4), item('iron_ingot', 1), item('redstone', 1)
+  ], [item('piston', 1)])
+  const oakRecipe = Recipe.find(registry.itemsByName.piston.id)
+    .find(recipe => recipe.inShape?.[0]?.[0]?.id === registry.itemsByName.oak_planks.id)
+  assert.ok(oakRecipe)
+  f.bot.recipesAll = () => [oakRecipe]
+  const step = {
+    requiresTable: true,
+    result: { name: 'piston', count: 1 },
+    inputs: [
+      { names: ['cherry_planks'], count: 3 },
+      { names: ['cobblestone'], count: 4 },
+      { names: ['iron_ingot'], count: 1 },
+      { names: ['redstone'], count: 1 }
+    ]
+  }
+  const result = await f.executor.execute({ step })
+  assert.deepEqual(amounts(result.produced), [['minecraft:piston', 1]])
+  const chosen = f.calls.find(call => Array.isArray(call) && call[0] === 'craft')[1]
+  assert.equal(chosen.inShape[0][0].id, registry.itemsByName.cherry_planks.id)
+})
+
 test('shapeless crafting selects the exact input ids instead of the first result recipe', async () => {
   const f = fixture([item('oak_log', 1)], [item('oak_planks', 4)])
   const result = await f.executor.execute({ step: { requiresTable: false, result: { name: 'oak_planks', count: 4 }, inputs: [{ names: ['oak_log'], count: 1 }] } })
