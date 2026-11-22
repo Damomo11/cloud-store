@@ -23,6 +23,7 @@ function fixture (options = {}) {
   db.upsertChest(chest)
   const bot = new EventEmitter()
   bot._client = new EventEmitter()
+  bot.closeWindow = window => { if (bot.currentWindow === window) bot.currentWindow = null }
   bot.inventory = windows.createWindow(0, 'minecraft:inventory', 'Inventory')
   if (!options.withdraw) bot.inventory.updateSlot(9, make(4))
   bot.username = 'CraftBot'
@@ -58,6 +59,7 @@ function fixture (options = {}) {
       if (options.transferMode === 'cursor') response.carriedItem = Item.toNotch(make(1))
       if (options.transferMode === 'missing') delete response.carriedItem
       bot._client.emit('window_items', response)
+      if (options.closeAfterClick && packet.windowId !== 0) bot.closeWindow(current)
     }
     config.craft = { ...config.craft, confirmTimeoutMs: 30 }
   }
@@ -155,6 +157,15 @@ test('modern strict deposit confirms its shift without a fixed settle delay and 
     assert.equal(f.bot._client.listenerCount('window_items'), 0)
     assert.equal(settles, 0)
   } finally { global.setTimeout = originalTimer; f.bot.clickWindow = originalClick; f.close() }
+})
+
+test('modern strict deposit keeps a confirmed transfer when the server closes the barrel window', async () => {
+  const f = fixture({ modern: true, closeAfterClick: true })
+  try {
+    await f.warehouse.depositAllPossible({ requireServerEvidence: true })
+    assert.deepEqual(f.bot.inventory.items(), [])
+    assert.equal(f.db.listChestSlots().find(row => row.slot === 0)?.amount, 4)
+  } finally { f.close() }
 })
 
 test('modern strict deposit still rejects a missing final independent barrel snapshot', async () => {
