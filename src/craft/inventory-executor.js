@@ -8,6 +8,7 @@ const { readServerContainer } = require('./server-container-evidence')
 const { shortKey } = require('../traceLog')
 const { createConfirmedWindowClicker } = require('./confirmed-window')
 const { planTransfer } = require('./transfer-plan')
+const { findCraftRecipes } = require('./live-recipes')
 
 // A fragmented source stack can be split with right-clicks, but each click is
 // a separate server window action.  Keep small legacy batches compatible while
@@ -251,7 +252,7 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
   }
 
   function selectRecipe (step, declared, table, items) {
-    const recipes = bot.recipesAll(declared.result.type, null, table) || []
+    const recipes = findCraftRecipes(bot, registry, declared.result.type, table)
     const candidates = []
     for (const recipe of recipes) {
       const candidate = {
