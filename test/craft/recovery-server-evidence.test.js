@@ -32,8 +32,9 @@ function fixture (options = {}) {
   db.addBalanceItems('alice', before)
   const ledger = new CraftLedger(db)
   const id = 'craft:server-evidence'
+  const accountTotalsAtStart = db.getLedgerTotals()
   ledger.begin({ id, botId: 'bot-a', owner: { uuid: 'alice', username: 'Alice' }, actor: 'Alice', allocations: before,
-    data: options.ready ? { held: [], pending: null, physicalTotals: before, stepIndex: 0 } : undefined })
+    data: options.ready ? { held: [], pending: null, physicalTotals: before, accountTotalsAtStart, stepIndex: 0 } : undefined })
   const data = {
     held: products,
     pending: {
@@ -46,6 +47,7 @@ function fixture (options = {}) {
       ...(options.progressAfter ? { progressAfter: options.progressAfter } : {})
     },
     physicalTotals: options.physicalTotals || before,
+    accountTotalsAtStart,
     stepIndex: 0,
     ...(options.recoveryPhase ? { recoveryPhase: options.recoveryPhase } : {}),
     ...(options.progress ? { progress: options.progress } : {}),
@@ -194,7 +196,9 @@ test('failed resume can settle a safely returned journal and release its reserva
   try {
     const progress = { stepIndex: 0, nextTrigger: 0 }
     const plan = { target: { name: 'stick', quantity: 4 }, craftSteps: [{ times: 1 }] }
+    const operation = f.ledger.get('craft:server-evidence')
     f.ledger.checkpoint('craft:server-evidence', 'crafting', {
+      ...operation.data,
       held: f.before,
       pending: { stepId: '0:0+1', before: f.before, expectedConsumed: f.before,
         expectedProduced: f.products, triggers: 1, progressBefore: progress, progressAfter: { stepIndex: 1, nextTrigger: 0 } },
@@ -456,7 +460,7 @@ test('fallback sync fixes balances before releasing the recovery journal', async
   } finally { f.close() }
 })
 
-test('recovery settles verified physical differences even when the retry error is not a mismatch', async () => {
+test('recovery does not settle an arbitrary retry failure without a verified mismatch', async () => {
   const f = fixture({ held: [] })
   try {
     const operation = f.ledger.pending()[0]
@@ -465,13 +469,80 @@ test('recovery settles verified physical differences even when the retry error i
     f.db.replaceChestSlots(f.chest.chestId, f.products.map((item, slot) => ({ ...item, slot })))
     f.controller.recoverLocked = async () => { throw new Error('temporary recovery read failure') }
 
+    await assert.rejects(f.controller.recover(), /temporary recovery read failure/)
+
+    assert.equal(f.db.getBalance('alice', f.before[0].itemKey), 2)
+    assert.equal(f.db.getBalance(f.db.momoOwner, f.products[0].itemKey), 0)
+    assert.equal(f.ledger.pending().length, 1)
+  } finally { f.close() }
+})
+
+test('recovery fallback does not book another bot inventory change to momo', async () => {
+  const f = fixture({ held: [] })
+  try {
+    const operation = f.ledger.pending()[0]
+    f.ledger.checkpoint(operation.id, 'ready', { ...operation.data, held: [], pending: null,
+      recoveryIntent: { phase: 'crafting', baseline: f.before, observed: [] } })
+    const Item = require('prismarine-item')(f.controller.catalog.mcData)
+    const extra = f.controller.catalog.aggregatePrismarineItems([
+      new Item(f.controller.catalog.mcData.itemsByName.stick.id, 4)
+    ])
+    f.db.runWithBotContext({ botId: 'bot-b' }, () => f.db.addBalanceItems('bob', extra))
+    f.db.replaceChestSlots(f.chest.chestId, [
+      ...f.before.map((item, slot) => ({ ...item, slot })),
+      ...extra.map((item, slot) => ({ ...item, slot: slot + f.before.length }))
+    ])
+    f.controller.recoverLocked = async () => {
+      throw Object.assign(new Error('verified physical mismatch'), { recoveryMismatch: true })
+    }
+
     const result = await f.controller.recover()
 
     assert.equal(result.status, 'recovered')
-    assert.equal(result.diffRegistered, true)
-    assert.equal(f.db.getBalance('alice', f.before[0].itemKey), 0)
-    assert.equal(f.db.getBalance(f.db.momoOwner, f.products[0].itemKey), f.products[0].amount)
+    assert.equal(f.db.getBalance('bob', extra[0].itemKey), extra[0].amount)
+    assert.equal(f.db.getBalance(f.db.momoOwner, extra[0].itemKey), 0)
     assert.equal(f.ledger.pending().length, 0)
+  } finally { f.close() }
+})
+
+test('recovery fallback does not count a confirmed craft batch twice', async () => {
+  const f = fixture({ held: [] })
+  try {
+    const operation = f.ledger.pending()[0]
+    f.ledger.checkpoint(operation.id, 'crafting', operation.data)
+    f.ledger.confirm(operation.id, '0:0', f.before, f.products, {
+      ...operation.data, before: f.before, after: f.products, held: [], pending: null,
+      physicalTotals: f.products, recovery: true
+    })
+    f.db.replaceChestSlots(f.chest.chestId, f.products.map((item, slot) => ({ ...item, slot })))
+    const confirmed = f.ledger.get(operation.id)
+    f.ledger.checkpoint(operation.id, 'ready', { ...confirmed.data, held: [], pending: null,
+      physicalTotals: f.products, recoveryBaseline: f.products })
+    f.controller.recoverLocked = async () => {
+      throw Object.assign(new Error('verified physical mismatch'), { recoveryMismatch: true })
+    }
+
+    const result = await f.controller.recover()
+
+    assert.equal(result.status, 'recovered')
+    assert.equal(f.db.getBalance('alice', f.products[0].itemKey), f.products[0].amount)
+    assert.equal(f.db.getBalance(f.db.momoOwner, f.products[0].itemKey), 0)
+    assert.equal(f.db.getBalance('alice', f.before[0].itemKey), 0)
+  } finally { f.close() }
+})
+
+test('task fuse cancellation keeps a failed-resume journal pending', async () => {
+  const f = fixture({ ready: true })
+  try {
+    const operation = f.ledger.pending()[0]
+    f.controller.recover = async () => ({ status: 'resumable', operationId: operation.id })
+    const cancelled = new Error('admin task fuse')
+    cancelled.cancelled = true
+
+    await assert.rejects(f.controller.settleResumeFailure(operation.id, cancelled), /admin task fuse/)
+
+    assert.equal(f.ledger.pending().length, 1)
+    assert.equal(f.db.getBalance('alice', f.before[0].itemKey), 2)
   } finally { f.close() }
 })
 

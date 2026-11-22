@@ -157,6 +157,7 @@ class CraftLedger {
     return this.transaction(() => {
       const existing = this.db.db.prepare('SELECT id FROM craft_operations WHERE id = ?').get(id)
       if (existing) return this.getCraftOperation(id)
+      if (Array.isArray(data.physicalTotals)) data.physicalLedgerTotals = this.db.getLedgerTotals()
       this.db.db.prepare(`
         INSERT INTO craft_operations
           (id, bot_id, owner_json, actor, target_json, state, phase, data_json, reservations_json)
@@ -251,6 +252,7 @@ class CraftLedger {
       if (!operation) throw new Error(`craft operation not found: ${operationId}`)
       if (TERMINAL.has(operation.state)) throw new Error(`craft operation is already ${operation.state}`)
       const nextData = this.normalizeData(data)
+      if (Array.isArray(data.physicalTotals)) nextData.physicalLedgerTotals = this.db.getLedgerTotals()
       this.db.db.prepare(`UPDATE craft_operations SET phase = ?, data_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`)
         .run(String(phase || ''), JSON.stringify(nextData), operationId)
       return this.getCraftOperation(operationId)
@@ -401,10 +403,11 @@ class CraftLedger {
         (operation_id, batch_key, before_json, after_json, consumed_json, produced_json)
         VALUES (?, ?, ?, ?, ?, ?)`)
         .run(operationId, batchKey, JSON.stringify(before), JSON.stringify(after), JSON.stringify(consumed), JSON.stringify(produced))
-      this.db.db.prepare(`UPDATE craft_operations SET phase = 'storing', data_json = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`)
-        .run(JSON.stringify(this.normalizeData(nextData)), operationId)
-      this.db.db.prepare('UPDATE craft_operations SET reservations_json = ? WHERE id = ?')
-        .run(JSON.stringify(this.listCraftReservations(operationId)), operationId)
+      if (Array.isArray(nextData.physicalTotals)) nextData.physicalLedgerTotals = this.db.getLedgerTotals()
+      this.db.db.prepare(`UPDATE craft_operations
+        SET phase = 'storing', data_json = ?, reservations_json = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ?`)
+        .run(JSON.stringify(this.normalizeData(nextData)), JSON.stringify(this.listCraftReservations(operationId)), operationId)
       return this.getCraftOperation(operationId)
     })
     const current = this.db.transactionContext?.getStore?.() || {}

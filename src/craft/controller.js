@@ -180,8 +180,10 @@ class CraftController {
   inventory () { return merge(this.catalog.aggregatePrismarineItems(this.bot.inventory.items())) }
   isBusy () { return Boolean(this.active) }
   cancel (reason = '合成已取消') {
-    this.active?.abort.abort(new Error(reason))
-    this.executor?.cancel(reason)
+    const error = reason instanceof Error ? reason : new Error(String(reason))
+    error.cancelled = true
+    this.active?.abort.abort(error)
+    this.executor?.cancel(error)
   }
 
   hasInventoryResidue () {
@@ -561,7 +563,7 @@ class CraftController {
         const allocations = this.allocate(planned.plan.inventoryUses, rows)
         const id = `craft:${randomUUID()}`
         let operation = this.ledger.begin({ id, botId: this.botId, owner: request.owner, actor: request.actor, target: planned.command.target, allocations,
-          data: { held: [], pending: null, physicalTotals: this.physicalTotals(), stepIndex: 0,
+          data: { held: [], pending: null, physicalTotals: this.physicalTotals(), accountTotalsAtStart: this.db.getLedgerTotals(), stepIndex: 0,
             progress: { stepIndex: 0, nextTrigger: 0 }, plan: planned.command } })
         this.debug('controller.operation_started', {
           operationId: id,
@@ -904,6 +906,11 @@ class CraftController {
         return { status: 'complete', operationId: id, target: operation.target }
       })
     } catch (error) {
+      if (lease.abort.signal.aborted) {
+        const reason = lease.abort.signal.reason
+        if (reason instanceof Error) reason.cancelled = true
+        error = reason instanceof Error ? reason : Object.assign(new Error(String(reason || error.message)), { cancelled: true })
+      }
       // Resume has already passed recovery's evidence checks, but navigation,
       // withdrawal, preview or the final return can still fail transiently.
       // Keep the original reservation and cursor durable so the next spawn or
@@ -1040,10 +1047,44 @@ class CraftController {
   canSettleRecoveryFailure (error) {
     const operation = this.ledger.pending(this.botId)[0]
     const baseline = operation?.data?.recoveryIntent?.baseline || operation?.data?.recoveryBaseline || operation?.data?.physicalTotals
-    return Boolean(!error?.cancelled && this.ledger.pending(this.botId).length === 1 &&
+    return Boolean(error?.recoveryMismatch && !error?.cancelled && this.ledger.pending(this.botId).length === 1 &&
       Array.isArray(baseline) && (operation?.data?.recoveryIntent || operation?.data?.recoveryBaseline) &&
-      operation?.data?.pendingReturnChestId == null && !this.inventory().length &&
+      Array.isArray(this.recoveryLedgerBaseline(operation)) && operation?.data?.pendingReturnChestId == null && !this.inventory().length &&
       !this.hasInventoryResidue() && this.db.listChests().length)
+  }
+
+  recoveryLedgerBaseline (operation) {
+    const data = operation?.data || {}
+    if (Array.isArray(data.recoveryIntent?.ledgerBaseline)) return data.recoveryIntent.ledgerBaseline
+    if (Array.isArray(data.recoveryLedgerBaseline)) return data.recoveryLedgerBaseline
+    if (Array.isArray(data.physicalLedgerTotals) &&
+      (data.recoveryIntent?.baseline ? same(data.recoveryIntent.baseline, data.physicalTotals) :
+        data.recoveryBaseline ? same(data.recoveryBaseline, data.physicalTotals) : true)) {
+      return data.physicalLedgerTotals
+    }
+    return null
+  }
+
+  recoveryAccountingBaseline (operation, physicalBaseline) {
+    const baselineLedger = this.recoveryLedgerBaseline(operation)
+    if (!Array.isArray(baselineLedger) || typeof this.db.getLedgerTotals !== 'function') {
+      throw new Error('恢复差异结算缺少实物基线对应的账本快照；恢复记录仍保留。')
+    }
+    const baselineByKey = new Map(baselineLedger.map(item => [item.itemKey, item]))
+    const currentByKey = new Map(this.db.getLedgerTotals().map(item => [item.itemKey, item]))
+    const physicalByKey = new Map(physicalBaseline.map(item => [item.itemKey, item]))
+    const adjusted = []
+    for (const itemKey of new Set([...baselineByKey.keys(), ...currentByKey.keys(), ...physicalByKey.keys()])) {
+      const baselineLedgerItem = baselineByKey.get(itemKey)
+      const current = currentByKey.get(itemKey)
+      const physical = physicalByKey.get(itemKey)
+      const amount = Number(physical?.amount || 0) + Number(current?.amount || 0) - Number(baselineLedgerItem?.amount || 0)
+      if (!Number.isSafeInteger(amount) || amount < 0) {
+        throw new Error(`恢复差异结算无法安全校正起始账本：${itemKey}；恢复记录仍保留。`)
+      }
+      if (amount > 0) adjusted.push({ ...(physical || current || baselineLedgerItem), amount })
+    }
+    return adjusted
   }
 
   settleRecoveryDiff (error, actual, check) {
@@ -1051,13 +1092,15 @@ class CraftController {
     if (!operation || !Array.isArray(actual)) throw new Error('恢复差异结算缺少本轮实物账本。')
     const baseline = operation.data.recoveryIntent?.baseline || operation.data.recoveryBaseline || operation.data.physicalTotals
     if (!Array.isArray(baseline)) throw new Error('恢复差异结算缺少原始实物基线。')
+    const ledgerBaseline = this.recoveryLedgerBaseline(operation)
+    const accountingBaseline = this.recoveryAccountingBaseline(operation, baseline)
     return this.ledger.transaction(() => {
       check()
       const result = this.db.runWithBotContext
-        ? this.db.runWithBotContext({ botId: this.botId }, () => this.db.reconcileRecoveryDeltaToMomo(baseline, actual, operation.id))
-        : this.db.reconcileRecoveryDeltaToMomo(baseline, actual, operation.id)
+        ? this.db.runWithBotContext({ botId: this.botId }, () => this.db.reconcileRecoveryDeltaToMomo(accountingBaseline, actual, operation.id))
+        : this.db.reconcileRecoveryDeltaToMomo(accountingBaseline, actual, operation.id)
       this.ledger.checkpoint(operation.id, 'ready', { ...operation.data, held: [], pending: null,
-        physicalTotals: actual, recoveryBaseline: baseline, recoveryReconciled: true })
+        physicalTotals: actual, recoveryBaseline: baseline, recoveryLedgerBaseline: ledgerBaseline, recoveryReconciled: true })
       this.ledger.finish(operation.id, 'failed', `恢复对账重试 ${RECOVER_RETRY_ATTEMPTS} 次未通过，已同步实物账目并登记差异：${error.message}`)
       return { status: 'recovered', operationId: operation.id,
         diffRegistered: Boolean(result.addedToMomo.length || result.removedFromMomo.length || result.unresolved.length) }
@@ -1065,6 +1108,7 @@ class CraftController {
   }
 
   async settleResumeFailure (operationId, error) {
+    if (error?.cancelled) throw error
     const id = String(operationId || '')
     const current = this.ledger.get(id)
     if (!current || current.botId !== this.botId || this.ledger.pending(this.botId).length !== 1) throw error
@@ -1144,7 +1188,7 @@ class CraftController {
     if (!saved) {
       operation = this.ledger.checkpoint(operation.id, operation.phase, { ...operation.data, recoveryIntent: {
         phase: operation.data.recoveryPhase || operation.phase,
-        baseline, pending: operation.data.pending || null, observed: this.inventory(),
+        baseline, ledgerBaseline: this.recoveryLedgerBaseline(operation), pending: operation.data.pending || null, observed: this.inventory(),
         progress: operation.data.progress || null
       } })
     }
@@ -1152,7 +1196,7 @@ class CraftController {
     const depositBaseline = this.physicalTotals()
     operation = this.ledger.checkpoint(operation.id, 'storing', {
       ...operation.data, held: this.inventory(), pending: null, physicalTotals: depositBaseline,
-      recoveryBaseline: baseline
+      recoveryBaseline: baseline, recoveryLedgerBaseline: this.recoveryLedgerBaseline(operation)
     })
     this.debug('controller.recovery_return_start', { operationId: operation.id, items: this.summarizeItems(this.inventory()) })
     const { deposited, operation: verified } = await this.depositReturn(operation)
