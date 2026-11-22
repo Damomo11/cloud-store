@@ -1008,7 +1008,7 @@ class CraftController {
           try {
             check()
             this.debug('controller.recovery_attempt', { attempt: attempt + 1, maxAttempts: RECOVER_RETRY_ATTEMPTS })
-            const result = await this.recoverLocked(check)
+            const result = await this.recoverLocked(check, { finalAttempt: attempt + 1 === RECOVER_RETRY_ATTEMPTS })
             this.debug('controller.recovery_complete', { status: result.status, operationId: result.operationId || null, diffRegistered: Boolean(result.diffRegistered) })
             return result
           } catch (error) {
@@ -1167,7 +1167,7 @@ class CraftController {
     return this.ledger.checkpoint(operation.id, operation.phase, data)
   }
 
-  async recoverLocked (check) {
+  async recoverLocked (check, { finalAttempt = false } = {}) {
     check()
     const operations = this.ledger.pending(this.botId)
     if (!operations.length) {
@@ -1215,13 +1215,13 @@ class CraftController {
       deposited = returned.deposited
       operation = returned.operation
     } catch (error) {
+      if (!finalAttempt || !error?.uncertainTransfer || error.cancelled || this.hasInventoryResidue()) throw error
       check()
-      if (!error?.uncertainTransfer || error.cancelled || this.hasInventoryResidue()) throw error
       const pendingReturn = this.ledger.get(operation.id)
       const chestId = pendingReturn?.data?.pendingReturnChestId
       if (chestId == null) throw error
-      // The last transfer may have moved everything despite a lost click response.
-      // Reread that barrel and prove conservation before clearing its checkpoint.
+      // After the last attempt there is no next retry to reread the barrel.
+      // Prove conservation before clearing the unconfirmed return checkpoint.
       this.debug('controller.recovery_return_recheck', { operationId: operation.id, chestId, message: error.message })
       operation = await this.recheckPendingReturn(pendingReturn, chests, check, depositBaseline)
     }

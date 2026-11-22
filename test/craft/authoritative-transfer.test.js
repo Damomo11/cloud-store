@@ -307,15 +307,16 @@ test('recovery completes a deposit whose first confirmation packet was missing',
   } finally { f.close() }
 })
 
-test('recovery verifies the touched barrel in the same attempt after an unconfirmed final transfer', async () => {
+test('recovery verifies only the touched barrel after an unconfirmed transfer on the final attempt', async () => {
   const f = fixture({ modern: true, transferMode: 'missing' })
   try {
-    const events = []
-    const { controller, ledger } = storingOperation(f, event => events.push(event))
-    f.warehouse.goHomeIfAway = async () => {}
+    const { controller, ledger } = storingOperation(f)
+    let attempts = 0
+    f.warehouse.goHomeIfAway = async () => {
+      if (++attempts < 3) throw new Error('transient navigation failure')
+    }
     const result = await controller.recover()
     assert.equal(result.status, 'recovered')
-    assert.equal(events.filter(event => event === 'controller.recovery_attempt').length, 1)
     assert.deepEqual(f.openedChestIds, [f.chest.chestId, f.chest.chestId])
     assert.equal(ledger.pending().length, 0)
     assert.equal(f.db.listChestSlots().find(row => row.slot === 0)?.amount, 4)
@@ -326,13 +327,16 @@ test('recovery keeps the return checkpoint when the fresh snapshot does not cons
   const f = fixture({ modern: true, transferMode: 'missing' })
   try {
     const { controller, operation, ledger } = storingOperation(f)
-    f.warehouse.goHomeIfAway = async () => {}
+    let attempts = 0
+    f.warehouse.goHomeIfAway = async () => {
+      if (++attempts < 3) throw new Error('transient navigation failure')
+    }
     const open = f.warehouse.openContainerAt.bind(f.warehouse)
     f.warehouse.openContainerAt = chest => {
       if (f.opens() === 1) f.server.chest.count = 3
       return open(chest)
     }
-    await assert.rejects(controller.recoverLocked(() => {}), error => error.uncertainTransfer === true && !error.recoveryMismatch)
+    await assert.rejects(controller.recover(), error => error.uncertainTransfer === true && !error.recoveryMismatch)
     assert.deepEqual(f.openedChestIds, [f.chest.chestId, f.chest.chestId])
     assert.equal(ledger.get(operation.id).data.pendingReturnChestId, f.chest.chestId)
     assert.equal(ledger.pending().length, 1)
