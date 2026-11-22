@@ -304,6 +304,7 @@ class Warehouse {
       const container = await this.openContainerAt(chest)
       let movedInChest = 0
       let returnEvidencePending = false
+      let reopenAfterConfirmedClose = false
       const noSpaceKeys = new Set()
       try {
         const confirmedDeposit = options.requireServerEvidence ? createConfirmedDepositor(this, options.check, container) : null
@@ -343,16 +344,24 @@ class Warehouse {
                 moved,
                 decision: `存入 ${moved} 个 ${item.name}`
               })
+              if (confirmedDeposit && this.bot.currentWindow !== container) {
+                // The server may close the barrel immediately after a
+                // confirmed shift-click. The transfer is authoritative, but
+                // the old window must never be reused for another click.
+                reopenAfterConfirmedClose = true
+                break
+              }
               if (!confirmedDeposit) await sleep(this.config.timing.containerSettleMs)
             }
           }
+          if (reopenAfterConfirmedClose) break
         }
         this.refreshChestSnapshot(chest, container)
       } finally {
         this.closeContainerQuietly(container)
       }
 
-      if (craftVisited) {
+      if (craftVisited && (!reopenAfterConfirmedClose || !this.bot.inventory.items().length)) {
         craftVisited.add(chest.chestId)
         craftRoutePosition = { x: chest.x, y: chest.y, z: chest.z }
       }
