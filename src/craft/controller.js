@@ -1008,7 +1008,7 @@ class CraftController {
           try {
             check()
             this.debug('controller.recovery_attempt', { attempt: attempt + 1, maxAttempts: RECOVER_RETRY_ATTEMPTS })
-            const result = await this.recoverLocked(check)
+            const result = await this.recoverLocked(check, { finalAttempt: attempt + 1 === RECOVER_RETRY_ATTEMPTS })
             this.debug('controller.recovery_complete', { status: result.status, operationId: result.operationId || null, diffRegistered: Boolean(result.diffRegistered) })
             return result
           } catch (error) {
@@ -1152,7 +1152,22 @@ class CraftController {
     }
   }
 
-  async recoverLocked (check) {
+  async recheckPendingReturn (operation, chests, check, expectedTotals = null) {
+    const chestId = operation.data.pendingReturnChestId
+    const chest = chests.find(value => value.chestId === chestId)
+    if (!chest) throw new Error('合成回库待复核的木桶未登记，无法核对本次转移。')
+    check()
+    await this.warehouse.refreshUnconfirmedCraftReturn(chest)
+    check()
+    if (expectedTotals !== null && (this.hasInventoryResidue() || !same(this.physicalTotals(), expectedTotals))) {
+      throw Object.assign(new Error('合成回库复核未能确认背包已清空且实物总量一致。'), { uncertainTransfer: true })
+    }
+    const data = { ...operation.data }
+    delete data.pendingReturnChestId
+    return this.ledger.checkpoint(operation.id, operation.phase, data)
+  }
+
+  async recoverLocked (check, { finalAttempt = false } = {}) {
     check()
     const operations = this.ledger.pending(this.botId)
     if (!operations.length) {
@@ -1178,13 +1193,7 @@ class CraftController {
     const chests = this.db.listChests()
     if (!chests.length) throw new Error('恢复没有可用的入库木桶；请先登记可用容器。')
     if (operation.data.pendingReturnChestId != null) {
-      const chest = chests.find(value => value.chestId === operation.data.pendingReturnChestId)
-      if (!chest) throw new Error('合成回库待复核的木桶未登记，无法核对本次转移。')
-      await this.warehouse.refreshUnconfirmedCraftReturn(chest)
-      const data = { ...operation.data }
-      delete data.pendingReturnChestId
-      operation = this.ledger.checkpoint(operation.id, operation.phase, data)
-      check()
+      operation = await this.recheckPendingReturn(operation, chests, check)
     }
     if (!saved) {
       operation = this.ledger.checkpoint(operation.id, operation.phase, { ...operation.data, recoveryIntent: {
@@ -1200,8 +1209,22 @@ class CraftController {
       recoveryBaseline: baseline, recoveryLedgerBaseline: this.recoveryLedgerBaseline(operation)
     })
     this.debug('controller.recovery_return_start', { operationId: operation.id, items: this.summarizeItems(this.inventory()) })
-    const { deposited, operation: verified } = await this.depositReturn(operation, check)
-    operation = verified
+    let deposited
+    try {
+      const returned = await this.depositReturn(operation, check)
+      deposited = returned.deposited
+      operation = returned.operation
+    } catch (error) {
+      if (!finalAttempt || !error?.uncertainTransfer || error.cancelled || this.hasInventoryResidue()) throw error
+      check()
+      const pendingReturn = this.ledger.get(operation.id)
+      const chestId = pendingReturn?.data?.pendingReturnChestId
+      if (chestId == null) throw error
+      // After the last attempt there is no next retry to reread the barrel.
+      // Prove conservation before clearing the unconfirmed return checkpoint.
+      this.debug('controller.recovery_return_recheck', { operationId: operation.id, chestId, message: error.message })
+      operation = await this.recheckPendingReturn(pendingReturn, chests, check, depositBaseline)
+    }
     check()
     if (this.inventory().length) throw new Error('仓库空间不足，恢复的物品保留在机器人背包并等待恢复。')
     this.assertCleanInventory()

@@ -307,6 +307,42 @@ test('recovery completes a deposit whose first confirmation packet was missing',
   } finally { f.close() }
 })
 
+test('recovery verifies only the touched barrel after an unconfirmed transfer on the final attempt', async () => {
+  const f = fixture({ modern: true, transferMode: 'missing' })
+  try {
+    const { controller, ledger } = storingOperation(f)
+    let attempts = 0
+    f.warehouse.goHomeIfAway = async () => {
+      if (++attempts < 3) throw new Error('transient navigation failure')
+    }
+    const result = await controller.recover()
+    assert.equal(result.status, 'recovered')
+    assert.deepEqual(f.openedChestIds, [f.chest.chestId, f.chest.chestId])
+    assert.equal(ledger.pending().length, 0)
+    assert.equal(f.db.listChestSlots().find(row => row.slot === 0)?.amount, 4)
+  } finally { f.close() }
+})
+
+test('recovery keeps the return checkpoint when the fresh snapshot does not conserve the items', async () => {
+  const f = fixture({ modern: true, transferMode: 'missing' })
+  try {
+    const { controller, operation, ledger } = storingOperation(f)
+    let attempts = 0
+    f.warehouse.goHomeIfAway = async () => {
+      if (++attempts < 3) throw new Error('transient navigation failure')
+    }
+    const open = f.warehouse.openContainerAt.bind(f.warehouse)
+    f.warehouse.openContainerAt = chest => {
+      if (f.opens() === 1) f.server.chest.count = 3
+      return open(chest)
+    }
+    await assert.rejects(controller.recover(), error => error.uncertainTransfer === true && !error.recoveryMismatch)
+    assert.deepEqual(f.openedChestIds, [f.chest.chestId, f.chest.chestId])
+    assert.equal(ledger.get(operation.id).data.pendingReturnChestId, f.chest.chestId)
+    assert.equal(ledger.pending().length, 1)
+  } finally { f.close() }
+})
+
 test('sync rewrites chest slots without the old global craft lockout', async () => {
   const f = fixture()
   try {
