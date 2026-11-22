@@ -239,20 +239,52 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
 
   function selectRecipe (step, declared, table, items) {
     const recipes = bot.recipesAll(declared.result.type, null, table) || []
+    const candidates = []
     for (const recipe of recipes) {
-      if (recipe?.result?.id !== declared.result.type || recipe.result.count !== declared.result.count ||
-        recipe.requiresTable !== step.requiresTable) continue
+      const candidate = {
+        result: recipe?.result?.id == null ? null : catalog.fromPrismarineItem(new Item(recipe.result.id, 1, recipe.result.metadata)).itemId,
+        resultCount: Number(recipe?.result?.count || 0),
+        requiresTable: Boolean(recipe?.requiresTable)
+      }
+      if (recipe?.result?.id !== declared.result.type || recipe.result.count !== declared.result.count) {
+        candidates.push({ ...candidate, rejection: 'result_mismatch' })
+        continue
+      }
+      if (recipe.requiresTable !== step.requiresTable) {
+        candidates.push({ ...candidate, rejection: 'table_requirement_mismatch' })
+        continue
+      }
       let executable
       try {
         executable = withStandardRecipeOutputs(registry, normalizeRecipeVariants(recipe, declared.inputs))
-      } catch { continue }
+      } catch (cause) {
+        candidates.push({ ...candidate, rejection: 'invalid_standard_recipe', message: cause.message })
+        continue
+      }
       const materials = recipeMaterials(executable)
       if (!materials || !sameAmounts(materials.inputs.map(input => ({ ...input, amount: input.amount * declared.triggers })),
-        declared.inputs, entry => ingredientFamily(entry.id ?? entry.type)) ||
-        !matchesMetadata(materials.inputs, items, declared.triggers)) continue
+        declared.inputs, entry => ingredientFamily(entry.id ?? entry.type))) {
+        candidates.push({ ...candidate, rejection: 'ingredient_mismatch' })
+        continue
+      }
+      if (!matchesMetadata(materials.inputs, items, declared.triggers)) {
+        candidates.push({ ...candidate, rejection: 'metadata_or_variant_mismatch' })
+        continue
+      }
       const expected = catalog.aggregatePrismarineItems(standardRecipeOutputs(registry, executable).map(entry => new Item(entry.id, entry.count, entry.metadata)))
       return { recipe: executable, expected }
     }
+    emitDebug('executor.recipe_selection_failed', {
+      requested: {
+        result: catalog.fromPrismarineItem(new Item(declared.result.type, 1)).itemId,
+        resultCount: declared.result.count,
+        triggers: declared.triggers,
+        requiresTable: step.requiresTable,
+        inputs: amountSummary(declared.inputs.map(input => ({ ...input, count: input.amount })))
+      },
+      inventory: amountSummary(items.map(item => ({ ...catalog.fromPrismarineItem(item), count: item.count }))),
+      candidates
+    })
     throw error('no standard recipe matches the concrete input ids, counts, result and table requirement')
   }
 

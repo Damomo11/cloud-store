@@ -10,6 +10,7 @@ const REPAIR_BOTTLE_AMOUNT = 64
 const REPAIR_MAX_DISTANCE = 4
 const WHOLE_SHULKER_WITHDRAW_THRESHOLD = 1728
 const CRAFT_DEBUG_COMMAND = /^!调试\s+合成日志\s+(开|关)$/
+const TASK_FUSE_COMMAND = /^!调试\s+任务熔断$/
 
 // 扣账幂等键的进程级盐。任务序号（taskPool.sequence）是内存自增、进程重启后归零，
 // 幂等键若只由 botId+taskId+批次号组成，重启后会与重启前的任务撞键：
@@ -35,7 +36,22 @@ async function recoverAndResumeCraft (service, controller) {
     stepIndex: recovered.stepIndex ?? null,
     nextTrigger: recovered.nextTrigger ?? null
   })
-  const resumed = await controller.resume(recovered.operationId)
+  let resumed
+  try {
+    resumed = await controller.resume(recovered.operationId)
+  } catch (resumeError) {
+    service.debugCraft?.('service.resume_failure', {
+      operationId: recovered.operationId,
+      message: resumeError.message
+    })
+    if (typeof controller.settleResumeFailure === 'function') {
+      const settled = await controller.settleResumeFailure(recovered.operationId, resumeError)
+      const resumeFailedSettled = settled.status === 'recovered'
+      return { ...settled, recoveredOperationId: recovered.operationId,
+        ...(resumeFailedSettled ? { resumeFailedSettled: true } : {}), resumeFailure: resumeError.message }
+    }
+    throw resumeError
+  }
   if (resumed?.status === 'complete' && operation?.actor) {
     const target = operation.target || {}
     const item = target.name || target.item || target.itemId || '目标物品'
@@ -606,6 +622,11 @@ class CloudStoreService {
 
   handlePublicCraftDebugCommand (username, text) {
     if (!this.isAdmin(username) || !this.taskPool.acceptIncoming(username, text, 'craft-debug:public')) return
+    if (TASK_FUSE_COMMAND.test(text)) {
+      const result = this.taskPool.beginFuse('admin task fuse')
+      this.msg(username, `任务熔断已触发：已清空 ${result.cancelledQueued} 个排队任务，并请求停止 ${result.stopRequested} 个运行任务；恢复记录未删除，任务排空后自动恢复派发。`)
+      return
+    }
     const match = text.match(CRAFT_DEBUG_COMMAND)
     if (!match) {
       this.handleCraftDebugCommand(username, text)
@@ -638,15 +659,35 @@ class CloudStoreService {
   handleCraftDebugCommand (username, text, { reply = true } = {}) {
     if (!this.isAdmin(username)) return false
 
+    if (TASK_FUSE_COMMAND.test(String(text || '').trim())) {
+      if (typeof this.taskPool?.beginFuse !== 'function') {
+        if (reply) this.msg(username, '当前任务池不支持任务熔断。')
+        return false
+      }
+      const result = this.taskPool.beginFuse('admin task fuse')
+      if (reply) this.msg(username, `任务熔断已触发：已清空 ${result.cancelledQueued} 个排队任务，并请求停止 ${result.stopRequested} 个运行任务；恢复记录未删除，任务排空后自动恢复派发。`)
+      return true
+    }
+
     const match = String(text || '').trim().match(CRAFT_DEBUG_COMMAND)
     if (!match) {
-      if (reply) this.msg(username, '格式：!调试 合成日志 开|关')
+      if (reply) this.msg(username, '格式：!调试 合成日志 开/关 或 !调试 任务熔断')
       return false
     }
 
     this.craftDebugEnabled = match[1] === '开'
     const state = this.craftDebugEnabled ? '开启' : '关闭'
     if (reply) this.msg(username, `机器人 ${this.bot.username || this.botId} 的合成日志已${state}，重启后自动关闭。`)
+    return true
+  }
+
+  cancelActiveTask (reason = 'admin task fuse') {
+    if (!this.active) return false
+    this.active.cancelled = true
+    this.craftController?.cancel(reason)
+    this.packingController?.cancel(reason)
+    try { this.bot.pathfinder?.stop() } catch {}
+    try { this.bot.clearControlStates?.() } catch {}
     return true
   }
 
@@ -2630,7 +2671,11 @@ class CloudStoreService {
       const canStart = !this.taskPool || Boolean(this.taskPool.eligibleWorkerForTask({ type: 'craft_recovery', stickyWorker }))
       const task = Promise.resolve(this.enqueueTask(username, 'craft_recovery', async worker => {
         const result = await recoverAndResumeCraft(worker, worker.getCraftController())
-        this.msg(username, result.status === 'empty'
+        this.msg(username, result.resumeFailedSettled
+          ? (result.diffRegistered
+              ? `机器人 ${botId} 的续跑失败；实物差异已记入 momo 并登记库存异常，恢复记录已释放，可重新提交合成。`
+              : `机器人 ${botId} 的续跑失败；已按核验后的实物状态记账并释放恢复记录，可重新提交合成。`)
+          : result.status === 'empty'
           ? `机器人 ${botId} 没有待恢复的合成任务。`
           : result.resumedFromRecovery
             ? '已核对中断时的物品，并从上次确认位置继续完成原合成订单。'
@@ -2671,6 +2716,10 @@ class CloudStoreService {
         // 含 diffRegistered=true 时要提示管理员有差异登记待复核。
         const notice = result?.resumedFromRecovery
           ? `机器人 ${this.bot.username} 已核对中断时的物品，并从上次确认位置继续完成原合成订单。`
+          : result?.resumeFailedSettled
+          ? (result.diffRegistered
+              ? `机器人 ${this.bot.username} 的合成续跑失败；实物差异已记入 momo 并登记库存异常，恢复记录已释放，可重新提交。`
+              : `机器人 ${this.bot.username} 的合成续跑失败；已按核验后的实物状态记账并释放恢复记录，可重新提交。`)
           : result?.status === 'recovered'
           ? (result?.diffRegistered
               ? `机器人 ${this.bot.username} 启动时自动恢复了一笔中断的合成，物品已回云仓；对账差异已登记库存异常，请管理员在 Web 管理页复核。`

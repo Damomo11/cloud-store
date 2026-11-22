@@ -17,11 +17,11 @@ function worker (botId) {
   }
 }
 
-test('unstarted offline recovery is not a queue barrier, while running recovery stays exclusive', async () => {
+test('unstarted offline recovery is not a queue barrier and running recovery does not stop other bots', async () => {
   const pool = new BotTaskPool()
   const healthy = worker('healthy')
   pool.register(healthy)
-  const waiting = pool.enqueue({ type: 'craft_recovery', exclusive: true, stickyWorker: { botId: 'offline' }, run: () => assert.fail('offline recovery ran') })
+  const waiting = pool.enqueue({ type: 'craft_recovery', stickyWorker: { botId: 'offline' }, run: () => assert.fail('offline recovery ran') })
   let ordinaryStarted = false
   pool.enqueue({ type: 'withdraw', run: () => { ordinaryStarted = true } })
   await tick()
@@ -33,8 +33,8 @@ test('unstarted offline recovery is not a queue barrier, while running recovery 
   let laterStarted = false
   const later = pool.enqueue({ type: 'withdraw', run: () => { laterStarted = true } })
   await tick()
-  assert.equal(laterStarted, false)
-  assert.equal(pool.inFlight.get(owner).exclusive, true)
+  assert.equal(laterStarted, true)
+  assert.equal(Boolean(pool.inFlight.get(owner).exclusive), false)
   release()
   await Promise.all([waiting, later])
   assert.equal(laterStarted, true)
@@ -93,15 +93,24 @@ test('a new craft first recovers its own pending journal before the upstream glo
   assert.equal(ran, true)
 })
 
-test('ordinary tasks still respect upstream global pending protection', async () => {
+test('ordinary task inventory guard is evaluated for its own bot context', async () => {
   let recovered = false, ran = false
   const service = Object.assign(Object.create(Service.prototype), {
-    botId: 'healthy', db: { assertNoPendingCraft: () => { throw new Error('pending craft owned by offline') } },
+    botId: 'healthy', db: {
+      assertNoPendingCraft: () => { throw new Error('pending craft owned by offline') },
+      currentCommandLogId: () => 0,
+      runWithCommandContext: (_id, fn) => fn(),
+      runWithBotContext: (_context, fn) => fn()
+    },
+    withBotContext: fn => fn(),
     getCraftController: () => ({ recover: async () => { recovered = true } })
   })
-  await assert.rejects(service.runExclusive('Alice', 'withdraw', () => { ran = true }), /offline/)
+  service.db.assertNoPendingCraft = (_operationId, actingBotId) => {
+    if (actingBotId !== 'healthy') throw new Error('acting bot id missing')
+  }
+  await service.runExclusive('Alice', 'withdraw', () => { ran = true })
   assert.equal(recovered, false)
-  assert.equal(ran, false)
+  assert.equal(ran, true)
 })
 
 
@@ -116,7 +125,7 @@ test('the real service and pool return the recovery result used by completion no
   })
   pool.register(service)
   const result = await service.enqueueTask('Admin', 'craft_recovery', async () => ({ status: 'recovered', diffRegistered: true }),
-    { exclusive: true, stickyWorker: service })
+    { stickyWorker: service })
   assert.deepEqual(result, { status: 'recovered', diffRegistered: true })
   assert.equal(service.active, null)
 })

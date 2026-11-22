@@ -179,7 +179,7 @@ test('invalid public debug syntax returns one usage reply without changing any b
     fixture.service.handleIncoming('Admin', '!调试 合成输出 开', 'chat', { channel: 'public' })
   }
   assert.equal(group.replies().length, 1)
-  assert.match(group.replies()[0], /格式：!调试 合成日志 开 关/)
+  assert.match(group.replies()[0], /格式：!调试 合成日志 开\/关/)
   assert.ok(group.fixtures.every(fixture => fixture.service.craftDebugEnabled === false))
 })
 
@@ -244,4 +244,37 @@ test('formatted private system chat affects only its recipient and dedupes whisp
   group.fixtures[1].service.handleIncoming('Admin', '调试 合成日志 开', 'whisper', { channel: 'private' })
   assert.deepEqual(group.fixtures.map(fixture => fixture.service.craftDebugEnabled), [false, true, false])
   assert.equal(group.replies().length, 1)
+})
+test('admin task fuse stops every worker, drains safely, and keeps recovery records', async () => {
+  const group = createBotGroup()
+  let release
+  const running = group.pool.enqueue({ type: 'craft', run: () => new Promise(resolve => { release = resolve }) })
+  await new Promise(resolve => setImmediate(resolve))
+  let cancelRequests = 0
+  group.fixtures[0].service.cancelActiveTask = () => { cancelRequests++; return true }
+
+  group.fixtures[0].service.handleIncoming('Admin', '!调试 任务熔断', 'whisper', { channel: 'private' })
+  await new Promise(resolve => setImmediate(resolve))
+
+  assert.equal(group.pool.fused, true)
+  assert.equal(cancelRequests, 1)
+  assert.ok(group.replies().some(message => message.includes('任务熔断已触发')))
+  release(null)
+  await running
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(group.pool.fused, false)
+  assert.ok(group.replies().some(message => message.includes('恢复记录未删除')))
+})
+
+test('public task fuse is applied once across bots and sends one reply', () => {
+  const group = createBotGroup()
+  for (const fixture of group.fixtures) {
+    for (const source of ['chat', 'messagestr', 'packet:player_chat']) {
+      fixture.service.handleIncoming('Admin', '!调试 任务熔断', source, { channel: 'public' })
+    }
+  }
+
+  assert.equal(group.replies().length, 1)
+  assert.match(group.replies()[0], /任务熔断已触发/)
+  assert.match(group.replies()[0], /恢复记录未删除/)
 })

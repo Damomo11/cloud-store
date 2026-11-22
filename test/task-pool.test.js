@@ -48,3 +48,46 @@ test('two idle bots claim two queued tasks concurrently', async () => {
   for (const release of releases) release()
   await Promise.all([firstTask, secondTask])
 })
+
+test('task fuse cancels queued work, blocks dispatch while active work drains, then resumes', async () => {
+  const pool = new BotTaskPool()
+  const worker = createWorker('bot-1')
+  let cancelled = 0
+  worker.cancelActiveTask = () => { cancelled++; worker.active.cancelled = true; return true }
+  pool.register(worker)
+  let finishActive
+  let started = 0
+  const active = pool.enqueue({ type: 'withdraw', run: () => new Promise(resolve => { started++; finishActive = resolve }) })
+  await new Promise(resolve => setImmediate(resolve))
+  const queued = pool.enqueue({ type: 'deposit', run: () => { started++; return true } })
+  const fuse = pool.beginFuse('admin test')
+
+  assert.equal(fuse.cancelledQueued, 1)
+  assert.equal(fuse.stopRequested, 1)
+  assert.equal(cancelled, 1)
+  assert.equal(pool.fused, true)
+  assert.equal(await queued, null)
+  assert.equal(started, 1)
+
+  finishActive('cancelled')
+  await active
+  await fuse.drained
+  assert.equal(pool.fused, false)
+
+  const resumed = pool.enqueue({ type: 'deposit', run: () => { started++; return 'resumed' } })
+  assert.equal(await resumed, 'resumed')
+  assert.equal(started, 2)
+})
+
+test('task fuse rejects tasks enqueued while there is no active worker', async () => {
+  const pool = new BotTaskPool()
+  const worker = createWorker('bot-1')
+  pool.packingRecoveryLeases.add(worker)
+  const fuse = pool.beginFuse('admin test')
+  assert.equal(pool.fused, true)
+  assert.equal(await pool.enqueue({ type: 'withdraw', run: () => 'must not run' }), null)
+  pool.packingRecoveryLeases.delete(worker)
+  pool.resolveFuseDrain()
+  assert.equal(await fuse.drained, undefined)
+  assert.equal(pool.fused, false)
+})

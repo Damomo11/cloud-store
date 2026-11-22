@@ -28,6 +28,7 @@ function createWarehouse (blocks, registeredChests = 1) {
   const catalog = { fromPrismarineItem: item => item }
   const config = structuredClone(DEFAULT_CONFIG)
   config.server.botName = 'BotA'
+  config.timing.servux.enabled = false
   config.debug = false
   const warehouse = new Warehouse(bot, db, catalog, config)
   warehouse.goHome = async () => {}

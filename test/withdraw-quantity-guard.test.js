@@ -76,6 +76,7 @@ function createFixture (withdrawAmounts) {
       inventory = amount > 0 ? [{ ...item, count: amount }] : []
       return { withdrawn: amount > 0 ? [{ ...item, amount }] : [], missing: [] }
     },
+    depositInventoryForOwner: async () => ({ deposited: [], leftover: [] }),
     depositInventoryWithoutBalance: async type => {
       depositCalls.push(type)
       const deposited = catalog.aggregatePrismarineItems(inventory)

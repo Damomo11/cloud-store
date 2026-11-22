@@ -50,7 +50,11 @@ test('generic residual cleanup refuses inventory belonging to a pending craft', 
 
 test('service refuses a new asset task while durable craft recovery is pending', async () => {
   let ran = false
-  const service = { db: { assertNoPendingCraft: () => { throw new Error('pending craft recovery') } }, active: null }
+  const service = {
+    db: { assertNoPendingCraft: () => { throw new Error('pending craft recovery') } },
+    withBotContext: fn => fn(),
+    active: null
+  }
   await assert.rejects(Service.prototype.runExclusive.call(service, 'Alice', 'withdraw', async () => { ran = true }), /pending craft/)
   assert.equal(ran, false)
   assert.equal(service.active, null)

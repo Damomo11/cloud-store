@@ -579,6 +579,38 @@ test('resume clears stale recovery evidence and journals pre-craft failures for 
   } finally { f.db.close() }
 })
 
+test('resume preserves fuse cancellation when an operation error races with the abort', async () => {
+  const { CraftController } = require('../../src/craft/controller')
+  const f = fixture()
+  try {
+    f.seed('alice', 'oak_planks', 2)
+    const owner = { uuid: 'alice', username: 'Alice', scope: 'personal' }
+    const controller = new CraftController({ ...f, botId: 'bot-a' })
+    const planned = planToCraftCommand({ item: 'stick', quantity: 4, available: controller.availableStock(owner.uuid), config: f.config, forceCraft: true })
+    const id = 'craft:resume-cancel-race'
+    const allocations = controller.allocate(planned.plan.inventoryUses, controller.availableItems(owner.uuid))
+    const data = {
+      held: [], pending: null, physicalTotals: controller.physicalTotals(),
+      progress: { stepIndex: 0, nextTrigger: 0 }, plan: planned.command
+    }
+    controller.ledger.begin({ id, botId: 'bot-a', owner, actor: 'Alice', target: planned.command.target, allocations, data })
+    controller.ledger.checkpoint(id, 'ready', data)
+    f.warehouse.goHomeIfAway = async () => {
+      controller.cancel('admin task fuse')
+      throw new Error('executor failure raced with cancellation')
+    }
+
+    await assert.rejects(controller.resume(id), error => {
+      assert.equal(error.message, 'admin task fuse')
+      assert.equal(error.cancelled, true)
+      return true
+    })
+
+    assert.equal(controller.ledger.pending('bot-a').length, 1)
+    assert.equal(controller.ledger.get(id).state, 'running')
+  } finally { f.db.close() }
+})
+
 test('batch budget respects input and output stack limits while reserving one slot', () => {
   const { CraftController } = require('../../src/craft/controller')
   const f = fixture()

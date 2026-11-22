@@ -17,6 +17,7 @@ function createService ({ botName, pool, failPartition = false, prepareBlocks = 
   config.server = { ...config.server, botName, username: botName }
   const bot = { username: botName, chat: () => {} }
   const db = {
+    listChests: () => [],
     claimLegacyRecoveryTask: () => {},
     addCommandReply: () => {},
     saveRecoveryTask: () => {},

@@ -87,6 +87,7 @@ function createFixture (withdrawAmounts, options = {}) {
       }
       return { withdrawn: amount > 0 ? [{ ...item, amount }] : [], missing: [] }
     },
+    depositInventoryForOwner: async () => ({ deposited: [], leftover: [] }),
     depositInventoryWithoutBalance: async type => {
       depositCalls.push(type)
       if (type === 'withdraw_failed_return' && options.failedReturnLeftover) {

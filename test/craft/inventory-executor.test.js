@@ -1540,3 +1540,14 @@ test('server evidence must remain stable instead of accepting a transient predic
   }
   await assert.rejects(f.executor.execute({ step: stickStep }), error => error.recoveryRequired === true)
 })
+test('recipe preview failure logs requested step, observed inventory, and candidate rejection reasons', () => {
+  const f = fixture([item('oak_planks', 2)], [])
+  f.bot.recipesAll = () => [{ result: { id: registry.itemsByName.stick.id, count: 4 }, requiresTable: true,
+    ingredients: [{ id: registry.itemsByName.oak_planks.id, count: 1 }] }]
+
+  assert.throws(() => f.executor.preview(stickStep, 1), /no standard recipe/)
+  const failure = f.debugEvents.find(entry => entry.event === 'executor.recipe_selection_failed')
+  assert.equal(failure.details.requested.result, 'minecraft:stick')
+  assert.deepEqual(failure.details.inventory, [['minecraft:oak_planks', 2]])
+  assert.equal(failure.details.candidates[0].rejection, 'table_requirement_mismatch')
+})
