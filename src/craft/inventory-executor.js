@@ -33,8 +33,13 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
       registry = nextRegistry
       Item = require('prismarine-item')(registry)
     }
+    // The clicker captures both the catalog and its Item decoder. Rebuild it so
+    // authoritative packets are never decoded with the pre-login registry.
+    confirmedClick = createConfirmedWindowClicker(bot, catalog, config, emitDebug, {
+      resyncInvalidatedConfirmation: true
+    })
   }
-  const confirmedClick = createConfirmedWindowClicker(bot, catalog, config, emitDebug, {
+  let confirmedClick = createConfirmedWindowClicker(bot, catalog, config, emitDebug, {
     resyncInvalidatedConfirmation: true
   })
   const snapshot = () => catalog.aggregatePrismarineItems(bot.inventory.items())
