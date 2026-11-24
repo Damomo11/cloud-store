@@ -4858,7 +4858,15 @@ class CloudStoreService {
   }
 
   getPlayer (username) {
-    const rawUuid = this.bot.players[username]?.uuid || `name:${username}`
+    // bot.players 的 UUID 来自 tab 列表（player_info 包）。协议层丢包（Via 解析炸、
+    // PartialReadError）或玩家离线后 tab 条目被清，都会让这里查不到 UUID；
+    // 直接落 name: 幽灵号会绕过 canonical/v3→v4 改挂，触发“没有可用仓库”误报
+    // （仓库、成员资格都挂在正版号上）。所以 name: 兜底前先问 DB：同名已知
+    // 正版号在库就沿用；查不到或只查到幽灵行才落 name:（真新玩家不受影响）。
+    // 归属复核交给后续 canonical/v3→v4（merged 冲突表 + 同名 v4 主号改挂）。
+    const online = this.bot.players[username]?.uuid
+    const known = this.db.getPlayerByUsername(username)?.uuid
+    const rawUuid = online || (known && !known.startsWith('name:') ? known : '') || `name:${username}`
     // upsertPlayer 内部会再过一次 canonical + v3→v4 改挂；这里先 canonical 是为了
     // 返回给调用方的 uuid 就是最终归属，避免调用方拿旧 v3 去写 balances。
     const uuid = this.db.resolveOfflineUuidToMojang(this.db.canonicalPlayerUuid(rawUuid), username)
