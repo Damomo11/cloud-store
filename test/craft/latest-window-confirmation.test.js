@@ -26,14 +26,16 @@ function fixture (container = false, { table = false, allowPacking = false } = {
       packet.items.forEach((value, slot) => { if (value) window.updateSlot(slot, Item.fromNotch(value)) })
     }
   })
-  const click = createConfirmedWindowClicker(bot, catalog, { craft: { confirmTimeoutMs: 20 } }, undefined,
+  const events = []
+  const click = createConfirmedWindowClicker(bot, catalog, { craft: { confirmTimeoutMs: 20 } },
+    (event, details) => events.push({ event, details }),
     { allowContainer: container && !table, allowPacking })
   const slots = window.slots.map(notch)
   const accepted = { windowId: window.id, stateId: 2, items: structuredClone(slots), carriedItem: notch(container ? null : stone) }
   accepted.items[source] = notch(null)
   if (container) accepted.items[0] = Item.toNotch(stone)
   const emit = packet => bot._client.emit('window_items', packet)
-  return { bot, window, source, click, accepted, emit }
+  return { bot, window, source, click, accepted, emit, events }
 }
 
 for (const container of [false, true]) {
@@ -84,6 +86,36 @@ test('an asynchronous response burst also invalidates an earlier matching full c
     f.emit(f.accepted)
     f.emit({ ...f.accepted, stateId: 3, carriedItem: notch(null) })
   })
+  await assert.rejects(f.click(f.window, f.source, 0, 0, () => {}), { recoveryRequired: true })
+})
+
+test('a placement click accepts the server-derived crafting preview update', async () => {
+  const f = fixture(true, { table: true })
+  const preview = Item.toNotch(new Item(registry.itemsByName.cherry_button.id, 1))
+  f.accepted.carriedItem = Item.toNotch(new Item(registry.itemsByName.stone.id, 1))
+  f.bot._client.write = () => setImmediate(() => {
+    f.emit(f.accepted)
+    f.bot._client.emit('set_slot', { windowId: f.window.id, slot: 0, item: preview })
+    f.bot._client.emit('container_set_slot', { containerId: f.window.id, slot: 0, item: preview })
+  })
+
+  await f.click(f.window, f.source, 0, 0, () => {})
+
+  assert.equal(f.window.slots[f.source], null)
+  assert.equal(f.window.selectedItem.name, 'stone')
+  assert.ok(f.events.some(entry => entry.event === 'executor.window_click_confirmed'))
+})
+
+test('a placement click still rejects a changed inventory slot after confirmation', async () => {
+  const f = fixture(true, { table: true })
+  f.bot._client.write = () => setImmediate(() => {
+    f.emit(f.accepted)
+    f.bot._client.emit('set_player_inventory', {
+      slotId: 9,
+      contents: Item.toNotch(new Item(registry.itemsByName.diamond.id, 1))
+    })
+  })
+
   await assert.rejects(f.click(f.window, f.source, 0, 0, () => {}), { recoveryRequired: true })
 })
 
