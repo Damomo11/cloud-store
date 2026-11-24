@@ -249,3 +249,44 @@ test('run() self-heals a leftover pending journal before starting the new craft'
     assert.equal(f.db.getBalance('alice', stickKey), 4, 'the new craft produced the sticks')
   } finally { f.close() }
 })
+
+test('a pending journal on another bot does not block a healthy bot', async () => {
+  const f = fixture()
+  try {
+    const planks = f.seed('alice', 'oak_planks', 2)
+    const otherItems = f.seed('bob', 'cobblestone', 1)
+    const ledger = f.controller.ledger
+    const otherId = 'craft:other-bot'
+    const otherData = {
+      held: [],
+      pending: null,
+      physicalTotals: f.controller.physicalTotals(),
+      stepIndex: 0
+    }
+    ledger.begin({
+      id: otherId,
+      botId: 'bot-b',
+      owner: { uuid: 'bob', username: 'Bob', scope: 'personal' },
+      allocations: [otherItems],
+      data: otherData
+    })
+    ledger.markRecovery(otherId, 'other bot offline', otherData)
+
+    const catalog = f.controller.catalog
+    f.executor.execute = async ({ step, triggers = 1 }) => {
+      const before = catalog.aggregatePrismarineItems(f.bot.inventory.items())
+      f.bot.inventory.items().splice(0, f.bot.inventory.items().length, f.make(step.result.name, step.result.count * triggers))
+      const after = catalog.aggregatePrismarineItems(f.bot.inventory.items())
+      return { before, after, consumed: before, produced: after }
+    }
+
+    const result = await f.controller.run(f.request())
+
+    assert.equal(result.status, 'complete')
+    assert.equal(ledger.pending('bot-a').length, 0)
+    assert.equal(ledger.pending('bot-b').length, 1)
+    assert.equal(f.db.getBalance('alice', planks.itemKey), 0)
+    assert.equal(f.db.getBalance('alice', catalog.fromPrismarineItem(f.make('stick', 1)).itemKey), 4)
+    assert.equal(f.db.getBalance('bob', otherItems.itemKey), 1)
+  } finally { f.close() }
+})
