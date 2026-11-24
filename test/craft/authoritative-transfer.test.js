@@ -47,6 +47,15 @@ function fixture (options = {}) {
     bot._client.write = (name, packet) => {
       assert.equal(name, 'window_click')
       assert.equal(packet.stateId, -1)
+      if (packet.slot === -1) {
+        bot._client.emit('window_items', {
+          windowId: current.id,
+          stateId: 2,
+          items: current.slots.map(item => Item.toNotch(item)),
+          carriedItem: Item.toNotch(null)
+        })
+        return
+      }
       current.acceptClick({ ...packet, item: current.slots[packet.slot] })
       server.chest = make(4)
       server.player = null
@@ -59,6 +68,9 @@ function fixture (options = {}) {
       if (options.transferMode === 'cursor') response.carriedItem = Item.toNotch(make(1))
       if (options.transferMode === 'missing') delete response.carriedItem
       bot._client.emit('window_items', response)
+      if (options.staleDeltaAfterConfirmation) {
+        bot._client.emit('set_cursor_item', { contents: Item.toNotch(make(1)) })
+      }
       if (options.closeAfterClick && packet.windowId !== 0) bot.closeWindow(current)
     }
     config.craft = { ...config.craft, confirmTimeoutMs: 30 }
@@ -157,6 +169,16 @@ test('modern strict deposit confirms its shift without a fixed settle delay and 
     assert.equal(f.bot._client.listenerCount('window_items'), 0)
     assert.equal(settles, 0)
   } finally { global.setTimeout = originalTimer; f.bot.clickWindow = originalClick; f.close() }
+})
+
+test('craft return resyncs once after a stale delta supersedes a matching snapshot', async () => {
+  const f = fixture({ modern: true, staleDeltaAfterConfirmation: true })
+  try {
+    await f.warehouse.depositAllPossible({ requireServerEvidence: true, craftBatch: true })
+    assert.equal(f.opens(), 2)
+    assert.deepEqual(f.bot.inventory.items(), [])
+    assert.equal(f.db.listChestSlots().find(row => row.slot === 0)?.amount, 4)
+  } finally { f.close() }
 })
 
 test('modern strict deposit keeps a confirmed transfer when the server closes the barrel window', async () => {

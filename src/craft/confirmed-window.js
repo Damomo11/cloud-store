@@ -156,6 +156,9 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
     let lastRejected = null
     let invalidationCount = 0
     let lastInvalidation = null
+    let resyncRequestCount = 0
+    let resyncRequestedMs = null
+    let resyncError = null
     const diagnostics = () => {
       let lastMismatch = null
       if (lastRejected) {
@@ -170,7 +173,7 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
       return { windowId: window.id, slot, mouseButton, mode, timeoutMs,
         elapsedMs: performance.now() - startedAt, firstResponseMs, confirmationMs,
         responseCount, incompleteResponseCount, rejectedResponseCount, lastMismatch,
-        invalidationCount, lastInvalidation }
+        invalidationCount, lastInvalidation, resyncRequestCount, resyncRequestedMs }
     }
     let confirmed = null
     let decodeError = null
@@ -187,6 +190,17 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
       lastInvalidation = { reason, confirmationMs, ...details }
       debug('executor.window_confirmation_invalidated', lastInvalidation)
       confirmed = null
+      if (!options.resyncInvalidatedConfirmation || resyncRequestCount) return
+      if ((bot.currentWindow || bot.inventory) !== window) return
+      resyncRequestCount++
+      resyncRequestedMs = performance.now() - startedAt
+      try {
+        bot._client.write('window_click', { windowId: window.id, stateId: -1, slot: -1, mouseButton: 0, mode: 0,
+          changedSlots: [], cursorItem: emptyClickCursor })
+      } catch (error) {
+        resyncError = error
+        wake()
+      }
     }
     const onContent = packet => {
       if (windowId(packet) !== window.id) {
@@ -244,6 +258,7 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
         // Packing cancellation stops the next transfer, but first drains this
         // sent click through its response/timeout before a recovery close.
         if (!options.allowPacking) check()
+        if (resyncError) throw failure(`cannot request a fresh craft window snapshot: ${resyncError.message}`)
         if (decodeError) throw failure(`cannot decode confirmed craft window: ${decodeError.message}`)
         if (Date.now() >= expires) {
           debug('executor.window_confirmation_timeout', diagnostics)

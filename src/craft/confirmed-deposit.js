@@ -4,11 +4,14 @@ const { createConfirmedWindowClicker } = require('./confirmed-window')
 
 // Used only by crafting's strict return-to-storage path. Each shift requests
 // its own authoritative menu; ordinary warehouse deposits keep their adapter.
-function createConfirmedDepositor (warehouse, check = () => {}, container, emitDebug) {
+function createConfirmedDepositor (warehouse, check = () => {}, container, emitDebug, options = {}) {
   if (!container?.type?.match(/^minecraft:generic_9x[1-6]$/) ||
     container.inventoryEnd - container.inventoryStart !== 36 || container.slots?.length !== container.inventoryEnd) return null
   const { bot, catalog, config } = warehouse
-  const click = createConfirmedWindowClicker(bot, catalog, config, emitDebug, { allowContainer: true })
+  const click = createConfirmedWindowClicker(bot, catalog, config, emitDebug, {
+    allowContainer: true,
+    resyncInvalidatedConfirmation: options.resyncInvalidatedConfirmation === true
+  })
   if (!click) return null
   const normalized = value => value ? { itemKey: catalog.fromPrismarineItem(value).itemKey, amount: value.count } : null
   const equal = (a, b) => a?.itemKey === b?.itemKey && a?.amount === b?.amount

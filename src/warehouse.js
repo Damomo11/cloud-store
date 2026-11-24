@@ -309,7 +309,11 @@ class Warehouse {
       try {
         if (options.craftBatch) options.check?.()
         const emitDebug = options.onCraftDepositDebug && ((event, details) => options.onCraftDepositDebug(event, { ...details, chestId: chest.chestId }))
-        const confirmedDeposit = options.requireServerEvidence ? createConfirmedDepositor(this, options.check, container, emitDebug) : null
+        const confirmedDeposit = options.requireServerEvidence
+          ? createConfirmedDepositor(this, options.check, container, emitDebug, {
+              resyncInvalidatedConfirmation: options.craftBatch === true
+            })
+          : null
         let progress = true
         while (progress && this.bot.inventory.items().length) {
           progress = false

@@ -11,7 +11,7 @@ const Item = require('prismarine-item')(registry)
 const windows = require('prismarine-windows')('1.21.11')
 const notch = value => value ? Item.toNotch(value) : { itemCount: 0 }
 
-function fixture (container = false, { table = false, allowPacking = false } = {}) {
+function fixture (container = false, { table = false, allowPacking = false, resyncInvalidatedConfirmation = false } = {}) {
   const inventory = windows.createWindow(0, 'minecraft:inventory', 'Inventory')
   const window = container ? windows.createWindow(5, table ? 'minecraft:crafting' : 'minecraft:generic_9x3', 'Container') : inventory
   const source = container ? window.inventoryStart : 9
@@ -29,7 +29,7 @@ function fixture (container = false, { table = false, allowPacking = false } = {
   const events = []
   const click = createConfirmedWindowClicker(bot, catalog, { craft: { confirmTimeoutMs: 20 } },
     (event, details) => events.push({ event, details }),
-    { allowContainer: container && !table, allowPacking })
+    { allowContainer: container && !table, allowPacking, resyncInvalidatedConfirmation })
   const slots = window.slots.map(notch)
   const accepted = { windowId: window.id, stateId: 2, items: structuredClone(slots), carriedItem: notch(container ? null : stone) }
   accepted.items[source] = notch(null)
@@ -78,6 +78,60 @@ test('a fresh full content response can confirm a click after an intervening slo
   await f.click(f.window, f.source, 0, 0, () => {})
   assert.equal(f.window.slots[f.source], null)
   assert.equal(f.window.selectedItem.name, 'stone')
+})
+
+test('a craft click requests one authoritative snapshot after its confirmation is invalidated', async () => {
+  const f = fixture(false, { resyncInvalidatedConfirmation: true })
+  const writes = []
+  f.bot._client.write = (name, packet) => {
+    writes.push({ name, packet })
+    if (packet.slot !== -1) {
+      setImmediate(() => {
+        f.emit(f.accepted)
+        f.bot._client.emit('set_cursor_item', { contents: notch(null) })
+      })
+    } else {
+      setImmediate(() => f.emit({ ...f.accepted, stateId: 4 }))
+    }
+  }
+
+  await f.click(f.window, f.source, 0, 0, () => {})
+
+  assert.equal(writes.length, 2)
+  assert.deepEqual(writes[1], {
+    name: 'window_click',
+    packet: {
+      windowId: f.window.id,
+      stateId: -1,
+      slot: -1,
+      mouseButton: 0,
+      mode: 0,
+      changedSlots: [],
+      cursorItem: null
+    }
+  })
+  const confirmed = f.events.find(entry => entry.event === 'executor.window_click_confirmed').details
+  assert.equal(confirmed.resyncRequestCount, 1)
+  assert.ok(confirmed.resyncRequestedMs >= 0)
+})
+
+test('a craft click never sends more than one authoritative snapshot request', async () => {
+  const f = fixture(false, { resyncInvalidatedConfirmation: true })
+  let resyncWrites = 0
+  f.bot._client.write = (name, packet) => {
+    if (packet.slot === -1) resyncWrites++
+    setImmediate(() => {
+      f.emit(f.accepted)
+      f.bot._client.emit('set_cursor_item', { contents: notch(null) })
+      if (packet.slot === -1) f.bot._client.emit('set_cursor_item', { contents: notch(null) })
+    })
+  }
+
+  await assert.rejects(f.click(f.window, f.source, 0, 0, () => {}), { recoveryRequired: true })
+
+  assert.equal(resyncWrites, 1)
+  const timeout = f.events.find(entry => entry.event === 'executor.window_confirmation_timeout').details
+  assert.equal(timeout.resyncRequestCount, 1)
 })
 
 test('an asynchronous response burst also invalidates an earlier matching full content', async () => {
