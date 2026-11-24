@@ -49,7 +49,7 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
     return value
   }
   const windowId = packet => packet.windowId ?? packet.containerId
-  const incrementalListeners = (window, snapshot, invalidate) => {
+  const incrementalListeners = (window, snapshot, invalidate, ignoredWindowSlots = new Set()) => {
     // A repeated value does not supersede a complete server snapshot. Changed,
     // malformed or unrepresented values still require a fresh full response.
     const compare = (raw, select) => {
@@ -76,7 +76,9 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
       if (id === -1 || id === 255) {
         if (packet.slot !== -1) invalidate()
         else compare(packet.item, current => current.rawCarried)
-      } else if (id === window.id) compareSlot(packet.item, packet.slot)
+      } else if (id === window.id) {
+        if (!ignoredWindowSlots.has(packet.slot)) compareSlot(packet.item, packet.slot)
+      }
       else if (id === 0) compareSlot(packet.item, playerSlot(packet.slot))
       else if (id === -2 || id === 254) compareSlot(packet.item, playerSlot(inventorySlot(packet.slot)))
     }
@@ -196,7 +198,11 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
     }
     const listeners = [
       ['window_items', onContent], ['container_set_content', onContent],
-      ...incrementalListeners(window, () => confirmed, invalidate)
+      // Placement clicks can change only the server-derived recipe preview in
+      // slot 0. The result slot remains strict for every other click and is
+      // validated separately after the whole wave is staged.
+      ...incrementalListeners(window, () => confirmed, invalidate,
+        mode === 0 && slot !== 0 && window.type === 'minecraft:crafting' ? new Set([0]) : new Set())
     ]
     for (const [name, listener] of listeners) bot._client.on(name, listener)
     const expires = Date.now() + timeoutMs
