@@ -520,8 +520,6 @@ class CraftController {
       const lockRequestedAt = performance.now()
       return await this.warehouse.withWarehouseLock(async () => {
         this.debug('controller.lock_acquired', { waitMs: performance.now() - lockRequestedAt })
-        const pendingOthers = this.ledger.pending().filter(operation => operation.botId !== this.botId)
-        if (pendingOthers.length) throw new Error('存在其他机器人未恢复的合成任务，请先执行 !合成恢复。')
         await this.validateOwner?.(request.owner, request.actor)
         // 开工先自愈窗口/光标残留：多为上次取货/拆盒操作遗留的窗口未关或光标
         // 未归位（服务器包 staleness 的幻影），关窗重读即可纠正。之前直接断言
