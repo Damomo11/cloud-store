@@ -2654,18 +2654,39 @@ class CloudStoreService {
     // 直接关窗归位（settleResidue 幂等），关窗退回的物品随本次清理一并回仓。
     try {
       const residue = this.bot.inventory.items()
-      if (residue.length) {
+      if (residue.length || this.bot.currentWindow || this.bot.inventory.selectedItem) {
         this.debugCraft('service.residual_cleanup_start', { items: residue.map(item => {
           const normalized = this.catalog.fromPrismarineItem(item)
           return { itemId: normalized.itemId, amount: normalized.amount, fingerprint: shortKey(normalized.itemKey) }
         }) })
-        await this.getCraftController().settleResidue()
+        const controller = this.getCraftController()
+        let cursorParkingBlocked = false
+        try {
+          await controller.settleResidue()
+        } catch (error) {
+          if (!error.cursorParkingBlocked) throw error
+          cursorParkingBlocked = true
+        }
         if (this.isActiveCancelled()) return
         notify('检测到机器人背包残留物品，正在按归属回仓清理，随后自动开工合成。')
-        await this.warehouse.goHomeIfAway()
+
+        const returnInventory = async () => {
+          const beforeReturn = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
+          if (!beforeReturn.length) return beforeReturn
+          await this.warehouse.goHomeIfAway()
+          if (this.isActiveCancelled()) return beforeReturn
+          await this.flushResidual()
+          return beforeReturn
+        }
+
+        const beforeReturn = await returnInventory()
         if (this.isActiveCancelled()) return
-        const beforeReturn = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
-        await this.flushResidual()
+        if (cursorParkingBlocked || this.bot.inventory.selectedItem) {
+          await controller.settleResidue()
+          if (this.isActiveCancelled()) return
+          await returnInventory()
+          if (this.isActiveCancelled()) return
+        }
         this.debugCraft('service.residual_cleanup_complete', {
           beforeReturn: beforeReturn.map(item => ({ itemId: item.itemId, amount: item.amount, fingerprint: shortKey(item.itemKey) })),
           remaining: this.catalog.aggregatePrismarineItems(this.bot.inventory.items())

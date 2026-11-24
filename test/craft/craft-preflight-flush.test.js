@@ -29,6 +29,14 @@ function preflightFixture () {
   bot.inventory = { items: () => inventory, selectedItem: null, slots: new Array(46).fill(null) }
   bot.username = 'CraftBot'
   bot.currentWindow = null
+  bot.closeWindow = () => { bot.currentWindow = null }
+  bot.clickWindow = async slot => {
+    if (!bot.inventory.selectedItem || slot < 9 || slot >= 45 || bot.inventory.slots[slot]) return
+    const moved = bot.inventory.selectedItem
+    bot.inventory.selectedItem = null
+    bot.inventory.slots[slot] = moved
+    inventory.push(moved)
+  }
 
   const executor = {
     execute: async ({ step, triggers = 1 }) => {
@@ -52,6 +60,7 @@ function preflightFixture () {
       stored.get(key).count += item.count
     }
     inventory = []
+    bot.inventory.slots.fill(null)
     refresh()
     return { deposited: [...stored.values()].filter(v => v.count > 0).map(v => ({ ...catalog.fromPrismarineItem(v), amount: v.count })), leftover: [] }
   }
@@ -180,5 +189,25 @@ test('背包干净时直接开工，不触发清理提示（回归）', async ()
     assert.equal(result.status, 'complete')
     assert.equal(f.balance('alice', 'stick'), 4)
     assert.equal(f.messages.some(message => /残留.*回仓/.test(message)), false)
+  } finally { f.close() }
+})
+
+test('背包全满且光标持物时先回存背包，再归位并回存光标物品', async () => {
+  const f = preflightFixture()
+  try {
+    f.seed('alice', 'oak_planks', 2)
+    const boxes = Array.from({ length: 36 }, () => f.make('shulker_box', 1))
+    f.setInventory(boxes)
+    boxes.forEach((item, index) => { f.bot.inventory.slots[9 + index] = item })
+    f.bot.inventory.selectedItem = f.make('shulker_box', 1)
+
+    const result = await f.service.runCraftCommand(f.command)
+
+    assert.equal(result.status, 'complete')
+    assert.equal(f.bot.inventory.selectedItem, null)
+    assert.deepEqual(f.getInventory(), [])
+    assert.equal(f.balance(f.config.momoOwner, 'shulker_box'), 37)
+    assert.equal(f.stored.get(f.catalog.fromPrismarineItem(f.make('shulker_box', 1)).itemKey).count, 37)
+    assert.equal(f.transactionCount('residual_to_momo'), 2)
   } finally { f.close() }
 })

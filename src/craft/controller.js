@@ -240,7 +240,11 @@ class CraftController {
         if (!slots[slot]) { target = slot; break }
       }
     }
-    if (target < 0) throw new Error(`无法自愈光标残留：${cursor.displayName || cursor.itemId}（背包没有可合并或空置的槽位）。`)
+    if (target < 0) {
+      const error = new Error(`无法自愈光标残留：${cursor.displayName || cursor.itemId}（背包没有可合并或空置的槽位）。`)
+      error.cursorParkingBlocked = true
+      throw error
+    }
     check()
     await this.bot.clickWindow(target, 0, 0)
     check()
