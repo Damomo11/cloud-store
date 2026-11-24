@@ -52,7 +52,7 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
   const incrementalListeners = (window, snapshot, invalidate, ignoredWindowSlots = new Set()) => {
     // A repeated value does not supersede a complete server snapshot. Changed,
     // malformed or unrepresented values still require a fresh full response.
-    const compare = (raw, select) => {
+    const compare = (raw, select, context) => {
       const current = snapshot()
       if (!current) return
       try {
@@ -61,32 +61,50 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
             ? !Number.isSafeInteger(raw.itemCount) || raw.itemCount < 0 || (raw.itemCount === 0 && !isEmptySlot(raw))
             : typeof raw.present !== 'boolean')) throw new Error('invalid slot')
         const expected = select(current)
-        if (expected === undefined || !isDeepStrictEqual(raw, expected)) invalidate()
-      } catch { invalidate() }
+        if (expected === undefined) {
+          invalidate('unrepresented_delta', context)
+        } else if (!isDeepStrictEqual(raw, expected)) {
+          invalidate('delta_mismatch', {
+            ...context,
+            expected: summarize(decode(expected)),
+            observed: summarize(decode(raw))
+          })
+        }
+      } catch (error) {
+        invalidate('invalid_delta', { ...context, detail: error.message })
+      }
     }
     const playerSlot = slot => window === bot.inventory ? slot
       : Number.isInteger(slot) && slot >= 9 && slot < 45 ? window.inventoryStart + slot - 9 : -1
     // Direct inventory packets use vanilla Inventory indices, unlike menu slots.
     const inventorySlot = slot => !Number.isInteger(slot) || slot < 0 || slot > 40 ? -1
       : slot < 9 ? slot + 36 : slot < 36 ? slot : slot < 40 ? 44 - slot : 45
-    const compareSlot = (raw, slot) => compare(raw, current =>
-      Number.isInteger(slot) && slot >= 0 && slot < current.rawSlots.length ? current.rawSlots[slot] : undefined)
-    const onSlot = packet => {
+    const compareSlot = (raw, slot, context) => compare(raw, current =>
+      Number.isInteger(slot) && slot >= 0 && slot < current.rawSlots.length ? current.rawSlots[slot] : undefined, context)
+    const onSlot = (packet, event) => {
       const id = windowId(packet)
       if (id === -1 || id === 255) {
-        if (packet.slot !== -1) invalidate()
-        else compare(packet.item, current => current.rawCarried)
+        if (packet.slot !== -1) invalidate('legacy_cursor_slot', { event, windowId: id, slot: packet.slot })
+        else compare(packet.item, current => current.rawCarried, { event, windowId: id, slot: -1 })
       } else if (id === window.id) {
-        if (!ignoredWindowSlots.has(packet.slot)) compareSlot(packet.item, packet.slot)
+        if (!ignoredWindowSlots.has(packet.slot)) {
+          compareSlot(packet.item, packet.slot, { event, windowId: id, slot: packet.slot })
+        }
+      } else if (id === 0) {
+        compareSlot(packet.item, playerSlot(packet.slot), { event, windowId: id, slot: packet.slot })
+      } else if (id === -2 || id === 254) {
+        compareSlot(packet.item, playerSlot(inventorySlot(packet.slot)), { event, windowId: id, slot: packet.slot })
       }
-      else if (id === 0) compareSlot(packet.item, playerSlot(packet.slot))
-      else if (id === -2 || id === 254) compareSlot(packet.item, playerSlot(inventorySlot(packet.slot)))
     }
-    const onCursor = packet => compare(packet.contents, current => current.rawCarried)
+    const onCursor = (packet, event) => compare(packet.contents, current => current.rawCarried, { event })
     return [
-      ['set_slot', onSlot], ['container_set_slot', onSlot],
-      ['set_cursor_item', onCursor], ['container_set_cursor_item', onCursor],
-      ['set_player_inventory', packet => compareSlot(packet.contents, playerSlot(inventorySlot(packet.slotId)))]
+      ['set_slot', packet => onSlot(packet, 'set_slot')],
+      ['container_set_slot', packet => onSlot(packet, 'container_set_slot')],
+      ['set_cursor_item', packet => onCursor(packet, 'set_cursor_item')],
+      ['container_set_cursor_item', packet => onCursor(packet, 'container_set_cursor_item')],
+      ['set_player_inventory', packet => compareSlot(packet.contents, playerSlot(inventorySlot(packet.slotId)), {
+        event: 'set_player_inventory', windowId: 0, slot: packet.slotId
+      })]
     ]
   }
 
@@ -136,6 +154,8 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
     let firstResponseMs = null
     let confirmationMs = null
     let lastRejected = null
+    let invalidationCount = 0
+    let lastInvalidation = null
     const diagnostics = () => {
       let lastMismatch = null
       if (lastRejected) {
@@ -149,7 +169,8 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
       }
       return { windowId: window.id, slot, mouseButton, mode, timeoutMs,
         elapsedMs: performance.now() - startedAt, firstResponseMs, confirmationMs,
-        responseCount, incompleteResponseCount, rejectedResponseCount, lastMismatch }
+        responseCount, incompleteResponseCount, rejectedResponseCount, lastMismatch,
+        invalidationCount, lastInvalidation }
     }
     let confirmed = null
     let decodeError = null
@@ -160,17 +181,25 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
       wakeConfirmation = null
       resolve()
     }
-    const invalidate = () => { confirmed = null }
+    const invalidate = (reason = 'unknown', details = {}) => {
+      if (!confirmed) return
+      invalidationCount++
+      lastInvalidation = { reason, confirmationMs, ...details }
+      debug('executor.window_confirmation_invalidated', lastInvalidation)
+      confirmed = null
+    }
     const onContent = packet => {
       if (windowId(packet) !== window.id) {
         if (windowId(packet) === 0 && confirmed && (options.allowPacking || bot.currentWindow !== window ||
             !registry.supportFeature('itemsWithComponents') ||
-            !repeatsPlayerState(packet, confirmed.rawSlots, confirmed.rawCarried, window))) invalidate()
+            !repeatsPlayerState(packet, confirmed.rawSlots, confirmed.rawCarried, window))) {
+          invalidate('player_refresh_mismatch', { windowId: 0, stateId: packet.stateId })
+        }
         return
       }
       // Only the latest relevant response may authorize mirroring state. A
       // later rejected/incomplete response must not leave an old acceptance.
-      invalidate()
+      invalidate('full_content_superseded', { windowId: window.id, stateId: packet.stateId })
       decodeError = null
       responseCount++
       firstResponseMs ??= performance.now() - startedAt
@@ -189,6 +218,8 @@ function createConfirmedWindowClicker (bot, catalog, config, emitDebug = () => {
           confirmed = { slots, carried, stateId: packet.stateId,
             rawSlots: deserialize(serialize(raw)), rawCarried: deserialize(serialize(packet.carriedItem)) }
           confirmationMs ??= performance.now() - startedAt
+          invalidationCount = 0
+          lastInvalidation = null
         } else {
           rejectedResponseCount++
           lastRejected = { slots, carried, stateId: packet.stateId }

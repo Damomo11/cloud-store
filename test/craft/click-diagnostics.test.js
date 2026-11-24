@@ -75,6 +75,36 @@ test('unconfirmed clicks report elapsed wait and the last conflicting slot befor
   assert.equal(f.client.listenerCount('window_items'), 0)
 })
 
+test('timeout diagnostics identify the delta that superseded a matching snapshot', async () => {
+  const f = fixture()
+  f.client.write = () => setImmediate(() => {
+    f.reply(true)
+    f.client.emit('set_slot', {
+      windowId: 0,
+      stateId: 8,
+      slot: 9,
+      item: Item.toNotch(new Item(registry.itemsByName.diamond.id, 1))
+    })
+  })
+
+  await assert.rejects(f.click(f.window, 9, 0, 0, () => {}), error => error.recoveryRequired)
+
+  const invalidated = f.events.find(entry => entry.event === 'executor.window_confirmation_invalidated').details
+  assert.equal(invalidated.reason, 'delta_mismatch')
+  assert.equal(invalidated.event, 'set_slot')
+  assert.equal(invalidated.windowId, 0)
+  assert.equal(invalidated.slot, 9)
+  assert.equal(invalidated.expected, null)
+  assert.equal(invalidated.observed.itemId, 'minecraft:diamond')
+  assert.ok(invalidated.confirmationMs >= 0)
+
+  const timeout = f.events.find(entry => entry.event === 'executor.window_confirmation_timeout').details
+  assert.equal(timeout.invalidationCount, 1)
+  assert.deepEqual(timeout.lastInvalidation, invalidated)
+  assert.doesNotMatch(JSON.stringify(f.events), /private component payload|components|nbt/)
+  assert.equal(f.client.listenerCount('window_items'), 0)
+})
+
 test('diagnostic writer failures cannot reject a server-confirmed click or close', async () => {
   const f = fixture(() => { throw new Error('log sink unavailable') })
   f.client.write = () => f.reply(true)
