@@ -34,7 +34,9 @@ function createInventoryExecutor (bot, catalog, config, warehouse, debugCraft = 
       Item = require('prismarine-item')(registry)
     }
   }
-  const confirmedClick = createConfirmedWindowClicker(bot, catalog, config, emitDebug)
+  const confirmedClick = createConfirmedWindowClicker(bot, catalog, config, emitDebug, {
+    resyncInvalidatedConfirmation: true
+  })
   const snapshot = () => catalog.aggregatePrismarineItems(bot.inventory.items())
 
   function error (message, recoveryRequired = false, cause) {
