@@ -13,6 +13,7 @@ function createService ({ admin = true } = {}) {
     upsertPlayer: () => {},
     canonicalPlayerUuid: uuid => uuid,
     resolveOfflineUuidToMojang: uuid => uuid,
+    getPlayerByUsername: () => null,
     createCommandLog: entry => {
       commandLogs.push(entry)
       return commandLogs.length

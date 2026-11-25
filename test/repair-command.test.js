@@ -10,6 +10,7 @@ function createFixture () {
     upsertPlayer: () => {},
     canonicalPlayerUuid: uuid => uuid,
     resolveOfflineUuidToMojang: uuid => uuid,
+    getPlayerByUsername: () => null,
     getEffectiveDefaultOwnerUuid: uuid => uuid,
     hasPersonalWarehouse: () => true,
     currentCommandLogId: () => 1,

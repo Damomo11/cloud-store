@@ -2226,6 +2226,20 @@ class StoreDb {
       SELECT uuid, username, default_owner_uuid AS defaultOwnerUuid
       FROM players
       WHERE lower(username) = lower(?)
+        AND uuid NOT LIKE 'name:%'
+      ORDER BY last_seen_at DESC
+      LIMIT 1
+    `).get(username) || null
+  }
+
+  // getPlayer 的 name: 兜底也走这里：按用户名找已知行（含幽灵行），供身份
+  // 归属复核。与 getPlayerByUsername 的区别是不滤 name:%——需要看到幽灵行
+  // 的调用方（如管理页诊断）用它，需要正版的调用方用 getPlayerByUsername。
+  getAnyPlayerRowByUsername (username) {
+    return this.db.prepare(`
+      SELECT uuid, username, default_owner_uuid AS defaultOwnerUuid
+      FROM players
+      WHERE lower(username) = lower(?)
       ORDER BY last_seen_at DESC
       LIMIT 1
     `).get(username) || null
