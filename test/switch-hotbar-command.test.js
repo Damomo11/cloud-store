@@ -10,6 +10,7 @@ function createFixture ({ admin = true } = {}) {
     upsertPlayer: () => {},
     canonicalPlayerUuid: uuid => uuid,
     resolveOfflineUuidToMojang: uuid => uuid,
+    getPlayerByUsername: () => null,
     createCommandLog: () => 1,
     runWithCommandContext: async (id, fn) => fn(),
     runWithBotContext: async (context, fn) => fn(),

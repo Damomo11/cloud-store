@@ -195,3 +195,88 @@ test('BreweryX potion ignores brew data and tooltip hidden components', () => {
   const renamed = catalog.fromPrismarineItem(createItem([9, 8, 7, 6], [44, 70, 53, 16], '另一瓶药'))
   assert.notEqual(first.itemKey, renamed.itemKey)
 })
+
+// 2026-11-24 绿牛典藏版案：同一瓶 BreweryX 药水，Servux 隔空读到占位符 lore
+//（extra:["§t"]，插件未解析的服务端存档形态）+ floats-only custom_model_data +
+// hidden_components 形 tooltip_display；协议开窗读到解析后的富文本 lore +
+// 全字段 custom_model_data + hideTooltip 形 tooltip_display。三条差异叠加，
+// sync 记 e2b055、开窗算 0073c1a8，取货按账本位置开桶 actual=0 缺货换桶 5/5
+// 全扑空，"取货失败自动销账"一晚烧掉 4 瓶账面，!同步 又把多出的划给 momo。
+// 指纹改为剥离三个渲染组件（brewdata/hiddenComponents 已有剥离继续生效），
+// 两路形状归一后同 key；盒内条目同剥。
+test('BreweryX potionServux placeholder lore and protocol rich lore unify into one fingerprint', () => {
+  const catalog = createCatalog()
+  const potion = catalog.mcData.itemsByName.potion
+
+  // Servux 路（sync 写入形状）：占位符 lore、floats-only custom_model_data、
+  // hidden_components 列表形 tooltip_display——对应生产 e2b055。
+  const servuxShape = {
+    name: potion.name,
+    type: potion.id,
+    count: 1,
+    metadata: 0,
+    components: [
+      customData({ 'breweryx:brewdata': typedByteArray([86, 1, 0, 0, 10, -71, 2, 0, 6, -25, -69, -65, -25, -119, -101, 0, 0, 0, 0, 0]) }),
+      { type: 'lore', data: [
+        { extra: ['§t'], text: '' },
+        { extra: ['§t'], text: '' },
+        { extra: ['§u'], text: '' },
+        { extra: ['§s'], text: '' },
+        { extra: ['§p'], text: '' },
+        { extra: ['§y'], text: '' }
+      ] },
+      { type: 'potion_contents', data: { custom_color: 32768 } },
+      { type: 'custom_name', data: { extra: [{ bold: 0, color: 'white', italic: 0, obfuscated: 0, strikethrough: 0, text: '绿牛典藏版', underlined: 0 }], text: '' } },
+      { type: 'custom_model_data', data: { floats: [10000] } },
+      { type: 'tooltip_display', data: { hidden_components: ['minecraft:attribute_modifiers', 'minecraft:banner_patterns', 'minecraft:container'] } }
+    ]
+  }
+
+  // 协议开窗路（取货实测形状）：富文本 lore、全字段 custom_model_data、
+  // hideTooltip 布尔形 tooltip_display——对应生产 0073c1a8。
+  const windowShape = {
+    name: potion.name,
+    type: potion.id,
+    count: 1,
+    metadata: 0,
+    components: [
+      customData({ 'breweryx:brewdata': typedByteArray([86, 1, 29, -28, 83, 93, 54, -62, -11, 6, 16, -118, 118, -33, 46, 126]) }),
+      { type: 'lore', data: [
+        { extra: [{ '': '§t' }, { bold: 0, color: 'gray', italic: 0, obfuscated: 0, strikethrough: 0, text: '喝下它你会觉得十分有力', underlined: 0 }], text: '' },
+        { extra: [{ '': '§t' }, { bold: 0, color: 'dark_green', italic: 0, obfuscated: 0, strikethrough: 0, text: '绿牛之力欲破罐而出', underlined: 0 }], text: '' }
+      ] },
+      { type: 'potion_contents', data: { customColor: 32768, customEffects: [], customName: null, potionId: null } },
+      { type: 'custom_name', data: { extra: [{ bold: 0, color: 'white', italic: 0, obfuscated: 0, strikethrough: 0, text: '绿牛典藏版', underlined: 0 }], text: '' } },
+      { type: 'custom_model_data', data: { colors: [], flags: [], floats: [10000], strings: [] } },
+      { type: 'tooltip_display', data: { hideTooltip: false } }
+    ]
+  }
+
+  const servux = catalog.fromPrismarineItem(servuxShape)
+  const opened = catalog.fromPrismarineItem(windowShape)
+  assert.equal(servux.itemKey, opened.itemKey, '两路形状必须归一到同一指纹')
+
+  // 存档形状不受指纹剥离影响：lore 文案原样保留
+  assert.match(opened.metaJson, /绿牛之力欲破罐而出/)
+
+  // 盒内条目同剥：装这瓶酒的盒子两路也必须同 key
+  const nested = catalog.fromContainerEntry({
+    itemId: potion.id,
+    itemCount: 1,
+    components: servuxShape.components
+  })
+  assert.equal(nested.itemKey, opened.itemKey)
+
+  // 非 BreweryX 的普通药水不受影响：lore 差异仍是指纹差异
+  const plainServux = {
+    ...servuxShape,
+    components: servuxShape.components.filter(component => component?.type !== 'custom_data')
+  }
+  const plainOpened = {
+    ...windowShape,
+    components: windowShape.components.filter(component => component?.type !== 'custom_data')
+  }
+  const plainA = catalog.fromPrismarineItem(plainServux)
+  const plainB = catalog.fromPrismarineItem(plainOpened)
+  assert.notEqual(plainA.itemKey, plainB.itemKey, '非 BreweryX 物品的 lore 差异保持区分')
+})
