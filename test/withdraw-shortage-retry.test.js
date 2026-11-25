@@ -37,6 +37,7 @@ function createFixture (withdrawAmounts, options = {}) {
     upsertPlayer: () => {},
     canonicalPlayerUuid: uuid => uuid,
     resolveOfflineUuidToMojang: uuid => uuid,
+    getPlayerByUsername: () => null,
     currentCommandLogId: () => 1,
     addCommandReply: () => {},
     runWithCommandContext: (commandLogId, fn) => fn(),

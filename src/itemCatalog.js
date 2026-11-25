@@ -877,8 +877,33 @@ class ItemCatalog {
             .filter(component => !this.isEmptyCustomDataComponent(component))
         }
       }
+      // BreweryX 药水的文本组件是插件渲染文案，两路读取形状必不一致且会
+      // 被原地改写：Servux 隔空读到占位符形态（extra:["§t"]），协议开窗读到
+      // 解析后的富文本（extra:[{bold:0,color:gray,…}]）——同一瓶绿牛典藏版
+      // sync 记 e2b055、开窗算 0073c1a8，取货按账本位置开桶 actual=0、缺货
+      // 换桶 5/5 全扑空，触发"取货失败自动销账"反复烧账面，!同步 又把多出
+      // 的划给 momo，账本每转一圈净亏（2026-11-24 绿牛典藏版案，一晚销 4 瓶）。
+      // custom_model_data 的 floats-only vs 全字段形状、tooltip_display 的
+      // hideTooltip 字段同理漂移。指纹锚定稳定身份（custom_name 酒名 +
+      // potion_contents 颜色），lore/custom_model_data/tooltip_display 整体
+      // 剥离；存档形状原样，不受影响。
+      stripped = this.stripBreweryTextComponentsForFingerprint(stripped)
     }
     return stripped
+  }
+
+  // BreweryX 酒类指纹剥离插件渲染组件：lore（菜单/星级/年份文案，插件解析
+  // 前后的两代形态）、custom_model_data（floats-only 简写 vs 全字段包装）、
+  // tooltip_display（hideTooltip 档位与已剥的 hiddenComponents 形状）。
+  // custom_name 保留——酒名是玩家身份信息（改名后指纹必须变，见既有测试）。
+  stripBreweryTextComponentsForFingerprint (meta) {
+    if (!Array.isArray(meta?.components)) return meta
+    const kept = meta.components.filter(component =>
+      component?.type !== 'lore' &&
+      component?.type !== 'custom_model_data' &&
+      component?.type !== 'tooltip_display')
+    if (!kept.length) return { ...meta, components: null }
+    return { ...meta, components: kept }
   }
 
   shouldIgnoreCraftEngineNetworkData (itemId) {
@@ -1074,12 +1099,23 @@ class ItemCatalog {
     // 必须同形，否则同一只盒 8 月旧档与重读各算各的 key（音符盒 05b1b67f 案：
     // 账上 22 个盒、桶里读出的是新 key，取货全部回退失败）。
     const entryIsDurable = !fixedBeeContainer && this.isDurableItem(fingerprintItemId)
-    const components = !fixedBeeContainer && Array.isArray(entry.components)
+    let components = !fixedBeeContainer && Array.isArray(entry.components)
       ? entry.components
         .filter(component => this.shouldKeepComponentForFingerprint(component))
         .filter(component => !(entryIsDurable && component?.type === 'damage'))
         .map(component => this.normalizeContainerComponentForFingerprint(component, isBreweryX))
       : []
+    // 盒内 BreweryX 药水条目同顶层剥离渲染组件（lore/custom_model_data/
+    // tooltip_display，见 stripBreweryTextComponentsForFingerprint）：散货在
+    // normalizeMetaForFingerprint→stripVolatileMetaForFingerprint 剥，盒内条目
+    // 此前漏了则装酒的盒子两路各算各的 key，拆盒取酒必败（同 2026-11-24
+    // 绿牛典藏版案的盒内连带）。
+    if (isBreweryX) {
+      components = components.filter(component =>
+        component?.type !== 'lore' &&
+        component?.type !== 'custom_model_data' &&
+        component?.type !== 'tooltip_display')
+    }
     components.sort((a, b) => this.compareFingerprintValues(a, b))
     const removeComponents = !fixedBeeContainer && Array.isArray(entry.removeComponents) && entry.removeComponents.length
       ? [...entry.removeComponents].sort()
