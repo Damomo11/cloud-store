@@ -280,3 +280,90 @@ test('BreweryX potionServux placeholder lore and protocol rich lore unify into o
   const plainB = catalog.fromPrismarineItem(plainOpened)
   assert.notEqual(plainA.itemKey, plainB.itemKey, '非 BreweryX 物品的 lore 差异保持区分')
 })
+
+// 2026-11-24 小三月仓库案：潜影盒内 2 瓶 BreweryX 龙涎酒被 isBeeContainerEntry
+// 的字符串值全域匹配误判成蜂箱，sanitizeShulkerContainerEntry 把它们的身份改写
+// 成 bee_nest + 空组件——同一只盒子 sync 记新指纹，旧指纹 missing 销账、新指纹
+// extra 划 momo，pair 配对器因签名差异漏配。修复后判定只认组件名/legacy 键名，
+// 不再对任意字符串值做全域匹配；真蜂箱（nestedItemId 命中）与杂牌带蜂数据
+// （removeComponents 'bees'）的既有归一不受影响。
+test('bee container detection does not misread nested BreweryX potions as bee nests', () => {
+  const catalog = createCatalog()
+  const shulker = catalog.mcData.itemsByName.shulker_box
+  const potion = catalog.mcData.itemsByName.potion
+  const nest = catalog.mcData.itemsByName.bee_nest
+
+  // 盒内的 BreweryX 酒（带 brewdata/custom_data 等组件；lore 里的字符串值
+  // 不再触发蜂箱判定）
+  const breweryPotion = {
+    itemId: potion.id,
+    itemCount: 1,
+    addedComponentCount: 2,
+    components: [
+      { type: 'custom_data', data: { type: 'compound', value: { 'PublicBukkitValues': { type: 'compound', value: { 'breweryx:brewdata': { type: 'byteArray', value: [86, 1, 0, 0] } } } } } },
+      { type: 'custom_name', data: { extra: [{ text: '龙涎酒', color: 'white', italic: false }], text: '' } },
+      { type: 'lore', data: [{ extra: [{ text: 'bees', color: 'gray' }], text: '' }] }
+    ],
+    removeComponents: [],
+    removedComponentCount: 0
+  }
+  // 直接判定：蜂箱判定为 false
+  assert.equal(catalog.isBeeContainerEntry(breweryPotion), false)
+
+  // 落库归一：身份保持 potion，不变成 bee_nest
+  const stored = catalog.sanitizeShulkerContainerEntry(breweryPotion)
+  assert.equal(stored.itemId, `minecraft:${potion.name}`)
+
+  // 真蜂巢格子仍归一（nestedItemId 命中）
+  const trueNest = {
+    itemId: nest.id,
+    itemCount: 1,
+    addedComponentCount: 1,
+    components: [{ type: 'bees', data: { bees: [{ ticksInHive: 20 }] } }],
+    removeComponents: [],
+    removedComponentCount: 0
+  }
+  assert.equal(catalog.isBeeContainerEntry(trueNest), true)
+  const storedNest = catalog.sanitizeShulkerContainerEntry(trueNest)
+  assert.equal(storedNest.itemId, `minecraft:${nest.name}`)
+  assert.deepEqual(storedNest.components, [])
+
+  // 杂牌带蜂数据（removeComponents 显式移除 bees）仍归一到 bee_nest
+  const corrupted = {
+    itemId: catalog.mcData.itemsByName.copper_nugget.id,
+    itemCount: 1,
+    addedComponentCount: 0,
+    components: [],
+    removeComponents: ['minecraft:bees'],
+    removedComponentCount: 1
+  }
+  assert.equal(catalog.isBeeContainerEntry(corrupted), true)
+
+  // legacy NBT 键名 Bees 也仍触发
+  const legacyBees = {
+    itemId: catalog.mcData.itemsByName.oak_planks.id,
+    itemCount: 1,
+    addedComponentCount: 1,
+    components: [{ type: 'custom_data', data: { type: 'compound', value: { Bees: { type: 'list', value: { type: 'compound', value: [] } } } } }],
+    removeComponents: [],
+    removedComponentCount: 0
+  }
+  assert.equal(catalog.isBeeContainerEntry(legacyBees), true)
+
+  // end-to-end：装着 BreweryX 酒的潜影盒，两条读取路径（开窗协议/Servux NBT）
+  // 落库后盒内条目都是 potion，指纹不再因蜂箱误判分裂
+  const shulkerMeta = contents => ({
+    name: shulker.name,
+    type: shulker.id,
+    count: 1,
+    metadata: 0,
+    components: [{ type: 'container', data: { contents } }]
+  })
+  const windowBox = catalog.fromPrismarineItem(shulkerMeta([
+    breweryPotion,
+    { itemId: catalog.mcData.itemsByName.oak_planks.id, itemCount: 3, addedComponentCount: 0, components: [], removeComponents: [], removedComponentCount: 0 }
+  ]))
+  const windowEntry = JSON.parse(windowBox.metaJson).components[0].data.contents[0]
+  assert.equal(windowEntry.itemId, `minecraft:${potion.name}`)
+  assert.equal(JSON.stringify(windowEntry.components).includes('brewdata'), true)
+})
