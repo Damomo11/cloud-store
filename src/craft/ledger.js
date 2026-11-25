@@ -476,6 +476,25 @@ class CraftLedger {
     return result
   }
 
+  // 管理员强制终止（!合成清空）：不做 held/pending 收尾核对——那正是
+  // 恢复流程反复失败时的死锁点——直接释放库存预留（reserve 不动账面，
+  // 释放后余额原样回到可用额度）并把记录标记失败。实物侧从此不受保护，
+  // 残留物由管理员人工核对。
+  abortCraftOperation (id, message = '') {
+    const operationId = String(id || '')
+    return this.transaction(() => {
+      const operation = this.getCraftOperation(operationId)
+      if (!operation) throw new Error(`craft operation not found: ${operationId}`)
+      if (TERMINAL.has(operation.state)) return operation
+      this.db.releaseInventoryReservation?.(operationId)
+      this.db.db.prepare(`UPDATE craft_operations SET state = ?, phase = ?, message = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`)
+        .run('failed', 'failed', String(message || ''), operationId)
+      this.db.addTransaction('craft', 'failed', operation.owner.uuid,
+        operation.owner.username || operation.owner.uuid, [], `operation=${operationId}; ${message || ''}`)
+      return this.getCraftOperation(operationId)
+    })
+  }
+
   markCraftRecoveryRequired (id, message = '') {
     const operationId = String(id || '')
     return this.transaction(() => {

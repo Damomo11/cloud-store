@@ -1116,6 +1116,10 @@ class CloudStoreService {
       await this.handleCraftRecovery(username)
       return
     }
+    if (text === '!合成清空') {
+      await this.handleCraftAbort(username)
+      return
+    }
     if (text.startsWith('!合成')) {
       await this.handleCraft(username, text, this.defaultStorageOwnerForPlayer(this.getPlayer(username)))
       return
@@ -2758,6 +2762,37 @@ class CloudStoreService {
       }
     }
     return outcomes.length === 1 ? outcomes[0] : outcomes
+  }
+
+  // !合成清空：管理员强制终止卡住的合成记录。跟 !合成恢复 不同，不做
+  // 窗口对账（那正是恢复反复失败的死锁点）：直接释放库存预留（余额原样
+  // 退回仓库可用额度）并把记录标失败。之后机器人恢复接活；它身上的残留
+  // 实物不再受保护，需要人工核对后 !清空背包。真在执行的合成不硬拆，
+  // 先请求停止，等它落地后再清。
+  async handleCraftAbort (username) {
+    if (!this.isAdmin(username)) throw new Error('合成清空只允许系统管理员使用。')
+    const pending = this.db.pendingCraftOperations?.() || []
+    if (!pending.length) {
+      this.msg(username, '没有待清空的合成记录。')
+      return { status: 'empty' }
+    }
+    const ledger = this.getCraftController().ledger
+    const stopped = []
+    for (const operation of pending) {
+      if (this.taskPool?.hasInFlightCraft?.(operation.botId)) {
+        const worker = [...this.taskPool.workers].find(current => current.botId === operation.botId)
+        worker?.getCraftController?.()?.cancel?.('管理员强制终止合成')
+        this.msg(username, `${operation.botId} 的合成正在执行（${String(operation.id).slice(0, 13)}…），已请求停止；等它结束后再执行 !合成清空。`)
+        continue
+      }
+      ledger.abortCraftOperation(operation.id, '管理员强制终止合成任务')
+      stopped.push(operation)
+    }
+    if (stopped.length) {
+      const names = stopped.map(operation => `${operation.botId} ${String(operation.id).slice(0, 13)}…`).join('；')
+      this.msg(username, `已强制终止 ${stopped.length} 条合成记录（${names}）：材料余额已退回仓库可用额度；机器人身上的残留实物不再受保护，请核对后执行 !清空背包。`)
+    }
+    return { status: stopped.length ? 'aborted' : 'stopping', stopped: stopped.length }
   }
 
   // Automatic craft recovery: a bot that spawns (first login, reconnect after a

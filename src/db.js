@@ -2941,6 +2941,13 @@ class StoreDb {
       .all().map(row => String(row.botId || ''))
   }
 
+  // 未终结的合成记录列表（!合成清空用）：跨机器人，按 bot+订单号排序
+  pendingCraftOperations () {
+    if (!this.db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='craft_operations'").get()) return []
+    return this.db.prepare("SELECT id, bot_id AS botId, state, phase FROM craft_operations WHERE state NOT IN ('completed','complete','failed') ORDER BY bot_id, id")
+      .all().map(row => ({ ...row, botId: String(row.botId || '') }))
+  }
+
   // 在途合成/恢复记录仍占用的物品键集合 = 该记录可能还在动的账：
   // 预留行（inventory_reservations）+ 背包持有（data.held/pending.before）+
   // 实物基线（physicalTotals/recoveryBaseline/recoveryIntent.baseline）+
