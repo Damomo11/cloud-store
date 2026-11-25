@@ -1354,6 +1354,17 @@ class ItemCatalog {
     return { ...entry, itemId: `minecraft:${name}` }
   }
 
+  // 盒内条目的蜜蜂容器判定（isBeeContainerEntry 三层）：① 物品本尊是
+  // beehive/bee_nest（数字 id 反查名字）；② removeComponents 显式移除
+  // 'bees'；③ 组件树里带蜂群数据组件——只认组件名（NBT 键 minecraft:bees
+  // → componentsMapToArray 后 type='bees'）或 legacy 键名 'Bees'/'bees'。
+  // 此前的第三层还对「任意字符串值 == bees/bee_nest/beehive」做全域匹配
+  // （walkValue 深搜每个字符串）：任何插件在 custom_data/lore 里塞个
+  // 'bees' 字符串值都会把整格物品误判成蜂箱，随后 sanitizeShulkerContainerEntry
+  // 把它的身份永久改写成 bee_nest + 空组件——同一只盒子 sync 记新指纹，
+  // 账面旧指纹 missing 销账、新指纹 extra 划 momo（2026-11-24 小三月仓库案：
+  // 潜影盒内 2 瓶 BreweryX 龙涎酒被改写成 2 个 bee_nest，盒子 missing 销账
+  // 一只、extra 划 momo 一只，pair 配对器因签名差异漏配）。
   isBeeContainerEntry (entry) {
     if (!entry || !Number.isInteger(entry.itemId)) return false
     const nestedItem = this.mcData.items[entry.itemId]
@@ -1367,7 +1378,6 @@ class ItemCatalog {
     let found = false
     this.walkValue(entry.components, value => {
       if (found) return
-      if (typeof value === 'string' && /^(?:minecraft:)?(?:bees|bee_nest|beehive)$/.test(value)) found = true
       if (!value || typeof value !== 'object') return
       if (Object.prototype.hasOwnProperty.call(value, 'Bees') || Object.prototype.hasOwnProperty.call(value, 'bees')) found = true
       if (value.type === 'bees') found = true
