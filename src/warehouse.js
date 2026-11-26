@@ -4071,7 +4071,10 @@ class Warehouse {
       await sleep(intervalMs)
       const signature = this.inventorySignature()
       const hasNearbyDrop = Boolean(this.nearestDroppedItem())
-      if (signature !== lastSignature || hasNearbyDrop) {
+      // 背包已满时脚边掉落物永远吸不进（满出来的那件），等它被吸走只会
+      // 白转满整个 maxMs 超时（曾 4 秒空等）；满包即视为已收干净。
+      const inventoryFull = this.bot.inventory.emptySlotCount() === 0
+      if (signature !== lastSignature || (hasNearbyDrop && !inventoryFull)) {
         lastSignature = signature
         stableSince = Date.now()
         continue
