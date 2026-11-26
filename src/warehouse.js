@@ -694,14 +694,19 @@ class Warehouse {
     )
     // 并发发完全部点击；单个点击失败/超时不阻塞其他格子（服务器吞包时
     // promise 挂起，用超时兜底，槽位未变空一律不记成功）
-    await Promise.all(clickables.map(clickable =>
+    const results = await Promise.all(clickables.map(clickable =>
       Promise.race([
-        this.bot.clickWindow(clickable.windowSlot, 0, 1).catch(() => {}),
-        sleep(confirmTimeoutMs)
+        this.bot.clickWindow(clickable.windowSlot, 0, 1).then(() => ({ status: 'ok', clickable })).catch(() => ({ status: 'rejected', clickable })),
+        sleep(confirmTimeoutMs).then(() => ({ status: 'timeout', clickable }))
       ])
     ))
+    // 三态分治：服务器明确拒绝的格子（桶满被拒等）物品原地不动，直接剔出
+    // 等待名单——它们永远等不到"变空"，留着只会空转满整个 deadline（第一
+    // 桶满后 9 格被拒曾白等 2 秒）。点击确认成功的等格子清空；超时未知的
+    // （吞包，服务器可能处理了但回执丢了）保守保留等待，靠 deadline 兜底，
+    // 最终统计一律按格子实况记账，不漏不多。
+    const pending = new Set(results.filter(result => result.status !== 'rejected').map(result => result.clickable))
     const deadline = Date.now() + confirmTimeoutMs
-    const pending = new Set(clickables)
     while (pending.size && Date.now() < deadline) {
       for (const clickable of [...pending]) {
         if (!container.slots?.[clickable.windowSlot]) pending.delete(clickable)
