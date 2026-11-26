@@ -322,6 +322,28 @@ class Warehouse {
           // moved item is not clicked again through its stale slot number.
           const items = this.currentDepositItemsFromContainer(container)
           if (!items.length) break
+          // 普通存入（非合成取存）走整窗并发：一次性把全部物品点完。
+          // 全批未确认（吞包/被拦）时退回逐个点，老行为兜底。
+          if (!confirmedDeposit && !options.requireServerEvidence) {
+            const batch = await this.tryDepositAllInto(container, items)
+            if (batch.moved > 0) {
+              progress = true
+              movedInChest += batch.moved
+              this.debug(`deposited ${batch.moved} items in one parallel batch into ${this.describeChest(chest)}`)
+            } else if (batch.attempted > 0) {
+              for (const item of items) {
+                const moved = await this.tryDepositInto(container, item)
+                if (moved > 0) {
+                  progress = true
+                  movedInChest += moved
+                  this.debug(`deposited ${moved} ${item.name} into ${this.describeChest(chest)}`)
+                }
+                await sleep(this.config.timing.containerSettleMs)
+              }
+            }
+            await sleep(this.config.timing.containerSettleMs)
+            continue
+          }
           for (const item of items) {
             if (options.requireServerEvidence) {
               const key = this.catalog.fromPrismarineItem(item).itemKey
@@ -638,6 +660,61 @@ class Warehouse {
       this.debug(`deposit exact slot ${item.name}@${item.slot} failed: ${error.message}`)
       return 0
     }
+  }
+
+  // 一次性把整窗物品并发点完：所有 shift-click 同一拍发出（服务器按包序
+  // 串行处理，shift-click 失败物品原地留在背包，天然无副作用），然后统一
+  // 等每个格子变空确认。格子间判定正交，互不干扰。任何格子没等到确认就
+  // 当作失败：物品留在背包，交给外层换桶/回退逐个重试。
+  async tryDepositAllInto (container, items) {
+    const clickables = []
+    for (const item of items) {
+      const normalized = this.catalog.fromPrismarineItem(item)
+      if (this.containerFreeSpaceFor(container, normalized.itemKey, item) <= 0) {
+        this.debug(`deposit no actual space for ${item.name} key=${normalized.itemKey}`)
+        continue
+      }
+      const windowSlot = Number.isInteger(item.windowSlot)
+        ? item.windowSlot
+        : this.windowSlotFromBotInventorySlot(container, item.slot)
+      if (windowSlot === null) continue
+      const sourceWindowItem = container.slots?.[windowSlot] || null
+      if (!sourceWindowItem) {
+        this.debug(`deposit skip stale inventory slot ${item.name}@${item.slot}: window slot ${windowSlot} is empty`)
+        continue
+      }
+      clickables.push({ item, windowSlot, sourceCount: Math.max(0, Number(sourceWindowItem.count || item.count || 0)) })
+    }
+    if (!clickables.length) return { moved: 0, attempted: 0 }
+
+    const confirmTimeoutMs = Math.max(
+      Number(this.config.timing?.containerSettleMs || 0),
+      Number(this.config.timing?.inventoryUpdateTimeoutMs || 2000),
+      500
+    )
+    // 并发发完全部点击；单个点击失败/超时不阻塞其他格子（服务器吞包时
+    // promise 挂起，用超时兜底，槽位未变空一律不记成功）
+    await Promise.all(clickables.map(clickable =>
+      Promise.race([
+        this.bot.clickWindow(clickable.windowSlot, 0, 1).catch(() => {}),
+        sleep(confirmTimeoutMs)
+      ])
+    ))
+    const deadline = Date.now() + confirmTimeoutMs
+    const pending = new Set(clickables)
+    while (pending.size && Date.now() < deadline) {
+      for (const clickable of [...pending]) {
+        if (!container.slots?.[clickable.windowSlot]) pending.delete(clickable)
+      }
+      if (!pending.size) break
+      await sleep(50)
+    }
+    let moved = 0
+    for (const clickable of clickables) {
+      if (!container.slots?.[clickable.windowSlot]) moved += clickable.sourceCount
+      else this.debug(`deposit batch slot ${clickable.item.name}@${clickable.windowSlot} unconfirmed, left in inventory`)
+    }
+    return { moved, attempted: clickables.length }
   }
 
   inventoryCountByItemKey (itemKey) {
