@@ -2596,6 +2596,12 @@ class Warehouse {
         if (wholeGroups.length >= 2) {
           const total = wholeGroups.reduce((sum, group) => sum + group.count, 0)
           const clickTimeoutMs = Math.max(500, Number(this.config.timing?.withdrawParallelClickTimeoutMs ?? 2000))
+          // 基线必须在点击前取：点击后物品已到账，基线含新物品会让末端
+          // 核对永远等不到增量（误报 0），触发逐槽重复搬运导致超领。
+          const inventoryBaseline = this.hasInventoryItems() ? this.inventoryCountByItemKey(itemKey) : 0
+          const windowInventoryBaseline = this.hasWindowItems(container)
+            ? this.windowInventoryCountByItemKey(container, itemKey)
+            : 0
           await Promise.all(wholeGroups.map(group => Promise.race([
             this.bot.clickWindow(group.slot, 0, 1).catch(error => {
               this.debug(`parallel withdraw slot ${group.slot} rejected: ${error?.message || error}`)
@@ -2606,8 +2612,8 @@ class Warehouse {
           const confirmed = await this.waitForInventoryTransfer(
             container,
             itemKey,
-            this.hasInventoryItems() ? this.inventoryCountByItemKey(itemKey) : 0,
-            this.hasWindowItems(container) ? this.windowInventoryCountByItemKey(container, itemKey) : 0,
+            inventoryBaseline,
+            windowInventoryBaseline,
             total
           )
           this.trace('take', 'parallel_whole_groups', {
