@@ -18,6 +18,9 @@ class Warehouse {
     this.config = config
     this.warehouseMutex = warehouseMutex
     this.warehouseState = warehouseState || { revision: 0, chestRevisions: new Map() }
+    // 桶级租约：存桶段允许多只 bot 并行（各存各的桶）。租约登记在共享
+    // warehouseState 上，选桶（锁内）时跳过他 bot 正在存的桶，杜绝撞桶。
+    if (!this.warehouseState.barrelLeases) this.warehouseState.barrelLeases = new Map()
     this.botId = String(config.server?.botName || config.server?.username || bot.username || 'bot').toLowerCase()
     this.chestNames = new Set(config.warehouse.chestBlockNames || ['barrel'])
     this.homePosition = null
@@ -169,10 +172,12 @@ class Warehouse {
   }
 
   async depositInventoryForOwner (ownerUuid, username) {
-    return this.withWarehouseLock(() => this.depositInventoryForOwnerLocked(ownerUuid, username))
+    // 租约模式：不再整段持仓库大锁（那是三只 bot 存桶串行的根源），
+    // 改为桶级租约并行；DB 写（better-sqlite3 同步原子）无需大锁。
+    return this.depositInventoryForOwnerLocked(ownerUuid, username, { barrelLease: true })
   }
 
-  async depositInventoryForOwnerLocked (ownerUuid, username) {
+  async depositInventoryForOwnerLocked (ownerUuid, username, options = {}) {
     const before = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
     if (!before.length) return { deposited: [], leftover: [] }
 
@@ -183,7 +188,7 @@ class Warehouse {
       decision: `开始入库：背包共 ${before.reduce((sum, item) => sum + item.amount, 0)} 个`
     })
 
-    const depositResult = await this.depositAllPossible()
+    const depositResult = await this.depositAllPossible(options)
 
     const after = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
     this.debug(`deposit inventory result owner=${username} before=${before.reduce((sum, item) => sum + item.amount, 0)} after=${after.reduce((sum, item) => sum + item.amount, 0)}`)
@@ -219,14 +224,15 @@ class Warehouse {
   }
 
   async depositInventoryWithoutBalance (type = 'recovery', message = '') {
-    return this.withWarehouseLock(() => this.depositInventoryWithoutBalanceLocked(type, message))
+    // 与 depositInventoryForOwner 一致：桶级租约并行，不再整段持大锁。
+    return this.depositInventoryWithoutBalanceLocked(type, message, { barrelLease: true })
   }
 
-  async depositInventoryWithoutBalanceLocked (type = 'recovery', message = '') {
+  async depositInventoryWithoutBalanceLocked (type = 'recovery', message = '', options = {}) {
     const before = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
     if (!before.length) return { deposited: [], leftover: [] }
 
-    const depositResult = await this.depositAllPossible()
+    const depositResult = await this.depositAllPossible(options)
 
     const after = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
     this.debug(`deposit inventory without balance result type=${type} before=${before.reduce((sum, item) => sum + item.amount, 0)} after=${after.reduce((sum, item) => sum + item.amount, 0)}`)
@@ -275,12 +281,21 @@ class Warehouse {
       const skipped = craftVisited
         ? new Set([...skippedNoProgress, ...craftVisited])
         : skippedNoProgress
-      const chest = this.nextDepositChest(skipped, {
+      const nextChestArgs = {
         allowEmpty: emptyAttempts < maxEmptyAttempts,
         allowFull: fullAttempts < maxFullAttempts,
         craftBatch: Boolean(options.craftBatch),
         routePosition: craftRoutePosition
-      })
+      }
+      // 租约模式：选桶+登记租约在锁内（毫秒级，快），走位/开桶/放物品在
+      // 锁外（秒级，多只 bot 并行各存各的桶），写账+放租再回锁内。
+      const chest = options.barrelLease
+        ? await this.withWarehouseLock(() => {
+            const c = this.nextDepositChest(skipped, nextChestArgs)
+            if (c) this.leaseBarrel(c.chestId)
+            return c
+          })
+        : this.nextDepositChest(skipped, nextChestArgs)
       if (!chest) {
         stopReason = `没有本地记录可用的入库木桶；已尝试空槽木桶 ${emptyAttempts} 个、满记录木桶 ${fullAttempts} 个。请管理员执行 !同步 后再试。`
         this.debug('deposit no local candidate chest left')
@@ -385,9 +400,14 @@ class Warehouse {
           }
           if (reopenAfterConfirmedClose) break
         }
-        this.refreshChestSnapshot(chest, container)
+        if (options.barrelLease) {
+          await this.withWarehouseLock(() => this.refreshChestSnapshot(chest, container))
+        } else {
+          this.refreshChestSnapshot(chest, container)
+        }
       } finally {
         this.closeContainerQuietly(container)
+        if (options.barrelLease) this.releaseBarrel(chest.chestId)
       }
 
       if (craftVisited && (!reopenAfterConfirmedClose || !this.bot.inventory.items().length)) {
@@ -424,6 +444,9 @@ class Warehouse {
 
   async verifyCraftContainer (chest) {
     try {
+      // 桶可能正被其它 bot 的并行存入租用（锁外放物品段）；等租约放掉
+      // 再取权威快照对账，避免把"别人正在放"的中间状态当成不一致。
+      await this.waitBarrelLeaseRelease(chest.chestId)
       const expectedChest = this.db.listChestSlots().filter(row => row.chestId === chest.chestId && row.slot !== null)
         .map(row => ({ slot: row.slot, itemKey: row.itemKey, amount: row.amount }))
       const expectedPlayer = this.catalog.aggregatePrismarineItems(this.bot.inventory.items())
@@ -498,6 +521,23 @@ class Warehouse {
     return totals(left) === totals(right)
   }
 
+  // ---- 桶级租约（并行存桶） ----
+  leaseBarrel (chestId) {
+    this.warehouseState.barrelLeases.set(chestId, { bot: this.botId, since: Date.now() })
+  }
+
+  releaseBarrel (chestId) {
+    const lease = this.warehouseState.barrelLeases.get(chestId)
+    if (lease && lease.bot === this.botId) this.warehouseState.barrelLeases.delete(chestId)
+  }
+
+  async waitBarrelLeaseRelease (chestId, timeoutMs = 8000) {
+    const start = Date.now()
+    while (this.warehouseState.barrelLeases.has(chestId) && Date.now() - start < timeoutMs) {
+      await sleep(200)
+    }
+  }
+
   nextDepositChest (skipped = new Set(), options = {}) {
     const containerSlots = this.config.warehouse?.containerSlots || 27
     const inventorySpace = this.currentDepositSpaceByItemKey()
@@ -528,7 +568,7 @@ class Warehouse {
     }
 
     const candidates = [...chests.values()]
-      .filter(chest => !skipped.has(chest.chestId))
+      .filter(chest => !skipped.has(chest.chestId) && !this.warehouseState.barrelLeases.has(chest.chestId))
       .map(chest => {
         const emptySlots = Math.max(0, containerSlots - chest.usedSlots.size)
         return {
@@ -539,7 +579,7 @@ class Warehouse {
       })
       .filter(chest => chest.sameItemFree > 0 || chest.emptySlots > 0)
     const fullRecordCandidates = [...chests.values()]
-      .filter(chest => !skipped.has(chest.chestId))
+      .filter(chest => !skipped.has(chest.chestId) && !this.warehouseState.barrelLeases.has(chest.chestId))
       .map(chest => {
         const emptySlots = Math.max(0, containerSlots - chest.usedSlots.size)
         return { ...chest, emptySlots, score: 0 }
