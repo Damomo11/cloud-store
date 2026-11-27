@@ -1724,7 +1724,10 @@ class CloudStoreWebServer {
       WHERE ${where.join(' AND ')}
       ORDER BY b.owner_uuid COLLATE NOCASE ASC, i.display_name COLLATE NOCASE ASC
       LIMIT ?
-    `).all(...params, limit * 3)
+    `).all(...params, itemQ ? 100000 : limit * 3)
+    // 搜索（itemQ 非空）时取全量再在 JS 里匹配：原预取上限 limit*3（默认
+    // 1500 行）会在大仓库（如 3009 行的椰汁橙）把排序后半的物品整段截
+    // 掉——关键词命中的行若落在截断区，网页搜索结果就不完整。
 
     const result = []
     const owners = new Set()
