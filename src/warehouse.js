@@ -2572,6 +2572,57 @@ class Warehouse {
       if (expectedTake <= 0) break
 
       let planned = 0
+      // 整组并发段：计划量能整组收下的槽（整槽数量 <= 剩余计划量），
+      // shift-click 一次性全点。整组 = 拿整槽恰好等于计划量，物理上不可
+      // 能多领；被拒/吞包的组留在桶里，差额由下方逐槽循环补取（少取无
+      // 损失）。shift-click 不碰光标可安全并发；craft 证据路径保持逐次
+      // 确认不走并发。权威计数仍以 pass 末容器净减量为准（不双计）。
+      if (!options.requireServerEvidence) {
+        const sortedSlots = this.containerContentItems(container)
+          .filter(entry => this.catalog.fromPrismarineItem(entry).itemKey === itemKey)
+          .sort((a, b) => {
+            const ao = preferredOrder.has(a.slot) ? preferredOrder.get(a.slot) : Number.MAX_SAFE_INTEGER
+            const bo = preferredOrder.has(b.slot) ? preferredOrder.get(b.slot) : Number.MAX_SAFE_INTEGER
+            return ao - bo || b.count - a.count || a.slot - b.slot
+          })
+        const wholeGroups = []
+        let scouted = 0
+        for (const entry of sortedSlots) {
+          if (entry.count > expectedTake - scouted) break
+          wholeGroups.push({ slot: entry.slot, count: entry.count })
+          scouted += entry.count
+          if (scouted >= expectedTake) break
+        }
+        if (wholeGroups.length >= 2) {
+          const total = wholeGroups.reduce((sum, group) => sum + group.count, 0)
+          const clickTimeoutMs = Math.max(500, Number(this.config.timing?.withdrawParallelClickTimeoutMs ?? 2000))
+          await Promise.all(wholeGroups.map(group => Promise.race([
+            this.bot.clickWindow(group.slot, 0, 1).catch(error => {
+              this.debug(`parallel withdraw slot ${group.slot} rejected: ${error?.message || error}`)
+              return null
+            }),
+            sleep(clickTimeoutMs).then(() => null)
+          ])))
+          const confirmed = await this.waitForInventoryTransfer(
+            container,
+            itemKey,
+            this.hasInventoryItems() ? this.inventoryCountByItemKey(itemKey) : 0,
+            this.hasWindowItems(container) ? this.windowInventoryCountByItemKey(container, itemKey) : 0,
+            total
+          )
+          this.trace('take', 'parallel_whole_groups', {
+            pass: pass + 1,
+            slots: wholeGroups.map(group => group.slot),
+            planned: total,
+            confirmed,
+            decision: `整组并发取货：${wholeGroups.length} 槽计划 ${total} 个，到账 ${confirmed} 个${confirmed < total ? '，差额转入逐槽补取' : ''}`
+          })
+          this.debug(`withdrew ${confirmed}/${total} in one parallel whole-group batch (${wholeGroups.length} slots)`)
+          // 已并发取走的组会从窗口消失，逐槽循环重挑时自然跳过；点击挂
+          // 起但实际到账的组由重挑（组已消失）兜住，不会双拿。
+          planned = Math.min(expectedTake, Math.max(planned, confirmed))
+        }
+      }
       while (planned < expectedTake) {
         const item = this.containerContentItems(container)
           .filter(entry => {
